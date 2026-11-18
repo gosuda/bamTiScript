@@ -37,8 +37,10 @@ use super::{
     Surface, print_json_value, print_with_jsx_plan,
 };
 
+mod es5_class;
 mod namespaces;
 
+use es5_class::{MemberScope, SuperContext};
 use namespaces::{ContainerBinding, NamespaceFrame, is_qualified_alias};
 
 /// Stable diagnostic identifiers produced by target transforms.
@@ -269,6 +271,7 @@ fn emit_json_file(
                 inline_lines: None,
                 prelude_tail: None,
                 expanded_sequences: None,
+                class_iifes: None,
             },
             model,
             print_options,
@@ -378,6 +381,7 @@ fn emit_json_object(
                 inline_lines: None,
                 prelude_tail: None,
                 expanded_sequences: None,
+                class_iifes: None,
             },
             model,
             *options,
@@ -473,6 +477,7 @@ pub fn emit_transformed(
             inline_lines: Some(&rewriter.inline_lines),
             prelude_tail: Some(&tail),
             expanded_sequences: Some(&rewriter.expanded_sequences),
+            class_iifes: Some(&rewriter.class_iifes),
         },
         model,
         PrintOptions {
@@ -752,6 +757,8 @@ struct ClassLowering {
     class: ClassDeclaration,
     prelude: Vec<Stmt>,
     postlude: Vec<Stmt>,
+    /// An arrow in a static initializer captured `this`, which is the class.
+    static_this: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -781,6 +788,10 @@ struct Rewriter<'a> {
     expanded_sequences: BTreeSet<NodeId>,
     /// One entry per enclosing function: what lowered arrows capture from it.
     capture_scopes: Vec<CaptureScope>,
+    /// Parenthesized ES5 class IIFEs, which print a `/** @class */` marker.
+    class_iifes: BTreeSet<NodeId>,
+    /// The class member being rewritten, one entry per ES5 class member.
+    super_contexts: Vec<SuperContext>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
     /// Names `import type` binds, which an `export { name }` cannot publish.
@@ -816,6 +827,8 @@ struct Rewriter<'a> {
 struct CaptureScope {
     /// Lowered arrows being rewritten inside this function right now.
     arrow_depth: usize,
+    /// Every `this` reads the capture, as in a derived ES5 constructor.
+    this_always: bool,
     this: Option<IdentifierNode>,
     arguments: Option<IdentifierNode>,
 }
@@ -949,6 +962,8 @@ impl<'a> Rewriter<'a> {
             expression_temp_scopes: Vec::new(),
             expanded_sequences: BTreeSet::new(),
             capture_scopes: Vec::new(),
+            class_iifes: BTreeSet::new(),
+            super_contexts: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
             type_imports: type_import_names(file, options),
@@ -1981,7 +1996,7 @@ impl<'a> Rewriter<'a> {
         if !self
             .capture_scopes
             .last()
-            .is_some_and(|scope| scope.arrow_depth > 0)
+            .is_some_and(|scope| scope.arrow_depth > 0 || scope.this_always)
         {
             return expression.clone();
         }
@@ -3853,6 +3868,11 @@ impl<'a> Rewriter<'a> {
         wrapper: ExportWrapper,
     ) -> Vec<Stmt> {
         if Self::needs(LanguageFeature::Classes, self.options) {
+            if let Some(statements) =
+                self.lower_es5_class_statement(statement, class_range, class, wrapper)
+            {
+                return statements;
+            }
             self.diag(
                 codes::CLASS_REQUIRES_ES2015,
                 statement.range(),
@@ -3911,6 +3931,10 @@ impl<'a> Rewriter<'a> {
     ) -> ClassLowering {
         let mode = FieldMode::for_options(self.options);
         let mut class = class.clone();
+        let derived = class.extends.is_some();
+        let es5 = Self::needs(LanguageFeature::Classes, self.options);
+        let mut ctor_this_captured = false;
+        let mut static_this = false;
         let mut prelude = Vec::new();
         let mut instance = Vec::new();
         let mut static_steps = Vec::new();
@@ -3961,8 +3985,18 @@ impl<'a> Rewriter<'a> {
             match member.data() {
                 ClassMember::Constructor(ctor) => {
                     let mut ctor = ctor.clone();
-                    ctor.parameters = self.rewrite_parameters(&ctor.parameters);
-                    let statements = self.rewrite_statements(&ctor.body.data().statements);
+                    let scope = es5.then_some(MemberScope {
+                        is_static: false,
+                        rebinds_this: derived,
+                    });
+                    let ((parameters, statements), captured) =
+                        self.with_class_member(scope, |this| {
+                            let parameters = this.rewrite_parameters(&ctor.parameters);
+                            let statements = this.rewrite_statements(&ctor.body.data().statements);
+                            (parameters, statements)
+                        });
+                    ctor_this_captured |= !derived && captured.is_some();
+                    ctor.parameters = parameters;
                     ctor.body = self.node(ctor.body.range(), Block { statements });
                     constructor = Some(self.node(member.range(), ClassMember::Constructor(ctor)));
                 }
@@ -4000,11 +4034,24 @@ impl<'a> Rewriter<'a> {
                     if property.initializer.is_none() && matches!(mode, FieldMode::Assign) {
                         continue;
                     }
-                    let init = property
-                        .initializer
-                        .as_deref()
-                        .map(|value| self.rewrite_expr(value))
-                        .unwrap_or_else(|| self.void_zero(member.range()));
+                    let scope = es5.then_some(MemberScope {
+                        is_static: property.modifiers.is_static,
+                        rebinds_this: derived && !property.modifiers.is_static,
+                    });
+                    let (init, captured) = self.with_class_member(scope, |this| {
+                        property
+                            .initializer
+                            .as_deref()
+                            .map(|value| this.rewrite_expr(value))
+                            .unwrap_or_else(|| this.void_zero(member.range()))
+                    });
+                    if captured.is_some() {
+                        if property.modifiers.is_static {
+                            static_this = true;
+                        } else {
+                            ctor_this_captured |= !derived;
+                        }
+                    }
                     let field = FieldInit {
                         name,
                         init,
@@ -4024,7 +4071,14 @@ impl<'a> Rewriter<'a> {
                     } else {
                         self.lower_class_member_name(&method.name, &mut prelude, member.range())
                     };
-                    method.function = self.rewrite_function_like(&method.function, member.range());
+                    let scope = es5.then_some(MemberScope {
+                        is_static: method.modifiers.is_static,
+                        rebinds_this: false,
+                    });
+                    let (function, _) = self.with_class_member(scope, |this| {
+                        this.rewrite_function_like(&method.function, member.range())
+                    });
+                    method.function = function;
                     members.push(self.node(member.range(), ClassMember::Method(method)));
                 }
                 ClassMember::AutoAccessor(accessor) if matches!(mode, FieldMode::Native) => {
@@ -4051,7 +4105,14 @@ impl<'a> Rewriter<'a> {
                 }
                 ClassMember::StaticBlock(block) => {
                     self.expression_temp_scopes.push(Vec::new());
-                    let mut statements = self.rewrite_statements(&block.data().statements);
+                    let scope = es5.then_some(MemberScope {
+                        is_static: true,
+                        rebinds_this: false,
+                    });
+                    let (mut statements, captured) = self.with_class_member(scope, |this| {
+                        this.rewrite_statements(&block.data().statements)
+                    });
+                    static_this |= captured.is_some();
                     let temps = self.expression_temp_scopes.pop().unwrap_or_default();
                     if let Some(declaration) = self.temp_declaration(temps, block.range()) {
                         statements.insert(0, declaration);
@@ -4078,10 +4139,23 @@ impl<'a> Rewriter<'a> {
             if let Some(ctor) = constructor {
                 members.insert(0, ctor);
             }
-        } else if let Some(ctor) =
-            self.lower_constructor(constructor, &instance, class.extends.is_some(), range, mode)
-        {
-            members.insert(0, ctor);
+        } else {
+            let this_receiver = (es5 && derived).then(|| self.capture_name("_this"));
+            if let Some(ctor) = self.lower_constructor(
+                constructor,
+                &instance,
+                derived,
+                range,
+                mode,
+                this_receiver.as_ref(),
+            ) {
+                let ctor = if ctor_this_captured {
+                    self.declare_constructor_this(ctor)
+                } else {
+                    ctor
+                };
+                members.insert(0, ctor);
+            }
         }
         class.members = members;
         let mut postlude = Vec::new();
@@ -4105,6 +4179,7 @@ impl<'a> Rewriter<'a> {
             class,
             prelude,
             postlude,
+            static_this,
         }
     }
 
@@ -4158,6 +4233,27 @@ impl<'a> Rewriter<'a> {
         )
     }
 
+    /// `var _this = this;` at the top of a constructor whose arrows captured it.
+    fn declare_constructor_this(&mut self, constructor: ClassMemberNode) -> ClassMemberNode {
+        let ClassMember::Constructor(ctor) = constructor.data() else {
+            unreachable!("constructor slot must contain constructor");
+        };
+        let range = constructor.range();
+        let name = self.capture_name("_this");
+        let value = self.syn_node(range, Expression::This);
+        let declaration = self.make_temp_declaration(name, value, range);
+        let mut statements = vec![declaration];
+        statements.extend(ctor.body.data().statements.iter().cloned());
+        let body = self.syn_node(ctor.body.range(), Block { statements });
+        self.syn_node(
+            range,
+            ClassMember::Constructor(ConstructorDeclaration {
+                body,
+                ..ctor.clone()
+            }),
+        )
+    }
+
     fn lower_constructor(
         &mut self,
         constructor: Option<ClassMemberNode>,
@@ -4165,13 +4261,14 @@ impl<'a> Rewriter<'a> {
         derived: bool,
         range: TextRange,
         mode: FieldMode,
+        this_receiver: Option<&IdentifierNode>,
     ) -> Option<ClassMemberNode> {
         if fields.is_empty() && constructor.is_none() {
             return None;
         }
         let inits: Vec<Stmt> = fields
             .iter()
-            .map(|field| self.field_statement(None, field, mode))
+            .map(|field| self.field_statement(this_receiver, field, mode))
             .collect();
         match constructor {
             Some(existing) => {
@@ -5442,20 +5539,36 @@ impl<'a> Rewriter<'a> {
         )
     }
     fn static_block_statement(&mut self, block: BlockNode, range: TextRange) -> Stmt {
-        let arrow = self.syn_node(
-            range,
-            Expression::Arrow(ArrowFunction {
+        let callee = if Self::needs(LanguageFeature::ArrowFunctions, self.options) {
+            let function = FunctionLike {
+                decorators: Vec::new(),
+                name: None,
                 is_async: false,
+                is_generator: false,
                 type_parameters: None,
                 parameters: Vec::new(),
                 return_type: None,
-                body: FunctionBody::Block(block),
-            }),
-        );
+                body: Some(FunctionBody::Block(block)),
+            };
+            let function =
+                self.syn_node(range, Expression::Function(FunctionExpression { function }));
+            self.syn_node(range, Expression::Parenthesized(Box::new(function)))
+        } else {
+            self.syn_node(
+                range,
+                Expression::Arrow(ArrowFunction {
+                    is_async: false,
+                    type_parameters: None,
+                    parameters: Vec::new(),
+                    return_type: None,
+                    body: FunctionBody::Block(block),
+                }),
+            )
+        };
         let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
-                callee: Box::new(arrow),
+                callee: Box::new(callee),
                 optional: false,
                 type_arguments: None,
                 arguments: Vec::new(),
@@ -8649,6 +8762,12 @@ impl<'a> Rewriter<'a> {
         inferred_name: Option<&str>,
         hoist_suspending: bool,
     ) -> Expr {
+        if Self::needs(LanguageFeature::Classes, self.options)
+            && let Some(lowered) =
+                self.lower_es5_class_expression(expression, &class_expression.class)
+        {
+            return lowered;
+        }
         if matches!(FieldMode::for_options(self.options), FieldMode::Native) {
             let lowered = self.lower_class(&class_expression.class, expression.range(), None);
             let child_marked = self.any_marked(lowered.class.members.iter().map(|m| m.id()));
@@ -8953,6 +9072,31 @@ impl<'a> Rewriter<'a> {
                 let rewritten = self.rewrite_arrow(expression, arrow);
                 self.replace_await = previous;
                 rewritten
+            }
+            Expression::Super if !self.super_contexts.is_empty() => self
+                .rewrite_super_object(expression.range())
+                .unwrap_or_else(|| expression.clone()),
+            Expression::Call(call)
+                if !self.super_contexts.is_empty()
+                    && matches!(call.callee.data(), Expression::Super) =>
+            {
+                let arguments = self.rewrite_call_arguments(&call.arguments);
+                self.node(
+                    expression.range(),
+                    Expression::Call(CallExpression {
+                        arguments,
+                        ..call.clone()
+                    }),
+                )
+            }
+            Expression::Call(call)
+                if !self.super_contexts.is_empty()
+                    && matches!(
+                        call.callee.data(),
+                        Expression::Member(member) if matches!(member.object.data(), Expression::Super)
+                    ) =>
+            {
+                self.lower_super_method_call(expression, call)
             }
             Expression::Await(awaited) => {
                 let argument = self.rewrite_expr(&awaited.argument);
@@ -13384,7 +13528,7 @@ mod tests {
 
     #[test]
     fn classes_below_es2015_are_errors() {
-        let output = emit_at("class C {}\n", ScriptTarget::Es5);
+        let output = emit_at("class C { #x = 1; }\n", ScriptTarget::Es5);
         assert!(
             output
                 .diagnostics
@@ -15696,6 +15840,106 @@ console.log(JSON.stringify([bar, bar4, log]));
         let output = emit_at("var f = (x) => x + this.y;\n", ScriptTarget::Es2015);
         let code = javascript(&output);
         assert!(code.contains("var f = (x) => x + this.y;"), "{code}");
+    }
+
+    #[test]
+    fn es5_class_becomes_a_constructor_function_with_prototype_members() {
+        let output = emit_at(
+            "class C {\n    static foo() { }\n    get x() {\n        return 1;\n    }\n    bar() { }\n}\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let expected = "var C = /** @class */ (function () {\n    function C() {\n    }\n    C.foo = function () { };\n    Object.defineProperty(C.prototype, \"x\", {\n        get: function () {\n            return 1;\n        },\n        enumerable: false,\n        configurable: true\n    });\n    C.prototype.bar = function () { };\n    return C;\n}());\n";
+        assert!(code.contains(expected), "{code}");
+    }
+
+    #[test]
+    fn es5_derived_class_calls_super_through_this_returned_by_the_super_call() {
+        let output = emit_at(
+            "class C { static bar() { } baz() { } }\nclass D extends C {\n    static foo() {\n        super.bar();\n    }\n    constructor() {\n        super();\n        super.baz();\n    }\n}\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let expected = "var D = /** @class */ (function (_super) {\n    __extends(D, _super);\n    function D() {\n        var _this = _super.call(this) || this;\n        _super.prototype.baz.call(_this);\n        return _this;\n    }\n    D.foo = function () {\n        _super.bar.call(this);\n    };\n    return D;\n}(C));\n";
+        assert!(code.contains(expected), "{code}");
+        assert!(code.contains("var __extends = "), "{code}");
+    }
+
+    #[test]
+    fn es5_derived_class_without_a_constructor_forwards_its_arguments() {
+        let output = emit_at("class B { }\nclass E extends B { }\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("    function E() {\n        return _super !== null && _super.apply(this, arguments) || this;\n    }\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_parameter_properties_and_field_initializers_assign_in_the_constructor() {
+        let output = emit_at(
+            "class B { constructor(public x: number) { } }\nclass D extends B {\n    z = 1;\n    w = () => this.z;\n    constructor(a: number, public y: number) { super(a); }\n}\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("    function B(x) {\n        this.x = x;\n    }\n"),
+            "{code}"
+        );
+        assert!(
+            code.contains("        var _this = _super.call(this, a) || this;\n        _this.y = y;\n        _this.z = 1;\n        _this.w = function () { return _this.z; };\n        return _this;\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_base_class_arrows_in_field_initializers_capture_this_in_the_constructor() {
+        let output = emit_at("class F { v = () => this.v; }\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("    function F() {\n        var _this = this;\n        this.v = function () { return _this.v; };\n    }\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_static_members_follow_the_methods_inside_the_class_function() {
+        let output = emit_at(
+            "class F { m() { } static t = 1; static { F.t++; } }\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("    F.prototype.m = function () { };\n    F.t = 1;\n    (function () { F.t++; })();\n    return F;\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_class_expressions_and_default_exports_name_their_constructor() {
+        let output = emit_at(
+            "var G = class { };\nexport class X { }\nexport default class { }\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "var G = /** @class */ (function () {\n    function class_1() {\n    }\n    return class_1;\n}());\n",
+            "export var X = /** @class */ (function () {\n    function X() {\n    }\n    return X;\n}());\n",
+            "var default_1 = /** @class */ (function () {\n    function default_1() {\n    }\n    return default_1;\n}());\nexport default default_1;\n",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn es2015_keeps_class_syntax() {
+        let output = emit_at(
+            "class C extends B { m() { return super.m(); } }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("class C extends B {"), "{code}");
+        assert!(code.contains("return super.m();"), "{code}");
     }
 
     #[test]

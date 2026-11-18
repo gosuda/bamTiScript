@@ -551,6 +551,8 @@ pub(crate) struct PrintSource<'a> {
     pub(crate) prelude_tail: Option<&'a str>,
     /// Comma sequences that print one element per line.
     pub(crate) expanded_sequences: Option<&'a BTreeSet<NodeId>>,
+    /// Parenthesized class IIFEs, which print `/** @class */ ` first.
+    pub(crate) class_iifes: Option<&'a BTreeSet<NodeId>>,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -638,6 +640,7 @@ pub(crate) fn print(
             inline_lines: None,
             prelude_tail: None,
             expanded_sequences: None,
+            class_iifes: None,
         },
         model,
         options,
@@ -666,6 +669,7 @@ pub(crate) fn print_with_jsx_plan(
         inline_lines,
         prelude_tail,
         expanded_sequences,
+        class_iifes,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -732,6 +736,7 @@ pub(crate) fn print_with_jsx_plan(
         inline_lines,
         prelude_tail,
         expanded_sequences,
+        class_iifes,
         temp_names: TempNames::new(authored_identifiers(file, original_content)),
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
@@ -793,6 +798,7 @@ pub(crate) fn print_json_value(
         inline_lines,
         prelude_tail: _,
         expanded_sequences,
+        class_iifes,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new().with_sources_content(options.inline_sources);
@@ -854,6 +860,7 @@ pub(crate) fn print_json_value(
         inline_lines,
         prelude_tail: None,
         expanded_sequences,
+        class_iifes,
         temp_names: TempNames::new(HashSet::new()),
     };
     emitter.emit_expression_prec(expression, 0);
@@ -1033,6 +1040,7 @@ struct Emitter<'a> {
     inline_lines: Option<&'a HashMap<NodeId, String>>,
     prelude_tail: Option<&'a str>,
     expanded_sequences: Option<&'a BTreeSet<NodeId>>,
+    class_iifes: Option<&'a BTreeSet<NodeId>>,
     /// Final names for the rewriter's temporary placeholders.
     temp_names: TempNames,
 }
@@ -2080,8 +2088,9 @@ impl<'a> Emitter<'a> {
             // `{\n}` for statement blocks, ParameterList6 for function bodies;
             // an empty block authored on one line prints `{ }`, its space
             // synthesized and unmapped.
-            if self.node_spans_authored_lines(block)
-                && self.source.spans_multiple_lines(block.range())
+            if self.is_synthesized(block.id())
+                || (self.node_spans_authored_lines(block)
+                    && self.source.spans_multiple_lines(block.range()))
             {
                 self.newline();
             } else {
@@ -2989,6 +2998,12 @@ impl<'a> Emitter<'a> {
         let parenthesize = prec < min_prec;
         if parenthesize {
             self.raw("(");
+        }
+        if self
+            .class_iifes
+            .is_some_and(|marked| marked.contains(&expression.id()))
+        {
+            self.raw("/** @class */ ");
         }
         self.emit_expression_inner(expression);
         if parenthesize {
