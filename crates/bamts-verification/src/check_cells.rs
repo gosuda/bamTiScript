@@ -2093,7 +2093,7 @@ const NO_JAVASCRIPT_OUTPUT: &str = "javascript emit reached no case units";
 
 /// The directory components every emitting unit shares, which tsc drops from
 /// the paths under `outDir`.
-fn common_directory<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+pub(crate) fn common_directory<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let mut common: Option<Vec<&str>> = None;
     for path in paths {
         let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -2113,7 +2113,12 @@ fn common_directory<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
 
 /// The output path `fullEmitPaths` prints: `outDir`, the unit's directories
 /// below the common source directory, then the section name.
-fn emitted_path(directory: &str, common: &[&str], unit_path: &str, section: &str) -> String {
+pub(crate) fn emitted_path(
+    directory: &str,
+    common: &[&str],
+    unit_path: &str,
+    section: &str,
+) -> String {
     let parts: Vec<&str> = unit_path
         .split('/')
         .filter(|part| !part.is_empty())
