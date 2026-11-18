@@ -245,6 +245,8 @@ pub struct ResolvedProgram {
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
     commonjs: bool,
+    /// The wrapper module kinds beyond CommonJS that change emitted output.
+    wrapped_module: Option<crate::emitter::ModuleKind>,
     no_implicit_any: bool,
     strict_null_checks: bool,
     strict_property_initialization: bool,
@@ -322,6 +324,12 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn is_commonjs(&self) -> bool {
         self.commonjs
+    }
+
+    /// The AMD or UMD module kind the options select, if any.
+    #[must_use]
+    pub const fn wrapped_module(&self) -> Option<crate::emitter::ModuleKind> {
+        self.wrapped_module
     }
 
     #[must_use]
@@ -771,6 +779,16 @@ impl ProgramLoader {
             modules: Arc::from(state.modules),
             module_indices,
             commonjs: ambient == ResolutionMode::Require,
+            wrapped_module: self
+                .options
+                .module()
+                .and_then(crate::emitter::parse_module)
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        crate::emitter::ModuleKind::Amd | crate::emitter::ModuleKind::Umd
+                    )
+                }),
             no_implicit_any: self.options.no_implicit_any(),
             strict_null_checks: self.options.strict_null_checks(),
             strict_property_initialization: self.options.strict_property_initialization(),

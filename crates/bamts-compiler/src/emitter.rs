@@ -553,6 +553,18 @@ pub(crate) struct PrintSource<'a> {
     pub(crate) expanded_sequences: Option<&'a BTreeSet<NodeId>>,
     /// Parenthesized class IIFEs, which print `/** @class */ ` first.
     pub(crate) class_iifes: Option<&'a BTreeSet<NodeId>>,
+    /// The factory an AMD or UMD module's body prints inside.
+    pub(crate) module_wrapper: Option<&'a ModuleWrapper>,
+}
+
+/// The text around the body of an AMD or UMD module.
+pub(crate) struct ModuleWrapper {
+    /// Printed first, at the left margin.
+    pub(crate) head: String,
+    /// Printed after the head inside the factory, one level in.
+    pub(crate) inner: String,
+    /// Printed last, at the left margin.
+    pub(crate) tail: String,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -641,6 +653,7 @@ pub(crate) fn print(
             prelude_tail: None,
             expanded_sequences: None,
             class_iifes: None,
+            module_wrapper: None,
         },
         model,
         options,
@@ -670,6 +683,7 @@ pub(crate) fn print_with_jsx_plan(
         prelude_tail,
         expanded_sequences,
         class_iifes,
+        module_wrapper,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -737,6 +751,7 @@ pub(crate) fn print_with_jsx_plan(
         prelude_tail,
         expanded_sequences,
         class_iifes,
+        module_wrapper,
         temp_names: TempNames::new(authored_identifiers(file, original_content)),
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
@@ -799,6 +814,7 @@ pub(crate) fn print_json_value(
         prelude_tail: _,
         expanded_sequences,
         class_iifes,
+        module_wrapper: _,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new().with_sources_content(options.inline_sources);
@@ -861,6 +877,7 @@ pub(crate) fn print_json_value(
         prelude_tail: None,
         expanded_sequences,
         class_iifes,
+        module_wrapper: None,
         temp_names: TempNames::new(HashSet::new()),
     };
     emitter.emit_expression_prec(expression, 0);
@@ -1041,6 +1058,7 @@ struct Emitter<'a> {
     prelude_tail: Option<&'a str>,
     expanded_sequences: Option<&'a BTreeSet<NodeId>>,
     class_iifes: Option<&'a BTreeSet<NodeId>>,
+    module_wrapper: Option<&'a ModuleWrapper>,
     /// Final names for the rewriter's temporary placeholders.
     temp_names: TempNames,
 }
@@ -1737,12 +1755,16 @@ impl<'a> Emitter<'a> {
             })
     }
 
+    fn emit_lines(&mut self, text: &str) {
+        for line in text.lines() {
+            self.raw(line);
+            self.newline();
+        }
+    }
+
     fn emit_prelude_tail(&mut self) {
         if let Some(tail) = self.prelude_tail.filter(|tail| !tail.is_empty()) {
-            self.raw(tail);
-            if !tail.ends_with('\n') {
-                self.newline();
-            }
+            self.emit_lines(tail);
         }
     }
 
@@ -1752,10 +1774,19 @@ impl<'a> Emitter<'a> {
                 .first()
                 .is_some_and(|statement| self.is_hoisted_temp_declaration(statement)),
         );
+        let wrapper = self.module_wrapper;
+        if let Some(wrapper) = wrapper {
+            self.write_detached_comments();
+            self.emit_lines(&wrapper.head);
+            self.indent += 1;
+            self.emit_lines(&wrapper.inner);
+        }
         if hoisted == 0 {
             self.emit_prelude_tail();
         }
-        self.write_detached_comments();
+        if wrapper.is_none() {
+            self.write_detached_comments();
+        }
         self.emit_statement_list(&statements[..hoisted]);
         if hoisted == 1 {
             self.emit_prelude_tail();
@@ -1766,6 +1797,10 @@ impl<'a> Emitter<'a> {
             self.newline();
         }
         self.write_closing_comments();
+        if let Some(wrapper) = wrapper {
+            self.indent -= 1;
+            self.emit_lines(&wrapper.tail);
+        }
     }
 
     fn emit_module_decl(&mut self, statements: &[Stmt]) {

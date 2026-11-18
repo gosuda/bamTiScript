@@ -33,13 +33,15 @@ use crate::syntax::*;
 
 use super::helpers::{self, HelperKind, HelperOptions};
 use super::{
-    EmitFileNames, EmitOutput, EmittedFile, ModuleKind, Newline, PrintOptions, PrintSource,
-    Surface, print_json_value, print_with_jsx_plan,
+    EmitFileNames, EmitOutput, EmittedFile, ModuleKind, ModuleWrapper, Newline, PrintOptions,
+    PrintSource, Surface, print_json_value, print_with_jsx_plan,
 };
 
+mod amd_module;
 mod es5_class;
 mod namespaces;
 
+use amd_module::{AmdDependency, AmdPlan};
 use es5_class::{MemberScope, SuperContext};
 use namespaces::{ContainerBinding, NamespaceFrame, is_qualified_alias};
 
@@ -272,6 +274,7 @@ fn emit_json_file(
                 prelude_tail: None,
                 expanded_sequences: None,
                 class_iifes: None,
+                module_wrapper: None,
             },
             model,
             print_options,
@@ -382,6 +385,7 @@ fn emit_json_object(
                 prelude_tail: None,
                 expanded_sequences: None,
                 class_iifes: None,
+                module_wrapper: None,
             },
             model,
             *options,
@@ -463,10 +467,17 @@ pub fn emit_transformed(
     let helper_emit =
         helpers::emit_helpers_for_source(&used_helpers, &options.helpers, &rewritten, is_module);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
-    let head = join_preludes(
-        &strict_prelude(file, options, is_module),
-        &helper_emit.prelude,
-    );
+    let strict = strict_prelude(file, options, is_module);
+    let wrapper = if is_module {
+        rewriter.module_wrapper(file, options, strict.clone())
+    } else {
+        None
+    };
+    let head = if wrapper.is_some() {
+        helper_emit.prelude.clone()
+    } else {
+        join_preludes(&strict, &helper_emit.prelude)
+    };
     let tail = join_preludes(&cjs_marker, &runtime_prelude);
     let mut output = print_with_jsx_plan(
         PrintSource {
@@ -478,6 +489,7 @@ pub fn emit_transformed(
             prelude_tail: Some(&tail),
             expanded_sequences: Some(&rewriter.expanded_sequences),
             class_iifes: Some(&rewriter.class_iifes),
+            module_wrapper: wrapper.as_ref(),
         },
         model,
         PrintOptions {
@@ -652,7 +664,10 @@ fn strict_prelude(file: &SourceFile, options: &TransformOptions, is_module: bool
         }
     });
     let strict = if is_module {
-        module_kind == ModuleKind::CommonJs
+        matches!(
+            module_kind,
+            ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd
+        )
     } else {
         options.always_strict
     };
@@ -872,6 +887,8 @@ struct CjsPlan {
     export_assignment: bool,
     /// Require-local names whose member calls become `(0, m.p)()`.
     require_roots: BTreeSet<String>,
+    /// The AMD or UMD wrapper's dependencies, for those module kinds.
+    amd: Option<AmdPlan>,
 }
 
 #[derive(Clone)]
@@ -936,7 +953,10 @@ impl<'a> Rewriter<'a> {
         model: Option<&'a SemanticModel>,
         ids: &'a mut NodeIdSource,
     ) -> Self {
-        let cjs = if options.module_kind == Some(ModuleKind::CommonJs) {
+        let cjs = if matches!(
+            options.module_kind,
+            Some(ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd)
+        ) {
             model.and_then(|model| Self::build_cjs_plan(file, options, model))
         } else {
             None
@@ -990,6 +1010,14 @@ impl<'a> Rewriter<'a> {
         let mut names = RequireNames::new(identifier_names(file));
         let mut plan = CjsPlan {
             es_module_interop: options.es_module_interop,
+            amd: match options.module_kind {
+                Some(ModuleKind::Amd) => Some(AmdPlan::default()),
+                Some(ModuleKind::Umd) => Some(AmdPlan {
+                    umd: true,
+                    ..AmdPlan::default()
+                }),
+                _ => None,
+            },
             ..CjsPlan::default()
         };
         let module_scope = model.module_scope();
@@ -1011,8 +1039,24 @@ impl<'a> Rewriter<'a> {
                     // quotes in every require form.
                     let quoted = quote_module_specifier(module);
                     let Some(clause) = &import.clause else {
-                        plan.statement_lines
-                            .insert(statement.id(), format!("require({quoted});"));
+                        match plan.amd.as_mut() {
+                            Some(amd) if !amd.umd => amd.dependencies.push(AmdDependency {
+                                specifier: quoted,
+                                alias: None,
+                            }),
+                            Some(amd) => {
+                                amd.dependencies.push(AmdDependency {
+                                    specifier: quoted.clone(),
+                                    alias: None,
+                                });
+                                plan.statement_lines
+                                    .insert(statement.id(), format!("require({quoted});"));
+                            }
+                            None => {
+                                plan.statement_lines
+                                    .insert(statement.id(), format!("require({quoted});"));
+                            }
+                        }
                         continue;
                     };
                     let clause = match &reads {
@@ -1125,6 +1169,21 @@ impl<'a> Rewriter<'a> {
                 Statement::ImportEquals(import) => {
                     plan.is_module |= !import.is_type_only
                         && matches!(import.reference, ExternalModuleReference::Require(_));
+                    if let Some(amd) = plan.amd.as_mut()
+                        && !import.is_type_only
+                        && let ExternalModuleReference::Require(source) = &import.reference
+                    {
+                        let local = identifier_text(file, &import.local);
+                        if reads.as_ref().is_none_or(|reads| reads.contains(&local)) {
+                            amd.dependencies.push(AmdDependency {
+                                specifier: quote_module_specifier(&module_specifier(file, source)),
+                                alias: Some(local),
+                            });
+                            if !amd.umd {
+                                amd.erased_imports.insert(statement.id());
+                            }
+                        }
+                    }
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
@@ -1191,8 +1250,28 @@ impl<'a> Rewriter<'a> {
                 _ => {}
             }
             if !plan.requires.is_empty() {
-                let lines = std::mem::take(&mut plan.requires).join("\n");
-                plan.statement_lines.insert(statement.id(), lines);
+                let requires = std::mem::take(&mut plan.requires);
+                let lines = match plan.amd.as_mut() {
+                    None => requires,
+                    Some(amd) if amd.umd => {
+                        for line in &requires {
+                            amd_module::scan_requires(line, amd);
+                        }
+                        requires
+                    }
+                    Some(amd) => requires
+                        .iter()
+                        .filter_map(|line| {
+                            amd_module::amd_line(line, amd, |specifier| {
+                                names.allocate(specifier.trim_matches('"'))
+                            })
+                        })
+                        .collect(),
+                };
+                if !lines.is_empty() {
+                    plan.statement_lines
+                        .insert(statement.id(), lines.join("\n"));
+                }
             }
         }
         plan_cjs_declared_exports(file, model, &exported_locals, &mut plan);
@@ -1590,6 +1669,19 @@ impl<'a> Rewriter<'a> {
         )
     }
 
+    /// The AMD or UMD factory around the module body, for those module kinds.
+    fn module_wrapper(
+        &self,
+        file: &SourceFile,
+        options: &TransformOptions,
+        inner: String,
+    ) -> Option<ModuleWrapper> {
+        let amd = self.cjs.as_ref()?.amd.as_ref()?;
+        let directives = amd_module::source_directives(file.source_text().as_str());
+        let indent = " ".repeat(usize::from(options.indent_width));
+        Some(amd.wrapper(&directives, inner, &indent, options.newline.as_str()))
+    }
+
     /// The `__esModule` marker plus the `void 0` export preamble.
     fn cjs_marker_prelude(&self, force_module: bool) -> String {
         let Some(plan) = &self.cjs else {
@@ -1615,6 +1707,12 @@ impl<'a> Rewriter<'a> {
         for (exported, local) in &plan.hoisted_exports {
             prelude.push_str(&format!("{} = {local};\n", exports_member(exported)));
         }
+        if let Some(amd) = &plan.amd {
+            for line in &amd.interop {
+                prelude.push_str(line);
+                prelude.push('\n');
+            }
+        }
         prelude
     }
 
@@ -1632,6 +1730,14 @@ impl<'a> Rewriter<'a> {
     /// `module.exports = value;`, which `export =` means under CommonJS.
     fn cjs_export_assignment_statement(&mut self, range: TextRange, value: &Expr) -> Stmt {
         let value = self.rewrite_expr(value);
+        if self.cjs.as_ref().is_some_and(|plan| plan.amd.is_some()) {
+            return self.syn_node(
+                range,
+                Statement::Return(ReturnStatement {
+                    argument: Some(Box::new(value)),
+                }),
+            );
+        }
         let module = self.ident("module");
         let object = self.syn_node(range, Expression::Identifier(module));
         let property = MemberProperty::Named(self.ident("exports"));
@@ -2017,12 +2123,14 @@ impl<'a> Rewriter<'a> {
         self.syn_node(expression.range(), Expression::Identifier(name))
     }
 
-    /// `arguments` inside a lowered arrow reads the enclosing function's.
+    /// `arguments` inside a lowered arrow reads the enclosing function's; a file
+    /// has none to capture.
     fn rewrite_arguments(&mut self, expression: &Expr) -> Option<Expr> {
-        if !self
-            .capture_scopes
-            .last()
-            .is_some_and(|scope| scope.arrow_depth > 0)
+        if self.capture_scopes.len() < 2
+            || !self
+                .capture_scopes
+                .last()
+                .is_some_and(|scope| scope.arrow_depth > 0)
         {
             return None;
         }
@@ -2465,6 +2573,15 @@ impl<'a> Rewriter<'a> {
                 ContainerBinding::Local,
                 statement.range(),
             ),
+            Statement::ImportEquals(_)
+                if self.cjs.as_ref().is_some_and(|plan| {
+                    plan.amd
+                        .as_ref()
+                        .is_some_and(|amd| amd.erased_imports.contains(&statement.id()))
+                }) =>
+            {
+                Vec::new()
+            }
             Statement::ImportEquals(import) => self.lower_alias(statement, import),
             Statement::Export(_)
             | Statement::Interface(_)
@@ -15267,6 +15384,82 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
         }
+    }
+
+    #[test]
+    fn amd_module_lists_its_dependencies_and_receives_them_as_parameters() {
+        let output = emit_with_options(
+            "import a = require('./a');\nimport * as ns from './n';\nimport './side';\nexport var x = a.v + ns.w;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let expected = "define([\"require\", \"exports\", \"./a\", \"./n\", \"./side\"], function (require, exports, a, ns) {\n    \"use strict\";\n    Object.defineProperty(exports, \"__esModule\", { value: true });\n    exports.x = void 0;\n    ns = __importStar(ns);\n    exports.x = a.v + ns.w;\n});\n";
+        assert!(code.ends_with(expected), "{code}");
+    }
+
+    #[test]
+    fn amd_module_assigns_interop_helpers_before_the_body_and_returns_export_assignments() {
+        let output = emit_with_options(
+            "import d from './d';\nexport = d;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let expected = "define([\"require\", \"exports\", \"./d\"], function (require, exports, d_1) {\n    \"use strict\";\n    d_1 = __importDefault(d_1);\n    return d_1.default;\n});\n";
+        assert!(code.ends_with(expected), "{code}");
+    }
+
+    #[test]
+    fn amd_directives_name_the_module_and_add_dependencies() {
+        let output = emit_with_options(
+            "///<amd-module name='Named'/>\n///<amd-dependency path='bar' name='b'/>\n\nimport m2 = require('m2');\nm2.f();\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("define(\"Named\", [\"require\", \"exports\", \"bar\", \"m2\"], function (require, exports, b, m2) {"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn umd_module_wraps_the_commonjs_body_and_lists_its_dependencies() {
+        let output = emit_with_options(
+            "import a from './a';\nexport var x = a;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Umd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let expected = "(function (factory) {\n    if (typeof module === \"object\" && typeof module.exports === \"object\") {\n        var v = factory(require, exports);\n        if (v !== undefined) module.exports = v;\n    }\n    else if (typeof define === \"function\" && define.amd) {\n        define([\"require\", \"exports\", \"./a\"], factory);\n    }\n})(function (require, exports) {\n    \"use strict\";\n    Object.defineProperty(exports, \"__esModule\", { value: true });\n    exports.x = void 0;\n    const a_1 = __importDefault(require(\"./a\"));\n    exports.x = a_1.default;\n});\n";
+        assert!(code.ends_with(expected), "{code}");
+    }
+
+    #[test]
+    fn amd_leaves_a_script_unwrapped() {
+        let output = emit_with_options(
+            "var x = 1;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("define("), "{code}");
     }
 
     #[test]
