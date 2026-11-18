@@ -1280,8 +1280,7 @@ impl<'a> Rewriter<'a> {
                             }
                             _ => {
                                 let names = declared_binding_names(file, inner);
-                                if let Statement::Variable(declaration) = inner.data()
-                                    && is_reassignable(declaration)
+                                if matches!(inner.data(), Statement::Variable(declaration) if !names_anonymous_functions(declaration))
                                 {
                                     plan.exported_variables
                                         .extend(names.iter().filter_map(|name| symbol_of(name)));
@@ -1401,11 +1400,10 @@ impl<'a> Rewriter<'a> {
                 out.push(self.cjs_export_assignment(&name, &name, range));
                 out
             }
-            Statement::Variable(declaration) if is_reassignable(declaration) => {
+            Statement::Variable(declaration) if !names_anonymous_functions(declaration) => {
                 self.namespace_export_variables(declaration, "exports", range)
             }
             _ => {
-                // A const never changes, so its local copy stays accurate.
                 let names = declared_binding_names(self.file, inner);
                 let mut out = self.rewrite_statement(inner);
                 for name in &names {
@@ -12448,9 +12446,21 @@ fn plan_cjs_local_exports(
     }
 }
 
-/// Whether a declaration's bindings can change after it runs.
-fn is_reassignable(declaration: &VariableDeclaration) -> bool {
-    matches!(declaration.kind, VariableKind::Var | VariableKind::Let)
+/// Whether every declarator binds a name to an anonymous function or class.
+/// Such an initializer keeps its inferred name only while it stays in a local
+/// declaration, so the export publishes the local binding afterwards.
+fn names_anonymous_functions(declaration: &VariableDeclaration) -> bool {
+    !declaration.declarations.is_empty()
+        && declaration.declarations.iter().all(|declarator| {
+            let declarator = declarator.data();
+            matches!(declarator.binding.data(), BindingPattern::Identifier(_))
+                && declarator.initializer.as_ref().is_some_and(|initializer| {
+                    matches!(
+                        initializer.data(),
+                        Expression::Arrow(_) | Expression::Function(_) | Expression::Class(_)
+                    )
+                })
+        })
 }
 
 fn collect_pattern_names(file: &SourceFile, pattern: &Pattern, names: &mut Vec<String>) {
@@ -14146,9 +14156,6 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
 
     #[test]
     fn commonjs_class_and_variable_exports_receive_void_0_preamble() {
-        // Upstream importHelpersWithImportStarAs a.js (a2836e68) emits
-        // `exports.A = void 0;` + class + `exports.A = A;`; the variable form
-        // follows es6ImportDefaultBindingWithExport client.js (adfd4388).
         let output = emit_with_options(
             "export class A {}\nexport const x = 1;\n",
             EmitOptions {
@@ -14169,13 +14176,10 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             .expect("preamble");
         let class_at = code.find("class A").expect("class kept");
         let class_export = code.find("exports.A = A;").expect("class export");
-        let variable = code.find("const x = 1;").expect("variable kept");
-        let variable_export = code.find("exports.x = x;").expect("variable export");
+        let variable_export = code.find("exports.x = 1;").expect("variable export");
+        assert!(!code.contains("const x"), "{code}");
         assert!(
-            marker < class_at
-                && class_at < class_export
-                && class_export < variable
-                && variable < variable_export,
+            marker < class_at && class_at < class_export && class_export < variable_export,
             "{code}"
         );
     }
