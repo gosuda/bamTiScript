@@ -141,6 +141,8 @@ pub struct EmitOptions {
     pub experimental_decorators: bool,
     /// Add `design:*` metadata to lowered decorators (`emitDecoratorMetadata`).
     pub emit_decorator_metadata: bool,
+    /// `strictNullChecks` decides whether unions keep `null` and `undefined`.
+    pub strict_null_checks: bool,
     /// `module` is a Node mode (node16, node18, node20, nodenext), where
     /// dynamic `import()` stays as written even in CommonJS-format files.
     pub node_module_mode: bool,
@@ -182,6 +184,7 @@ impl Default for EmitOptions {
             node_module_mode: false,
             experimental_decorators: false,
             emit_decorator_metadata: false,
+            strict_null_checks: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -446,6 +449,7 @@ impl EmitOptions {
             node_module_mode: self.node_module_mode,
             experimental_decorators: self.experimental_decorators,
             emit_decorator_metadata: self.emit_decorator_metadata,
+            strict_null_checks: self.strict_null_checks,
         }
     }
 
