@@ -3928,18 +3928,59 @@ impl<'a> Emitter<'a> {
 
     fn emit_member_object(&mut self, member: &MemberExpression) {
         let dotted = !matches!(member.property, MemberProperty::Computed(_));
-        let numeric_object = dotted
-            && matches!(
-                self.unwrap_expression(&member.object).data(),
-                Expression::Literal(Literal::Number(_))
-            );
-        if numeric_object && !self.starts_parenthesized(&member.object) {
-            self.raw("(");
-            self.emit_expression_prec(&member.object, 0);
-            self.raw(")");
-        } else {
-            self.emit_expression_prec(&member.object, P_CALL_MEMBER);
+        self.emit_access_object(&member.object, dotted);
+    }
+
+    /// The object of a property access: an integer literal gets the extra dot
+    /// (`1..foo`) and a `new` without arguments its own parentheses
+    /// (`(new A).foo`), unless the source already wrote parentheses.
+    fn emit_access_object(&mut self, object: &Expr, dotted: bool) {
+        let inner = self.unwrap_expression(object);
+        if self.starts_parenthesized(object) {
+            self.emit_expression_prec(object, P_CALL_MEMBER);
+            return;
         }
+        match inner.data() {
+            Expression::Literal(Literal::Number(literal)) if dotted => {
+                if self.generated_text(literal.id()).is_some() {
+                    self.raw("(");
+                    self.emit_expression_prec(object, 0);
+                    self.raw(")");
+                } else {
+                    self.emit_expression_prec(object, P_CALL_MEMBER);
+                    if self
+                        .text(literal.data().token())
+                        .is_some_and(Self::integer_needs_extra_dot)
+                    {
+                        self.raw(".");
+                    }
+                }
+            }
+            Expression::New(new) if self.new_prints_without_arguments(new, inner.range()) => {
+                self.raw("(");
+                self.emit_expression_prec(object, 0);
+                self.raw(")");
+            }
+            _ => self.emit_expression_prec(object, P_CALL_MEMBER),
+        }
+    }
+
+    fn integer_needs_extra_dot(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        !(lower.starts_with("0x")
+            || lower.starts_with("0b")
+            || lower.starts_with("0o")
+            || lower.contains('.')
+            || lower.contains('e'))
+    }
+
+    fn new_prints_without_arguments(&self, new: &NewExpression, range: TextRange) -> bool {
+        let callee = self.unwrap_expression(&new.callee);
+        let open_pos = self.source_pos_of(
+            TextRange::new(callee.range().end(), range.end()).unwrap_or(range),
+            '(',
+        );
+        range.end() <= self.authored_len && new.arguments.is_empty() && open_pos.is_none()
     }
 
     fn emit_member_property(&mut self, member: &MemberExpression) {
@@ -4329,18 +4370,7 @@ impl<'a> Emitter<'a> {
             AssignmentTarget::Identifier(ident) => self.emit_ident(ident),
             AssignmentTarget::Member(member) => {
                 let dotted = !matches!(member.property, MemberProperty::Computed(_));
-                let numeric_object = dotted
-                    && matches!(
-                        self.unwrap_expression(&member.object).data(),
-                        Expression::Literal(Literal::Number(_))
-                    );
-                if numeric_object && !self.starts_parenthesized(&member.object) {
-                    self.raw("(");
-                    self.emit_expression_prec(&member.object, 0);
-                    self.raw(")");
-                } else {
-                    self.emit_expression_prec(&member.object, P_CALL_MEMBER);
-                }
+                self.emit_access_object(&member.object, dotted);
                 match &member.property {
                     MemberProperty::Named(name) => {
                         self.raw(".");
