@@ -787,6 +787,7 @@ pub(crate) fn print_with_jsx_plan(
         alternate_layout,
         module_wrapper,
         temp_names: TempNames::new(authored_identifiers(file, original_content)),
+        param_scope_marks: Vec::new(),
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -915,6 +916,7 @@ pub(crate) fn print_json_value(
         alternate_layout,
         module_wrapper: None,
         temp_names: TempNames::new(HashSet::new()),
+        param_scope_marks: Vec::new(),
     };
     emitter.emit_expression_prec(expression, 0);
     emitter.newline();
@@ -1098,6 +1100,10 @@ struct Emitter<'a> {
     module_wrapper: Option<&'a ModuleWrapper<'a>>,
     /// Final names for the rewriter's temporary placeholders.
     temp_names: TempNames,
+    /// Depths of parameter-list temp scopes awaiting their function-body
+    /// block; a `FunctionBody` block at the marked depth reuses the scope
+    /// instead of opening a nested one.
+    param_scope_marks: Vec<usize>,
 }
 
 /// The identifiers the program itself writes, which temporaries never reuse.
@@ -2396,11 +2402,15 @@ impl<'a> Emitter<'a> {
 
     fn emit_block_with_braces(&mut self, block: &BlockNode, range: TextRange, layout: BlockLayout) {
         let function_scope = layout != BlockLayout::Statement;
-        if function_scope {
+        let covered =
+            function_scope && self.param_scope_marks.last() == Some(&self.temp_names.depth());
+        if covered {
+            self.param_scope_marks.pop();
+        } else if function_scope {
             self.temp_names.enter();
         }
         self.emit_block_body(block, range, layout);
-        if function_scope {
+        if function_scope && !covered {
             self.temp_names.exit();
         }
     }
@@ -2953,9 +2963,13 @@ impl<'a> Emitter<'a> {
             self.raw(" ");
             self.emit_ident(name);
         }
+        let temp_scope = self.open_param_temp_scope(&function.parameters);
         self.emit_params_js(&function.parameters, range);
         self.raw(" ");
         self.emit_function_body_js(function.body.as_ref());
+        if temp_scope {
+            self.close_param_temp_scope();
+        }
     }
 
     fn emit_function_expression_js(&mut self, function: &FunctionLike, range: TextRange) {
@@ -2982,15 +2996,20 @@ impl<'a> Emitter<'a> {
             // name instead.
             self.raw(" ");
         }
+        let temp_scope = self.open_param_temp_scope(&function.parameters);
         self.emit_params_js(&function.parameters, range);
         self.raw(" ");
         self.emit_function_body_js(function.body.as_ref());
+        if temp_scope {
+            self.close_param_temp_scope();
+        }
     }
 
     fn emit_arrow_js(&mut self, arrow: &ArrowFunction, range: TextRange) {
         if arrow.is_async {
             self.raw_mapped_char("async ", range, 'a', 5);
         }
+        let temp_scope = self.open_param_temp_scope(&arrow.parameters);
         if self.arrow_params_authored_bare(arrow) {
             // tsc preserves the authored bare form for a single plain
             // identifier parameter (`props => {`); parenthesized forms keep
@@ -3032,6 +3051,44 @@ impl<'a> Emitter<'a> {
                 self.raw("{}");
             }
         }
+        if temp_scope {
+            self.close_param_temp_scope();
+        }
+    }
+    /// Whether a parameter list carries a rest-lowering temporary: its
+    /// binding is a bare `_t` placeholder that must resolve inside the
+    /// function's own temp scope, which opens before the parameter list.
+    fn params_need_temp_scope(&self, parameters: &[ParameterNode]) -> bool {
+        parameters
+            .iter()
+            .any(|parameter| match parameter.data().binding.data() {
+                BindingPattern::Identifier(ident) => self
+                    .text(ident.data().token())
+                    .is_some_and(TempNames::is_parameter_placeholder),
+                _ => false,
+            })
+    }
+
+    /// Opens the function temp scope before the parameter list when it
+    /// carries a rest temporary; the matching [`Self::close_param_temp_scope`]
+    /// runs after the body.
+    fn open_param_temp_scope(&mut self, parameters: &[ParameterNode]) -> bool {
+        if !self.params_need_temp_scope(parameters) {
+            return false;
+        }
+        self.temp_names.enter();
+        self.param_scope_marks.push(self.temp_names.depth());
+        true
+    }
+
+    /// Closes a scope [`Self::open_param_temp_scope`] opened. A block body
+    /// already consumed the mark and reused the scope, so only an
+    /// expression or missing body still holds it.
+    fn close_param_temp_scope(&mut self) {
+        if self.param_scope_marks.last() == Some(&self.temp_names.depth()) {
+            self.param_scope_marks.pop();
+        }
+        self.temp_names.exit();
     }
 
     fn emit_function_body_js(&mut self, body: Option<&FunctionBody>) {
@@ -3284,15 +3341,20 @@ impl<'a> Emitter<'a> {
             }
         }
         self.emit_property_name(&method.name);
+        let temp_scope = self.open_param_temp_scope(&method.function.parameters);
         self.emit_params_js(&method.function.parameters, self.anchor);
         self.raw(" ");
         self.emit_function_body_js(method.function.body.as_ref());
+        if temp_scope {
+            self.close_param_temp_scope();
+        }
     }
 
     fn emit_constructor_js(&mut self, constructor: &ConstructorDeclaration) {
         let range = self.anchor;
         let keyword_pos = self.source_pos_of(range, 'c').unwrap_or(range.start());
         self.raw_mapped_token("constructor", keyword_pos, 11);
+        let temp_scope = self.open_param_temp_scope(&constructor.parameters);
         self.emit_params_js(&constructor.parameters, self.anchor);
         self.raw(" ");
 
@@ -3312,6 +3374,9 @@ impl<'a> Emitter<'a> {
                 constructor.body.range(),
                 BlockLayout::FunctionBody,
             );
+            if temp_scope {
+                self.close_param_temp_scope();
+            }
             return;
         }
         self.raw("{");
@@ -3336,6 +3401,9 @@ impl<'a> Emitter<'a> {
         self.emit_statement_list(&body.statements);
         self.indent -= 1;
         self.raw_mapped_char_end("}", range, '}');
+        if temp_scope {
+            self.close_param_temp_scope();
+        }
     }
 
     // =======================================================================
@@ -4028,9 +4096,13 @@ impl<'a> Emitter<'a> {
             }
         }
         self.emit_property_name(&method.name);
+        let temp_scope = self.open_param_temp_scope(&method.function.parameters);
         self.emit_params_js(&method.function.parameters, self.anchor);
         self.raw(" ");
         self.emit_function_body_js(method.function.body.as_ref());
+        if temp_scope {
+            self.close_param_temp_scope();
+        }
     }
 
     fn emit_property_name(&mut self, name: &PropertyName) {
