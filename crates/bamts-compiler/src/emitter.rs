@@ -776,7 +776,7 @@ pub(crate) fn print_with_jsx_plan(
     }
     match surface {
         Surface::JavaScript => emitter.emit_module_js(file.statements()),
-        Surface::Declaration => emitter.emit_module_decl(file.statements()),
+        Surface::Declaration => emitter.emit_module_decl(file),
     }
     let mut code = emitter.out;
     emitter.diagnostics.sort();
@@ -1866,13 +1866,196 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_module_decl(&mut self, statements: &[Stmt]) {
+    fn emit_module_decl(&mut self, file: &SourceFile) {
         self.decl_ambient = true;
-        for statement in statements {
+        let is_module = crate::checker::source_is_module(file);
+        let mut marks = ModuleScopeMarks::default();
+        let mut deferred = Vec::new();
+        for statement in file.statements() {
+            if is_module && self.map.is_none() {
+                let names = self.declared_names(statement);
+                if !names.is_empty() {
+                    deferred.push(DeferredDeclaration {
+                        offset: self.out.len(),
+                        statement,
+                        names,
+                    });
+                    continue;
+                }
+            }
             if self.emit_declaration(statement) {
                 self.newline();
+                marks.record(statement);
             }
         }
+        self.restore_referenced_declarations(&deferred, &mut marks);
+        if is_module && marks.needs_marker() {
+            self.raw("export {};");
+            self.newline();
+        }
+    }
+
+    /// A module's declaration file keeps a non-exported declaration only when
+    /// the rest of the output names it, and an import only for the bindings
+    /// that are named. Naming one declaration can name another, so this
+    /// repeats until nothing more joins.
+    fn restore_referenced_declarations(
+        &mut self,
+        deferred: &[DeferredDeclaration<'_>],
+        marks: &mut ModuleScopeMarks,
+    ) {
+        if deferred.is_empty() {
+            return;
+        }
+        let mut used = declaration_identifiers(&self.out);
+        let mut rendered: Vec<Option<String>> = vec![None; deferred.len()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (index, item) in deferred.iter().enumerate() {
+                let is_import = matches!(item.statement.data(), Statement::Import(_));
+                if rendered[index].is_some()
+                    || is_import
+                    || !item.names.iter().any(|name| used.contains(name))
+                {
+                    continue;
+                }
+                let Some(text) = self.render_declaration(item.statement) else {
+                    continue;
+                };
+                used.extend(declaration_identifiers(&text));
+                marks.record(item.statement);
+                rendered[index] = Some(text);
+                changed = true;
+            }
+        }
+        for (index, item) in deferred.iter().enumerate() {
+            if let Statement::Import(import) = item.statement.data()
+                && let Some(pruned) = self.prune_import(import, &used)
+            {
+                marks.record(item.statement);
+                rendered[index] = Some(self.render_import(&pruned));
+            }
+        }
+        for (item, text) in deferred.iter().zip(rendered).rev() {
+            if let Some(text) = text {
+                self.out.insert_str(item.offset, &text);
+            }
+        }
+    }
+
+    fn render_declaration(&mut self, statement: &Stmt) -> Option<String> {
+        let saved = std::mem::take(&mut self.out);
+        let emitted = self.emit_declaration(statement);
+        if emitted {
+            self.newline();
+        }
+        let text = std::mem::replace(&mut self.out, saved);
+        emitted.then_some(text)
+    }
+
+    fn render_import(&mut self, import: &ImportDeclaration) -> String {
+        let saved = std::mem::take(&mut self.out);
+        self.emit_import(import, true);
+        self.newline();
+        std::mem::replace(&mut self.out, saved)
+    }
+
+    /// The names a top-level declaration, or an import, binds. Empty for what
+    /// a declaration file always keeps: exports, global and module
+    /// augmentations, and side-effect imports.
+    fn declared_names(&self, statement: &Stmt) -> Vec<String> {
+        let name = |ident: &IdentifierNode| self.text(ident.data().token()).map(str::to_owned);
+        let single = |ident: Option<&IdentifierNode>| ident.and_then(name).into_iter().collect();
+        match statement.data() {
+            Statement::Variable(declaration) => {
+                let mut names = Vec::new();
+                for declarator in &declaration.declarations {
+                    self.collect_pattern_names(&declarator.data().binding, &mut names);
+                }
+                names
+            }
+            Statement::Function(function) => single(function.function.name.as_ref()),
+            Statement::Class(class) => single(class.name.as_ref()),
+            Statement::Interface(interface) => single(Some(&interface.name)),
+            Statement::TypeAlias(alias) => single(Some(&alias.name)),
+            Statement::Enum(declaration) => single(Some(&declaration.name)),
+            Statement::Namespace(namespace) => match &namespace.name {
+                NamespaceName::Identifier { name, .. } => single(Some(name)),
+                _ => Vec::new(),
+            },
+            Statement::ImportEquals(import) => single(Some(&import.local)),
+            Statement::Import(import) => {
+                let Some(clause) = &import.clause else {
+                    return Vec::new();
+                };
+                let mut names: Vec<String> = clause.default.iter().filter_map(name).collect();
+                match &clause.binding {
+                    Some(ImportBinding::Namespace(local)) => names.extend(name(local)),
+                    Some(ImportBinding::Named(specifiers)) => {
+                        names.extend(specifiers.iter().filter_map(|s| name(&s.data().local)));
+                    }
+                    None => {}
+                }
+                names
+            }
+            Statement::Declare(inner) => self.declared_names(inner),
+            _ => Vec::new(),
+        }
+    }
+
+    fn collect_pattern_names(&self, pattern: &Pattern, names: &mut Vec<String>) {
+        match pattern.data() {
+            BindingPattern::Identifier(ident) => {
+                names.extend(self.text(ident.data().token()).map(str::to_owned));
+            }
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    self.collect_pattern_names(&property.binding, names);
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let ArrayBindingElement::Binding(inner) = element {
+                        self.collect_pattern_names(inner, names);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => self.collect_pattern_names(&rest.argument, names),
+            BindingPattern::Assignment(assignment) => {
+                self.collect_pattern_names(&assignment.left, names);
+            }
+            BindingPattern::Missing(_) => {}
+        }
+    }
+
+    fn prune_import(
+        &self,
+        import: &ImportDeclaration,
+        used: &BTreeSet<String>,
+    ) -> Option<ImportDeclaration> {
+        let clause = import.clause.as_ref()?;
+        let is_used = |name: &IdentifierNode| {
+            self.text(name.data().token())
+                .is_some_and(|text| used.contains(text))
+        };
+        let default = clause.default.clone().filter(is_used);
+        let binding = match &clause.binding {
+            Some(ImportBinding::Namespace(name)) if is_used(name) => clause.binding.clone(),
+            Some(ImportBinding::Named(specifiers)) => {
+                let kept: Vec<_> = specifiers
+                    .iter()
+                    .filter(|specifier| is_used(&specifier.data().local))
+                    .cloned()
+                    .collect();
+                (!kept.is_empty()).then_some(ImportBinding::Named(kept))
+            }
+            _ => None,
+        };
+        (default.is_some() || binding.is_some()).then(|| ImportDeclaration {
+            clause: Some(ImportClause { default, binding }),
+            ..import.clone()
+        })
     }
 
     // =======================================================================
@@ -6131,6 +6314,103 @@ fn is_parameter_property(parameter: &Parameter) -> bool {
     parameter.modifiers.accessibility.is_some()
         || parameter.modifiers.is_readonly
         || parameter.modifiers.is_override
+}
+
+/// A module-level declaration whose place in the output waits on whether the
+/// rest of the output names it.
+struct DeferredDeclaration<'s> {
+    offset: usize,
+    statement: &'s Stmt,
+    names: Vec<String>,
+}
+
+/// What a declaration file's top level says about its module-ness. tsc ends a
+/// module with `export {};` when nothing in the output marks it as a module,
+/// or when non-exported declarations remain beside no export declaration.
+#[derive(Default)]
+struct ModuleScopeMarks {
+    has_module_syntax: bool,
+    has_scope_marker: bool,
+    has_unexported_declaration: bool,
+}
+
+impl ModuleScopeMarks {
+    fn record(&mut self, statement: &Stmt) {
+        match statement.data() {
+            Statement::Import(_) => self.has_module_syntax = true,
+            Statement::ImportEquals(import)
+                if matches!(import.reference, ExternalModuleReference::Require(_)) =>
+            {
+                self.has_module_syntax = true;
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(_))) => {
+                self.has_module_syntax = true
+            }
+            Statement::Export(ExportDeclaration::Default(default)) => {
+                self.has_module_syntax = true;
+                self.has_scope_marker |= matches!(default.value, ExportDefaultValue::Expression(_));
+            }
+            Statement::Export(_) => {
+                self.has_module_syntax = true;
+                self.has_scope_marker = true;
+            }
+            Statement::Declare(inner) => self.record(inner),
+            _ => self.has_unexported_declaration = true,
+        }
+    }
+
+    const fn needs_marker(&self) -> bool {
+        !self.has_module_syntax || (self.has_unexported_declaration && !self.has_scope_marker)
+    }
+}
+
+/// The words of declaration output that could name an import: identifiers
+/// outside strings and comments that do not follow a `.`.
+fn declaration_identifiers(text: &str) -> BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut words = BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'"' | b'\'' | b'`' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != byte {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            _ if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80 => {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric()
+                        || matches!(bytes[index], b'_' | b'$')
+                        || bytes[index] >= 0x80)
+                {
+                    index += 1;
+                }
+                let after_dot = start > 0 && bytes[start - 1] == b'.';
+                if !after_dot && !byte.is_ascii_digit() {
+                    words.insert(text[start..index].to_owned());
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    words
 }
 
 const fn variable_kind_str(kind: VariableKind) -> &'static str {
