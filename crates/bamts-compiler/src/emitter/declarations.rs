@@ -1007,6 +1007,18 @@ mod tests {
             "expected inferred void return type, got: {code}"
         );
     }
+    #[test]
+    fn string_concat_with_rest_join_infers_string() {
+        let output = emit_dts(
+            "export function f(a: string, ...rests: string[]) { return a + rests.join(\"\"); }\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare function f(a: string, ...rests: string[]): string;"),
+            "expected inferred string return type, got: {code}"
+        );
+    }
 
     /// Generic function-type arguments in type arguments are wrapped in
     /// parens to disambiguate `<<T>() => T>` from a misplaced `<<`.
