@@ -779,6 +779,8 @@ struct Rewriter<'a> {
     /// Comma sequences that print one element per line, as tsc lays out the
     /// lowering of a class or a multi-line object literal.
     expanded_sequences: BTreeSet<NodeId>,
+    /// One entry per enclosing function: what lowered arrows capture from it.
+    capture_scopes: Vec<CaptureScope>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
     /// Names `import type` binds, which an `export { name }` cannot publish.
@@ -806,6 +808,16 @@ struct Rewriter<'a> {
     read_aliases: Option<BTreeSet<Utf16Pos>>,
     /// The parameter holding each alias a namespace body publishes.
     published_aliases: BTreeMap<crate::checker::SymbolId, String>,
+}
+
+/// What the arrows lowered below ES2015 capture from their enclosing
+/// function: `this` and `arguments` become locals declared at its top.
+#[derive(Default)]
+struct CaptureScope {
+    /// Lowered arrows being rewritten inside this function right now.
+    arrow_depth: usize,
+    this: Option<IdentifierNode>,
+    arguments: Option<IdentifierNode>,
 }
 
 /// Exported names one `exports.a = exports.b = void 0;` statement may chain.
@@ -936,6 +948,7 @@ impl<'a> Rewriter<'a> {
             key_prelude: Vec::new(),
             expression_temp_scopes: Vec::new(),
             expanded_sequences: BTreeSet::new(),
+            capture_scopes: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
             type_imports: type_import_names(file, options),
@@ -1919,13 +1932,100 @@ impl<'a> Rewriter<'a> {
 
     fn rewrite_root_statements(&mut self, statements: &[Stmt], range: TextRange) -> Vec<Stmt> {
         self.expression_temp_scopes.push(Vec::new());
+        self.capture_scopes.push(CaptureScope::default());
         let mut rewritten = self.rewrite_statements(statements);
         rewritten.extend(self.export_assignment.take());
         let temps = self.expression_temp_scopes.pop().unwrap_or_default();
         if let Some(declaration) = self.temp_declaration(temps, range) {
             rewritten.insert(0, declaration);
         }
+        let captures = self.capture_scopes.pop().unwrap_or_default();
+        let declarations = self.capture_declarations(captures, range);
+        rewritten.splice(0..0, declarations);
         rewritten
+    }
+
+    /// `var _this = this;` and `var _arguments = arguments;` for what a
+    /// function's lowered arrows captured.
+    fn capture_declarations(&mut self, captures: CaptureScope, range: TextRange) -> Vec<Stmt> {
+        let mut declarations = Vec::new();
+        if let Some(name) = captures.this {
+            let value = self.syn_node(range, Expression::This);
+            declarations.push(self.make_temp_declaration(name, value, range));
+        }
+        if let Some(name) = captures.arguments {
+            let value = self.ident_expr("arguments");
+            declarations.push(self.make_temp_declaration(name, value, range));
+        }
+        declarations
+    }
+
+    /// The name tsc gives a captured `this` or `arguments`: the plain name
+    /// unless the program already writes it.
+    fn capture_name(&mut self, base: &str) -> IdentifierNode {
+        let file = self.file;
+        let occupied = self
+            .occupied_names
+            .get_or_insert_with(|| identifier_names(file));
+        let mut name = base.to_owned();
+        let mut suffix = 0;
+        while occupied.contains(&name) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        self.ident(&name)
+    }
+
+    /// A `this` inside a lowered arrow reads the enclosing function's capture.
+    fn rewrite_this(&mut self, expression: &Expr) -> Expr {
+        if !self
+            .capture_scopes
+            .last()
+            .is_some_and(|scope| scope.arrow_depth > 0)
+        {
+            return expression.clone();
+        }
+        let existing = self
+            .capture_scopes
+            .last()
+            .and_then(|scope| scope.this.clone());
+        let name = match existing {
+            Some(name) => name,
+            None => {
+                let name = self.capture_name("_this");
+                if let Some(scope) = self.capture_scopes.last_mut() {
+                    scope.this = Some(name.clone());
+                }
+                name
+            }
+        };
+        self.syn_node(expression.range(), Expression::Identifier(name))
+    }
+
+    /// `arguments` inside a lowered arrow reads the enclosing function's.
+    fn rewrite_arguments(&mut self, expression: &Expr) -> Option<Expr> {
+        if !self
+            .capture_scopes
+            .last()
+            .is_some_and(|scope| scope.arrow_depth > 0)
+        {
+            return None;
+        }
+        let existing = self
+            .capture_scopes
+            .last()
+            .and_then(|scope| scope.arguments.clone());
+        let name = match existing {
+            Some(name) => name,
+            None => {
+                let name = self.capture_name("_arguments");
+                if let Some(scope) = self.capture_scopes.last_mut() {
+                    scope.arguments = Some(name.clone());
+                }
+                name
+            }
+        };
+        Some(self.syn_node(expression.range(), Expression::Identifier(name)))
     }
 
     fn node<T>(&mut self, range: TextRange, data: T) -> Node<T> {
@@ -5448,6 +5548,54 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_function_like(&mut self, function: &FunctionLike, range: TextRange) -> FunctionLike {
+        self.capture_scopes.push(CaptureScope::default());
+        let mut rewritten = self.lower_function_like(function, range);
+        let captures = self.capture_scopes.pop().unwrap_or_default();
+        let declarations = self.capture_declarations(captures, range);
+        if !declarations.is_empty() {
+            rewritten.body = rewritten
+                .body
+                .map(|body| self.prepend_to_body(body, declarations, range));
+        }
+        rewritten
+    }
+
+    fn prepend_to_body(
+        &mut self,
+        body: FunctionBody,
+        mut declarations: Vec<Stmt>,
+        range: TextRange,
+    ) -> FunctionBody {
+        match body {
+            FunctionBody::Block(block) => {
+                declarations.extend(block.data().statements.iter().cloned());
+                FunctionBody::Block(self.syn_node(
+                    block.range(),
+                    Block {
+                        statements: declarations,
+                    },
+                ))
+            }
+            FunctionBody::Expression(value) => {
+                let returned = self.syn_node(
+                    range,
+                    Statement::Return(ReturnStatement {
+                        argument: Some(value),
+                    }),
+                );
+                declarations.push(returned);
+                FunctionBody::Block(self.syn_node(
+                    range,
+                    Block {
+                        statements: declarations,
+                    },
+                ))
+            }
+            FunctionBody::Missing(missing) => FunctionBody::Missing(missing),
+        }
+    }
+
+    fn lower_function_like(&mut self, function: &FunctionLike, range: TextRange) -> FunctionLike {
         let parameters = self.rewrite_parameters(&function.parameters);
         if function.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let mut rewritten = function.clone();
@@ -8971,7 +9119,13 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
+            Expression::This => self.rewrite_this(expression),
             Expression::Identifier(ident) => {
+                if self.identifier_name(ident).as_deref() == Some("arguments")
+                    && let Some(captured) = self.rewrite_arguments(expression)
+                {
+                    return captured;
+                }
                 if let Some(parameter) = self.namespace_member_parameter(expression.id())
                     && let Some(name) = self.identifier_name(ident)
                 {
@@ -10105,6 +10259,11 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_arrow(&mut self, expression: &Expr, arrow: &ArrowFunction) -> Expr {
+        let lowers_to_function = Self::needs(LanguageFeature::ArrowFunctions, self.options)
+            && !(arrow.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options));
+        if lowers_to_function && let Some(scope) = self.capture_scopes.last_mut() {
+            scope.arrow_depth += 1;
+        }
         let parameters = self.rewrite_parameters(&arrow.parameters);
         if arrow.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let previous = self.replace_await;
@@ -10250,6 +10409,25 @@ impl<'a> Rewriter<'a> {
             }
             other => self.rewrite_body(other),
         };
+        if lowers_to_function {
+            if let Some(scope) = self.capture_scopes.last_mut() {
+                scope.arrow_depth -= 1;
+            }
+            let function = FunctionLike {
+                decorators: Vec::new(),
+                name: None,
+                is_async: false,
+                is_generator: false,
+                type_parameters: None,
+                parameters,
+                return_type: None,
+                body: Some(body),
+            };
+            return self.syn_node(
+                expression.range(),
+                Expression::Function(FunctionExpression { function }),
+            );
+        }
         let body_marked = match &body {
             FunctionBody::Block(block) => self.synthesized_ids.contains(&block.id()),
             FunctionBody::Expression(expr) => self.synthesized_ids.contains(&expr.id()),
@@ -15466,6 +15644,58 @@ console.log(JSON.stringify([bar, bar4, log]));
             code.contains("var o = { x: x, m: function () { return x; } };"),
             "{code}"
         );
+    }
+
+    #[test]
+    fn es5_arrows_become_function_expressions() {
+        let output = emit_at(
+            "var f = (x) => x + 1;\nvar g = () => { return 1; };\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("var f = function (x) { return x + 1; };"),
+            "{code}"
+        );
+        assert!(
+            code.contains("var g = function () { return 1; };"),
+            "{code}"
+        );
+        assert!(!code.contains("=>"), "{code}");
+    }
+
+    #[test]
+    fn es5_arrow_reads_this_and_arguments_from_captures_in_the_enclosing_function() {
+        let output = emit_at(
+            "function outer() {\n    var a = () => () => this.x;\n    var b = () => arguments[0];\n    var c = function () { return () => this; };\n}\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        for expected in [
+            "function outer() {\n    var _this = this;\n    var _arguments = arguments;\n",
+            "var a = function () { return function () { return _this.x; }; };",
+            "var b = function () { return _arguments[0]; };",
+            "var c = function () {\n        var _this = this;\n        return function () { return _this; };\n    };",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn es5_arrow_at_the_top_level_captures_this_before_everything() {
+        let output = emit_at("var h = () => this;\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("var _this = this;\nvar h = function () { return _this; };"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es2015_keeps_arrows() {
+        let output = emit_at("var f = (x) => x + this.y;\n", ScriptTarget::Es2015);
+        let code = javascript(&output);
+        assert!(code.contains("var f = (x) => x + this.y;"), "{code}");
     }
 
     #[test]
