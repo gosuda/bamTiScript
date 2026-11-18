@@ -47,19 +47,49 @@ fn attribute<'a>(directive: &'a str, name: &str) -> Option<&'a str> {
     value.find(quote).map(|end| &value[..end])
 }
 
+enum LeadingLine<'a> {
+    Skipped,
+    TripleSlash(&'a str),
+    Code,
+}
+
+fn classify_leading_line<'a>(line: &'a str, inside_block: &mut bool) -> LeadingLine<'a> {
+    let line = line.trim();
+    if *inside_block {
+        *inside_block = !line.contains("*/");
+        return LeadingLine::Skipped;
+    }
+    if let Some(body) = line.strip_prefix("///") {
+        return LeadingLine::TripleSlash(body);
+    }
+    if line.is_empty() || line.starts_with("//") {
+        return LeadingLine::Skipped;
+    }
+    let Some(rest) = line.strip_prefix("/*") else {
+        return LeadingLine::Code;
+    };
+    let Some((_, after)) = rest.rsplit_once("*/") else {
+        *inside_block = true;
+        return LeadingLine::Skipped;
+    };
+    if after.trim().is_empty() || after.trim().starts_with("//") {
+        LeadingLine::Skipped
+    } else {
+        LeadingLine::Code
+    }
+}
+
 /// The `amd-dependency` and `amd-module` directives in the comments that open
-/// a file.
+/// a file, wherever they sit among the other leading comments.
 pub(super) fn source_directives(text: &str) -> SourceDirectives {
     let mut directives = SourceDirectives::default();
+    let mut inside_block = false;
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some(body) = line.strip_prefix("///") else {
-            break;
+        let body = match classify_leading_line(line, &mut inside_block) {
+            LeadingLine::Skipped => continue,
+            LeadingLine::Code => break,
+            LeadingLine::TripleSlash(body) => body.trim(),
         };
-        let body = body.trim();
         if body.starts_with("<amd-dependency") {
             if let Some(path) = attribute(body, "path") {
                 directives
