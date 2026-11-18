@@ -9386,6 +9386,7 @@ impl<'src> Binder<'src> {
     fn run_with_imported_types_and_cancel(
         &mut self,
         imported_types: &[ImportedSymbolType<'_>],
+        sibling_scripts: &[&SemanticModel],
     ) -> Result<(), super::CheckCancelled> {
         let statements = self.source.statements();
         let scope = self.module_scope;
@@ -9447,6 +9448,9 @@ impl<'src> Binder<'src> {
             &models_by_source,
             &mut next_imported_symbol,
         )?;
+        if !self.is_module {
+            self.install_sibling_script_globals(sibling_scripts)?;
+        }
         self.resolve_statement_class_bounds(statements);
         self.check_cancel()?;
         self.build_program_flow()?;
@@ -9518,6 +9522,103 @@ impl<'src> Binder<'src> {
         Ok(())
     }
 
+    fn install_sibling_script_globals(
+        &mut self,
+        siblings: &[&SemanticModel],
+    ) -> Result<(), super::CheckCancelled> {
+        let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
+        let mut next_imported_symbol =
+            u32::try_from(self.symbols.len()).expect("symbol count fits in u32");
+        for sibling in siblings {
+            self.check_cancel()?;
+            let sibling_scope = sibling.module_scope();
+            for (index, symbol) in sibling.symbols().iter().enumerate() {
+                self.check_cancel()?;
+                if symbol.scope() != sibling_scope {
+                    continue;
+                }
+                if symbol.parent().is_some() {
+                    continue;
+                }
+                if symbol.kind() == SymbolKind::Import {
+                    continue;
+                }
+                let sibling_id =
+                    SymbolId::new(u32::try_from(index).expect("symbol count fits in u32"));
+                let name = symbol.name().to_owned();
+                let occupies_value = symbol.kind().occupies_value();
+                let occupies_type = symbol.kind().occupies_type();
+                let module = self.module_scope;
+                let has_value = !occupies_value
+                    || self.scopes[module.0 as usize].values.contains_key(&name);
+                let has_type = !occupies_type
+                    || self.scopes[module.0 as usize].types.contains_key(&name);
+                if has_value && has_type {
+                    continue;
+                }
+                let source_types = sibling.types();
+                let identities = imported_by_source
+                    .entry(std::ptr::from_ref(source_types))
+                    .or_default();
+                let (value_type_id, type_parameters) = self.types.import_type(
+                    source_types,
+                    sibling.value_side_type(sibling_id),
+                    sibling.generic_type_parameters(sibling_id),
+                    identities,
+                    &mut next_imported_symbol,
+                );
+                if matches!(
+                    self.types.get(value_type_id),
+                    Type::Error | Type::Any | Type::Unknown
+                ) {
+                    continue;
+                }
+                let type_plane_id = match symbol.kind() {
+                    SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::TypeAlias
+                    | SymbolKind::Enum => {
+                        let (type_id, _) = self.types.import_type(
+                            source_types,
+                            sibling.symbol_type(sibling_id),
+                            sibling.generic_type_parameters(sibling_id),
+                            identities,
+                            &mut next_imported_symbol,
+                        );
+                        Some(type_id)
+                    }
+                    _ => None,
+                };
+                let id = SymbolId::new(
+                    u32::try_from(self.symbols.len()).expect("symbol count fits in u32"),
+                );
+                self.symbols.push(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Import,
+                    scope: self.module_scope,
+                    declaration: NodeId::default(),
+                    range: NodeId::default_range(),
+                    parent: None,
+                });
+                self.symbol_types.push(value_type_id);
+                self.overload_signatures.push(Vec::new());
+                self.type_state.push(TypeState::Done(value_type_id));
+                if !type_parameters.is_empty() {
+                    self.imported_type_parameters.insert(id, type_parameters);
+                }
+                if let Some(type_id) = type_plane_id {
+                    self.imported_type_planes.insert(id, type_id);
+                }
+                if !has_value {
+                    self.scopes[module.0 as usize].values.insert(name.clone(), id);
+                }
+                if !has_type {
+                    self.scopes[module.0 as usize].types.insert(name, id);
+                }
+            }
+        }
+        Ok(())
+    }
     fn validate_alias_cycles(&mut self) {
         let aliases: Vec<SymbolId> = self
             .type_defs
@@ -24117,7 +24218,7 @@ pub(crate) fn bind_source_with_cancel(
         ProgramCheckOptions::standard(),
         cancel,
     );
-    binder.run_with_imported_types_and_cancel(&[])?;
+    binder.run_with_imported_types_and_cancel(&[], &[])?;
     binder.finish()
 }
 
@@ -24147,6 +24248,7 @@ pub(crate) fn bind_source_with_environment_and_cancel(
         is_module,
         options,
         &[],
+        &[],
         cancel,
     )
 }
@@ -24165,6 +24267,7 @@ pub(crate) fn bind_source_with_environment_and_imports(
         is_module,
         options,
         imported_types,
+        &[],
         bamts_cancel::CancellationToken::new(),
     )
     .expect("fresh token is never cancelled")
@@ -24176,11 +24279,12 @@ pub(crate) fn bind_source_with_environment_and_imports_with_cancel(
     is_module: bool,
     options: ProgramCheckOptions,
     imported_types: &[ImportedSymbolType<'_>],
+    sibling_scripts: &[&SemanticModel],
     cancel: bamts_cancel::CancellationToken,
 ) -> Result<(SemanticModel, Vec<Diagnostic>), super::CheckCancelled> {
     let mut binder =
         Binder::with_environment_and_cancel(source, environment, is_module, options, cancel);
-    binder.run_with_imported_types_and_cancel(imported_types)?;
+    binder.run_with_imported_types_and_cancel(imported_types, sibling_scripts)?;
     binder.finish()
 }
 

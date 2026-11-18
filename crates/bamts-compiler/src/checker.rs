@@ -859,6 +859,22 @@ fn semantic_diagnostics_enabled(source: &SourceFile, options: ProgramCheckOption
     enabled
 }
 
+fn sibling_script_models<'m>(
+    files: &'m BTreeMap<SourceId, SemanticModel>,
+    script_ids: &HashSet<SourceId>,
+    self_id: SourceId,
+) -> Vec<&'m SemanticModel> {
+    files
+        .iter()
+        .filter_map(|(id, model)| {
+            if *id != self_id && script_ids.contains(id) {
+                Some(model)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 /// Checks a set of loaded files after module resolution.
 #[must_use]
 pub fn check_program(
@@ -909,6 +925,12 @@ pub fn check_program_with_options_and_cancel(
         .map(|edge| ((edge.from, edge.specifier), edge.to))
         .collect();
 
+    let script_ids: HashSet<SourceId> = input
+        .files
+        .iter()
+        .filter(|recovered| !source_is_module(recovered.product()))
+        .map(|recovered| recovered.product().source_id())
+        .collect();
     let mut files = BTreeMap::new();
     for recovered in input.files {
         cancel.check()?;
@@ -951,12 +973,14 @@ pub fn check_program_with_options_and_cancel(
             if imported.is_empty() {
                 continue;
             }
+            let sibling_scripts = sibling_script_models(&files, &script_ids, source_id);
             let (model, _) = bind_source_with_environment_and_imports_with_cancel(
                 source,
                 options.environment(),
                 source_is_module(source),
                 options,
                 &imported,
+                &sibling_scripts,
                 cancel.clone(),
             )?;
             files.insert(source_id, model);
@@ -981,24 +1005,16 @@ pub fn check_program_with_options_and_cancel(
             &export_stars,
             &files,
         );
-        let (mut model, core_diagnostics) = if imported.is_empty() {
-            bind_source_with_environment_and_cancel(
-                source,
-                options.environment(),
-                source_is_module(source),
-                options,
-                cancel.clone(),
-            )?
-        } else {
-            bind_source_with_environment_and_imports_with_cancel(
-                source,
-                options.environment(),
-                source_is_module(source),
-                options,
-                &imported,
-                cancel.clone(),
-            )?
-        };
+        let sibling_scripts = sibling_script_models(&files, &script_ids, source_id);
+        let (mut model, core_diagnostics) = bind_source_with_environment_and_imports_with_cancel(
+            source,
+            options.environment(),
+            source_is_module(source),
+            options,
+            &imported,
+            &sibling_scripts,
+            cancel.clone(),
+        )?;
         model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
         if checked_sources.contains(&source_id) {
             diagnostics.extend(core_diagnostics);
@@ -3518,6 +3534,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dom_classes_resolve_as_types() {
+        let result = check_text("var x: CustomEvent; var e: Element;");
+        assert!(checker_codes(&result).is_empty());
+    }
+    #[test]
+    fn resize_observer_resolves_as_value_and_type() {
+        let result = check_text("var entry: ResizeObserverEntry; var ro = new ResizeObserver(() => {});");
+        assert!(checker_codes(&result).is_empty());
+    }
     #[test]
     fn enum_value_assignable_to_matching_object() {
         let result = check_text_with(
@@ -6304,6 +6330,21 @@ function check(options: Options = {}) {
         );
     }
 
+    #[test]
+    fn script_values_resolve_across_files_in_any_order() {
+        let checked = linked(&["var a = b;", "var b = 1;"], &[]);
+        assert!(program_codes(&checked).is_empty());
+    }
+    #[test]
+    fn script_types_resolve_across_files() {
+        let checked = linked(&["var x: C;", "class C { }"], &[]);
+        assert!(program_codes(&checked).is_empty());
+    }
+    #[test]
+    fn module_top_levels_stay_invisible_to_scripts() {
+        let checked = linked(&["var a = foo;", "export const foo = 1;"], &[]);
+        assert!(program_codes(&checked).contains(&CANNOT_FIND_NAME.as_str()));
+    }
     #[test]
     fn imported_const_enum_initializers_inline_transitively() {
         let importer = "import { B } from './b'; B.X;";
