@@ -13683,9 +13683,37 @@ impl<'src> Binder<'src> {
                 }
             },
             crate::syntax::ExportDeclaration::Assignment(expression) => {
-                self.resolve_expr(expression, scope);
+                self.resolve_export_assignment_operand(expression, scope);
             }
             _ => {}
+        }
+    }
+
+    fn resolve_export_assignment_operand(&mut self, expression: &'src Expr, scope: ScopeId) {
+        if self.scopes[scope.0 as usize].kind != ScopeKind::Module {
+            self.resolve_expr(expression, scope);
+            return;
+        }
+        let Expression::Identifier(identifier) = expression.data() else {
+            self.resolve_expr(expression, scope);
+            self.legacy_type_of_expr(expression, scope);
+            return;
+        };
+        let name = self.identifier_text(identifier);
+        let value = self.lookup_value(scope, &name);
+        let Some(symbol) = value.or_else(|| self.lookup_type(scope, &name)) else {
+            self.resolve_expr(expression, scope);
+            return;
+        };
+        if value.is_some() {
+            self.resolve_expr(expression, scope);
+        } else {
+            self.references.insert(identifier.id(), symbol);
+            self.symbol_references.push((identifier.range(), symbol));
+        }
+        let type_id = self.symbol_types[symbol.get() as usize];
+        if self.node_types.insert(expression.id(), type_id).is_none() {
+            self.typed_expressions.push((expression.range(), type_id));
         }
     }
 
