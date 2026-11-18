@@ -257,6 +257,9 @@ pub struct HelperEmit {
     pub prelude: String,
     /// Helpers included in `prelude`, in emit order.
     pub helpers: Vec<HelperKind>,
+    /// Whether imported helpers are reached through one namespace binding
+    /// (`const tslib_1 = require("tslib");`) that the caller emits itself.
+    pub tslib_binding: bool,
     /// Policy diagnostics in canonical [`Diagnostic`] order.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -372,6 +375,7 @@ fn emit_closed(
         return HelperEmit {
             prelude: String::new(),
             helpers,
+            tslib_binding: false,
             diagnostics,
         };
     }
@@ -398,6 +402,7 @@ fn emit_closed(
         return HelperEmit {
             prelude: String::new(),
             helpers: Vec::new(),
+            tslib_binding: false,
             diagnostics,
         };
     }
@@ -418,11 +423,6 @@ fn emit_closed(
             prelude.push_str(&inline_prelude);
             prelude
         }
-        HelperStyle::CommonJs if external_imports => {
-            let mut prelude = cjs_prelude(&imported, &options.module_specifier);
-            prelude.push_str(&inline_prelude);
-            prelude
-        }
         HelperStyle::EsModule | HelperStyle::CommonJs => inline_prelude,
     };
 
@@ -430,6 +430,7 @@ fn emit_closed(
     HelperEmit {
         prelude,
         helpers,
+        tslib_binding: options.style == HelperStyle::CommonJs && !imported.is_empty(),
         diagnostics,
     }
 }
@@ -468,20 +469,6 @@ fn es_import_prelude(helpers: &[HelperKind], specifier: &str) -> String {
     prelude.push_str(" } from ");
     push_quoted(&mut prelude, specifier);
     prelude.push_str(";\n");
-    prelude
-}
-
-fn cjs_prelude(helpers: &[HelperKind], specifier: &str) -> String {
-    let mut prelude = String::new();
-    for helper in helpers {
-        prelude.push_str("var ");
-        prelude.push_str(helper.ident());
-        prelude.push_str(" = require(");
-        push_quoted(&mut prelude, specifier);
-        prelude.push_str(").");
-        prelude.push_str(helper.ident());
-        prelude.push_str(";\n");
-    }
     prelude
 }
 
@@ -610,9 +597,10 @@ mod tests {
     }
 
     #[test]
-    fn commonjs_binds_each_helper_from_require() {
+    fn commonjs_binds_imported_helpers_through_one_namespace() {
         let emitted = emit_helpers(&[HelperKind::Rest], &HelperOptions::common_js(), None);
-        assert_eq!(emitted.prelude, "var __rest = require(\"tslib\").__rest;\n");
+        assert!(emitted.prelude.is_empty());
+        assert!(emitted.tslib_binding);
     }
 
     #[test]
@@ -627,10 +615,8 @@ mod tests {
             &HelperOptions::common_js().with_module_specifier("custom-lib"),
             None,
         );
-        assert_eq!(
-            cjs.prelude,
-            "var __assign = require(\"custom-lib\").__assign;\n"
-        );
+        assert!(cjs.prelude.is_empty());
+        assert!(cjs.tslib_binding);
     }
 
     #[test]
@@ -672,10 +658,8 @@ mod tests {
             None,
         );
         assert!(!common_js.has_errors());
-        assert_eq!(
-            common_js.prelude,
-            "var __awaiter = require(\"tslib\").__awaiter;\n"
-        );
+        assert!(common_js.prelude.is_empty());
+        assert!(common_js.tslib_binding);
     }
 
     #[test]

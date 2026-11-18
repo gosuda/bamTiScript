@@ -478,7 +478,23 @@ pub fn emit_transformed(
     } else {
         join_preludes(&strict, &helper_emit.prelude)
     };
-    let tail = join_preludes(&cjs_marker, &runtime_prelude);
+    let tslib_binding = if helper_emit.tslib_binding {
+        let declare = if options.target < ScriptTarget::Es2015 {
+            "var"
+        } else {
+            "const"
+        };
+        format!(
+            "{declare} {TSLIB_BINDING} = require({});\n",
+            quote_module_specifier(&options.helpers.module_specifier)
+        )
+    } else {
+        String::new()
+    };
+    let tail = join_preludes(
+        &join_preludes(&cjs_marker, &tslib_binding),
+        &runtime_prelude,
+    );
     let mut output = print_with_jsx_plan(
         PrintSource {
             file: &rewritten,
@@ -634,6 +650,28 @@ fn collision_free_name(preferred: &str, occupied: &mut BTreeSet<String>) -> Stri
 
 fn quote_module_specifier(module: &str) -> String {
     format!("\"{}\"", module.replace('\\', "\\\\").replace('"', "\\\""))
+}
+const TSLIB_BINDING: &str = "tslib_1";
+
+/// Whether imported helpers are called through `tslib_1.<helper>`: a CommonJS
+/// module under `importHelpers`.
+fn binds_helpers_to_tslib(options: &TransformOptions, file: &SourceFile) -> bool {
+    options.helpers.import_helpers
+        && options.helpers.style == helpers::HelperStyle::CommonJs
+        && options.module_kind == Some(ModuleKind::CommonJs)
+        && crate::checker::source_is_module(file)
+}
+
+fn bind_helper_calls(line: &str, helpers: &BTreeSet<HelperKind>) -> String {
+    helpers
+        .iter()
+        .filter(|helper| helper.can_import())
+        .fold(line.to_owned(), |line, helper| {
+            line.replace(
+                &format!("{}(", helper.ident()),
+                &format!("{TSLIB_BINDING}.{}(", helper.ident()),
+            )
+        })
 }
 
 /// An unset `module` resolves the way upstream resolves it, from the target:
@@ -813,6 +851,7 @@ struct Rewriter<'a> {
     super_contexts: Vec<SuperContext>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
+    tslib_helpers: bool,
     /// Names `import type` binds, which an `export { name }` cannot publish.
     type_imports: BTreeSet<String>,
     /// Names the file reads as values, or `None` when imports stay as written.
@@ -990,6 +1029,7 @@ impl<'a> Rewriter<'a> {
             super_contexts: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
+            tslib_helpers: binds_helpers_to_tslib(options, file),
             type_imports: type_import_names(file, options),
             import_reads: import_reads(file, options, model),
             inline_lines: HashMap::new(),
@@ -1283,6 +1323,11 @@ impl<'a> Rewriter<'a> {
         // require prelude (for example the JSX runtime) forces module form.
         let mut seen = HashSet::new();
         plan.void_0.retain(|name| seen.insert(name.clone()));
+        if binds_helpers_to_tslib(options, file) {
+            for line in plan.statement_lines.values_mut() {
+                *line = bind_helper_calls(line, &plan.helpers);
+            }
+        }
         Some(plan)
     }
 
@@ -1926,6 +1971,11 @@ impl<'a> Rewriter<'a> {
 
     fn helper_ident(&mut self, kind: HelperKind) -> Expr {
         self.used_helpers.insert(kind);
+        if self.tslib_helpers && kind.can_import() {
+            let namespace = self.ident_expr(TSLIB_BINDING);
+            let range = namespace.range();
+            return self.member_access(namespace, kind.ident(), range);
+        }
         self.ident_expr(kind.ident())
     }
 
@@ -15484,6 +15534,41 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         let expected = "(function (factory) {\n    if (typeof module === \"object\" && typeof module.exports === \"object\") {\n        var v = factory(require, exports);\n        if (v !== undefined) module.exports = v;\n    }\n    else if (typeof define === \"function\" && define.amd) {\n        define([\"require\", \"exports\", \"./a\"], factory);\n    }\n})(function (require, exports) {\n    \"use strict\";\n    Object.defineProperty(exports, \"__esModule\", { value: true });\n    exports.x = void 0;\n    const a_1 = __importDefault(require(\"./a\"));\n    exports.x = a_1.default;\n});\n";
         assert!(code.ends_with(expected), "{code}");
+    }
+
+    #[test]
+    fn commonjs_import_helpers_call_through_one_tslib_binding() {
+        let output = emit_with_options(
+            "import d from './d';\nexport async function f() { return d; }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                import_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        let expected = "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.f = f;\nconst tslib_1 = require(\"tslib\");\nconst d_1 = tslib_1.__importDefault(require(\"./d\"));\nfunction f() {\n    return tslib_1.__awaiter(this, void 0, void 0, function* () { return d_1.default; });\n}\n";
+        assert!(code.ends_with(expected), "{code}");
+    }
+
+    #[test]
+    fn commonjs_import_helpers_leave_a_script_with_inline_helpers() {
+        let output = emit_with_options(
+            "async function f() {}\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                import_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("var __awaiter = (this && this.__awaiter)"),
+            "{code}"
+        );
+        assert!(!code.contains("tslib"), "{code}");
     }
 
     #[test]
