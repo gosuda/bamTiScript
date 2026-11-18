@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use crate::checker::SymbolId;
+use crate::checker::{SemanticModel, SymbolId, SymbolKind};
 use crate::emitter::{ModuleWrapper, temp_names::TempNames};
 use crate::source::TextRange;
 use crate::syntax::*;
@@ -20,7 +20,8 @@ use super::namespaces::{
 use super::{
     CaptureScope, CjsPlan, RequireNames, Rewriter, collect_target_identifiers,
     declared_binding_names, exported_locals, identifier_text, is_identifier_name,
-    module_export_text, module_specifier, quote_module_specifier, quote_string,
+    is_type_only_export, module_export_text, module_specifier, quote_module_specifier,
+    quote_string,
 };
 
 /// One action a dependency's setter performs, in statement order.
@@ -406,6 +407,37 @@ pub(super) fn mark_reexported(plan: &mut CjsPlan, symbol: SymbolId) {
     if let Some(system) = plan.system.as_mut() {
         system.reexported.insert(symbol);
     }
+}
+
+/// Whether re-exporting a named import binding publishes nothing because the
+/// binding names only a type. Import-type and erased locals arrive in
+/// `type_imports`, same-file type-only declarations answer through the
+/// semantic model, and a resolved target answers by its kind: an interface
+/// or type alias carries no value unless a same-named value declaration
+/// shares its scope. Every other target kind carries a value, and an
+/// unresolved target publishes, as the import may carry a value. The first
+/// two facts are the ones the CommonJS export specifiers consult in
+/// `exports_only_a_type`; the kind rule is the one `promise_names_a_value`
+/// applies to annotation symbols. Registration still runs for such a
+/// binding, so the specifier statement keeps skipping the name.
+pub(super) fn import_reexport_is_type_only(
+    model: &SemanticModel,
+    target: Option<SymbolId>,
+    local: &str,
+    type_imports: &BTreeSet<String>,
+) -> bool {
+    if type_imports.contains(local) || is_type_only_export(model, local) {
+        return true;
+    }
+    target.is_some_and(|target| {
+        let declared = model.symbol(target);
+        match declared.kind() {
+            SymbolKind::Interface | SymbolKind::TypeAlias => model
+                .lookup_value(declared.scope(), declared.name())
+                .is_none(),
+            _ => false,
+        }
+    })
 }
 
 impl Rewriter<'_> {
