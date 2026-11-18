@@ -2937,6 +2937,7 @@ fn project_trace_lane(
     if kind != Some(ObservableKind::Trace)
         && kind != Some(ObservableKind::Declaration)
         && kind != Some(ObservableKind::Diagnostics)
+        && kind != Some(ObservableKind::JavaScript)
     {
         return CompilerLaneObservation::blocking(
             input,
@@ -2961,6 +2962,7 @@ fn project_trace_lane(
         Some(ObservableKind::Diagnostics) => {
             observe_project_diagnostics(snapshot, _ctx, index_entry)
         }
+        Some(ObservableKind::JavaScript) => observe_project_javascript(snapshot, index_entry),
         _ => {
             return CompilerLaneObservation::blocking(
                 input,
@@ -3249,28 +3251,35 @@ fn observe_project_declaration(
     }
 }
 
-fn produce_project_declaration(
+struct ProjectFixture {
+    value: serde_json::Value,
+    root: String,
+    input_files: Vec<String>,
+    relative_case: String,
+}
+
+fn read_project_fixture(
     snapshot: &(impl SnapshotAssets + ?Sized),
     index_entry: &IndexEntry,
-) -> std::result::Result<(Vec<u8>, usize), ProjectEmitError> {
+) -> std::result::Result<ProjectFixture, ProjectEmitError> {
     let descriptor = read_verified_snapshot_asset(snapshot, &index_entry.logical_path)
         .map_err(|error| ProjectEmitError::Harness(error.to_string()))?;
-    let fixture: serde_json::Value = serde_json::from_slice(&descriptor).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_slice(&descriptor).map_err(|error| {
         ProjectEmitError::InvalidFixture(format!("invalid project fixture: {error}"))
     })?;
-    let project_root = fixture
+    let root = value
         .get("projectRoot")
         .and_then(|value| value.as_str())
         .ok_or_else(|| {
             ProjectEmitError::InvalidFixture("project fixture has no projectRoot".to_owned())
         })?
         .to_owned();
-    if !project_root.starts_with("tests/cases/projects/") || !is_safe_logical_path(&project_root) {
+    if !root.starts_with("tests/cases/projects/") || !is_safe_logical_path(&root) {
         return Err(ProjectEmitError::UnsafeProjectRoot(format!(
-            "project fixture has unsafe projectRoot `{project_root}`"
+            "project fixture has unsafe projectRoot `{root}`"
         )));
     }
-    let input_files: Vec<String> = fixture
+    let input_files: Vec<String> = value
         .get("inputFiles")
         .and_then(|value| value.as_array())
         .map(|items| {
@@ -3294,33 +3303,24 @@ fn produce_project_declaration(
                 "project fixture path `{}` has no project baseline stem",
                 index_entry.logical_path
             ))
-        })?;
-    let manifest_path =
-        format!("tests/baselines/reference/project/{relative_case}/node/{relative_case}.json");
-    let manifest_bytes =
-        read_verified_snapshot_asset(snapshot, &manifest_path).map_err(|error| {
-            ProjectEmitError::MissingBaseline(format!(
-                "missing declaration manifest `{manifest_path}`: {error}"
-            ))
-        })?;
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-        ProjectEmitError::Harness(format!("invalid declaration manifest: {error}"))
-    })?;
-    let empty = Vec::new();
-    let emitted = manifest
-        .get("emittedFiles")
-        .and_then(|value| value.as_array())
-        .unwrap_or(&empty);
-    let mut expected_dts: Vec<String> = emitted
-        .iter()
-        .filter_map(|item| item.as_str())
-        .filter(|name| name.ends_with(".d.ts"))
-        .map(str::to_owned)
-        .collect();
-    expected_dts.sort();
-    let temp = TempDir::new("bamts-project-decl")
+        })?
+        .to_owned();
+    Ok(ProjectFixture {
+        value,
+        root,
+        input_files,
+        relative_case,
+    })
+}
+
+fn materialize_project(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    project_root: &str,
+    temp_prefix: &str,
+) -> std::result::Result<(TempDir, PathBuf), ProjectEmitError> {
+    let temp = TempDir::new(temp_prefix)
         .map_err(|error| ProjectEmitError::Harness(format!("project temp root: {error}")))?;
-    let project_dir = temp.path().join(&project_root);
+    let project_dir = temp.path().join(project_root);
     fs::create_dir_all(&project_dir).map_err(|error| {
         ProjectEmitError::Harness(format!("project root `{}`: {error}", project_dir.display()))
     })?;
@@ -3350,7 +3350,15 @@ fn produce_project_declaration(
             ))
         })?;
     }
-    let root = ProjectRoot::new(&project_dir)
+    Ok((temp, project_dir))
+}
+
+fn project_config(
+    fixture: &serde_json::Value,
+    project_dir: &Path,
+    forced: &[(&str, &str)],
+) -> std::result::Result<ProjectConfig, ProjectEmitError> {
+    let root = ProjectRoot::new(project_dir)
         .map_err(|error| ProjectEmitError::Harness(format!("project root: {error}")))?;
     let config_path = project_dir.join("tsconfig.json");
     let on_disk = if config_path.exists() {
@@ -3393,11 +3401,78 @@ fn produce_project_declaration(
             }
             map.insert(key.clone(), value.clone());
         }
+        for (key, value) in forced {
+            map.entry((*key).to_owned())
+                .or_insert_with(|| serde_json::Value::String((*value).to_owned()));
+        }
     }
     let merged_source = serde_json::to_string(&disk_value)
         .map_err(|error| ProjectEmitError::Harness(format!("project config serialize: {error}")))?;
-    let config = ProjectConfig::parse(&root, &config_path, &merged_source)
-        .map_err(|error| ProjectEmitError::Harness(format!("project config: {error}")))?;
+    ProjectConfig::parse(&root, &config_path, &merged_source)
+        .map_err(|error| ProjectEmitError::Harness(format!("project config: {error}")))
+}
+
+fn load_project_program(
+    input_files: &[String],
+    config: &ProjectConfig,
+    project_dir: &Path,
+) -> std::result::Result<bamts_compiler::program::ResolvedProgram, ProjectEmitError> {
+    let root = ProjectRoot::new(project_dir)
+        .map_err(|error| ProjectEmitError::Harness(format!("project root: {error}")))?;
+    let mut roots: Vec<PathBuf> = input_files.iter().map(PathBuf::from).collect();
+    if roots.is_empty() {
+        roots = config.files().to_vec();
+    }
+    if roots.is_empty() {
+        roots = collect_project_sources(project_dir).map_err(ProjectEmitError::Harness)?;
+    }
+    if roots.is_empty() {
+        return Err(ProjectEmitError::Compile(
+            "project has no roots to compile".to_owned(),
+        ));
+    }
+    let loader = ProgramLoader::new(&root, config.options())
+        .map_err(|error| ProjectEmitError::Harness(format!("project loader: {error}")))?;
+    loader
+        .load_roots(&roots)
+        .map_err(|error| ProjectEmitError::Compile(format!("project load failed: {error}")))
+}
+
+fn produce_project_declaration(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> std::result::Result<(Vec<u8>, usize), ProjectEmitError> {
+    let ProjectFixture {
+        value: fixture,
+        root: project_root,
+        input_files,
+        relative_case,
+    } = read_project_fixture(snapshot, index_entry)?;
+    let manifest_path =
+        format!("tests/baselines/reference/project/{relative_case}/node/{relative_case}.json");
+    let manifest_bytes =
+        read_verified_snapshot_asset(snapshot, &manifest_path).map_err(|error| {
+            ProjectEmitError::MissingBaseline(format!(
+                "missing declaration manifest `{manifest_path}`: {error}"
+            ))
+        })?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+        ProjectEmitError::Harness(format!("invalid declaration manifest: {error}"))
+    })?;
+    let empty = Vec::new();
+    let emitted = manifest
+        .get("emittedFiles")
+        .and_then(|value| value.as_array())
+        .unwrap_or(&empty);
+    let mut expected_dts: Vec<String> = emitted
+        .iter()
+        .filter_map(|item| item.as_str())
+        .filter(|name| name.ends_with(".d.ts"))
+        .map(str::to_owned)
+        .collect();
+    expected_dts.sort();
+    let (_temp, project_dir) = materialize_project(snapshot, &project_root, "bamts-project-decl")?;
+    let config = project_config(&fixture, &project_dir, &[])?;
     if !config.options().declaration() {
         if expected_dts.is_empty() {
             return Ok((Vec::new(), 0));
@@ -3407,23 +3482,7 @@ fn produce_project_declaration(
             expected_dts.join(", ")
         )));
     }
-    let mut roots: Vec<PathBuf> = input_files.iter().map(PathBuf::from).collect();
-    if roots.is_empty() {
-        roots = config.files().to_vec();
-    }
-    if roots.is_empty() {
-        roots = collect_project_sources(&project_dir).map_err(ProjectEmitError::Harness)?;
-    }
-    if roots.is_empty() {
-        return Err(ProjectEmitError::Compile(
-            "project has no roots to compile".to_owned(),
-        ));
-    }
-    let loader = ProgramLoader::new(&root, config.options())
-        .map_err(|error| ProjectEmitError::Harness(format!("project loader: {error}")))?;
-    let loaded = loader
-        .load_roots(&roots)
-        .map_err(|error| ProjectEmitError::Compile(format!("project load failed: {error}")))?;
+    let loaded = load_project_program(&input_files, &config, &project_dir)?;
     let frontend = compile_program_frontend(&loaded, FrontendMode::Declaration);
     let mut produced_by_source: BTreeMap<String, String> = BTreeMap::new();
     for module in loaded.modules() {
@@ -3523,6 +3582,184 @@ fn produce_project_declaration(
         artifact.push('\n');
     }
     Ok((artifact.into_bytes(), expected_dts.len()))
+}
+
+fn observe_project_javascript(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> check_cells::CompilerCheckObservation {
+    match produce_project_javascript(snapshot, index_entry) {
+        Ok(produced) => check_cells::CompilerCheckObservation {
+            class: FailureClass::Pass,
+            detail: String::new(),
+            artifact: Some(produced),
+        },
+        Err(
+            err @ (ProjectEmitError::Harness(_)
+            | ProjectEmitError::InvalidFixture(_)
+            | ProjectEmitError::InvalidPath(_)),
+        ) => check_cells::CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail: err.detail(),
+            artifact: None,
+        },
+        Err(err) => check_cells::CompilerCheckObservation {
+            class: FailureClass::FailBehavior,
+            detail: err.detail(),
+            artifact: None,
+        },
+    }
+}
+
+const PROJECT_MODULE_VARIANTS: [(&str, &str); 2] = [("amd", "amd"), ("node", "commonjs")];
+
+fn produce_project_javascript(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> std::result::Result<Vec<u8>, ProjectEmitError> {
+    let fixture = read_project_fixture(snapshot, index_entry)?;
+    let mut artifact = String::new();
+    for (variant, module) in PROJECT_MODULE_VARIANTS {
+        let relative_case = &fixture.relative_case;
+        let manifest_path = format!(
+            "tests/baselines/reference/project/{relative_case}/{variant}/{relative_case}.json"
+        );
+        let manifest_bytes =
+            read_verified_snapshot_asset(snapshot, &manifest_path).map_err(|error| {
+                ProjectEmitError::MissingBaseline(format!(
+                    "missing project manifest `{manifest_path}`: {error}"
+                ))
+            })?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| {
+                ProjectEmitError::Harness(format!("invalid project manifest: {error}"))
+            })?;
+        let mut expected: Vec<String> = manifest
+            .get("emittedFiles")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .filter(|name| name.ends_with(".js"))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        expected.sort();
+        let (_temp, project_dir) =
+            materialize_project(snapshot, &fixture.root, "bamts-project-javascript")?;
+        let config = project_config(
+            &fixture.value,
+            &project_dir,
+            &[("module", module), ("target", "es5")],
+        )?;
+        let produced = if expected.is_empty() {
+            BTreeMap::new()
+        } else {
+            let loaded = load_project_program(&fixture.input_files, &config, &project_dir)?;
+            project_javascript_outputs(&loaded, &config, &project_dir)
+        };
+        let produced_names: Vec<String> = produced.keys().cloned().collect();
+        if produced_names != expected {
+            return Err(ProjectEmitError::Compile(format!(
+                "javascript file list mismatch against `{manifest_path}`: produced [{}], expected [{}]",
+                produced_names.join(", "),
+                expected.join(", ")
+            )));
+        }
+        for (name, code) in &produced {
+            let baseline_path =
+                format!("tests/baselines/reference/project/{relative_case}/{variant}/{name}");
+            let baseline =
+                read_verified_snapshot_asset(snapshot, &baseline_path).map_err(|error| {
+                    ProjectEmitError::MissingBaseline(format!(
+                        "missing javascript baseline `{baseline_path}`: {error}"
+                    ))
+                })?;
+            if code.as_bytes() != baseline.as_slice() {
+                return Err(ProjectEmitError::Compile(format!(
+                    "javascript mismatch against `{baseline_path}`: produced {} bytes, expected {} bytes",
+                    code.len(),
+                    baseline.len()
+                )));
+            }
+            artifact.push_str(code);
+            artifact.push('\n');
+        }
+    }
+    Ok(artifact.into_bytes())
+}
+
+fn project_javascript_outputs(
+    loaded: &bamts_compiler::program::ResolvedProgram,
+    config: &ProjectConfig,
+    project_dir: &Path,
+) -> BTreeMap<String, String> {
+    let frontend = compile_program_frontend(loaded, FrontendMode::JavaScript);
+    let sources: Vec<(String, String)> = loaded
+        .modules()
+        .iter()
+        .filter_map(|module| {
+            let relative = module.path().strip_prefix(project_dir).ok()?;
+            let posix = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let code = frontend
+                .modules()
+                .iter()
+                .find(|item| item.source_file().source_id() == module.source_id())?
+                .emit()
+                .as_ref()?
+                .javascript
+                .as_ref()?
+                .code
+                .clone();
+            Some((posix, code))
+        })
+        .filter(|(posix, _)| {
+            !posix.ends_with(".d.ts")
+                && !posix.ends_with(".json")
+                && (config.options().allow_js() || !posix.ends_with(".js"))
+        })
+        .collect();
+    let common: Vec<String> =
+        check_cells::common_directory(sources.iter().map(|(posix, _)| posix.as_str()))
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    let common: Vec<&str> = common.iter().map(String::as_str).collect();
+    let out_dir = config
+        .options()
+        .out_dir()
+        .and_then(|dir| dir.strip_prefix(project_dir).ok())
+        .map(|relative| {
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        });
+    sources
+        .into_iter()
+        .map(|(posix, code)| {
+            let stem = posix
+                .rsplit_once('.')
+                .map_or(posix.as_str(), |(stem, _)| stem);
+            let path = match &out_dir {
+                Some(directory) => check_cells::emitted_path(
+                    directory,
+                    &common,
+                    &posix,
+                    &format!("{}.js", stem.rsplit('/').next().unwrap_or(stem)),
+                ),
+                None => format!("{stem}.js"),
+            };
+            (path.trim_start_matches('/').to_owned(), code)
+        })
+        .collect()
 }
 fn observe_project_diagnostics(
     snapshot: &(impl SnapshotAssets + ?Sized),
@@ -5669,14 +5906,14 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         assert!(observation.artifacts.contains_key("trace"));
 
         // A project row routed with a still-unrouted observable stays a closed
-        // blocking fail (trace, declaration, and diagnostics now route;
-        // javascript needs AMD emit and does not yet).
+        // blocking fail (trace, declaration, diagnostics, and javascript
+        // route; symbols do not yet).
         let request = compiler_lane_request(
             &fixture.snapshot,
             COMPILER_CATALOG,
             "project/tests/cases/project/traceFix.json",
-            "default#javascript",
-            &["javascript"],
+            "default#symbols",
+            &["symbols"],
         );
         let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
         closed_non_pass(&observation);
