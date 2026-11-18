@@ -1066,6 +1066,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "composite"
             | "emitdeclarationonly"
             | "sourcemap"
+            | "inlinesourcemap"
+            | "inlinesources"
             | "declarationmap"
             | "usedefineforclassfields"
             | "importhelpers"
@@ -1106,7 +1108,11 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "strictpropertyinitialization" => "strictPropertyInitialization",
             "emitdeclarationonly" => "emitDeclarationOnly",
             "sourcemap" => "sourceMap",
+            "inlinesourcemap" => "inlineSourceMap",
+            "inlinesources" => "inlineSources",
             "declarationmap" => "declarationMap",
+            "maproot" => "mapRoot",
+            "sourceroot" => "sourceRoot",
             "tsbuildinfofile" => "tsBuildInfoFile",
             "outfile" => "outFile",
             "outdir" => "outDir",
@@ -2238,6 +2244,8 @@ pub fn emit_javascript_baseline(
         Some(directory) => emitted_path(directory, &common, &unit.virtual_path, section),
         None => section.to_owned(),
     };
+    let mut last_body_had_trailing_newline = true;
+
     if !options.emit_declaration_only() {
         for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
@@ -2271,6 +2279,7 @@ pub fn emit_javascript_baseline(
                     .and_then(|emit| emit.javascript.as_ref())
                     .map(|javascript| javascript.code.as_str())
                     .unwrap_or("");
+                last_body_had_trailing_newline = body.ends_with('\n');
                 push_output_section(&mut out, &placed(&name, unit), body);
                 outputs += 1;
                 continue;
@@ -2291,6 +2300,7 @@ pub fn emit_javascript_baseline(
                 output_extension(name, jsx_preserve).to_owned()
             });
             push_output_section(&mut out, &placed(&js_name, unit), &javascript.code);
+            last_body_had_trailing_newline = javascript.code.ends_with('\n');
             outputs += 1;
         }
     }
@@ -2316,7 +2326,7 @@ pub fn emit_javascript_baseline(
         if !declarations.is_empty() {
             // Upstream writes the `\r\n\r\n` block separator and then the
             // declaration sections back to back, with no per-file separator.
-            out.push_str("\n\n");
+            out.push_str(if last_body_had_trailing_newline { "\n\n" } else { "\n" });
             for (section, code) in declarations {
                 out.push_str(&format!("//// [{section}]\n{code}"));
                 outputs += 1;
