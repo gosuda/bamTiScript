@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::checker::{SymbolId, SymbolKind};
+use crate::checker::{SemanticModel, SymbolId, SymbolKind};
 use crate::emitter::{enum_number_lexeme, enum_string_lexeme};
 use crate::enum_plan::{EnumMemberPlan, EnumScalar};
 use crate::source::{TextRange, Utf16Pos};
@@ -38,6 +38,30 @@ pub(super) enum ContainerBinding {
 /// Whether an `import a = ...` aliases a name rather than requiring a module.
 pub(super) fn is_qualified_alias(import: &ImportEqualsDeclaration) -> bool {
     matches!(import.reference, ExternalModuleReference::Qualified(_))
+}
+
+/// Whether the name a qualified alias stands for has a runtime value. An
+/// unresolved alias counts as one, so the error it reports is not erased.
+pub(super) fn alias_target_bears_value(model: Option<&SemanticModel>, statement: &Stmt) -> bool {
+    let Some(model) = model else {
+        return true;
+    };
+    let facts = model.namespace_facts();
+    let target = facts
+        .qualified_import_path(statement.id())
+        .and_then(<[SymbolId]>::last);
+    let Some(&target) = target else {
+        return true;
+    };
+    match model.symbol(target).kind() {
+        SymbolKind::Interface | SymbolKind::TypeAlias => false,
+        SymbolKind::Namespace => facts.merged_declarations(target).iter().any(|declaration| {
+            facts
+                .declaration(*declaration)
+                .is_some_and(|plan| plan.is_value_bearing())
+        }),
+        _ => true,
+    }
 }
 
 impl Rewriter<'_> {
@@ -224,25 +248,7 @@ impl Rewriter<'_> {
     /// Whether an alias resolves to something with a runtime value. One that
     /// resolves to nothing counts, so the error it reports is not also erased.
     fn alias_target_is_value(&self, statement: &Stmt) -> bool {
-        let Some(model) = self.model else {
-            return true;
-        };
-        let facts = model.namespace_facts();
-        let target = facts
-            .qualified_import_path(statement.id())
-            .and_then(<[SymbolId]>::last);
-        let Some(&target) = target else {
-            return true;
-        };
-        match model.symbol(target).kind() {
-            SymbolKind::Interface | SymbolKind::TypeAlias => false,
-            SymbolKind::Namespace => facts.merged_declarations(target).iter().any(|declaration| {
-                facts
-                    .declaration(*declaration)
-                    .is_some_and(|plan| plan.is_value_bearing())
-            }),
-            _ => true,
-        }
+        alias_target_bears_value(self.model, statement)
     }
 
     /// `E[E["A"] = 0] = "A";`, or `E["A"] = "a";` for a member with no reverse
