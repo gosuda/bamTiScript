@@ -9020,14 +9020,13 @@ impl<'a> Rewriter<'a> {
                                 temp,
                             );
                             declaration.extends = declaration.extends.map(|mut heritage| {
-                                heritage.expression = Box::new(
-                                    self.rename_class_self_in_expression(
+                                heritage.expression =
+                                    Box::new(self.rename_class_self_in_expression(
                                         *heritage.expression,
                                         original,
                                         class,
                                         temp,
-                                    ),
-                                );
+                                    ));
                                 heritage
                             });
                         }

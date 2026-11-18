@@ -22810,15 +22810,15 @@ impl<'src> Binder<'src> {
                     | BinaryOperator::StrictEqual
                     | BinaryOperator::StrictNotEqual => self.types.boolean(),
                     BinaryOperator::Add
+                        if self.is_string_like(left) || self.is_string_like(right) =>
+                    {
+                        self.types.string()
+                    }
+                    BinaryOperator::Add
                         if matches!(self.types.get(left), Type::Any)
                             || matches!(self.types.get(right), Type::Any) =>
                     {
                         self.types.any()
-                    }
-                    BinaryOperator::Add
-                        if self.is_string_like(left) || self.is_string_like(right) =>
-                    {
-                        self.types.string()
                     }
                     BinaryOperator::Add
                     | BinaryOperator::Subtract
