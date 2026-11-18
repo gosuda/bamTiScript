@@ -361,6 +361,12 @@ impl ResolvedProgram {
         self.module_kind == Some(crate::emitter::ModuleKind::Node)
     }
 
+    /// Whether `module` is a Node mode, where dynamic `import()` is never lowered.
+    #[must_use]
+    pub fn is_node_module_mode(&self) -> bool {
+        self.module_kind == Some(crate::emitter::ModuleKind::Node)
+    }
+
     #[must_use]
     pub const fn jsx(&self) -> Option<JsxEmit> {
         self.jsx
