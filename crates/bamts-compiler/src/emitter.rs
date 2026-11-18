@@ -5784,6 +5784,9 @@ impl<'a> Emitter<'a> {
         self.raw(" {");
         let body = namespace.body.data();
         if body.statements.is_empty() {
+            if !matches!(namespace.name, NamespaceName::StringLiteral(_)) {
+                self.newline();
+            }
             self.raw("}");
             return;
         }

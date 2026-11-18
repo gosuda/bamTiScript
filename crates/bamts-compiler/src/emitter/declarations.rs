@@ -598,6 +598,13 @@ mod tests {
     }
 
     #[test]
+    fn empty_namespace_body_closes_on_its_own_line() {
+        let output = emit_dts("export namespace empty {}\n", DeclarationOptions::default());
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(code.contains("export declare namespace empty {\n}"), "{code}");
+    }
+
+    #[test]
     fn let_literal_type_is_widened() {
         let output = emit_dts(
             "export let n = 42;\nexport let s = \"hello\";\nexport let b = true;\n",
