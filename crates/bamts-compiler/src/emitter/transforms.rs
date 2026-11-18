@@ -14333,6 +14333,22 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn commonjs_marker_follows_a_source_directive() {
+        let output = emit_with_options(
+            "\"use strict\";\nexport class Foo {}\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.Foo = void 0;\nclass Foo {\n}\nexports.Foo = Foo;\n"
+        );
+    }
+
+    #[test]
     fn commonjs_class_and_variable_exports_receive_void_0_preamble() {
         let output = emit_with_options(
             "export class A {}\nexport const x = 1;\n",
