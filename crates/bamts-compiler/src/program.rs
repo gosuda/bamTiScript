@@ -1071,8 +1071,17 @@ impl ProgramLoader {
                 )))
             }
             ReferenceDirectiveKind::Path => {
-                if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
-                    let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
+                let rewritten =
+                    reference_path_target(&edge.specifier).map(|target| UnresolvedEdge {
+                        kind: edge.kind,
+                        mode: edge.mode,
+                        specifier: target,
+                        range: edge.range,
+                        directive: edge.directive,
+                    });
+                let probe = rewritten.as_ref().unwrap_or(edge);
+                if let Some(target) = self.resolve_local(importer, probe, flavor, cancel)? {
+                    let type_overlay = self.type_overlay(importer, probe, &target, cancel)?;
                     return Ok(ResolvedEdge {
                         target,
                         type_overlay,
@@ -2764,6 +2773,23 @@ fn split_package_specifier(specifier: &str) -> Option<(&str, String)> {
         }
         None => None,
     }
+}
+
+/// Rewrites a `/// <reference path>` value to the relative specifier it
+/// names. A path without a `./`, `../`, `/`, or `#` lead is relative to
+/// the importing file, never a package name. Values that already carry a
+/// lead, or that relative resolution rejects outright, return `None`.
+fn reference_path_target(specifier: &str) -> Option<Arc<str>> {
+    if specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+        || specifier.starts_with('#')
+        || specifier.contains("://")
+        || specifier.contains('?')
+    {
+        return None;
+    }
+    Some(Arc::from(format!("./{specifier}")))
 }
 
 fn diagnostic(
@@ -5781,6 +5807,58 @@ mod tests {
         assert!(
             main_wire.edges().is_empty(),
             "a reference directive creates no runtime edge"
+        );
+    }
+
+    #[test]
+    fn reference_path_directive_without_dot_slash_resolves_beside_importer() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;\n");
+        fixture.write(
+            "main.ts",
+            "/// <reference path=\"dep.ts\" />\nexport const x = 1;\n",
+        );
+        let resolved = fixture
+            .loader()
+            .load("main.ts")
+            .expect("bare path directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(edge.specifier(), "dep.ts");
+        assert_eq!(
+            edge.reference_directive(),
+            Some(ReferenceDirectiveKind::Path)
+        );
+        assert!(!edge.is_unresolved());
+        assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+    }
+
+    #[test]
+    fn reference_path_directive_without_dot_slash_stays_in_importer_directory() {
+        let fixture = Fixture::new();
+        fixture.write("nested/dep.ts", "export const value = 1;\n");
+        fixture.write(
+            "nested/main.ts",
+            "/// <reference path=\"dep.ts\" />\nexport const x = 1;\n",
+        );
+        fixture.write("dep.ts", "export const shadow = 2;\n");
+        let resolved = fixture
+            .loader()
+            .load("nested/main.ts")
+            .expect("nested bare path directive loads");
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert!(!edge.is_unresolved());
+        let target = edge.target().local_source_id().expect("local target");
+        let nested = resolved
+            .module(target)
+            .expect("referenced module is in the program");
+        assert!(
+            nested.path().ends_with("nested/dep.ts"),
+            "bare path resolves beside the importer, got {}",
+            nested.path().display()
         );
     }
 
