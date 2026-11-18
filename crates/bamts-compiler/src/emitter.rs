@@ -1359,14 +1359,24 @@ impl Emitter<'_> {
         if !matches!(parameter.binding.data(), BindingPattern::Identifier(_)) {
             return false;
         }
-        let start = parameter.binding.range().start();
-        let index = self
-            .tokens
-            .partition_point(|token| token.range().start() < start);
-        let Some(before) = index.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
+        let range = parameter.binding.range();
+        let first_at_or_after = |position| {
+            self.tokens
+                .partition_point(|token| token.range().start() < position)
+        };
+        let Some(before) = first_at_or_after(range.start())
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+        else {
             return true;
         };
-        !(before.kind() == TokenKind::LParen && before.range().end() == start)
+        let after = self.tokens.get(first_at_or_after(range.end()));
+        let wrapped_in_parens = before.kind() == TokenKind::LParen
+            && before.range().end() == range.start()
+            && after.is_some_and(|token| {
+                token.kind() == TokenKind::RParen && token.range().start() == range.end()
+            });
+        !wrapped_in_parens
     }
 }
 
