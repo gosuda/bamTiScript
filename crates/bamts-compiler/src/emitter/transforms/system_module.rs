@@ -419,7 +419,7 @@ impl Rewriter<'_> {
     }
 
     /// The text of an identifier, wherever its range points.
-    fn bank_text(&self, token: &Token) -> String {
+    pub(super) fn bank_text(&self, token: &Token) -> String {
         let range = token.range();
         self.bank
             .names
@@ -659,7 +659,12 @@ impl Rewriter<'_> {
     }
 
     /// `name = value;` for a hoisted System binding.
-    fn system_plain_assignment(&mut self, name: &str, value: Expr, range: TextRange) -> Stmt {
+    pub(super) fn system_plain_assignment(
+        &mut self,
+        name: &str,
+        value: Expr,
+        range: TextRange,
+    ) -> Stmt {
         let local = self.ident(name);
         let left = self.syn_node(range, AssignmentTarget::Identifier(local));
         let assignment = self.assignment(left, value, range);

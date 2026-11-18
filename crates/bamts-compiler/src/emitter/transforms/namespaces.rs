@@ -338,10 +338,15 @@ impl Rewriter<'_> {
         self.declared_names.push(BTreeSet::new());
         self.expression_temp_scopes.push(Vec::new());
         self.publish_aliases(namespace, parameter);
+        let members = &namespace.body.data().statements;
+        let disposal = self.open_disposal_environment(members);
         let mut body = Vec::new();
-        for member in &namespace.body.data().statements {
+        for member in members {
             self.record_declaration(member);
             body.extend(self.rewrite_namespace_member(member, parameter));
+        }
+        if let Some(disposal) = disposal {
+            body = self.close_disposal_environment(body, disposal, namespace.body.range());
         }
         let temps = self.expression_temp_scopes.pop().unwrap_or_default();
         if let Some(declaration) = self.temp_declaration(temps, namespace.body.range()) {

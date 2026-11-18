@@ -570,6 +570,10 @@ pub(crate) struct PrintSource<'a> {
     pub(crate) expanded_sequences: Option<&'a BTreeSet<NodeId>>,
     /// Parenthesized class IIFEs, which print `/** @class */ ` first.
     pub(crate) class_iifes: Option<&'a BTreeSet<NodeId>>,
+    /// Synthesized nodes that take the layout their kind does not default
+    /// to: an object literal on one line, an `if` with its statement on the
+    /// next line.
+    pub(crate) alternate_layout: Option<&'a BTreeSet<NodeId>>,
     /// The factory an AMD or UMD module's body prints inside.
     pub(crate) module_wrapper: Option<&'a ModuleWrapper<'a>>,
 }
@@ -680,6 +684,7 @@ pub(crate) fn print(
             prelude_tail: None,
             expanded_sequences: None,
             class_iifes: None,
+            alternate_layout: None,
             module_wrapper: None,
         },
         model,
@@ -710,6 +715,7 @@ pub(crate) fn print_with_jsx_plan(
         prelude_tail,
         expanded_sequences,
         class_iifes,
+        alternate_layout,
         module_wrapper,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
@@ -778,6 +784,7 @@ pub(crate) fn print_with_jsx_plan(
         prelude_tail,
         expanded_sequences,
         class_iifes,
+        alternate_layout,
         module_wrapper,
         temp_names: TempNames::new(authored_identifiers(file, original_content)),
     };
@@ -841,6 +848,7 @@ pub(crate) fn print_json_value(
         prelude_tail: _,
         expanded_sequences,
         class_iifes,
+        alternate_layout,
         module_wrapper: _,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
@@ -904,6 +912,7 @@ pub(crate) fn print_json_value(
         prelude_tail: None,
         expanded_sequences,
         class_iifes,
+        alternate_layout,
         module_wrapper: None,
         temp_names: TempNames::new(HashSet::new()),
     };
@@ -1085,6 +1094,7 @@ struct Emitter<'a> {
     prelude_tail: Option<&'a str>,
     expanded_sequences: Option<&'a BTreeSet<NodeId>>,
     class_iifes: Option<&'a BTreeSet<NodeId>>,
+    alternate_layout: Option<&'a BTreeSet<NodeId>>,
     module_wrapper: Option<&'a ModuleWrapper<'a>>,
     /// Final names for the rewriter's temporary placeholders.
     temp_names: TempNames,
@@ -1513,6 +1523,10 @@ impl<'a> Emitter<'a> {
     /// Whether `id` is a synthesized node produced by the rewriter.
     fn is_synthesized(&self, id: NodeId) -> bool {
         self.synthesized.is_some_and(|set| set.contains(&id))
+    }
+
+    fn takes_alternate_layout(&self, id: NodeId) -> bool {
+        self.alternate_layout.is_some_and(|set| set.contains(&id))
     }
 
     /// Whether a node with `id` and `range` preserves single-line emit:
@@ -2317,7 +2331,8 @@ impl<'a> Emitter<'a> {
         self.raw_mapped("if (", self.anchor);
         self.emit_expression(&if_statement.test);
         self.raw_mapped_pos(")", if_statement.test.range().end());
-        let hug = if_statement.test.id().get() >= self.synthesized_floor;
+        let hug = if_statement.test.id().get() >= self.synthesized_floor
+            && !self.takes_alternate_layout(statement.id());
         self.emit_control_body_hug(&if_statement.consequent, hug);
         let machine_if = statement.id().get() >= self.synthesized_floor;
         if let Some(alternate) = &if_statement.alternate {
@@ -3942,7 +3957,7 @@ impl<'a> Emitter<'a> {
         }
         // Preservation: members authored on one line join with `, `.
         // Synthesized or multi-line-authored objects take the expanded path.
-        if self.preserves_single_line(id, range) {
+        if self.takes_alternate_layout(id) || self.preserves_single_line(id, range) {
             self.raw("{ ");
             let count = object.members.len();
             for (index, member) in object.members.iter().enumerate() {
