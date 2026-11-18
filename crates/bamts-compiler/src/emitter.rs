@@ -1500,6 +1500,16 @@ impl<'a> Emitter<'a> {
             range.start().get() + utf16_len(&text[..index]),
         ))
     }
+
+    /// Whether a clause's statement was authored on the line of its `case`
+    /// or `default`; tsc keeps a clause's only statement there.
+    fn starts_on_the_clause_line(&self, clause: TextRange, statement: &Stmt) -> bool {
+        if statement.range().end() > self.authored_len {
+            return false;
+        }
+        TextRange::new(clause.start(), statement.range().start())
+            .is_ok_and(|lead| !self.source.spans_multiple_lines(lead))
+    }
     /// Whether `id` is a synthesized node produced by the rewriter.
     fn is_synthesized(&self, id: NodeId) -> bool {
         self.synthesized.is_some_and(|set| set.contains(&id))
@@ -2460,15 +2470,15 @@ impl<'a> Emitter<'a> {
                 }
                 None => self.raw_mapped("default:", case_range),
             }
-            // Synthesized machines (the __generator state machine) print a
-            // single-statement case inline the way tsc emits them. The
-            // discriminator is the case test: authored tests live inside the
-            // authored text, machine tests are interned past its end.
-            let inline = case.consequent.len() == 1
-                && case
-                    .test
-                    .as_ref()
-                    .is_some_and(|test| test.range().end() > self.authored_len);
+            let inline = match case.consequent.as_slice() {
+                [only] => {
+                    case.test
+                        .as_ref()
+                        .is_some_and(|test| test.range().end() > self.authored_len)
+                        || self.starts_on_the_clause_line(case_range, only)
+                }
+                _ => false,
+            };
             if inline {
                 self.raw(" ");
                 self.emit_statement(&case.consequent[0]);
@@ -7884,11 +7894,11 @@ export {};
     }
 
     #[test]
-    fn authored_switch_cases_never_inline() {
-        // Authority: sourceMapValidationSwitch — authored single-statement
-        // cases print one statement per line; only synthesized machine
-        // cases print inline.
-        let input = "var x = 10;\nswitch (x) {\ncase 5: x = 0;\n}\n";
+    fn a_clause_keeps_its_only_statement_on_the_authored_line() {
+        // Authority: booleanLiteralTypes1 (`case true: return "true";`) and
+        // sourceMapValidationSwitch (two statements, or one on its own line,
+        // print one per line).
+        let input = "var x = 10;\nswitch (x) {\ncase 5: x = 0;\ncase 6: x++; break;\ncase 7:\n    x = 1;\n}\n";
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
@@ -7897,8 +7907,12 @@ export {};
         assert!(parsed.diagnostics().is_empty());
         let output = emit_output(parsed.product(), &EmitOptions::default());
         let code = &javascript(&output).code;
-        assert!(code.contains("case 5:\n        x = 0;"), "{code}");
-        assert!(!code.contains("case 5: x = 0;"), "{code}");
+        assert!(
+            code.contains(
+                "    case 5: x = 0;\n    case 6:\n        x++;\n        break;\n    case 7:\n        x = 1;\n"
+            ),
+            "{code}"
+        );
     }
 
     #[test]
