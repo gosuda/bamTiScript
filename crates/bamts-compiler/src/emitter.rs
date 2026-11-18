@@ -2458,6 +2458,11 @@ impl<'a> Emitter<'a> {
         self.newline();
         self.indent += 1;
         self.emit_statement_list(&block.data().statements);
+        if !self.is_synthesized(block.id()) {
+            let closing_brace = Utf16Pos::new(block.range().end().get().saturating_sub(1));
+            self.queue_leading_comments(closing_brace);
+            self.flush_comments();
+        }
         self.indent -= 1;
         self.raw_mapped_char_end("}", range, '}');
     }
