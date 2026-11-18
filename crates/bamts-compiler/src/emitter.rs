@@ -137,6 +137,9 @@ pub struct EmitOptions {
     pub erased_imports: Arc<BTreeSet<(String, String)>>,
     /// Something outside the source reads imports, so none can be proven unused.
     pub keeps_imports: bool,
+    /// `module` is a Node mode (node16, node18, node20, nodenext), where
+    /// dynamic `import()` stays as written even in CommonJS-format files.
+    pub node_module_mode: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
@@ -172,6 +175,7 @@ impl Default for EmitOptions {
             verbatim_module_syntax: false,
             erased_imports: Arc::default(),
             keeps_imports: false,
+            node_module_mode: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -433,6 +437,7 @@ impl EmitOptions {
             verbatim_module_syntax: self.verbatim_module_syntax,
             erased_imports: Arc::clone(&self.erased_imports),
             keeps_imports: self.keeps_imports,
+            node_module_mode: self.node_module_mode,
         }
     }
 
