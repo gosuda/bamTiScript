@@ -245,8 +245,9 @@ pub struct ResolvedProgram {
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
     commonjs: bool,
-    /// The wrapper module kinds beyond CommonJS that change emitted output.
-    wrapped_module: Option<crate::emitter::ModuleKind>,
+    module_kind: Option<crate::emitter::ModuleKind>,
+    /// For a Node module mode, the format each module emits as, by module index.
+    node_formats: Arc<[crate::emitter::ModuleKind]>,
     no_implicit_any: bool,
     strict_null_checks: bool,
     strict_property_initialization: bool,
@@ -326,10 +327,20 @@ impl ResolvedProgram {
         self.commonjs
     }
 
-    /// The AMD or UMD module kind the options select, if any.
+    /// The module kind the module at `index` emits as, when the options give it
+    /// one: CommonJS, the AMD and UMD wrappers, or the per-file format a Node
+    /// module mode derives from extension and package type.
     #[must_use]
-    pub const fn wrapped_module(&self) -> Option<crate::emitter::ModuleKind> {
-        self.wrapped_module
+    pub fn emit_module_kind(&self, index: usize) -> Option<crate::emitter::ModuleKind> {
+        use crate::emitter::ModuleKind;
+        if self.commonjs {
+            return Some(ModuleKind::CommonJs);
+        }
+        match self.module_kind? {
+            ModuleKind::Node => self.node_formats.get(index).copied(),
+            kind @ (ModuleKind::Amd | ModuleKind::Umd) => Some(kind),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -773,22 +784,20 @@ impl ProgramLoader {
         } else {
             crate::checker::intrinsic_environment::LibSet::from_lib_names(self.options.lib())
         };
+        let module_kind = self.options.module().and_then(crate::emitter::parse_module);
+        let node_formats = if module_kind == Some(crate::emitter::ModuleKind::Node) {
+            node_module_formats(&state.modules, &self.root, self.fs.as_ref())
+        } else {
+            Arc::from([])
+        };
         Ok(ResolvedProgram {
             root: self.root.clone(),
             roots: Arc::from(root_ids),
             modules: Arc::from(state.modules),
             module_indices,
             commonjs: ambient == ResolutionMode::Require,
-            wrapped_module: self
-                .options
-                .module()
-                .and_then(crate::emitter::parse_module)
-                .filter(|kind| {
-                    matches!(
-                        kind,
-                        crate::emitter::ModuleKind::Amd | crate::emitter::ModuleKind::Umd
-                    )
-                }),
+            module_kind,
+            node_formats,
             no_implicit_any: self.options.no_implicit_any(),
             strict_null_checks: self.options.strict_null_checks(),
             strict_property_initialization: self.options.strict_property_initialization(),
@@ -2717,6 +2726,64 @@ fn ambient_resolution_mode(options: &CompilerOptions) -> ResolutionMode {
     } else {
         ResolutionMode::Import
     }
+}
+
+/// The module format a Node module mode emits for each file: the extension
+/// decides, then the `type` of the nearest `package.json`, and a file with
+/// neither is CommonJS.
+fn node_module_formats(
+    modules: &[ResolvedModule],
+    root: &ProjectRoot,
+    fs: &dyn FileSystem,
+) -> Arc<[crate::emitter::ModuleKind]> {
+    let mut directories = HashMap::new();
+    modules
+        .iter()
+        .map(|module| node_module_format(module.path(), root, fs, &mut directories))
+        .collect()
+}
+
+fn node_module_format(
+    path: &Path,
+    root: &ProjectRoot,
+    fs: &dyn FileSystem,
+    directories: &mut HashMap<PathBuf, crate::emitter::ModuleKind>,
+) -> crate::emitter::ModuleKind {
+    use crate::emitter::ModuleKind;
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("mts" | "mjs") => return ModuleKind::EsNext,
+        Some("cts" | "cjs") => return ModuleKind::CommonJs,
+        _ => {}
+    }
+    path.parent().map_or(ModuleKind::CommonJs, |directory| {
+        directory_module_format(directory, root, fs, directories)
+    })
+}
+
+fn directory_module_format(
+    directory: &Path,
+    root: &ProjectRoot,
+    fs: &dyn FileSystem,
+    directories: &mut HashMap<PathBuf, crate::emitter::ModuleKind>,
+) -> crate::emitter::ModuleKind {
+    use crate::emitter::ModuleKind;
+    if let Some(&format) = directories.get(directory) {
+        return format;
+    }
+    let package_path = directory.join("package.json");
+    let package = fs
+        .read(&package_path)
+        .ok()
+        .and_then(|text| PackageJson::parse(root, &package_path, &text).ok());
+    let format = match package {
+        Some(package) if package.package_type() == Some("module") => ModuleKind::EsNext,
+        Some(_) => ModuleKind::CommonJs,
+        None => directory.parent().map_or(ModuleKind::CommonJs, |parent| {
+            directory_module_format(parent, root, fs, directories)
+        }),
+    };
+    directories.insert(directory.to_path_buf(), format);
+    format
 }
 
 /// Compiler-only identity and resolved-edge provenance for one executable module.

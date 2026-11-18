@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::checker::diagnostic_messages::{Args, by_u32};
 use crate::checker::{self, ProgramCheckInput, ResolvedModuleEdge, SemanticModel};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
-use crate::emitter::{self, EmitFileNames, EmitOptions, EmitOutput, ModuleKind};
+use crate::emitter::{self, EmitFileNames, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
 use crate::program::{
@@ -235,7 +235,11 @@ fn local_dependency(
         .and_then(edge_target)
 }
 
-fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option<EmitOptions> {
+fn program_emit_options(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+    module_index: usize,
+) -> Option<EmitOptions> {
     let mut options = mode.emit_options()?;
 
     // Shared mapping: target, always_strict, module. The program carries the
@@ -246,10 +250,7 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
     let check = program.check_options();
     let target = check.target();
     let always_strict = check.always_strict();
-    let module = program
-        .is_commonjs()
-        .then_some(ModuleKind::CommonJs)
-        .or(program.wrapped_module());
+    let module = program.emit_module_kind(module_index);
     options.apply_emit_fields(
         target,
         always_strict,
@@ -669,7 +670,7 @@ pub fn compile_program_frontend_with_cancel(
                 source_root: None,
                 ..EmitFileNames::default()
             };
-            let emit = if let Some(options) = program_emit_options(program, mode) {
+            let emit = if let Some(options) = program_emit_options(program, mode, index) {
                 cancel.check()?;
                 let output = Telemetry::measure(Phase::Emit, || {
                     emitter::emit_checked(parsed.product(), &semantic_model, &options, &names)
