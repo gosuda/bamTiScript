@@ -5557,6 +5557,8 @@ impl<'a> Emitter<'a> {
             if let Some(annotation) = &parameter.type_annotation {
                 self.raw(": ");
                 self.emit_type(&annotation.data().type_node);
+            } else if matches!(parameter.binding.data(), BindingPattern::Rest(_)) {
+                self.raw(": any[]");
             }
         }
         self.raw(")");
