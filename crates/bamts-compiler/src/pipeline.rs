@@ -259,6 +259,7 @@ fn program_emit_options(
         program.import_helpers(),
     );
     options.es_module_interop = program.es_module_interop().unwrap_or(true);
+    options.node_module_mode = program.is_node_module_mode();
     options.no_emit_helpers = check.no_emit_helpers();
     options.remove_comments = check.remove_comments();
     options.verbatim_module_syntax = program.verbatim_module_syntax();

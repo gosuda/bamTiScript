@@ -150,6 +150,8 @@ pub struct TransformOptions {
     pub erased_imports: std::sync::Arc<BTreeSet<(String, String)>>,
     /// Something outside the source reads imports, so none can be proven unused.
     pub keeps_imports: bool,
+    /// Node module modes keep dynamic `import()` as written.
+    pub node_module_mode: bool,
     /// Whether the emitted file begins with a `"use strict"` prologue.
     pub always_strict: bool,
     /// When true, class fields that survive downlevel use `define` semantics.
@@ -1720,6 +1722,58 @@ impl<'a> Rewriter<'a> {
             range,
             Expression::Sequence(SequenceExpression {
                 expressions: vec![zero, callee],
+            }),
+        )
+    }
+
+    /// `import("m")` under CommonJS: a promise resolved on the next turn that
+    /// requires the module, wrapped by `__importStar` when interop is on.
+    fn lower_commonjs_dynamic_import(&mut self, range: TextRange, source: &Expr) -> Option<Expr> {
+        let plan = self.cjs.as_ref()?;
+        let interop = plan.es_module_interop;
+        if plan.amd.is_some()
+            || self.options.node_module_mode
+            || self.options.target < ScriptTarget::Es2015
+            || !matches!(source.data(), Expression::Literal(Literal::String(_)))
+        {
+            return None;
+        }
+        let require = self.ident_expr("require");
+        let required = self.call_expression(range, require, vec![source.clone()]);
+        let body = if interop {
+            let star = self.helper_ident(HelperKind::ImportStar);
+            self.call_expression(range, star, vec![required])
+        } else {
+            required
+        };
+        let continuation = self.node(
+            range,
+            Expression::Arrow(ArrowFunction {
+                is_async: false,
+                type_parameters: None,
+                parameters: Vec::new(),
+                return_type: None,
+                body: FunctionBody::Expression(Box::new(body)),
+            }),
+        );
+        let promise = self.ident_expr("Promise");
+        let resolve = self.member_access(promise, "resolve", range);
+        let resolved = self.call_expression(range, resolve, Vec::new());
+        let then = self.member_access(resolved, "then", range);
+        Some(self.call_expression(range, then, vec![continuation]))
+    }
+
+    fn call_expression(&mut self, range: TextRange, callee: Expr, arguments: Vec<Expr>) -> Expr {
+        self.node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(callee),
+                optional: false,
+                type_arguments: None,
+                arguments: arguments
+                    .into_iter()
+                    .map(|argument| CallArgument::Expression(Box::new(argument)))
+                    .collect(),
             }),
         )
     }
@@ -9391,6 +9445,11 @@ impl<'a> Rewriter<'a> {
                     .options
                     .as_deref()
                     .map(|value| Box::new(self.rewrite_expr(value)));
+                if let Some(lowered) =
+                    self.lower_commonjs_dynamic_import(expression.range(), &source)
+                {
+                    return lowered;
+                }
                 self.node(
                     expression.range(),
                     Expression::Import(ImportExpression {
