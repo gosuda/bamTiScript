@@ -8703,6 +8703,12 @@ impl<'a> Rewriter<'a> {
             _ => true,
         }
     }
+    /// Whether this rename carries an async body's `arguments` to its hoisted
+    /// copy: a nested non-arrow function binds its own `arguments`, so the
+    /// walk stops at its boundary and keeps descending into arrows.
+    fn rename_stops_at_functions(original: &str, class: Option<SymbolId>) -> bool {
+        class.is_none() && original == "arguments"
+    }
 
     fn rename_class_self_in_name(
         &mut self,
@@ -8818,6 +8824,9 @@ impl<'a> Rewriter<'a> {
         class: Option<SymbolId>,
         temp: &IdentifierNode,
     ) -> FunctionLike {
+        if Self::rename_stops_at_functions(original, class) {
+            return function;
+        }
         function.decorators =
             self.rename_class_self_in_decorators(function.decorators, original, class, temp);
         function.parameters =
@@ -9003,21 +9012,25 @@ impl<'a> Rewriter<'a> {
                         ),
                     }),
                     Statement::Class(mut declaration) => {
-                        declaration.members = self.rename_class_self_in_members(
-                            declaration.members,
-                            original,
-                            class,
-                            temp,
-                        );
-                        declaration.extends = declaration.extends.map(|mut heritage| {
-                            heritage.expression = Box::new(self.rename_class_self_in_expression(
-                                *heritage.expression,
+                        if !Self::rename_stops_at_functions(original, class) {
+                            declaration.members = self.rename_class_self_in_members(
+                                declaration.members,
                                 original,
                                 class,
                                 temp,
-                            ));
-                            heritage
-                        });
+                            );
+                            declaration.extends = declaration.extends.map(|mut heritage| {
+                                heritage.expression = Box::new(
+                                    self.rename_class_self_in_expression(
+                                        *heritage.expression,
+                                        original,
+                                        class,
+                                        temp,
+                                    ),
+                                );
+                                heritage
+                            });
+                        }
                         Statement::Class(declaration)
                     }
                     Statement::Block(block) => Statement::Block(
@@ -9526,9 +9539,20 @@ impl<'a> Rewriter<'a> {
                     temp,
                 ),
             }),
-            Expression::Class(nested) => Expression::Class(ClassExpression {
-                class: self.rename_class_self_in_nested_class(nested.class, original, class, temp),
-            }),
+            Expression::Class(nested) => {
+                if Self::rename_stops_at_functions(original, class) {
+                    Expression::Class(nested)
+                } else {
+                    Expression::Class(ClassExpression {
+                        class: self.rename_class_self_in_nested_class(
+                            nested.class,
+                            original,
+                            class,
+                            temp,
+                        ),
+                    })
+                }
+            }
             Expression::Arrow(arrow) => Expression::Arrow(ArrowFunction {
                 parameters: self.rename_class_self_in_parameters(
                     arrow.parameters,
@@ -14943,6 +14967,22 @@ mod tests {
             "{code}"
         );
         assert!(!code.contains("__generator"), "{code}");
+    }
+    #[test]
+    fn es5_async_arguments_rename_stops_at_nested_functions() {
+        let output = emit_at(
+            "async function f() { function g() { return arguments.length; } await 1; return arguments[0]; }\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("arguments_1[0]"), "{code}");
+        assert!(code.contains("return arguments.length"), "{code}");
+        let nested_only = emit_at(
+            "async function f() { function g() { return arguments.length; } await 1; }\n",
+            ScriptTarget::Es5,
+        );
+        let nested_code = javascript(&nested_only);
+        assert!(!nested_code.contains("arguments_1"), "{nested_code}");
     }
 
     #[test]
