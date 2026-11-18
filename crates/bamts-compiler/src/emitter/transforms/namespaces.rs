@@ -852,7 +852,7 @@ impl Rewriter<'_> {
         )
     }
 
-    fn expression_statement(&mut self, expression: Expr, range: TextRange) -> Stmt {
+    pub(super) fn expression_statement(&mut self, expression: Expr, range: TextRange) -> Stmt {
         self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
