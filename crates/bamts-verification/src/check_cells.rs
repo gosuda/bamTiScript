@@ -2164,7 +2164,7 @@ pub fn emit_javascript_baseline(
         let mut declarations = Vec::new();
         for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
-            if is_declaration_input_name(&name) {
+            if is_declaration_input_name(&name) || is_json_input_name(&name) {
                 continue;
             }
             let section = output_section_name(&name, bundle.as_deref(), declaration_extension);
