@@ -15434,6 +15434,40 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
     }
 
     #[test]
+    fn amd_directives_are_read_after_other_leading_comments() {
+        let output = emit_with_options(
+            "// copyright\n/* block\n   comment */\n///<amd-module name='Named'/>\n\nimport m2 = require('m2');\nm2.f();\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("define(\"Named\", [\"require\", \"exports\", \"m2\"], function (require, exports, m2) {"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn amd_directives_after_the_first_statement_are_ignored() {
+        let output = emit_with_options(
+            "import m2 = require('m2');\n///<amd-module name='Late'/>\nm2.f();\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("define([\"require\", \"exports\", \"m2\"]"),
+            "{code}"
+        );
+    }
+
+    #[test]
     fn umd_module_wraps_the_commonjs_body_and_lists_its_dependencies() {
         let output = emit_with_options(
             "import a from './a';\nexport var x = a;\n",
