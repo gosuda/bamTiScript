@@ -5144,6 +5144,11 @@ impl<'a> Emitter<'a> {
                     } else {
                         self.raw(": symbol");
                     }
+                } else if declaration.kind == VariableKind::Const
+                    && let Some(literal) = self.render_literal_initializer(initializer)
+                {
+                    self.raw(" = ");
+                    self.raw(&literal);
                 } else if let Some(type_id) = self.model.node_type(initializer.id()) {
                     let rendered = self.render_inferred_type(type_id, declaration.kind);
                     if !rendered.is_empty() {
@@ -5154,6 +5159,43 @@ impl<'a> Emitter<'a> {
             }
         }
         self.raw(";");
+    }
+
+    /// The literal a `const` keeps in a declaration file (`declare const n =
+    /// 42;`) instead of repeating it as a type; `None` for anything but a
+    /// plain literal initializer.
+    fn render_literal_initializer(&self, initializer: &Expr) -> Option<String> {
+        match initializer.data() {
+            Expression::Parenthesized(inner) => self.render_literal_initializer(inner),
+            Expression::Literal(
+                Literal::String(_) | Literal::Number(_) | Literal::BigInt(_) | Literal::Boolean(_),
+            ) => self.render_const_type(initializer),
+            Expression::Template(template) if template.expressions.is_empty() => {
+                self.render_const_type(initializer)
+            }
+            Expression::Unary(unary)
+                if matches!(unary.operator, UnaryOperator::Minus | UnaryOperator::Plus)
+                    && matches!(
+                        unary.argument.data(),
+                        Expression::Literal(Literal::Number(_) | Literal::BigInt(_))
+                    ) =>
+            {
+                let sign = if unary.operator == UnaryOperator::Minus {
+                    "-"
+                } else {
+                    ""
+                };
+                let operand = self.render_literal_initializer(&unary.argument)?;
+                Some(format!("{sign}{operand}"))
+            }
+            _ => None,
+        }
+    }
+
+    fn render_const_type(&self, expression: &Expr) -> Option<String> {
+        let type_id = self.model.node_type(expression.id())?;
+        let rendered = self.render_inferred_type(type_id, VariableKind::Const);
+        (!rendered.is_empty()).then_some(rendered)
     }
 
     fn emit_function_signature_decl(&mut self, function: &FunctionLike) {
