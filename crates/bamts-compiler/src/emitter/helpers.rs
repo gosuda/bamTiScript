@@ -9,7 +9,8 @@
 //! # Guarantees
 //! * **At most once.** A helper appears in the prelude at most once even when
 //!   requested repeatedly or pulled in as a dependency of several others.
-//! * **Stable order.** `[B, A]` and `[A, B]` produce byte-identical preludes.
+//! * **Stable order.** `[B, A]` and `[A, B]` produce byte-identical preludes,
+//!   except for helpers of equal [`HelperKind::rank`], which keep request order.
 //! * **Closed catalog.** Unknown helpers cannot be manufactured at runtime; the
 //!   [`HelperKind`] enum is the whole set.
 //! * **Exact semantics.** Helpers whose contract is stronger than the external
@@ -110,7 +111,9 @@ impl HelperOptions {
 
 /// One emit helper. Discriminant order is the emit order, which follows the
 /// order tsc 7.0.2 prints helpers in its baselines: no baseline puts a later
-/// variant before an earlier one that it also contains.
+/// variant before an earlier one that it also contains, except the two
+/// private-field accessors, which tsc prints in the order the output first
+/// uses them.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HelperKind {
     Extends,
@@ -138,6 +141,15 @@ pub enum HelperKind {
 }
 
 impl HelperKind {
+    /// The position a helper prints at. Helpers of equal rank print in the
+    /// order they were requested.
+    fn rank(self) -> usize {
+        match self {
+            Self::ClassPrivateFieldSet => Self::ClassPrivateFieldGet as usize,
+            other => other as usize,
+        }
+    }
+
     /// Returns every helper this catalog defines, in emit order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
@@ -360,14 +372,16 @@ pub fn emit_helpers_named(
 }
 
 fn close_helpers(requested: &[HelperKind]) -> Vec<HelperKind> {
-    let mut set = BTreeSet::new();
-    let mut stack: Vec<HelperKind> = requested.to_vec();
+    let mut closed: Vec<HelperKind> = Vec::new();
+    let mut stack: Vec<HelperKind> = requested.iter().rev().copied().collect();
     while let Some(kind) = stack.pop() {
-        if set.insert(kind) {
+        if !closed.contains(&kind) {
+            closed.push(kind);
             stack.extend(kind.dependencies().iter().copied());
         }
     }
-    set.into_iter().collect()
+    closed.sort_by_key(|kind| kind.rank());
+    closed
 }
 
 fn emit_closed(
@@ -388,7 +402,7 @@ fn emit_closed(
         };
     }
     let external_imports = import_helpers && options.style != HelperStyle::Inline;
-    let (imported, inline_only): (Vec<_>, Vec<_>) = if external_imports {
+    let (mut imported, inline_only): (Vec<_>, Vec<_>) = if external_imports {
         helpers
             .iter()
             .copied()
@@ -396,6 +410,7 @@ fn emit_closed(
     } else {
         (Vec::new(), helpers.clone())
     };
+    imported.sort();
     if !imported.is_empty() && options.style == HelperStyle::EsModule && !source_is_module {
         let (source_id, range) = file.map_or((SourceId::new(0), empty_range()), |file| {
             (file.source_id(), file.range())
@@ -456,10 +471,8 @@ fn inline_prelude(helpers: &[HelperKind]) -> String {
 
     let mut emitted = BTreeSet::new();
     let mut prelude = String::new();
-    // Canonical catalog order regardless of request order: the documented
-    // promise is that [B, A] and [A, B] produce byte-identical preludes,
-    // and tsc's own order is deterministic (awaiter before generator).
-    let ordered: BTreeSet<HelperKind> = helpers.iter().copied().collect();
+    let mut ordered = helpers.to_vec();
+    ordered.sort_by_key(|helper| helper.rank());
     for helper in ordered {
         append(helper, &mut emitted, &mut prelude);
     }

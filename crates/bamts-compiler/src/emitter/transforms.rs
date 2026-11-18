@@ -441,10 +441,10 @@ pub fn emit_transformed(
         .as_ref()
         .is_some_and(|plan| plan.demand.needs_assign)
     {
-        rewriter.used_helpers.insert(HelperKind::Assign);
+        rewriter.use_helper(HelperKind::Assign);
     }
     let statements = rewriter.rewrite_root_statements(file.statements(), file.range());
-    let used_helpers: Vec<_> = rewriter.used_helpers.iter().copied().collect();
+    let used_helpers = rewriter.used_helpers.clone();
     let (source, eof, range) = match rewriter.finish_source() {
         Ok(parts) => parts,
         Err(_error) => {
@@ -868,7 +868,8 @@ struct Rewriter<'a> {
     next_temp: u32,
     diagnostics: Vec<Diagnostic>,
     replace_await: bool,
-    used_helpers: BTreeSet<HelperKind>,
+    /// The helpers the output calls, in the order it first uses them.
+    used_helpers: Vec<HelperKind>,
     key_prelude: Vec<Stmt>,
     expression_temp_scopes: Vec<Vec<IdentifierNode>>,
     /// Comma sequences that print one element per line, as tsc lays out the
@@ -1054,7 +1055,7 @@ impl<'a> Rewriter<'a> {
         };
         let used_helpers = cjs
             .as_ref()
-            .map_or_else(BTreeSet::new, |plan| plan.helpers.clone());
+            .map_or_else(Vec::new, |plan| plan.helpers.iter().copied().collect());
         let synthesized_floor = ids.position();
         Self {
             options,
@@ -2179,8 +2180,14 @@ impl<'a> Rewriter<'a> {
         Node::new(self.alloc_id(), range, Expression::Identifier(ident))
     }
 
+    fn use_helper(&mut self, kind: HelperKind) {
+        if !self.used_helpers.contains(&kind) {
+            self.used_helpers.push(kind);
+        }
+    }
+
     fn helper_ident(&mut self, kind: HelperKind) -> Expr {
-        self.used_helpers.insert(kind);
+        self.use_helper(kind);
         if self.tslib_helpers && kind.can_import() {
             let namespace = self.ident_expr(TSLIB_BINDING);
             let range = namespace.range();
