@@ -1290,14 +1290,30 @@ impl<'a> Rewriter<'a> {
                         }
                         Some(ImportBinding::Named(specifiers)) => {
                             for specifier in specifiers {
+                                let specifier_id = specifier.id();
                                 let specifier = specifier.data();
                                 if !matches!(specifier.mode, ImportSpecifierMode::Value) {
                                     continue;
                                 }
                                 let property = module_export_text(file, &specifier.imported);
                                 let text = identifier_text(file, &specifier.local);
+                                let target = match &specifier.imported {
+                                    ModuleExportName::Identifier(imported) => model
+                                        .reference(imported.id())
+                                        .or_else(|| model.reference(specifier_id)),
+                                    _ => None,
+                                };
+                                let type_only = system_module::import_reexport_is_type_only(
+                                    model,
+                                    target,
+                                    &text,
+                                    &type_imports,
+                                );
                                 for exported in exported_locals.get(&text).into_iter().flatten() {
                                     plan.import_exports.insert(exported.clone());
+                                    if type_only {
+                                        continue;
+                                    }
                                     let commonjs = live_export(exported, &local, &property);
                                     system_module::publish_import_reexport(
                                         &mut plan,
@@ -16483,6 +16499,57 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
         }
+    }
+
+    #[test]
+    fn system_reexport_decision_drops_only_type_only_bindings() {
+        let source = "interface OnlyType {}\ntype Alias = string;\nclass WithValue {}\ninterface Merged {}\nconst Merged = 1;\nimport type { Imported } from './m';\nconst local = 1;\n";
+        let file = parse(source);
+        let checked = checker::check(&Recovered::clean(parse(source)));
+        let model = checked.product();
+        let options = EmitOptions {
+            target: ScriptTarget::Es2015,
+            module: Some(crate::emitter::ModuleKind::System),
+            ..EmitOptions::default()
+        };
+        let view = options.transform_view();
+        let type_imports = super::type_import_names(&file, &view);
+        let module_scope = model.module_scope();
+        let binding = |name: &str| {
+            model
+                .scope(module_scope)
+                .type_binding(name)
+                .or_else(|| model.scope(module_scope).value(name))
+        };
+        let decide = |target, name: &str| {
+            super::system_module::import_reexport_is_type_only(model, target, name, &type_imports)
+        };
+        assert!(decide(binding("OnlyType"), "OnlyType"));
+        assert!(decide(binding("Alias"), "Alias"));
+        assert!(decide(None, "Imported"));
+        assert!(decide(binding("OnlyType"), "local"));
+        assert!(!decide(binding("WithValue"), "WithValue"));
+        assert!(!decide(binding("Merged"), "Merged"));
+        assert!(!decide(binding("local"), "local"));
+        assert!(!decide(binding("Missing"), "Missing"));
+    }
+
+    #[test]
+    fn system_module_skips_a_reexport_of_an_erased_import_binding() {
+        let output = emit_with_options(
+            "import { A, I as EI } from 'file1';\nconsole.log(EI);\nexport { A };\nexport { EI };\nexport { EI as EI1 };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::System),
+                erased_imports: Arc::new(
+                    [("file1".to_owned(), "I".to_owned())].into_iter().collect(),
+                ),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("exports_1(\"EI\""), "{code}");
+        assert!(code.contains("exports_1(\"A\", file1_1.A)"), "{code}");
     }
 
     #[test]
