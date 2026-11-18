@@ -3501,7 +3501,7 @@ enum LhsContext {
 }
 
 impl LhsContext {
-    fn allows_newline_computed_member(self) -> bool {
+    fn allows_computed_member(self) -> bool {
         matches!(self, Self::Expression)
     }
 }
@@ -4061,9 +4061,7 @@ impl Parser {
                         }),
                     );
                 }
-                TokenKind::LBracket
-                    if ctx.allows_newline_computed_member() || !self.has_newline_before() =>
-                {
+                TokenKind::LBracket if ctx.allows_computed_member() => {
                     self.bump();
                     let index = self.parse_expression(false);
                     self.expect(TokenKind::RBracket, "expected `]`");
@@ -4118,9 +4116,7 @@ impl Parser {
                     self.bump();
                     expr = self.parse_optional_chain_link(start, expr, false);
                 }
-                TokenKind::LBracket
-                    if ctx.allows_newline_computed_member() || !self.has_newline_before() =>
-                {
+                TokenKind::LBracket if ctx.allows_computed_member() => {
                     self.bump();
                     let index = self.parse_expression(false);
                     self.expect(TokenKind::RBracket, "expected `]`");
@@ -8093,6 +8089,24 @@ mod tests {
             panic!("expected a class declaration");
         };
         assert_eq!(class.decorators.len(), 1);
+    }
+
+    #[test]
+    fn a_bracket_after_a_decorator_starts_the_member_name() {
+        let recovered = assert_clean("class C { @dec(2) [\"m\"]() {} }");
+        let Statement::Class(class) = recovered.product().statements()[0].data() else {
+            panic!("expected a class declaration");
+        };
+        let ClassMember::Method(method) = class.members[0].data() else {
+            panic!("expected a method");
+        };
+        assert!(matches!(method.name, PropertyName::Computed(_)));
+        assert!(method.function.body.is_some());
+        let decorator = &method.function.decorators[0];
+        assert!(matches!(
+            decorator.data().expression.data(),
+            Expression::Call(_)
+        ));
     }
 
     #[test]
