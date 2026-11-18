@@ -2429,6 +2429,21 @@ impl<'a> Emitter<'a> {
         self.raw(" }");
     }
 
+    fn emit_double_quoted_string(&mut self, literal: &StringLiteralNode) {
+        let requoted = self
+            .generated_text(literal.id())
+            .is_none()
+            .then(|| self.source_slice(literal.range()))
+            .flatten()
+            .and_then(|text| text.strip_prefix('\'')?.strip_suffix('\''))
+            .filter(|inner| !inner.contains(['"', '\\']))
+            .map(|inner| format!("\"{inner}\""));
+        match requoted {
+            Some(text) => self.raw_mapped(&text, literal.range()),
+            None => self.emit_string(literal),
+        }
+    }
+
     fn emit_import_equals_js(&mut self, import: &ImportEqualsDeclaration) {
         self.raw("const ");
         self.emit_ident(&import.local);
@@ -2436,7 +2451,7 @@ impl<'a> Emitter<'a> {
         match &import.reference {
             ExternalModuleReference::Require(source) => {
                 self.raw("require(");
-                self.emit_string(source);
+                self.emit_double_quoted_string(source);
                 self.raw(")");
             }
             ExternalModuleReference::Qualified(name) => self.emit_entity_name(name),
