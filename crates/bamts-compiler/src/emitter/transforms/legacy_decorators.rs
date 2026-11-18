@@ -89,7 +89,7 @@ impl Rewriter<'_> {
         } else {
             None
         };
-        let mut lowered = self.lower_class(&class, class_range, None);
+        let mut lowered = self.lower_class(&class, class_range, None, None);
         if anonymous && lowered.postlude.is_empty() {
             lowered.class.name = None;
         }

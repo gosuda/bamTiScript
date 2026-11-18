@@ -43,6 +43,7 @@ mod es5_class;
 mod legacy_decorators;
 mod namespaces;
 mod object_rest;
+mod private_names;
 mod system_module;
 mod using_declarations;
 
@@ -835,6 +836,14 @@ struct FieldInit {
     range: TextRange,
 }
 
+/// One statement the constructor runs for an instance member, in member
+/// order: a public field, or a private field already lowered to its
+/// `WeakMap` write.
+enum InstanceInit {
+    Field(FieldInit),
+    Lowered(Stmt),
+}
+
 #[derive(Clone)]
 enum StaticStep {
     Field(Box<FieldInit>),
@@ -924,6 +933,8 @@ struct Rewriter<'a> {
     /// The `createRequire` and require names a Node ES-format file's kept
     /// import assignments lower through, allocated on the first one.
     node_require_names: Option<(String, String)>,
+    /// Private-name storage of each enclosing class being lowered.
+    private_class_scopes: Vec<private_names::PrivateClassScope>,
 }
 
 /// What the arrows lowered below ES2015 capture from their enclosing
@@ -1097,6 +1108,7 @@ impl<'a> Rewriter<'a> {
             read_aliases: None,
             published_aliases: BTreeMap::new(),
             node_require_names: None,
+            private_class_scopes: Vec::new(),
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -2305,13 +2317,19 @@ impl<'a> Rewriter<'a> {
     /// A temporary whose name nested functions must not reuse: tsc reserves
     /// the ones it hands to class and namespace lowering that way.
     fn reserved_temp(&mut self) -> IdentifierNode {
-        let name = format!("_tr{}", self.next_temp);
-        self.next_temp += 1;
-        let temp = self.ident(&name);
+        let temp = self.reserved_temp_ident();
         if let Some(scope) = self.expression_temp_scopes.last_mut() {
             scope.push(temp.clone());
         }
         temp
+    }
+
+    /// Mints a reserved temp without hoisting it; the caller pushes it when
+    /// its lowering keeps it.
+    fn reserved_temp_ident(&mut self) -> IdentifierNode {
+        let name = format!("_tr{}", self.next_temp);
+        self.next_temp += 1;
+        self.ident(&name)
     }
 
     fn temp_declaration(&mut self, temps: Vec<IdentifierNode>, range: TextRange) -> Option<Stmt> {
@@ -4506,7 +4524,7 @@ impl<'a> Rewriter<'a> {
             class.name = Some(name.clone());
             restored_name = Some(name);
         }
-        let mut lowered = self.lower_class(&class, class_range, None);
+        let mut lowered = self.lower_class(&class, class_range, None, None);
         if restored_name.is_some() && lowered.postlude.is_empty() {
             restored_name = None;
             lowered.class.name = None;
@@ -4547,11 +4565,20 @@ impl<'a> Rewriter<'a> {
         class: &ClassDeclaration,
         range: TextRange,
         static_target: Option<&IdentifierNode>,
+        inferred_name: Option<&str>,
     ) -> ClassLowering {
         let mode = FieldMode::for_options(self.options);
         let mut class = class.clone();
         let derived = class.extends.is_some();
         let es5 = Self::needs(LanguageFeature::Classes, self.options);
+        let private_active = !es5 && self.private_lowering_active();
+        let mut private_plan = private_active
+            .then(|| self.plan_private_class(&mut class, static_target, inferred_name));
+        let mut constructor_temps: Option<Stmt> = None;
+        let private_brand = private_plan
+            .as_ref()
+            .and_then(|plan| plan.instances.clone())
+            .map(|instances| self.private_brand_statement(&instances, range));
         let mut ctor_this_captured = false;
         let mut static_this = false;
         let mut prelude = Vec::new();
@@ -4609,15 +4636,23 @@ impl<'a> Rewriter<'a> {
                         is_static: false,
                         rebinds_this: derived,
                     });
-                    let (((parameters, rest_decls), mut statements), captured) = self
+                    let (((parameters, rest_decls), mut statements, temps), captured) = self
                         .with_class_member(scope, |this| {
+                            this.expression_temp_scopes.push(Vec::new());
                             let (parameters, rest_decls) =
                                 this.rewrite_parameters(&ctor.parameters);
                             let statements = this.rewrite_statements(&ctor.body.data().statements);
-                            ((parameters, rest_decls), statements)
+                            let temps = this.expression_temp_scopes.pop().unwrap_or_default();
+                            ((parameters, rest_decls), statements, temps)
                         });
                     ctor_this_captured |= !derived && captured.is_some();
                     ctor.parameters = parameters;
+                    let temps = self.temp_declaration(temps, ctor.body.range());
+                    if derived || matches!(mode, FieldMode::Native) {
+                        statements.splice(0..0, temps);
+                    } else {
+                        constructor_temps = temps;
+                    }
                     if !rest_decls.is_empty() {
                         self.prepend_rest_declaration(
                             &mut statements,
@@ -4643,12 +4678,46 @@ impl<'a> Rewriter<'a> {
                 }
                 ClassMember::Property(property) => {
                     if matches!(property.name, PropertyName::Private(_)) {
-                        self.diag(
-                            codes::PRIVATE_FIELD_REQUIRES_ES2022,
-                            member.range(),
-                            "private class fields require ScriptTarget::Es2022 or later",
-                        );
-                        members.push(member.clone());
+                        if !private_active {
+                            if !self.options.target.supports(LanguageFeature::Classes) {
+                                self.diag(
+                                    codes::PRIVATE_FIELD_REQUIRES_ES2022,
+                                    member.range(),
+                                    "private class fields require ScriptTarget::Es2022 or later",
+                                );
+                            }
+                            members.push(member.clone());
+                            continue;
+                        }
+                        let slot = private_plan
+                            .as_mut()
+                            .and_then(|plan| plan.slots.pop_front())
+                            .expect("private property has a minted slot");
+                        let scope = es5.then_some(MemberScope {
+                            is_static: property.modifiers.is_static,
+                            rebinds_this: derived && !property.modifiers.is_static,
+                        });
+                        let init = self
+                            .with_class_member(scope, |this| {
+                                property
+                                    .initializer
+                                    .as_deref()
+                                    .map(|value| this.rewrite_expr(value))
+                                    .unwrap_or_else(|| this.void_zero(member.range()))
+                            })
+                            .0;
+                        if property.modifiers.is_static {
+                            let holder = slot.holder.expect("static field has a holder");
+                            if let Some(plan) = private_plan.as_mut() {
+                                plan.static_fields.push((holder, init));
+                            }
+                        } else {
+                            instance.push(InstanceInit::Lowered(self.private_field_set_statement(
+                                &slot.state,
+                                init,
+                                member.range(),
+                            )));
+                        }
                         continue;
                     }
                     let name =
@@ -4690,10 +4759,28 @@ impl<'a> Rewriter<'a> {
                     if property.modifiers.is_static {
                         static_steps.push(StaticStep::Field(Box::new(field)));
                     } else {
-                        instance.push(field);
+                        instance.push(InstanceInit::Field(field));
                     }
                 }
                 ClassMember::Method(method) => {
+                    if let Some(plan) = private_plan.as_mut()
+                        && matches!(method.name, PropertyName::Private(_))
+                    {
+                        let slot = plan
+                            .slots
+                            .pop_front()
+                            .expect("private method has a minted slot");
+                        let holder = slot.holder.expect("private method has a function");
+                        let (function, _) = self.with_class_member(None, |this| {
+                            this.rewrite_function_like(&method.function, member.range())
+                        });
+                        let assignment =
+                            self.private_function_assignment(&holder, function, member.range());
+                        if let Some(plan) = private_plan.as_mut() {
+                            plan.functions.push(assignment);
+                        }
+                        continue;
+                    }
                     let mut method = method.clone();
                     let hoist_all = class.extends.is_some() || class_has_suspending_key;
                     method.name = if matches!(mode, FieldMode::Native) || !hoist_all {
@@ -4776,14 +4863,16 @@ impl<'a> Rewriter<'a> {
             }
         } else {
             let this_receiver = (es5 && derived).then(|| self.capture_name("_this"));
-            if let Some(ctor) = self.lower_constructor(
-                constructor,
-                &instance,
-                derived,
-                range,
-                mode,
-                this_receiver.as_ref(),
-            ) {
+            let mut inits: Vec<Stmt> = constructor_temps.into_iter().chain(private_brand).collect();
+            for init in instance {
+                inits.push(match init {
+                    InstanceInit::Field(field) => {
+                        self.field_statement(this_receiver.as_ref(), &field, mode)
+                    }
+                    InstanceInit::Lowered(statement) => statement,
+                });
+            }
+            if let Some(ctor) = self.lower_constructor(constructor, inits, derived, range) {
                 let ctor = if ctor_this_captured {
                     self.declare_constructor_this(ctor)
                 } else if derived && !es5 {
@@ -4796,6 +4885,14 @@ impl<'a> Rewriter<'a> {
         }
         class.members = members;
         let mut postlude = Vec::new();
+        if let Some(plan) = private_plan.take() {
+            self.private_class_scopes.pop();
+            let declared_name = match static_target {
+                Some(_) => None,
+                None => class.name.clone(),
+            };
+            postlude.extend(self.private_postlude(plan, declared_name.as_ref(), range));
+        }
         if !matches!(mode, FieldMode::Native)
             && let Some(name) = static_target.or(class.name.as_ref())
         {
@@ -4894,19 +4991,13 @@ impl<'a> Rewriter<'a> {
     fn lower_constructor(
         &mut self,
         constructor: Option<ClassMemberNode>,
-        fields: &[FieldInit],
+        inits: Vec<Stmt>,
         derived: bool,
         range: TextRange,
-        mode: FieldMode,
-        this_receiver: Option<&IdentifierNode>,
     ) -> Option<ClassMemberNode> {
-        if fields.is_empty() && constructor.is_none() {
+        if inits.is_empty() && constructor.is_none() {
             return None;
         }
-        let inits: Vec<Stmt> = fields
-            .iter()
-            .map(|field| self.field_statement(this_receiver, field, mode))
-            .collect();
         match constructor {
             Some(existing) => {
                 let ClassMember::Constructor(ctor) = existing.data() else {
@@ -9559,7 +9650,12 @@ impl<'a> Rewriter<'a> {
             return lowered;
         }
         if matches!(FieldMode::for_options(self.options), FieldMode::Native) {
-            let lowered = self.lower_class(&class_expression.class, expression.range(), None);
+            let lowered = self.lower_class(
+                &class_expression.class,
+                expression.range(),
+                None,
+                inferred_name,
+            );
             let child_marked = self.any_marked(lowered.class.members.iter().map(|m| m.id()));
             return self.wrap_marked(
                 expression.range(),
@@ -9583,7 +9679,7 @@ impl<'a> Rewriter<'a> {
             class.members =
                 self.rename_class_self_in_members(class.members, &original, class_symbol, &temp);
         }
-        let mut lowered = self.lower_class(&class, expression.range(), Some(&temp));
+        let mut lowered = self.lower_class(&class, expression.range(), Some(&temp), inferred_name);
         // Nothing needed the temp — no field statements, computed keys,
         // heritage temps, or static steps — so tsc keeps the class
         // expression inline (classExpressionTest2 emits `var m = class C {`
@@ -9712,6 +9808,11 @@ impl<'a> Rewriter<'a> {
             rights.push(&*value.right);
             current = &value.left;
         }
+        let private_left = if self.private_lowering_active() {
+            self.private_identifier_name(current)
+        } else {
+            None
+        };
         let mut rebuilt = self.rewrite_expr(current);
         for index in (0..operators.len()).rev() {
             let right = self.rewrite_expr(rights[index]);
@@ -9721,6 +9822,27 @@ impl<'a> Rewriter<'a> {
                 && Self::needs(LanguageFeature::Exponentiation, self.options)
             {
                 rebuilt = self.math_pow(rebuilt, right, range);
+                continue;
+            }
+            if index + 1 == operators.len()
+                && operator == BinaryOperator::In
+                && let Some(name) = &private_left
+            {
+                rebuilt = match self.resolve_private(name, private_names::PrivateAccess::In) {
+                    Some(resolved) => self.private_in_call(right, &resolved, range),
+                    None => {
+                        let unresolved = self.ident("");
+                        let left = self.node(rebuilt.range(), Expression::Identifier(unresolved));
+                        self.node(
+                            range,
+                            Expression::Binary(BinaryExpression {
+                                operator,
+                                left: Box::new(left),
+                                right: Box::new(right),
+                            }),
+                        )
+                    }
+                };
                 continue;
             }
             rebuilt = self.node(
@@ -9793,6 +9915,26 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rebuild_access_link(&mut self, link: &Expr, inner: Expr) -> Expr {
+        if self.private_lowering_active()
+            && let Expression::Member(member) = link.data()
+            && let Some(name) = self.private_member_name(&member.property)
+        {
+            let range = link.range();
+            return match self.resolve_private(&name, private_names::PrivateAccess::Read) {
+                Some(resolved) => self.private_get_call(inner, &resolved, range),
+                None => {
+                    let property = MemberProperty::Named(self.ident(""));
+                    self.node(
+                        range,
+                        Expression::Member(MemberExpression {
+                            object: Box::new(inner),
+                            property,
+                            optional: member.optional,
+                        }),
+                    )
+                }
+            };
+        }
         let data = match link.data() {
             Expression::Call(call) => {
                 let callee = if self.cjs_call_needs_safe_wrap(&call.callee) {
@@ -9890,6 +10032,16 @@ impl<'a> Rewriter<'a> {
                     ) =>
             {
                 self.lower_super_method_call(expression, call)
+            }
+            Expression::Call(call)
+                if self.private_lowering_active()
+                    && matches!(
+                        call.callee.data(),
+                        Expression::Member(member) if matches!(member.property, MemberProperty::Private(_))
+                    ) =>
+            {
+                self.lower_private_member_call(expression, call)
+                    .unwrap_or_else(|| expression.clone())
             }
             Expression::Await(awaited) => {
                 let argument = self.rewrite_expr(&awaited.argument);
@@ -10050,6 +10202,12 @@ impl<'a> Rewriter<'a> {
                 self.lower_rest_assignment(assignment, expression.range(), true)
             }
             Expression::Assignment(assignment) => {
+                if self.private_lowering_active()
+                    && let Some(lowered) =
+                        self.lower_private_member_assignment(expression, assignment)
+                {
+                    return lowered;
+                }
                 if assignment.operator == AssignmentOperator::ExponentiateAssign
                     && Self::needs(LanguageFeature::Exponentiation, self.options)
                 {
@@ -10104,6 +10262,11 @@ impl<'a> Rewriter<'a> {
                 self.node(expression.range(), Expression::Template(template))
             }
             Expression::TaggedTemplate(tagged) => {
+                if self.private_lowering_active()
+                    && let Some(lowered) = self.lower_private_tagged_template(expression, tagged)
+                {
+                    return lowered;
+                }
                 let tag = self.rewrite_expr(&tagged.tag);
                 let template = self.rewrite_template(&tagged.template);
                 self.node(
@@ -10148,6 +10311,11 @@ impl<'a> Rewriter<'a> {
                 )
             }
             Expression::Update(value) => {
+                if self.private_lowering_active()
+                    && let Some(lowered) = self.lower_private_member_update(expression, value)
+                {
+                    return lowered;
+                }
                 let argument = self.rewrite_assignment_target(&value.argument);
                 self.node(
                     expression.range(),
@@ -16950,6 +17118,118 @@ console.log(JSON.stringify([bar, bar4, log]));
         assert_eq!(
             javascript(&output),
             "class B extends A {\n    constructor(y) {\n        log();\n        super();\n        this.y = y;\n        log();\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn a_private_field_lives_in_a_weak_map() {
+        let output = emit_at(
+            "class A {\n    #name: string;\n    constructor(name: string) {\n        this.#name = name;\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var _A_name;\nclass A {\n    constructor(name) {\n        _A_name.set(this, void 0);\n        __classPrivateFieldSet(this, _A_name, name, \"f\");\n    }\n}\n_A_name = new WeakMap();\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_private_method_leaves_the_class_behind_a_brand_check() {
+        let output = emit_at(
+            "class A1 {\n    #method(param: string): string {\n        return \"\";\n    }\n    constructor() {\n        this.#method(\"\");\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var _A1_instances, _A1_method;\nclass A1 {\n    constructor() {\n        _A1_instances.add(this);\n        __classPrivateFieldGet(this, _A1_instances, \"m\", _A1_method).call(this, \"\");\n    }\n}\n_A1_instances = new WeakSet(), _A1_method = function _A1_method(param) {\n    return \"\";\n};\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_private_accessor_passes_its_getter_or_setter() {
+        let output = emit_at(
+            "class A1 {\n    get #prop() { return \"\"; }\n    set #prop(param: string) { }\n    constructor() {\n        this.#prop = \"\";\n        console.log(this.#prop);\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "        __classPrivateFieldSet(this, _A1_instances, \"\", \"a\", _A1_prop_set);\n        console.log(__classPrivateFieldGet(this, _A1_instances, \"a\", _A1_prop_get));\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_static_private_field_is_a_value_record_behind_the_class_alias() {
+        let output = emit_at(
+            "class A {\n    static #myField = \"hello world\";\n    constructor() {\n        console.log(A.#myField);\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.ends_with(
+                "var _a, _A_myField;\nclass A {\n    constructor() {\n        console.log(__classPrivateFieldGet(_a, _a, \"f\", _A_myField));\n    }\n}\n_a = A;\n_A_myField = { value: \"hello world\" };\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_compound_private_write_copies_a_receiver_other_than_this() {
+        let output = emit_at(
+            "class A {\n    #field = 0;\n    constructor() {\n        this.#field += 2;\n        A.getInstance().#field += 2;\n    }\n    static getInstance() {\n        return new A();\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "    constructor() {\n        var _a;\n        _A_field.set(this, 0);\n        __classPrivateFieldSet(this, _A_field, __classPrivateFieldGet(this, _A_field, \"f\") + 2, \"f\");\n        __classPrivateFieldSet(_a = A.getInstance(), _A_field, __classPrivateFieldGet(_a, _A_field, \"f\") + 2, \"f\");\n    }\n"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_private_in_check_asks_the_storage() {
+        let output = emit_at(
+            "class Foo {\n    #field = 1;\n    check(v: any) {\n        #field in v;\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("        __classPrivateFieldIn(_Foo_field, v);\n"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn private_field_helpers_print_in_first_use_order() {
+        let written_first = emit_at(
+            "class A {\n    #f = 0;\n    m() {\n        this.#f = 1;\n        return this.#f;\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let read_first = emit_at(
+            "class A {\n    #f = 0;\n    m() {\n        this.#f;\n        this.#f = 1;\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let set_then_get = javascript(&written_first);
+        let get_then_set = javascript(&read_first);
+        assert!(
+            set_then_get.find("var __classPrivateFieldSet")
+                < set_then_get.find("var __classPrivateFieldGet"),
+            "{set_then_get}"
+        );
+        assert!(
+            get_then_set.find("var __classPrivateFieldGet")
+                < get_then_set.find("var __classPrivateFieldSet"),
+            "{get_then_set}"
         );
     }
     #[test]

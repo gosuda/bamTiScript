@@ -203,7 +203,7 @@ impl Rewriter<'_> {
         } else {
             Vec::new()
         };
-        let mut lowered = self.lower_class(&class, class_range, None);
+        let mut lowered = self.lower_class(&class, class_range, None, None);
         lowered.postlude.extend(decorations);
         let (mut statements, iife) = self.es5_class_iife(&name, lowered, class_range);
         let variable = self.class_variable(&name, iife, class_range);
@@ -249,7 +249,7 @@ impl Rewriter<'_> {
                 name
             }
         };
-        let lowered = self.lower_class(&class, range, None);
+        let lowered = self.lower_class(&class, range, None, None);
         if !lowered.prelude.is_empty() {
             return None;
         }
