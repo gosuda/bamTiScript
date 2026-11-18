@@ -1777,7 +1777,7 @@ fn emit_unit_types(
     out.push_str(&format!("=== {section} ===\n"));
     for (line_index, raw_line) in source.as_str().split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        out.push_str(line);
+        out.push_str(&strip_library_root(line));
         out.push('\n');
         let Some(line_records) = by_line.get(&line_index) else {
             continue;
@@ -3644,7 +3644,7 @@ fn emit_unit_symbols(
     out.push_str(&format!("=== {heading} ===\n"));
     for (line_index, raw_line) in source.as_str().split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        out.push_str(line);
+        out.push_str(&strip_library_root(line));
         out.push('\n');
         let Some(line_records) = by_line.get(&line_index) else {
             continue;
@@ -3652,6 +3652,16 @@ fn emit_unit_symbols(
         for record in line_records {
             out.push_str(&format!(">{} : {}\n", record.display, record.rendered));
         }
+    }
+}
+
+/// Upstream prints a reference directive's path without the virtual `/.lib/`
+/// root that the test sources use to point at shared library files.
+fn strip_library_root(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.starts_with("/// <reference") && line.contains("\"/.lib/") {
+        std::borrow::Cow::Owned(line.replace("\"/.lib/", "\""))
+    } else {
+        std::borrow::Cow::Borrowed(line)
     }
 }
 
