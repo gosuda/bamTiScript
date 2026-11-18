@@ -3205,7 +3205,10 @@ impl<'a> Emitter<'a> {
         self.raw("<");
         self.emit_jsx_element_name(&element.name);
         self.emit_jsx_attributes(&element.attributes);
-        self.raw(" />");
+        if element.attributes.is_empty() {
+            self.raw(" ");
+        }
+        self.raw("/>");
     }
 
     fn emit_jsx_opening_element(&mut self, element: &JsxOpeningElement) {
