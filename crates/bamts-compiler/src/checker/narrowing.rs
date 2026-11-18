@@ -1161,6 +1161,31 @@ impl<'a> NarrowingContext<'a> {
         self.apply_guards(flow, &guards);
     }
 
+    /// Guards for one `switch` case: `discriminant === test` at the given
+    /// polarity. Reuses the `===` guard construction, so `switch` narrows
+    /// exactly like an equivalent `if`.
+    pub fn case_guards(
+        &mut self,
+        discriminant: &Expr,
+        test: &Expr,
+        resolver: &dyn GuardResolver,
+        negated: bool,
+    ) -> Vec<NarrowingGuard> {
+        if let Some(guard) = typeof_guard(discriminant, test, resolver, negated)
+            .or_else(|| typeof_guard(test, discriminant, resolver, negated))
+        {
+            return vec![guard];
+        }
+        let mut guards = Vec::new();
+        if let Some(guard) = self
+            .equality_guard(discriminant, test, resolver, negated, false)
+            .or_else(|| self.equality_guard(test, discriminant, resolver, negated, false))
+        {
+            guards.push(guard);
+        }
+        guards
+    }
+
     /// Narrows to (or away from) the types whose `typeof` is `name`.
     /// `typeof null` is `"object"`, and `void` behaves as `undefined`.
     /// `AppliedClass` instances are runtime objects (`typeof new C() ===
@@ -2071,6 +2096,28 @@ impl<'a> NarrowingContext<'a> {
                 Some(self.table.boolean_literal(value))
             }
             Expression::Literal(Literal::Null(_)) => Some(self.table.null_type()),
+            Expression::Member(_) => self.singleton_member_type(expression, resolver),
+            _ => None,
+        }
+    }
+
+    /// The singleton type of an enum member access (`Choice.Yes`,
+    /// `En["B"]`): members are constants, so `===` against one narrows
+    /// exactly like a written-out literal.
+    fn singleton_member_type(
+        &mut self,
+        expression: &Expr,
+        resolver: &dyn GuardResolver,
+    ) -> Option<TypeId> {
+        let type_id = resolver.expression_type(expression);
+        match self.table.get(type_id) {
+            Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::BooleanLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::EnumMember { .. }
+            | Type::Null
+            | Type::Undefined => Some(type_id),
             _ => None,
         }
     }
