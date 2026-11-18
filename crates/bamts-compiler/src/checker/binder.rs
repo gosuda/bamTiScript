@@ -15075,7 +15075,7 @@ impl<'src> Binder<'src> {
                 self.emit(TYPE_NOT_ASSIGNABLE, range, NOT_ASSIGNABLE_MESSAGE);
             }
         }
-        self.check_class_property_initialization(&class.members, scope);
+        self.check_class_property_initialization(&class.members, scope, ambient);
         self.constructor_writable_readonly_properties.pop();
         let popped_derived = self.class_derived_stack.pop();
         debug_assert_eq!(popped_derived, Some(class.extends.is_some()));
@@ -15087,14 +15087,16 @@ impl<'src> Binder<'src> {
     }
     /// TS2564 (`strictPropertyInitialization`): an uninitialized, non-optional
     /// instance property whose type excludes `undefined` and that no
-    /// constructor assignment definitely assigns. The whole check is gated on
-    /// the compiler option.
+    /// constructor assignment definitely assigns. Ambient classes, abstract
+    /// properties, and declaration files never report it; the rest is gated
+    /// on the compiler option.
     fn check_class_property_initialization(
         &mut self,
         members: &'src [crate::syntax::ClassMemberNode],
         _scope: ScopeId,
+        ambient: bool,
     ) {
-        if !self.strict_property_initialization {
+        if !self.strict_property_initialization || self.is_declaration_file || ambient {
             return;
         }
         let assigned = self.constructor_property_assignments(members);
@@ -15110,6 +15112,7 @@ impl<'src> Binder<'src> {
                 || property.initializer.is_some()
                 || property.modifiers.is_static
                 || property.modifiers.is_declare
+                || property.modifiers.is_abstract
                 || matches!(
                     property.name,
                     PropertyName::String(_) | PropertyName::Number(_)
@@ -28050,6 +28053,58 @@ mod tests {
                 .any(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED),
             "{:?}",
             off.1
+        );
+    }
+
+    #[test]
+    fn ambient_class_members_skip_property_initialization() {
+        let (_, diagnostics) = bound_strict(
+            "declare class C { x: string; }\n\
+             declare module \"M\" { class D { y: string; } }\n\
+             class E { z: string; }\n",
+        );
+        let uninitialized = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED)
+            .count();
+        assert_eq!(
+            uninitialized, 1,
+            "expected C028 only for E.z: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn abstract_and_declaration_file_members_skip_property_initialization() {
+        let (_, diagnostics) =
+            bound_strict("abstract class C { abstract x: string; y: string; }\n");
+        let uninitialized = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED)
+            .count();
+        assert_eq!(
+            uninitialized, 1,
+            "expected C028 only for C.y: {diagnostics:?}"
+        );
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            declaration_source("class F { w: string; }\n"),
+        ));
+        let (_, file_diagnostics) = super::bind_source_with_environment(
+            parsed.product(),
+            super::super::intrinsic_environment::GlobalEnvironment::standard(
+                crate::checker::intrinsic_environment::LibSet::ALL,
+            ),
+            super::source_is_module(parsed.product()),
+            super::ProgramCheckOptions::standard()
+                .with_strict_null_checks(true)
+                .with_strict_property_initialization(true),
+        );
+        assert!(
+            !file_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED),
+            "{file_diagnostics:?}"
         );
     }
 
