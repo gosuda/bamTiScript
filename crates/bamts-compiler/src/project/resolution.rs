@@ -9,8 +9,8 @@
 use super::resolution_trace::{ResolutionRequest, ResolutionTraceLog};
 use crate::project::{
     CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode, PackageTarget,
-    PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor, parse_jsonc,
-    plan_relative_module,
+    PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor, append_unique,
+    append_with_extension, parse_jsonc, plan_relative_module,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,16 +25,19 @@ pub enum ModuleResolutionKind {
     Node16,
     NodeNext,
     Bundler,
+    Classic,
 }
 
 impl ModuleResolutionKind {
     /// Parses a tsconfig `moduleResolution` string. Matching is case-insensitive
-    /// and accepts the forms TypeScript documents (`node16`, `nodenext`, `bundler`).
+    /// and accepts the forms TypeScript documents (`node16`, `nodenext`, `bundler`,
+    /// `classic`).
     pub fn parse(value: &str) -> Result<Self, ResolutionError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "node16" => Ok(Self::Node16),
             "nodenext" => Ok(Self::NodeNext),
             "bundler" => Ok(Self::Bundler),
+            "classic" => Ok(Self::Classic),
             _ => Err(ResolutionError::UnsupportedKind {
                 value: Arc::from(value),
             }),
@@ -55,6 +58,7 @@ impl ModuleResolutionKind {
             Self::Node16 => "node16",
             Self::NodeNext => "nodenext",
             Self::Bundler => "bundler",
+            Self::Classic => "classic",
         }
     }
 
@@ -63,7 +67,7 @@ impl ModuleResolutionKind {
     /// `.js` → `.ts` rewrites).
     #[must_use]
     pub const fn allows_extensionless_relative(self) -> bool {
-        matches!(self, Self::Bundler)
+        matches!(self, Self::Bundler | Self::Classic)
     }
     /// Upstream trace spelling used by `traceResolution` output.
     #[must_use]
@@ -72,6 +76,7 @@ impl ModuleResolutionKind {
             Self::Node16 => "Node16",
             Self::NodeNext => "NodeNext",
             Self::Bundler => "Bundler",
+            Self::Classic => "Classic",
         }
     }
 }
@@ -607,6 +612,18 @@ fn resolve_uncached(
         });
     }
 
+    if kind == ModuleResolutionKind::Classic {
+        return resolve_classic(
+            (root, options),
+            importer,
+            containing,
+            specifier,
+            (kind, mode, flavor),
+            host,
+            trace,
+        );
+    }
+
     if specifier.starts_with("./") || specifier.starts_with("../") {
         return resolve_relative(
             (root, options),
@@ -679,6 +696,168 @@ fn is_url_like(specifier: &str) -> bool {
         || specifier.starts_with("data:")
         || specifier.contains('?')
         || specifier.contains('#') && !specifier.starts_with('#')
+}
+
+/// Resolves `specifier` under `ModuleResolutionKind::Classic`: relative names probe
+/// the importing file's directory, non-relative names probe `paths` mappings first
+/// and then walk up the directory chain to the project root. Every level
+/// tries `.ts`, `.tsx`, and `.d.ts` (plus `.js` and `.jsx` under `allowJs`). There
+/// is no `node_modules` or `@types` lookup and no directory-index probing.
+fn resolve_classic(
+    context: (&ProjectRoot, &CompilerOptions),
+    importer: &Path,
+    containing: &Path,
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<ResolvedModule, ResolutionError> {
+    let (root, _) = context;
+    if specifier.starts_with("./") || specifier.starts_with("../") {
+        return match resolve_classic_from(context, containing, specifier, strategy, host, trace)? {
+            Some(found) => Ok(found),
+            None => Err(ResolutionError::NotFound {
+                specifier: Arc::from(specifier),
+                from: importer.to_path_buf(),
+                trace: trace.clone(),
+            }),
+        };
+    }
+    if let Some(found) = resolve_classic_paths(context, specifier, strategy, host, trace)? {
+        return Ok(found);
+    }
+    let mut directory = containing.to_path_buf();
+    loop {
+        if !directory.starts_with(root.path()) {
+            break;
+        }
+        if let Some(found) =
+            resolve_classic_from(context, &directory, specifier, strategy, host, trace)?
+        {
+            return Ok(found);
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+    if let Some(found) = try_types_package(
+        context,
+        containing,
+        specifier,
+        (strategy.0, strategy.1),
+        host,
+        trace,
+    )? {
+        return Ok(found);
+    }
+    Err(ResolutionError::NotFound {
+        specifier: Arc::from(specifier),
+        from: importer.to_path_buf(),
+        trace: trace.clone(),
+    })
+}
+
+/// Probes `specifier` against one directory; `Ok(None)` means nothing at this
+/// level matched, and the caller decides whether another level exists.
+fn resolve_classic_from(
+    context: (&ProjectRoot, &CompilerOptions),
+    directory: &Path,
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let (root, _options) = context;
+    let requested = root.resolve_from(directory, specifier)?;
+    probe_classic_location(context, &requested, strategy, host, trace)
+}
+
+fn resolve_classic_paths(
+    context: (&ProjectRoot, &CompilerOptions),
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let (root, options) = context;
+    let Some((_, targets, capture)) = select_path_mapping(options.paths(), specifier) else {
+        return Ok(None);
+    };
+    for target_pattern in targets {
+        let substituted = substitute_star(target_pattern, capture.as_deref());
+        let confined = root.confine(substituted)?;
+        if let Some(found) = probe_classic_location(context, &confined, strategy, host, trace)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn probe_classic_location(
+    context: (&ProjectRoot, &CompilerOptions),
+    location: &Path,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let (root, options) = context;
+    let (kind, mode, _flavor) = strategy;
+    for candidate in classic_candidates(location, options.allow_js()) {
+        let exists = host.file_exists(&candidate);
+        trace.push(ResolutionTraceStep::Candidate {
+            path: candidate.clone(),
+            exists,
+        });
+        if exists {
+            let confined = root.confine(candidate)?;
+            return Ok(Some(ResolvedModule {
+                path: confined,
+                kind,
+                mode,
+                package_json: None,
+                trace: ResolutionTrace::default(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn classic_candidates(location: &Path, allow_js: bool) -> Vec<PathBuf> {
+    let extensions: &[&str] = if allow_js {
+        &["ts", "tsx", "d.ts", "js", "jsx"]
+    } else {
+        &["ts", "tsx", "d.ts"]
+    };
+    let mut candidates = Vec::new();
+    if location.extension().is_some() {
+        append_unique(&mut candidates, location.to_path_buf());
+    }
+    let stem = classic_stem(location).unwrap_or_else(|| location.to_path_buf());
+    for extension in extensions {
+        append_with_extension(&mut candidates, &stem, extension);
+    }
+    candidates
+}
+
+fn classic_stem(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let mut stem = name;
+    for suffix in [
+        ".d.mts", ".d.cts", ".d.ts", ".mts", ".cts", ".tsx", ".mjs", ".cjs", ".ts", ".js", ".jsx",
+    ] {
+        if let Some(base) = stem.strip_suffix(suffix) {
+            stem = base;
+            break;
+        }
+    }
+    if stem.is_empty() || stem == name {
+        return None;
+    }
+    Some(path.with_file_name(stem))
 }
 
 fn resolve_relative(
@@ -1557,6 +1736,7 @@ fn conditions_for(
         ModuleResolutionKind::Node16 | ModuleResolutionKind::NodeNext => {
             ResolutionConditions::for_mode(mode.package_mode())
         }
+        ModuleResolutionKind::Classic => ResolutionConditions::for_mode(mode.package_mode()),
     }
 }
 
@@ -1643,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_node16_nodenext_bundler_and_resolution_mode() {
+    fn parses_resolution_kinds_and_resolution_mode_case_insensitively() {
         assert_eq!(
             ModuleResolutionKind::parse("Node16").unwrap(),
             ModuleResolutionKind::Node16
@@ -1656,7 +1836,11 @@ mod tests {
             ModuleResolutionKind::parse("BUNDLER").unwrap(),
             ModuleResolutionKind::Bundler
         );
-        assert!(ModuleResolutionKind::parse("classic").is_err());
+        assert_eq!(
+            ModuleResolutionKind::parse("Classic").unwrap(),
+            ModuleResolutionKind::Classic
+        );
+        assert!(ModuleResolutionKind::parse("node10").is_err());
         assert_eq!(
             ResolutionMode::parse("import").unwrap(),
             ResolutionMode::Import
@@ -1667,7 +1851,111 @@ mod tests {
         );
         assert!(ResolutionMode::parse("eval").is_err());
         assert!(ModuleResolutionKind::Bundler.allows_extensionless_relative());
+        assert!(ModuleResolutionKind::Classic.allows_extensionless_relative());
         assert!(!ModuleResolutionKind::Node16.allows_extensionless_relative());
+    }
+
+    #[test]
+    fn classic_walks_up_ancestor_directories_for_bare_specifiers() {
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/ref/m1.ts"), "export const m1 = 1;\n");
+        host.file(
+            abs("/workspace/a/outputdir_ref/m2.tsx"),
+            "export const m2 = 2;\n",
+        );
+        host.file(abs("/workspace/node_modules/left.ts"), "export {};\n");
+        let options = options_with_resolution("classic");
+        let mut cache = ResolutionCache::new();
+        let importer = abs("/workspace/a/b/test.ts");
+
+        let bare = resolve_module_name(
+            &root(),
+            &options,
+            &importer,
+            "ref/m1",
+            (ModuleResolutionKind::Classic, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        )
+        .expect("bare specifier resolves from an ancestor directory");
+        assert_eq!(bare.path(), abs("/workspace/ref/m1.ts").as_path());
+
+        let relative = resolve_module_name(
+            &root(),
+            &options,
+            &importer,
+            "../outputdir_ref/m2",
+            (ModuleResolutionKind::Classic, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        )
+        .expect("relative specifier resolves beside the importer");
+        assert_eq!(
+            relative.path(),
+            abs("/workspace/a/outputdir_ref/m2.tsx").as_path()
+        );
+
+        let declaration = resolve_module_name(
+            &root(),
+            &options,
+            &importer,
+            "ref/m1",
+            (ModuleResolutionKind::Classic, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        )
+        .expect("second lookup stays cached and identical");
+        assert_eq!(declaration, bare);
+
+        assert!(!bare.trace().steps().iter().any(|step| matches!(
+            step,
+            ResolutionTraceStep::NodeModulesWalk { .. } | ResolutionTraceStep::TypesFallback { .. }
+        )));
+        assert!(bare.trace().steps().iter().any(|step| matches!(
+            step,
+            ResolutionTraceStep::Candidate { path, .. }
+                if path == abs("/workspace/a/b/ref/m1.ts").as_path(),
+        )));
+    }
+
+    #[test]
+    fn classic_prefers_type_script_extensions_and_gates_js_on_allow_js() {
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/dep.js"), "export {};\n");
+        let mut cache = ResolutionCache::new();
+        let importer = abs("/workspace/a/test.ts");
+
+        let without_allow_js = options_with_resolution("classic");
+        let miss = resolve_module_name(
+            &root(),
+            &without_allow_js,
+            &importer,
+            "dep",
+            (ModuleResolutionKind::Classic, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        );
+        assert!(matches!(miss, Err(ResolutionError::NotFound { .. })));
+
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{"moduleResolution":"classic","allowJs":true}}"#,
+        )
+        .expect("config");
+        let with_allow_js = config.options().clone();
+        let mut cache = ResolutionCache::new();
+        let found = resolve_module_name(
+            &root(),
+            &with_allow_js,
+            &importer,
+            "dep",
+            (ModuleResolutionKind::Classic, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        )
+        .expect("js candidate joins the family under allowJs");
+        assert_eq!(found.path(), abs("/workspace/dep.js").as_path());
     }
 
     #[test]

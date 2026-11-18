@@ -971,7 +971,10 @@ impl ProgramLoader {
                 flavor,
             });
         }
-        if flavor == ResolutionFlavor::Types && split_package_specifier(&edge.specifier).is_some() {
+        if flavor == ResolutionFlavor::Types
+            && !self.uses_classic_resolution()
+            && split_package_specifier(&edge.specifier).is_some()
+        {
             return Ok(ResolvedEdge {
                 target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
                 type_overlay: None,
@@ -1130,6 +1133,55 @@ impl ProgramLoader {
         .and_then(|resolved| self.fs.normalize(resolved.path()).ok())
     }
 
+    /// Whether the options pin `moduleResolution: classic`, the only kind the
+    /// loader routes through the traced classic resolver.
+    fn uses_classic_resolution(&self) -> bool {
+        ModuleResolutionKind::from_options(&self.options) == Ok(ModuleResolutionKind::Classic)
+    }
+
+    fn resolve_classic_edge(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        flavor: ResolutionFlavor,
+    ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
+        let strategy = (ModuleResolutionKind::Classic, edge.mode);
+        let host = LoaderResolutionHost(self.fs.as_ref());
+        let mut cache = ResolutionCache::new();
+        let outcome = if flavor == ResolutionFlavor::Types {
+            resolve_type_reference(
+                &self.root,
+                &self.options,
+                importer,
+                &edge.specifier,
+                strategy,
+                &host,
+                &mut cache,
+            )
+        } else {
+            resolve_module_name(
+                &self.root,
+                &self.options,
+                importer,
+                &edge.specifier,
+                strategy,
+                &host,
+                &mut cache,
+            )
+        };
+        let Some(resolved) = outcome.ok() else {
+            return Ok(None);
+        };
+        let path = self
+            .fs
+            .normalize(resolved.path())
+            .map_err(|error| ProgramLoadError::Read {
+                path: resolved.path().to_path_buf(),
+                source: file_system_io(error),
+            })?;
+        Ok(Some(ResolvedEdgeTarget::Local(path)))
+    }
+
     fn resolve_local(
         &self,
         importer: &Path,
@@ -1137,6 +1189,9 @@ impl ProgramLoader {
         flavor: ResolutionFlavor,
         cancel: &CancellationToken,
     ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
+        if self.uses_classic_resolution() {
+            return self.resolve_classic_edge(importer, edge, flavor);
+        }
         if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(
                 &self.root,
