@@ -34,17 +34,21 @@ use crate::syntax::*;
 use super::helpers::{self, HelperKind, HelperOptions};
 use super::{
     EmitFileNames, EmitOutput, EmittedFile, ModuleKind, ModuleWrapper, Newline, PrintOptions,
-    PrintSource, Surface, print_json_value, print_with_jsx_plan,
+    PrintSource, Surface, authored_identifiers, print_json_value, print_with_jsx_plan,
 };
 
 mod amd_module;
 mod es5_class;
 mod legacy_decorators;
 mod namespaces;
+mod system_module;
 
 use amd_module::{AmdDependency, AmdPlan};
 use es5_class::{MemberScope, SuperContext};
-use namespaces::{ContainerBinding, NamespaceFrame, alias_target_bears_value, is_qualified_alias};
+use namespaces::{
+    ContainerBinding, ExportSink, NamespaceFrame, alias_target_bears_value, is_qualified_alias,
+};
+use system_module::SystemPlan;
 
 /// Stable diagnostic identifiers produced by target transforms.
 pub mod codes {
@@ -475,8 +479,9 @@ pub fn emit_transformed(
         helpers::emit_helpers_for_source(&used_helpers, &options.helpers, &rewritten, is_module);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
     let strict = strict_prelude(file, options, is_module);
+    let system_hoisted = std::mem::take(&mut rewriter.system_hoisted);
     let wrapper = if is_module {
-        rewriter.module_wrapper(file, options, strict.clone())
+        rewriter.module_wrapper(file, options, strict.clone(), &system_hoisted)
     } else {
         None
     };
@@ -866,6 +871,9 @@ struct Rewriter<'a> {
     super_contexts: Vec<SuperContext>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
+    /// Exported function declarations a System factory prints above `return`,
+    /// each followed by its export call.
+    system_hoisted: Vec<Stmt>,
     tslib_helpers: bool,
     /// Names `import type` binds, which an `export { name }` cannot publish.
     type_imports: BTreeSet<String>,
@@ -947,6 +955,8 @@ struct CjsPlan {
     require_roots: BTreeSet<String>,
     /// The AMD or UMD wrapper's dependencies, for those module kinds.
     amd: Option<AmdPlan>,
+    /// The System.register wrapper's dependencies and hoisted names.
+    system: Option<SystemPlan>,
 }
 
 #[derive(Clone)]
@@ -1013,7 +1023,7 @@ impl<'a> Rewriter<'a> {
     ) -> Self {
         let cjs = if matches!(
             options.module_kind,
-            Some(ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd)
+            Some(ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System)
         ) {
             model.and_then(|model| Self::build_cjs_plan(file, options, model))
         } else {
@@ -1043,8 +1053,9 @@ impl<'a> Rewriter<'a> {
             class_iifes: BTreeSet::new(),
             super_contexts: Vec::new(),
             parameter_initializer_depths: Vec::new(),
-            cjs,
             tslib_helpers: binds_helpers_to_tslib(options, file),
+            cjs,
+            system_hoisted: Vec::new(),
             type_imports: type_import_names(file, options),
             import_reads: import_reads(file, options, model),
             inline_lines: HashMap::new(),
@@ -1077,6 +1088,14 @@ impl<'a> Rewriter<'a> {
                 }),
                 _ => None,
             },
+            system: match options.module_kind {
+                Some(ModuleKind::System) => Some(SystemPlan {
+                    module_name: amd_module::source_directives(file.source_text().as_str())
+                        .module_name,
+                    ..SystemPlan::default()
+                }),
+                _ => None,
+            },
             ..CjsPlan::default()
         };
         let module_scope = model.module_scope();
@@ -1099,6 +1118,10 @@ impl<'a> Rewriter<'a> {
                     // quotes in every require form.
                     let quoted = quote_module_specifier(module);
                     let Some(clause) = &import.clause else {
+                        if let Some(system) = plan.system.as_mut() {
+                            system.dependency(&quoted);
+                            continue;
+                        }
                         match plan.amd.as_mut() {
                             Some(amd) if !amd.umd => amd.dependencies.push(AmdDependency {
                                 specifier: quoted,
@@ -1126,7 +1149,7 @@ impl<'a> Rewriter<'a> {
                     let Some(clause) = &clause else {
                         continue;
                     };
-                    let interop = if plan.es_module_interop {
+                    let interop = if plan.es_module_interop && plan.system.is_none() {
                         import_interop(file, clause)
                     } else {
                         ImportInterop::Plain
@@ -1155,17 +1178,29 @@ impl<'a> Rewriter<'a> {
                         }
                         ImportInterop::Plain => format!("require({quoted})"),
                     };
-                    plan.requires
-                        .push(format!("{declare} {local} = {required};"));
-                    plan.require_roots.insert(local.clone());
+                    if plan.system.is_none() {
+                        plan.requires
+                            .push(format!("{declare} {local} = {required};"));
+                        plan.require_roots.insert(local.clone());
+                    } else {
+                        system_module::register_import(&mut plan, statement.id(), &quoted, &local);
+                    }
                     if let Some(default) = &clause.default {
                         let text = identifier_text(file, default);
                         for exported in exported_locals.get(&text).into_iter().flatten() {
                             plan.import_exports.insert(exported.clone());
-                            plan.requires
-                                .push(format!("{} = {local}.default;", exports_member(exported)));
+                            let commonjs =
+                                format!("{} = {local}.default;", exports_member(exported));
+                            system_module::publish_import_reexport(
+                                &mut plan,
+                                exported,
+                                &local,
+                                Some("default"),
+                                commonjs,
+                            );
                         }
                         if let Some(symbol) = symbol_of(&text) {
+                            system_module::mark_reexported(&mut plan, symbol);
                             plan.imports.insert(
                                 symbol,
                                 CjsImportRef {
@@ -1181,16 +1216,21 @@ impl<'a> Rewriter<'a> {
                             let root = if namespace_alone {
                                 local.clone()
                             } else {
-                                plan.requires.push(format!("{declare} {text} = {local};"));
-                                plan.require_roots.insert(text.clone());
+                                if plan.system.is_none() {
+                                    plan.requires.push(format!("{declare} {text} = {local};"));
+                                    plan.require_roots.insert(text.clone());
+                                }
                                 text.clone()
                             };
                             for exported in exported_locals.get(&text).into_iter().flatten() {
                                 plan.import_exports.insert(exported.clone());
-                                plan.requires
-                                    .push(format!("{} = {root};", exports_member(exported)));
+                                let commonjs = format!("{} = {root};", exports_member(exported));
+                                system_module::publish_import_reexport(
+                                    &mut plan, exported, &root, None, commonjs,
+                                );
                             }
                             if let Some(symbol) = symbol_of(&text) {
+                                system_module::mark_reexported(&mut plan, symbol);
                                 plan.imports.insert(
                                     symbol,
                                     CjsImportRef {
@@ -1210,9 +1250,17 @@ impl<'a> Rewriter<'a> {
                                 let text = identifier_text(file, &specifier.local);
                                 for exported in exported_locals.get(&text).into_iter().flatten() {
                                     plan.import_exports.insert(exported.clone());
-                                    plan.requires.push(live_export(exported, &local, &property));
+                                    let commonjs = live_export(exported, &local, &property);
+                                    system_module::publish_import_reexport(
+                                        &mut plan,
+                                        exported,
+                                        &local,
+                                        Some(&property),
+                                        commonjs,
+                                    );
                                 }
                                 if let Some(symbol) = symbol_of(&text) {
+                                    system_module::mark_reexported(&mut plan, symbol);
                                     plan.imports.insert(
                                         symbol,
                                         CjsImportRef {
@@ -1244,11 +1292,34 @@ impl<'a> Rewriter<'a> {
                             }
                         }
                     }
+                    if plan.system.is_some()
+                        && !import.is_type_only
+                        && let ExternalModuleReference::Require(source) = &import.reference
+                    {
+                        let local = identifier_text(file, &import.local);
+                        let specifier = quote_module_specifier(&module_specifier(file, source));
+                        system_module::register_import(
+                            &mut plan,
+                            statement.id(),
+                            &specifier,
+                            &local,
+                        );
+                    }
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
                     plan.export_assignment |= matches!(export, ExportDeclaration::Assignment(_));
-                    plan_cjs_reexport(file, export, &mut names, &mut plan, &options.erased_imports);
+                    if plan.system.is_some() {
+                        system_module::plan_export(file, export, &mut names, &mut plan);
+                    } else {
+                        plan_cjs_reexport(
+                            file,
+                            export,
+                            &mut names,
+                            &mut plan,
+                            &options.erased_imports,
+                        );
+                    }
                     let binds_type = |name: &str| {
                         type_imports.contains(name) || is_type_only_export(model, name)
                     };
@@ -1305,7 +1376,16 @@ impl<'a> Rewriter<'a> {
                             }
                             _ => {
                                 let names = declared_binding_names(file, inner);
-                                if matches!(inner.data(), Statement::Variable(declaration) if !names_anonymous_functions(declaration))
+                                if plan.system.is_some() {
+                                    for name in &names {
+                                        if let Some(symbol) = symbol_of(name) {
+                                            plan.live_locals
+                                                .entry(symbol)
+                                                .or_default()
+                                                .push(name.clone());
+                                        }
+                                    }
+                                } else if matches!(inner.data(), Statement::Variable(declaration) if !names_anonymous_functions(declaration))
                                 {
                                     plan.exported_variables
                                         .extend(names.iter().filter_map(|name| symbol_of(name)));
@@ -1433,9 +1513,12 @@ impl<'a> Rewriter<'a> {
                 out.push(self.cjs_export_assignment(&name, &name, range));
                 out
             }
-            Statement::Variable(declaration) if !names_anonymous_functions(declaration) => {
-                self.namespace_export_variables(declaration, "exports", range)
-            }
+            Statement::Variable(declaration) if !names_anonymous_functions(declaration) => self
+                .namespace_export_variables(
+                    declaration,
+                    ExportSink::Container(String::from("exports")),
+                    range,
+                ),
             _ => {
                 let names = declared_binding_names(self.file, inner);
                 let mut out = self.rewrite_statement(inner);
@@ -1637,6 +1720,9 @@ impl<'a> Rewriter<'a> {
         {
             return self.cjs_statement_lines(statement);
         }
+        if self.system_active() {
+            return self.system_export_declaration(statement, inner);
+        }
         let binding = if self.cjs.is_some() {
             ContainerBinding::CommonJs
         } else {
@@ -1724,9 +1810,10 @@ impl<'a> Rewriter<'a> {
     }
 
     /// Whether a call's original callee identifier maps to an imported
-    /// binding, so the rewritten member call becomes `(0, m.p)(...)`.
+    /// binding, so the rewritten member call becomes `(0, m.p)(...)`. A System
+    /// module calls the member directly.
     fn cjs_call_needs_safe_wrap(&self, original_callee: &Expr) -> bool {
-        let Some(plan) = &self.cjs else {
+        let Some(plan) = self.cjs.as_ref().filter(|plan| plan.system.is_none()) else {
             return false;
         };
         let Expression::Identifier(ident) = original_callee.data() else {
@@ -1806,13 +1893,18 @@ impl<'a> Rewriter<'a> {
         )
     }
 
-    /// The AMD or UMD factory around the module body, for those module kinds.
-    fn module_wrapper(
+    /// The AMD, UMD, or System factory around the module body.
+    fn module_wrapper<'b>(
         &self,
         file: &SourceFile,
         options: &TransformOptions,
         inner: String,
-    ) -> Option<ModuleWrapper> {
+        hoisted: &'b [Stmt],
+    ) -> Option<ModuleWrapper<'b>> {
+        if let Some(system) = self.cjs.as_ref().and_then(|plan| plan.system.as_ref()) {
+            let reserved = authored_identifiers(file, file.source_text().as_str());
+            return Some(system.wrapper(&reserved, hoisted));
+        }
         let amd = self.cjs.as_ref()?.amd.as_ref()?;
         let directives = amd_module::source_directives(file.source_text().as_str());
         let indent = " ".repeat(usize::from(options.indent_width));
@@ -1824,7 +1916,7 @@ impl<'a> Rewriter<'a> {
         let Some(plan) = &self.cjs else {
             return String::new();
         };
-        if !(plan.is_module || force_module) {
+        if !(plan.is_module || force_module) || plan.system.is_some() {
             return String::new();
         }
         let mut prelude = if plan.export_assignment {
@@ -2194,6 +2286,9 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_root_statements(&mut self, statements: &[Stmt], range: TextRange) -> Vec<Stmt> {
+        if self.system_active() {
+            return self.rewrite_root_statements_system(statements, range);
+        }
         self.expression_temp_scopes.push(Vec::new());
         self.capture_scopes.push(CaptureScope::default());
         let mut rewritten = self.rewrite_statements(statements);
@@ -2344,7 +2439,11 @@ impl<'a> Rewriter<'a> {
         for statement in statements {
             self.record_declaration(statement);
             out.extend(self.rewrite_statement(statement));
-            out.extend(self.cjs_publish_declared(statement));
+            if self.system_active() {
+                out.extend(self.system_publish_declared(statement));
+            } else {
+                out.extend(self.cjs_publish_declared(statement));
+            }
         }
         self.declared_names.pop();
         out
@@ -2353,6 +2452,9 @@ impl<'a> Rewriter<'a> {
     fn rewrite_statement(&mut self, statement: &Stmt) -> Vec<Stmt> {
         match statement.data() {
             Statement::Class(class) => self.rewrite_class_statement(statement, class),
+            Statement::Function(function) if self.system_active() && self.system_module_level() => {
+                self.system_module_function(statement.range(), &function.function)
+            }
             Statement::Function(function) => {
                 let function = self.rewrite_function_like(&function.function, statement.range());
                 vec![self.node(
@@ -2360,12 +2462,20 @@ impl<'a> Rewriter<'a> {
                     Statement::Function(FunctionDeclaration { function }),
                 )]
             }
+            Statement::Variable(declaration)
+                if self.system_active() && self.system_module_level() =>
+            {
+                self.system_variable_statement(statement, declaration)
+            }
             Statement::Variable(declaration) => {
                 self.rewrite_variable_statement(statement, declaration)
             }
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
                 inner,
             ))) => self.rewrite_export_named_declaration(statement, inner),
+            Statement::Export(ExportDeclaration::Default(default)) if self.system_active() => {
+                self.system_default_export(default, statement.range())
+            }
             Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
                 ExportDefaultValue::Class(class) => {
                     if self.cjs.is_some() {
@@ -2407,6 +2517,22 @@ impl<'a> Rewriter<'a> {
                 specifiers,
                 source,
                 ..
+            })) if self.system_active() => {
+                if source.is_none() && !type_only {
+                    self.system_export_specifiers(specifiers)
+                } else {
+                    Vec::new()
+                }
+            }
+            Statement::Export(ExportDeclaration::All(_)) if self.system_active() => Vec::new(),
+            Statement::Export(ExportDeclaration::Assignment(_)) if self.system_active() => {
+                Vec::new()
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only,
+                specifiers,
+                source,
+                ..
             })) => {
                 if self.cjs.is_none() {
                     if *type_only || self.options.verbatim_module_syntax {
@@ -2434,6 +2560,12 @@ impl<'a> Rewriter<'a> {
                 Vec::new()
             }
             Statement::Export(ExportDeclaration::Assignment(_)) if self.cjs.is_none() => Vec::new(),
+            Statement::Import(import) if self.system_active() => {
+                if import.type_only {
+                    return Vec::new();
+                }
+                self.cjs_statement_lines(statement)
+            }
             Statement::Import(import) => {
                 if self.cjs.is_none() {
                     return self.rewrite_esm_import(statement, import);
@@ -2733,6 +2865,9 @@ impl<'a> Rewriter<'a> {
                 }) =>
             {
                 Vec::new()
+            }
+            Statement::ImportEquals(import) if self.system_active() => {
+                self.system_alias_statement(statement, import)
             }
             Statement::ImportEquals(import) => self.lower_alias(statement, import),
             Statement::Export(_)
@@ -9173,6 +9308,9 @@ impl<'a> Rewriter<'a> {
     }
     fn rewrite_expr(&mut self, expression: &Expr) -> Expr {
         let rewritten = self.rewrite_expression(expression);
+        if self.system_active() {
+            return self.system_wrap_writes(expression, rewritten);
+        }
         if self
             .cjs
             .as_ref()
@@ -15165,6 +15303,71 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         ] {
             assert!(code.contains(expected), "missing {expected}: {code}");
         }
+    }
+
+    #[test]
+    fn commonjs_keeps_a_named_default_reexport_live() {
+        let output = emit_with_options(
+            "import { default as y } from './n';\nexport { y };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "Object.defineProperty(exports, \"y\", { enumerable: true, get: function () { return n_1.default; } });"
+            ),
+            "{code}"
+        );
+    }
+
+    fn emit_system(source: &str) -> EmitOutput {
+        emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::System),
+                ..EmitOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn system_module_publishes_an_exported_variable_from_execute() {
+        let output = emit_system("export var x = 1;\n");
+        assert_eq!(
+            javascript(&output),
+            "System.register([], function (exports_1, context_1) {\n    \"use strict\";\n    var x;\n    var __moduleName = context_1 && context_1.id;\n    return {\n        setters: [],\n        execute: function () {\n            exports_1(\"x\", x = 1);\n        }\n    };\n});\n"
+        );
+    }
+
+    #[test]
+    fn system_module_fills_imports_in_setters_and_republishes_them() {
+        let output = emit_system(
+            "import n, {x} from 'file1'\nimport n2 = require('file2');\nexport {x}\nexport {x as y}\nexport {n}\nexport {n2 as n3}\n",
+        );
+        let code = javascript(&output);
+        for expected in [
+            "System.register([\"file1\", \"file2\"], function (exports_1, context_1) {",
+            "    var file1_1, n2;\n",
+            "            function (file1_1_1) {\n                file1_1 = file1_1_1;\n            },\n            function (n2_1) {\n                n2 = n2_1;\n            }\n",
+            "            exports_1(\"n\", file1_1.default);\n            exports_1(\"x\", file1_1.x);\n            exports_1(\"y\", file1_1.x);\n            exports_1(\"n3\", n2);\n",
+        ] {
+            assert!(code.contains(expected), "missing {expected}: {code}");
+        }
+    }
+
+    #[test]
+    fn system_module_leaves_a_namespace_beside_a_default_import_unrewritten() {
+        let output = emit_system("import e, * as ns2 from 'file5';\ne();\nns2.f();\n");
+        let code = javascript(&output);
+        assert!(
+            code.contains("            file5_1.default();\n            ns2.f();\n"),
+            "{code}"
+        );
     }
 
     #[test]

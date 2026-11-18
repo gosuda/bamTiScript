@@ -238,7 +238,7 @@ impl AmdPlan {
         inner: String,
         indent: &str,
         newline: &str,
-    ) -> ModuleWrapper {
+    ) -> ModuleWrapper<'static> {
         let mut aliased: Vec<(&str, &str)> = Vec::new();
         let mut unaliased: Vec<&str> = Vec::new();
         let quoted: Vec<String> = directives
@@ -292,7 +292,10 @@ impl AmdPlan {
         ModuleWrapper {
             head,
             inner,
+            hoisted: None,
+            mid: String::new(),
             tail: "});".to_owned(),
+            body_indent: 0,
         }
     }
 }
