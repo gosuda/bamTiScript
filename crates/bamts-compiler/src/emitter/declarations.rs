@@ -591,6 +591,13 @@ mod tests {
     }
 
     #[test]
+    fn bare_declarators_are_typed_any() {
+        let output = emit_dts("let x, y;\n", DeclarationOptions::default());
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(code.contains("declare let x: any, y: any;"), "{code}");
+    }
+
+    #[test]
     fn let_literal_type_is_widened() {
         let output = emit_dts(
             "export let n = 42;\nexport let s = \"hello\";\nexport let b = true;\n",

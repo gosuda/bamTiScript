@@ -5339,6 +5339,8 @@ impl<'a> Emitter<'a> {
                         self.raw(&rendered);
                     }
                 }
+            } else {
+                self.raw(": any");
             }
         }
         self.raw(";");
