@@ -574,24 +574,20 @@ mod tests {
     }
 
     #[test]
-    fn const_literal_type_is_inferred() {
+    fn const_literal_initializer_stays_in_the_declaration() {
         let output = emit_dts(
-            "export const n = 42;\nexport const s = \"hello\";\nexport const b = true;\n",
+            "export const n = 42;\nexport const s = \"hello\";\nexport const b = true;\nexport const m = -1;\nexport const k = n;\n",
             DeclarationOptions::default(),
         );
         let code = &output.declaration.as_ref().unwrap().code;
+        assert!(code.contains("export declare const n = 42;"), "{code}");
         assert!(
-            code.contains("export declare const n: 42;"),
-            "expected literal type for const n, got: {code}"
+            code.contains("export declare const s = \"hello\";"),
+            "{code}"
         );
-        assert!(
-            code.contains("export declare const s: \"hello\";"),
-            "expected literal type for const s, got: {code}"
-        );
-        assert!(
-            code.contains("export declare const b: true;"),
-            "expected literal type for const b, got: {code}"
-        );
+        assert!(code.contains("export declare const b = true;"), "{code}");
+        assert!(code.contains("export declare const m = -1;"), "{code}");
+        assert!(code.contains("export declare const k: 42;"), "{code}");
     }
 
     #[test]
