@@ -3704,6 +3704,17 @@ fn symbol_decl_position(
             }
         }
     }
+    if matches!(
+        symbol.kind(),
+        SymbolKind::Parameter | SymbolKind::Variable(_)
+    ) {
+        while let Some(prev) = prev_significant_token(tokens, node_index) {
+            if !is_member_modifier(tokens[prev].kind()) {
+                break;
+            }
+            node_index = prev;
+        }
+    }
     // Decorator walk: scan left over accessor keywords and decorator
     // expression tokens so a decorated member anchors at the decorator's
     // `@` token, not the declaration name. Runs for all symbol kinds
@@ -3858,6 +3869,23 @@ const fn kind_is_keyword_led(kind: SymbolKind) -> bool {
             | SymbolKind::TypeAlias
             | SymbolKind::Enum
             | SymbolKind::Namespace
+    )
+}
+
+/// Modifiers and the rest marker that belong to a parameter or class member
+/// node, so its `Decl` marker anchors before them.
+const fn is_member_modifier(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::KwPublic
+            | TokenKind::KwPrivate
+            | TokenKind::KwProtected
+            | TokenKind::KwStatic
+            | TokenKind::KwReadonly
+            | TokenKind::KwAbstract
+            | TokenKind::KwOverride
+            | TokenKind::KwDeclare
+            | TokenKind::DotDotDot
     )
 }
 
