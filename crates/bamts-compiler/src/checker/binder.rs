@@ -15481,6 +15481,10 @@ impl<'src> Binder<'src> {
                 base,
                 heritage.expression.range(),
             );
+            if matches!(state, ClassState::Final) {
+                self.typed_expressions
+                    .push((heritage.expression.range(), base_instance));
+            }
             if let Some(base_view) = self.types.prepare_applied_class_view(base_instance)
                 && let Type::ObjectType(base_props) = self.types.get(base_view).clone()
             {
@@ -17424,7 +17428,11 @@ impl<'src> Binder<'src> {
             },
             _ => call.callee.range(),
         };
-        let callee_type = self.legacy_type_of_expr(&call.callee, scope);
+        let callee_type = if matches!(call.callee.data(), Expression::Super) {
+            self.types.any()
+        } else {
+            self.legacy_type_of_expr(&call.callee, scope)
+        };
         let evaluation = self.evaluate_call(call, scope, callee_type);
         for mismatch in evaluation.mismatches {
             let (code, range, message) = match mismatch {
@@ -22830,7 +22838,13 @@ impl<'src> Binder<'src> {
             Expression::Class(class) => self.resolve_class_expression(&class.class, scope),
             Expression::Arrow(arrow) => self.type_of_arrow(arrow, scope),
             Expression::Member(member) => {
+                if matches!(member.object.data(), Expression::Super) {
+                    self.publish_super_receiver(&member.object);
+                }
                 let object_type = self.legacy_type_of_expr(&member.object, scope);
+                let super_receiver = matches!(member.object.data(), Expression::Super);
+                let outer_probing = self.probing_contextual_type;
+                self.probing_contextual_type |= super_receiver;
                 let (type_id, short_circuits) = self.type_of_member(
                     &member.object,
                     &member.property,
@@ -22838,6 +22852,7 @@ impl<'src> Binder<'src> {
                     true,
                     scope,
                 );
+                self.probing_contextual_type = outer_probing;
                 self.record_member_reference_rows(
                     &member.object,
                     &member.property,
@@ -22846,6 +22861,11 @@ impl<'src> Binder<'src> {
                     expression.range(),
                     expression.id(),
                 );
+                if !self.probing_contextual_type
+                    && let MemberProperty::Named(name) = &member.property
+                {
+                    self.typed_expressions.push((name.range(), type_id));
+                }
                 self.optional_chain_result(expression, type_id, short_circuits)
             }
 
@@ -22859,6 +22879,9 @@ impl<'src> Binder<'src> {
                 .last()
                 .copied()
                 .unwrap_or_else(|| self.types.any()),
+            Expression::Call(call) if matches!(call.callee.data(), Expression::Super) => {
+                self.type_of_super_call(call, scope)
+            }
             Expression::Call(call) => {
                 let callee_type = self.legacy_type_of_expr(&call.callee, scope);
                 let evaluation = self.evaluate_call(call, scope, callee_type);
@@ -22878,6 +22901,61 @@ impl<'src> Binder<'src> {
             Expression::Template(_) => self.types.string(),
             _ => self.types.any(),
         }
+    }
+
+    fn publish_super_receiver(&mut self, expression: &'src Expr) {
+        let receiver = self.super_receiver_type();
+        if !self.probing_contextual_type
+            && self.node_types.insert(expression.id(), receiver).is_none()
+        {
+            self.typed_expressions.push((expression.range(), receiver));
+        }
+    }
+
+    fn super_base_symbol(&self) -> Option<SymbolId> {
+        let owner = self.class_owner_stack.last()?;
+        self.class_base_symbols.get(owner).copied()
+    }
+
+    fn super_constructor_type(&self) -> TypeId {
+        let Some(base) = self.super_base_symbol() else {
+            return self.types.any();
+        };
+        self.class_constructor_types
+            .get(&base)
+            .copied()
+            .unwrap_or(self.symbol_types[base.get() as usize])
+    }
+
+    fn super_receiver_type(&self) -> TypeId {
+        let in_static_member = matches!(
+            self.super_member_homes.last(),
+            Some(SuperMemberHome::ClassMember {
+                is_static: true,
+                ..
+            })
+        );
+        if in_static_member {
+            return self.super_constructor_type();
+        }
+        self.super_base_symbol()
+            .and_then(|base| self.class_instance_types.get(&base).copied())
+            .unwrap_or_else(|| self.types.any())
+    }
+
+    fn type_of_super_call(&mut self, call: &'src CallExpression, scope: ScopeId) -> TypeId {
+        let constructor = self.super_constructor_type();
+        if !self.probing_contextual_type
+            && self
+                .node_types
+                .insert(call.callee.id(), constructor)
+                .is_none()
+        {
+            self.typed_expressions
+                .push((call.callee.range(), constructor));
+        }
+        let _ = self.evaluate_call(call, scope, constructor);
+        self.types.void()
     }
 
     fn is_string_like(&self, type_id: TypeId) -> bool {
