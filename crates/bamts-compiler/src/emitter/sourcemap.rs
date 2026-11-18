@@ -1511,9 +1511,8 @@ mod tests {
         //   3:     case 5:
         //   4:         x++;
         //   5:         break;
-        //   6:     default:
-        //   7:         x = 0;
-        //   8: }                    ← close brace at gen col 0, EOL at gen col 1
+        //   6:     default: x = 0;
+        //   7: }                    ← close brace at gen col 0, EOL at gen col 1
         let source = "var x = 10;\nswitch (x) {\ncase 5: x++; break;\ndefault: x = 0;\n}\n";
         let javascript = emit(
             source,
@@ -1539,22 +1538,22 @@ mod tests {
             (2, 12, 1, 12),
             "switch open brace mapping\n  {mappings}"
         );
-        // Switch close `}` on generated line 8: glyph at gen col 0, src line 4, src col 0.
+        // Switch close `}` on generated line 7: glyph at gen col 0, src line 4, src col 0.
         let close = segs
             .iter()
-            .find(|(gl, gc, _sl, _sc)| *gl == 8 && *gc == 0)
-            .unwrap_or_else(|| panic!("switch close brace missing on line 8 col 0\n  {mappings}"));
+            .find(|(gl, gc, _sl, _sc)| *gl == 7 && *gc == 0)
+            .unwrap_or_else(|| panic!("switch close brace missing on line 7 col 0\n  {mappings}"));
         assert_eq!(
             *close,
-            (8, 0, 4, 0),
+            (7, 0, 4, 0),
             "switch close brace glyph mapping\n  {mappings}"
         );
         // EOL segment right after: gen col 1, src line 4, src col 1.
         let eol = segs
             .iter()
-            .find(|(gl, gc, _sl, _sc)| *gl == 8 && *gc == 1)
-            .unwrap_or_else(|| panic!("switch close EOL missing on line 8 col 1\n  {mappings}"));
-        assert_eq!(*eol, (8, 1, 4, 1), "switch close EOL mapping\n  {mappings}");
+            .find(|(gl, gc, _sl, _sc)| *gl == 7 && *gc == 1)
+            .unwrap_or_else(|| panic!("switch close EOL missing on line 7 col 1\n  {mappings}"));
+        assert_eq!(*eol, (7, 1, 4, 1), "switch close EOL mapping\n  {mappings}");
     }
 
     #[test]
