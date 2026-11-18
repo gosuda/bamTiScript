@@ -1832,11 +1832,16 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_module_js(&mut self, statements: &[Stmt]) {
-        let hoisted = usize::from(
-            statements
-                .first()
-                .is_some_and(|statement| self.is_hoisted_temp_declaration(statement)),
-        );
+        let directives = statements
+            .iter()
+            .take_while(|statement| is_directive(statement))
+            .count();
+        let lead = directives
+            + usize::from(
+                statements
+                    .get(directives)
+                    .is_some_and(|statement| self.is_hoisted_temp_declaration(statement)),
+            );
         let wrapper = self.module_wrapper;
         if let Some(wrapper) = wrapper {
             self.write_detached_comments();
@@ -1847,14 +1852,9 @@ impl<'a> Emitter<'a> {
         if wrapper.is_none() {
             self.write_detached_comments();
         }
-        if hoisted == 0 {
-            self.emit_prelude_tail();
-        }
-        self.emit_statement_list(&statements[..hoisted]);
-        if hoisted == 1 {
-            self.emit_prelude_tail();
-        }
-        self.emit_statement_list(&statements[hoisted..]);
+        self.emit_statement_list(&statements[..lead]);
+        self.emit_prelude_tail();
+        self.emit_statement_list(&statements[lead..]);
         if self.options.module_marker && !self.emitted_module_syntax {
             self.raw("export {};");
             self.newline();
@@ -6316,6 +6316,16 @@ fn is_parameter_property(parameter: &Parameter) -> bool {
     parameter.modifiers.accessibility.is_some()
         || parameter.modifiers.is_readonly
         || parameter.modifiers.is_override
+}
+
+/// A string-literal expression statement, which heads a file as a directive
+/// and so stays ahead of every generated prelude line.
+fn is_directive(statement: &Stmt) -> bool {
+    matches!(
+        statement.data(),
+        Statement::Expression(statement)
+            if matches!(statement.expression.data(), Expression::Literal(Literal::String(_)))
+    )
 }
 
 /// A module-level declaration whose place in the output waits on whether the
