@@ -3405,6 +3405,10 @@ fn project_config(
             map.entry((*key).to_owned())
                 .or_insert_with(|| serde_json::Value::String((*value).to_owned()));
         }
+        if !forced.is_empty() {
+            map.entry("moduleResolution".to_owned())
+                .or_insert_with(|| serde_json::Value::String("classic".to_owned()));
+        }
     }
     let merged_source = serde_json::to_string(&disk_value)
         .map_err(|error| ProjectEmitError::Harness(format!("project config serialize: {error}")))?;
