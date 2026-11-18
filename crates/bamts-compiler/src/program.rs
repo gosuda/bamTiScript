@@ -255,6 +255,8 @@ pub struct ResolvedProgram {
     no_emit_helpers: bool,
     remove_comments: bool,
     use_define_for_class_fields: Option<bool>,
+    experimental_decorators: bool,
+    emit_decorator_metadata: bool,
     import_helpers: Option<bool>,
     es_module_interop: Option<bool>,
     verbatim_module_syntax: bool,
@@ -276,6 +278,16 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn use_define_for_class_fields(&self) -> Option<bool> {
         self.use_define_for_class_fields
+    }
+
+    #[must_use]
+    pub const fn experimental_decorators(&self) -> bool {
+        self.experimental_decorators
+    }
+
+    #[must_use]
+    pub const fn emit_decorator_metadata(&self) -> bool {
+        self.emit_decorator_metadata
     }
 
     #[must_use]
@@ -811,6 +823,8 @@ impl ProgramLoader {
             no_emit_helpers: self.options.no_emit_helpers(),
             remove_comments: self.options.remove_comments(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
+            experimental_decorators: self.options.experimental_decorators(),
+            emit_decorator_metadata: self.options.emit_decorator_metadata(),
             import_helpers: self.options.import_helpers(),
             es_module_interop: self.options.es_module_interop(),
             verbatim_module_syntax: self.options.verbatim_module_syntax(),

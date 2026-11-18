@@ -39,6 +39,7 @@ use super::{
 
 mod amd_module;
 mod es5_class;
+mod legacy_decorators;
 mod namespaces;
 
 use amd_module::{AmdDependency, AmdPlan};
@@ -150,6 +151,10 @@ pub struct TransformOptions {
     pub erased_imports: std::sync::Arc<BTreeSet<(String, String)>>,
     /// Something outside the source reads imports, so none can be proven unused.
     pub keeps_imports: bool,
+    /// Lower legacy decorators to `__decorate` calls.
+    pub experimental_decorators: bool,
+    /// Add `design:*` metadata to lowered decorators.
+    pub emit_decorator_metadata: bool,
     /// Node module modes keep dynamic `import()` as written.
     pub node_module_mode: bool,
     /// Whether the emitted file begins with a `"use strict"` prologue.
@@ -828,7 +833,7 @@ struct ClassLowering {
     static_this: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum ExportWrapper {
     None,
     Named,
@@ -1406,6 +1411,14 @@ impl<'a> Rewriter<'a> {
                 else {
                     return self.rewrite_statement(inner);
                 };
+                if let Some(statements) = self.lower_legacy_decorated_class(
+                    range,
+                    inner.range(),
+                    class,
+                    ExportWrapper::Named,
+                ) {
+                    return statements;
+                }
                 let mut out = self.rewrite_statement(inner);
                 out.push(self.cjs_export_assignment(&name, &name, range));
                 out
@@ -1438,6 +1451,11 @@ impl<'a> Rewriter<'a> {
                 (renamed, String::from("default_1"))
             }
         };
+        if let Some(statements) =
+            self.lower_legacy_decorated_class(range, range, &class, ExportWrapper::Default)
+        {
+            return statements;
+        }
         let statement = self.syn_node(range, Statement::Class(class));
         let mut out = self.rewrite_statement(&statement);
         let default_value = self.ident_expr(&name);
@@ -4098,6 +4116,11 @@ impl<'a> Rewriter<'a> {
         class: &ClassDeclaration,
         wrapper: ExportWrapper,
     ) -> Vec<Stmt> {
+        if let Some(statements) =
+            self.lower_legacy_decorated_class(statement.range(), class_range, class, wrapper)
+        {
+            return statements;
+        }
         if Self::needs(LanguageFeature::Classes, self.options) {
             if let Some(statements) =
                 self.lower_es5_class_statement(statement, class_range, class, wrapper)

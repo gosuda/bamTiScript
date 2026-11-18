@@ -137,6 +137,10 @@ pub struct EmitOptions {
     pub erased_imports: Arc<BTreeSet<(String, String)>>,
     /// Something outside the source reads imports, so none can be proven unused.
     pub keeps_imports: bool,
+    /// Lower legacy decorators to `__decorate` calls (`experimentalDecorators`).
+    pub experimental_decorators: bool,
+    /// Add `design:*` metadata to lowered decorators (`emitDecoratorMetadata`).
+    pub emit_decorator_metadata: bool,
     /// `module` is a Node mode (node16, node18, node20, nodenext), where
     /// dynamic `import()` stays as written even in CommonJS-format files.
     pub node_module_mode: bool,
@@ -176,6 +180,8 @@ impl Default for EmitOptions {
             erased_imports: Arc::default(),
             keeps_imports: false,
             node_module_mode: false,
+            experimental_decorators: false,
+            emit_decorator_metadata: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -438,6 +444,8 @@ impl EmitOptions {
             erased_imports: Arc::clone(&self.erased_imports),
             keeps_imports: self.keeps_imports,
             node_module_mode: self.node_module_mode,
+            experimental_decorators: self.experimental_decorators,
+            emit_decorator_metadata: self.emit_decorator_metadata,
         }
     }
 
@@ -3169,7 +3177,7 @@ impl<'a> Emitter<'a> {
                 self.emit_expression_prec(&tagged.tag, P_CALL_MEMBER);
                 self.emit_template(&tagged.template);
             }
-            Expression::Array(array) => self.emit_array(array),
+            Expression::Array(array) => self.emit_array(array, expression.id()),
             Expression::Object(object) => {
                 self.emit_object(object, expression.id(), expression.range())
             }
@@ -3633,9 +3641,27 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_array(&mut self, array: &ArrayLiteral) {
+    fn emit_array(&mut self, array: &ArrayLiteral, id: NodeId) {
         let range = self.anchor;
         self.raw_mapped_char("[", range, '[', 1);
+        if self
+            .expanded_sequences
+            .is_some_and(|expanded| expanded.contains(&id))
+        {
+            self.newline();
+            self.indent += 1;
+            let count = array.elements.len();
+            for (index, element) in array.elements.iter().enumerate() {
+                self.emit_array_element(element);
+                if index + 1 < count {
+                    self.raw(",");
+                }
+                self.newline();
+            }
+            self.indent -= 1;
+            self.raw_mapped_char_end("]", range, ']');
+            return;
+        }
         let elements = &array.elements;
         let mut cursor = Utf16Pos::new(range.start().get().saturating_add(1));
         for (index, element) in elements.iter().enumerate() {
@@ -3644,22 +3670,7 @@ impl<'a> Emitter<'a> {
                 let limit = element_range.map_or(range.end(), |r| r.start());
                 cursor = self.mapped_list_separator_from(cursor, limit);
             }
-            match element {
-                ArrayElement::Expression(expression) => {
-                    self.emit_expression_prec(expression, P_ASSIGN);
-                }
-                ArrayElement::Spread(spread) => {
-                    self.raw_mapped_char("...", spread.argument.range(), '.', 3);
-                    self.emit_expression_prec(&spread.argument, P_ASSIGN);
-                }
-                ArrayElement::Elision => {}
-                ArrayElement::Missing(_) => {
-                    self.diag_here(
-                        codes::MISSING_ELEMENT,
-                        "cannot emit a missing array element",
-                    );
-                }
-            }
+            self.emit_array_element(element);
             if let Some(element_range) = element_range {
                 cursor = element_range.end();
             }
@@ -3668,6 +3679,25 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_char_end(",", range, ',');
         }
         self.raw_mapped_char_end("]", range, ']');
+    }
+
+    fn emit_array_element(&mut self, element: &ArrayElement) {
+        match element {
+            ArrayElement::Expression(expression) => {
+                self.emit_expression_prec(expression, P_ASSIGN);
+            }
+            ArrayElement::Spread(spread) => {
+                self.raw_mapped_char("...", spread.argument.range(), '.', 3);
+                self.emit_expression_prec(&spread.argument, P_ASSIGN);
+            }
+            ArrayElement::Elision => {}
+            ArrayElement::Missing(_) => {
+                self.diag_here(
+                    codes::MISSING_ELEMENT,
+                    "cannot emit a missing array element",
+                );
+            }
+        }
     }
 
     fn emit_object(&mut self, object: &ObjectLiteral, id: NodeId, range: TextRange) {

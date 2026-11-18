@@ -1069,6 +1069,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "declarationmap"
             | "usedefineforclassfields"
             | "importhelpers"
+            | "experimentaldecorators"
+            | "emitdecoratormetadata"
             | "esmoduleinterop" => value.eq_ignore_ascii_case("true").to_string(),
             "lib" => {
                 let items: Vec<String> = values
@@ -1096,6 +1098,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "usedefineforclassfields" => "useDefineForClassFields",
             "importhelpers" => "importHelpers",
             "esmoduleinterop" => "esModuleInterop",
+            "experimentaldecorators" => "experimentalDecorators",
+            "emitdecoratormetadata" => "emitDecoratorMetadata",
             "verbatimmodulesyntax" => "verbatimModuleSyntax",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
