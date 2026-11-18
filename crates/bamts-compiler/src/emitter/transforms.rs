@@ -43,6 +43,7 @@ mod es5_class;
 mod legacy_decorators;
 mod namespaces;
 mod system_module;
+mod using_declarations;
 
 use amd_module::{AmdDependency, AmdPlan};
 use es5_class::{MemberScope, SuperContext};
@@ -61,8 +62,6 @@ pub mod codes {
     pub const GENERATOR_REQUIRES_ES2015: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1102");
     /// Private fields below ES2022 require helpers this layer does not apply.
     pub const PRIVATE_FIELD_REQUIRES_ES2022: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1103");
-    /// `using` / `await using` is not downleveled.
-    pub const USING_UNSUPPORTED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1104");
     /// `for await` below ES2018 is not downleveled.
     pub const ASYNC_ITERATION_REQUIRES_ES2018: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1105");
     /// A static field on an unnamed class expression cannot be lowered.
@@ -288,6 +287,7 @@ fn emit_json_file(
                 prelude_tail: None,
                 expanded_sequences: None,
                 class_iifes: None,
+                alternate_layout: None,
                 module_wrapper: None,
             },
             model,
@@ -399,6 +399,7 @@ fn emit_json_object(
                 prelude_tail: None,
                 expanded_sequences: None,
                 class_iifes: None,
+                alternate_layout: None,
                 module_wrapper: None,
             },
             model,
@@ -528,6 +529,7 @@ pub fn emit_transformed(
             prelude_tail: Some(&tail),
             expanded_sequences: Some(&rewriter.expanded_sequences),
             class_iifes: Some(&rewriter.class_iifes),
+            alternate_layout: Some(&rewriter.alternate_layout),
             module_wrapper: wrapper.as_ref(),
         },
         model,
@@ -870,6 +872,9 @@ struct Rewriter<'a> {
     capture_scopes: Vec<CaptureScope>,
     /// Parenthesized ES5 class IIFEs, which print a `/** @class */` marker.
     class_iifes: BTreeSet<NodeId>,
+    /// Synthesized nodes that print in the layout their kind does not
+    /// default to.
+    alternate_layout: BTreeSet<NodeId>,
     /// The class member being rewritten, one entry per ES5 class member.
     super_contexts: Vec<SuperContext>,
     parameter_initializer_depths: Vec<usize>,
@@ -895,6 +900,9 @@ struct Rewriter<'a> {
     namespace_frames: Vec<NamespaceFrame>,
     /// Names each enclosing statement list has declared so far.
     declared_names: Vec<BTreeSet<String>>,
+    /// The disposal environment of each enclosing statement list that
+    /// declares a resource, innermost last.
+    disposal_environments: Vec<IdentifierNode>,
     /// Identifiers a generated name must avoid, once one is needed.
     occupied_names: Option<BTreeSet<String>>,
     /// Where each value name is declared, once a namespace needs to know.
@@ -1054,6 +1062,7 @@ impl<'a> Rewriter<'a> {
             expanded_sequences: BTreeSet::new(),
             capture_scopes: Vec::new(),
             class_iifes: BTreeSet::new(),
+            alternate_layout: BTreeSet::new(),
             super_contexts: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             tslib_helpers: binds_helpers_to_tslib(options, file),
@@ -1068,6 +1077,7 @@ impl<'a> Rewriter<'a> {
             file,
             namespace_frames: Vec::new(),
             declared_names: Vec::new(),
+            disposal_environments: Vec::new(),
             occupied_names: None,
             value_symbol_ranges: None,
             read_aliases: None,
@@ -2294,7 +2304,10 @@ impl<'a> Rewriter<'a> {
         }
         self.expression_temp_scopes.push(Vec::new());
         self.capture_scopes.push(CaptureScope::default());
-        let mut rewritten = self.rewrite_statements(statements);
+        let mut rewritten = match self.open_disposal_environment(statements) {
+            Some(disposal) => self.rewrite_root_resources(statements, disposal, range),
+            None => self.rewrite_statements(statements),
+        };
         rewritten.extend(self.export_assignment.take());
         let temps = self.expression_temp_scopes.pop().unwrap_or_default();
         if let Some(declaration) = self.temp_declaration(temps, range) {
@@ -2438,6 +2451,7 @@ impl<'a> Rewriter<'a> {
 
     fn rewrite_statements(&mut self, statements: &[Stmt]) -> Vec<Stmt> {
         self.declared_names.push(BTreeSet::new());
+        let disposal = self.open_disposal_environment(statements);
         let mut out = Vec::new();
         for statement in statements {
             self.record_declaration(statement);
@@ -2449,7 +2463,12 @@ impl<'a> Rewriter<'a> {
             }
         }
         self.declared_names.pop();
-        out
+        match (disposal, statements.first()) {
+            (Some(disposal), Some(first)) => {
+                self.close_disposal_environment(out, disposal, first.range())
+            }
+            _ => out,
+        }
     }
 
     fn rewrite_statement(&mut self, statement: &Stmt) -> Vec<Stmt> {
@@ -2712,6 +2731,11 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.lower_sync_for_of(statement, for_of);
                 }
+                if let ForBinding::Variable(declaration) = &for_of.binding
+                    && self.lowers_resources(declaration.kind)
+                {
+                    return self.lower_resource_for_of(statement, for_of, declaration);
+                }
                 let binding = match &for_of.binding {
                     ForBinding::Target(target) => {
                         ForBinding::Target(self.rewrite_assignment_target(target))
@@ -2757,6 +2781,12 @@ impl<'a> Rewriter<'a> {
                         body: Box::new(body),
                     }),
                 )]
+            }
+            Statement::For(value)
+                if matches!(&value.initializer, Some(ForInitializer::Variable(declaration))
+                    if self.lowers_resources(declaration.kind)) =>
+            {
+                self.lower_resource_for(statement, value)
             }
             Statement::For(value) => {
                 let initializer = value
@@ -3031,16 +3061,8 @@ impl<'a> Rewriter<'a> {
         statement: &Stmt,
         declaration: &VariableDeclaration,
     ) -> Vec<Stmt> {
-        if matches!(
-            declaration.kind,
-            VariableKind::Using | VariableKind::AwaitUsing
-        ) && Self::needs(LanguageFeature::Using, self.options)
-        {
-            self.diag(
-                codes::USING_UNSUPPORTED,
-                statement.range(),
-                "using declarations are not downleveled",
-            );
+        if self.lowers_resources(declaration.kind) {
+            return self.register_resources(statement, declaration);
         }
         if !Self::needs(LanguageFeature::Destructuring, self.options) {
             let outer_key_prelude = std::mem::take(&mut self.key_prelude);
@@ -14084,18 +14106,120 @@ mod tests {
             output.diagnostics
         );
     }
+    #[test]
+    fn a_block_with_a_resource_disposes_it_on_every_exit() {
+        let output = emit_at(
+            "{\n    using d1 = a, d2 = b;\n    d1;\n}\n",
+            ScriptTarget::Es2022,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "{\n    const env_1 = { stack: [], error: void 0, hasError: false };\n    try {\n        const d1 = __addDisposableResource(env_1, a, false), d2 = __addDisposableResource(env_1, b, false);\n        d1;\n    }\n    catch (e_1) {\n        env_1.error = e_1;\n        env_1.hasError = true;\n    }\n    finally {\n        __disposeResources(env_1);\n    }\n}"
+            ),
+            "{code}"
+        );
+    }
 
     #[test]
-    fn using_declarations_are_errors_before_esnext() {
-        let output = emit_at("using x = y;\n", ScriptTarget::Es2022);
-        assert!(
-            output
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code() == codes::USING_UNSUPPORTED),
-            "{:?}",
-            output.diagnostics
+    fn an_awaited_resource_waits_for_its_disposal() {
+        let output = emit_at(
+            "async function f() {\n    await using d = a;\n}\n",
+            ScriptTarget::Es2022,
         );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "        const d = __addDisposableResource(env_1, a, true);\n    }\n    catch (e_1) {\n        env_1.error = e_1;\n        env_1.hasError = true;\n    }\n    finally {\n        const result_1 = __disposeResources(env_1);\n        if (result_1)\n            await result_1;\n    }"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn nested_environments_number_outside_in_and_their_catches_inside_out() {
+        let output = emit_at(
+            "function f() {\n    using outer = a;\n    {\n        using inner = b;\n    }\n}\n",
+            ScriptTarget::Es2022,
+        );
+        let code = javascript(&output);
+        let outer = code.find("__addDisposableResource(env_1, a, false)");
+        let inner = code.find("__addDisposableResource(env_2, b, false)");
+        assert!(outer < inner && outer.is_some(), "{code}");
+        assert!(
+            code.find("catch (e_1)") < code.find("catch (e_2)")
+                && code.contains("env_2.error = e_1;"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_top_level_resource_hoists_the_names_declared_beside_it() {
+        let output = emit_at(
+            "using d = a;\nfunction f() { }\nclass C {\n}\n",
+            ScriptTarget::Es2022,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "function f() { }\nvar d, C;\nconst env_1 = { stack: [], error: void 0, hasError: false };\ntry {\n    d = __addDisposableResource(env_1, a, false);\n    C = class C {\n    };\n}\ncatch (e_1) {"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_body_disposes_its_own_resources() {
+        let output = emit_at("namespace N {\n    using d = a;\n}\n", ScriptTarget::Es2022);
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "(function (N) {\n    const env_1 = { stack: [], error: void 0, hasError: false };\n    try {\n        const d = __addDisposableResource(env_1, a, false);\n    }"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_for_of_resource_is_registered_once_per_iteration() {
+        let output = emit_at("for (using d of xs) {\n    d;\n}\n", ScriptTarget::Es2022);
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "for (const d_1 of xs) {\n    const env_1 = { stack: [], error: void 0, hasError: false };\n    try {\n        const d = __addDisposableResource(env_1, d_1, false);\n        d;\n    }"
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_for_head_resource_outlives_the_whole_loop() {
+        let output = emit_at("for (using d = a;;) {\n    d;\n}\n", ScriptTarget::Es2022);
+        let code = javascript(&output);
+        let registered = code.find("__addDisposableResource(env_1, a, false)");
+        let disposed = code.find("    __disposeResources(env_1);");
+        let body = code.find("        d;");
+        assert!(
+            registered.is_some() && registered < body && body < disposed,
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn generated_resource_bindings_are_var_below_es2015() {
+        let output = emit_at("{\n    using d = a;\n}\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("    var env_1 = { stack: [], error: void 0, hasError: false };")
+                && code.contains("        var d = __addDisposableResource(env_1, a, false);"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn a_constructor_keeps_its_place_among_native_fields() {
+        let source = "class C {\n    x = 1;\n    constructor() { }\n    y = 2;\n}\n";
+        assert_eq!(javascript(&emit_at(source, ScriptTarget::Es2022)), source);
     }
 
     #[test]
