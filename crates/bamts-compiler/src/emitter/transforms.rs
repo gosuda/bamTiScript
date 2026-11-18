@@ -2423,6 +2423,7 @@ impl<'a> Rewriter<'a> {
                 }
                 Vec::new()
             }
+            Statement::Export(ExportDeclaration::Assignment(_)) if self.cjs.is_none() => Vec::new(),
             Statement::Import(import) => {
                 if self.cjs.is_none() {
                     return self.rewrite_esm_import(statement, import);
@@ -2432,6 +2433,15 @@ impl<'a> Rewriter<'a> {
                     return Vec::new();
                 }
                 self.cjs_statement_lines(statement)
+            }
+            Statement::ImportEquals(import)
+                if self.cjs.is_none()
+                    && matches!(import.reference, ExternalModuleReference::Require(_))
+                    && self.import_reads.as_ref().is_some_and(|reads| {
+                        !reads.contains(&identifier_text(self.file, &import.local))
+                    }) =>
+            {
+                Vec::new()
             }
             Statement::Block(block) => {
                 let statements = self.rewrite_statements(&block.data().statements);
