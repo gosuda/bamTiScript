@@ -38,6 +38,7 @@ use super::{
 };
 
 mod amd_module;
+mod decorator_metadata;
 mod es5_class;
 mod legacy_decorators;
 mod namespaces;
@@ -159,6 +160,8 @@ pub struct TransformOptions {
     pub experimental_decorators: bool,
     /// Add `design:*` metadata to lowered decorators.
     pub emit_decorator_metadata: bool,
+    /// `strictNullChecks` decides whether unions keep `null` and `undefined`.
+    pub strict_null_checks: bool,
     /// Node module modes keep dynamic `import()` as written.
     pub node_module_mode: bool,
     /// Whether the emitted file begins with a `"use strict"` prologue.

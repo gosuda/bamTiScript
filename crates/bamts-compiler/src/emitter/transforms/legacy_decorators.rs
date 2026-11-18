@@ -6,6 +6,7 @@
 //! `C = __decorate([...], C);`. Class bodies keep their `class` syntax, so
 //! only targets that have classes take this path.
 
+use super::decorator_metadata;
 use crate::source::TextRange;
 use crate::syntax::*;
 
@@ -308,50 +309,83 @@ impl Rewriter<'_> {
         let mut static_statements = Vec::new();
         let members = std::mem::take(&mut class.members);
         let mut rebuilt = Vec::with_capacity(members.len());
-        for member in members {
+        let mut constructor_metadata = None;
+        for member in members.iter() {
             let (id, member_range) = (member.id(), member.range());
-            let data = match member.into_data() {
-                ClassMember::Constructor(mut constructor) => {
-                    for (index, parameter) in constructor.parameters.iter().enumerate() {
-                        class_decorators.extend(self.parameter_decorators(index, parameter));
+            let mut data = member.data().clone();
+            match &mut data {
+                ClassMember::Constructor(constructor) => {
+                    for (position, parameter) in constructor.parameters.iter().enumerate() {
+                        class_decorators.extend(self.parameter_decorators(position, parameter));
                     }
+                    constructor_metadata =
+                        Some(decorator_metadata::MetadataSubject::ConstructorParameters(
+                            constructor.parameters.clone(),
+                        ));
                     constructor.decorators = Vec::new();
-                    constructor.parameters = strip_parameter_decorators(constructor.parameters);
-                    ClassMember::Constructor(constructor)
+                    constructor.parameters =
+                        strip_parameter_decorators(std::mem::take(&mut constructor.parameters));
                 }
-                ClassMember::Method(mut method) => {
-                    let mut decorators = Vec::new();
+                ClassMember::Method(method) => {
                     if method.function.body.is_some() {
-                        decorators = decorator_expressions(&method.function.decorators);
-                        for (index, parameter) in method.function.parameters.iter().enumerate() {
-                            decorators.extend(self.parameter_decorators(index, parameter));
+                        let mut decorators = decorator_expressions(&method.function.decorators);
+                        for (position, parameter) in method.function.parameters.iter().enumerate() {
+                            decorators.extend(self.parameter_decorators(position, parameter));
                         }
-                    }
-                    if !decorators.is_empty() {
-                        let statement = self.member_decoration(
-                            name,
-                            &method.name,
-                            method.modifiers.is_static,
-                            decorators,
-                            false,
-                            range,
-                        );
-                        match statement {
-                            Some(statement) if method.modifiers.is_static => {
-                                static_statements.push(statement);
+                        if !decorators.is_empty() {
+                            let subject = match method.modifier {
+                                PropertyModifier::None => {
+                                    decorator_metadata::MetadataSubject::Method {
+                                        parameters: method.function.parameters.clone(),
+                                        return_type: method.function.return_type.as_ref().map(
+                                            |annotation| (*annotation.data().type_node).clone(),
+                                        ),
+                                        is_async: method.function.is_async,
+                                    }
+                                }
+                                PropertyModifier::Get | PropertyModifier::Set => {
+                                    decorator_metadata::MetadataSubject::accessor(
+                                        self, method, &members,
+                                    )
+                                }
+                            };
+                            decorators.extend(self.decorator_metadata(subject, range));
+                            let statement = self.member_decoration(
+                                name,
+                                &method.name,
+                                method.modifiers.is_static,
+                                decorators,
+                                false,
+                                range,
+                            );
+                            match statement {
+                                Some(statement) if method.modifiers.is_static => {
+                                    static_statements.push(statement);
+                                }
+                                Some(statement) => instance_statements.push(statement),
+                                None => {}
                             }
-                            Some(statement) => instance_statements.push(statement),
-                            None => {}
                         }
                     }
                     method.function.decorators = Vec::new();
                     method.function.parameters =
-                        strip_parameter_decorators(method.function.parameters);
-                    ClassMember::Method(method)
+                        strip_parameter_decorators(std::mem::take(&mut method.function.parameters));
                 }
-                ClassMember::Property(mut property) => {
+                ClassMember::Property(property) => {
                     let decorators = decorator_expressions(&property.decorators);
                     if !decorators.is_empty() {
+                        let mut decorators = decorators;
+                        decorators.extend(
+                            self.decorator_metadata(
+                                decorator_metadata::MetadataSubject::Property(
+                                    property
+                                        .type_annotation
+                                        .as_ref()
+                                        .map(|annotation| (*annotation.data().type_node).clone()),
+                                ),
+                                range,
+                            ),
+                        );
                         let statement = self.member_decoration(
                             name,
                             &property.name,
@@ -369,11 +403,13 @@ impl Rewriter<'_> {
                         }
                     }
                     property.decorators = Vec::new();
-                    ClassMember::Property(property)
                 }
-                other => other,
-            };
+                _ => {}
+            }
             rebuilt.push(Node::new(id, member_range, data));
+        }
+        if let Some(subject) = constructor_metadata {
+            class_decorators.extend(self.decorator_metadata(subject, range));
         }
         class.members = rebuilt;
         instance_statements.extend(static_statements);

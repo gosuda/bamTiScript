@@ -410,6 +410,7 @@ pub fn compile_project<F: FileSystem + Clone>(
         emit_options.emit_declaration_only = selection.declaration && !selection.javascript;
         emit_options.verbatim_module_syntax = project.options().verbatim_module_syntax();
         emit_options.keeps_imports = project.options().keeps_imports();
+        emit_options.strict_null_checks = project.options().strict_null_checks();
         emit_options.erased_imports = Arc::new(checked.erased_imports(
             &program,
             &erased_exports,
