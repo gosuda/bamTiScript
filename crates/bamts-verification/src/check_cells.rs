@@ -2011,10 +2011,18 @@ pub(crate) fn observe_javascript(
         Err(error) => compile_failure_observation(error),
         Ok(case) => {
             let Some(baseline_path) = baseline_path else {
-                return CompilerCheckObservation {
-                    class: FailureClass::HarnessError,
-                    detail: "classification/execution drift: no owned `.js` baseline".to_owned(),
-                    artifact: None,
+                return match emit_javascript_baseline(&case, &index_entry.logical_path) {
+                    Err(detail) if detail == NO_JAVASCRIPT_OUTPUT => CompilerCheckObservation {
+                        class: FailureClass::Pass,
+                        detail: "no javascript output and no javascript baseline".to_owned(),
+                        artifact: Some(Vec::new()),
+                    },
+                    _ => CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: "classification/execution drift: no owned `.js` baseline"
+                            .to_owned(),
+                        artifact: None,
+                    },
                 };
             };
             let emitted = match emit_javascript_baseline(&case, &index_entry.logical_path) {
@@ -2058,6 +2066,10 @@ pub(crate) fn observe_javascript(
         }
     }
 }
+
+/// What `emit_javascript_baseline` reports when the case emits no section: upstream
+/// then writes no `.js` baseline at all.
+const NO_JAVASCRIPT_OUTPUT: &str = "javascript emit reached no case units";
 
 pub fn emit_javascript_baseline(
     case: &CheckedCase,
@@ -2175,7 +2187,7 @@ pub fn emit_javascript_baseline(
         }
     }
     if outputs == 0 {
-        return Err("javascript emit reached no case units".to_owned());
+        return Err(NO_JAVASCRIPT_OUTPUT.to_owned());
     }
     Ok(out)
 }
