@@ -204,6 +204,9 @@ pub struct CheckedCase {
     options: bamts_compiler::project::CompilerOptions,
     /// The directory `fullEmitPaths` prints in front of every output name.
     emit_directory: Option<String>,
+    /// `noResolve`: imports add no files to the program, so units emit in
+    /// the order the case lists them.
+    no_resolve: bool,
 }
 
 impl CheckedCase {
@@ -212,6 +215,12 @@ impl CheckedCase {
     #[must_use]
     pub fn emit_directory(&self) -> Option<&str> {
         self.emit_directory.as_deref()
+    }
+
+    /// Whether the case sets `noResolve`.
+    #[must_use]
+    pub fn no_resolve(&self) -> bool {
+        self.no_resolve
     }
 
     /// The frontend output of one unit, when the program reached it.
@@ -1216,6 +1225,7 @@ pub fn compile_case_frontend(
         program,
         options,
         emit_directory: full_emit_directory(pragmas),
+        no_resolve: pragma_enabled(pragmas, "noresolve"),
     })
 }
 
@@ -2121,6 +2131,40 @@ fn emitted_path(directory: &str, common: &[&str], unit_path: &str, section: &str
     path
 }
 
+fn pragma_enabled(pragmas: &CasePragmas, name: &str) -> bool {
+    pragmas
+        .options
+        .iter()
+        .find(|(key, _)| key == name)
+        .and_then(|(_, values)| values.first())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+/// Whether the program compiles JavaScript inputs: `allowJs`, `checkJs` (which
+/// implies it), or a tsconfig unit that sets `allowJs` itself.
+fn compiles_scripts(case: &CheckedCase) -> bool {
+    let options = case.options();
+    options.allow_js()
+        || options.check_js()
+        || case.units.iter().any(|(unit, _)| {
+            is_config_unit_name(&unit_basename(&unit.virtual_path))
+                && unit
+                    .text
+                    .to_ascii_lowercase()
+                    .replace(char::is_whitespace, "")
+                    .contains("\"allowjs\":true")
+        })
+}
+
+/// Whether a unit name is a JavaScript source file, which tsc compiles only
+/// under `allowJs`.
+fn is_script_input_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
 /// The `outDir` that `fullEmitPaths` prints in front of every section name.
 fn full_emit_directory(pragmas: &CasePragmas) -> Option<String> {
     let value = |name: &str| {
@@ -2169,7 +2213,11 @@ pub fn emit_javascript_baseline(
     // unless declaration emit is on. The section set follows those two maps.
     let mut outputs = 0usize;
     let imported = runtime_imported_source_ids(case);
-    let emitted = case.reached_units_in_module_order();
+    let emitted = if case.no_resolve() {
+        case.reached_units().collect()
+    } else {
+        case.reached_units_in_module_order()
+    };
     let emit_directory = case.emit_directory();
     let common = common_directory(
         emitted
@@ -2184,7 +2232,9 @@ pub fn emit_javascript_baseline(
     if !options.emit_declaration_only() {
         for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
-            if is_declaration_input_name(&name) {
+            if is_declaration_input_name(&name)
+                || (is_script_input_name(&name) && !compiles_scripts(case))
+            {
                 continue;
             }
             if is_json_input_name(&name) {
@@ -2239,7 +2289,10 @@ pub fn emit_javascript_baseline(
         let mut declarations = Vec::new();
         for (unit, output) in &emitted {
             let name = unit_basename(&unit.virtual_path);
-            if is_declaration_input_name(&name) || is_json_input_name(&name) {
+            if is_declaration_input_name(&name)
+                || is_json_input_name(&name)
+                || (is_script_input_name(&name) && !compiles_scripts(case))
+            {
                 continue;
             }
             let section = output_section_name(&name, bundle.as_deref(), declaration_extension);
