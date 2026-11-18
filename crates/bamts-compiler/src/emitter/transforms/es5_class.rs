@@ -11,6 +11,7 @@ use crate::source::TextRange;
 use crate::syntax::*;
 
 use super::helpers::HelperKind;
+use super::legacy_decorators::is_decorated;
 use super::{ClassLowering, ExportWrapper, FieldInit, FieldMode, Rewriter};
 
 /// Where the code of one class member runs, for `this` and `super`.
@@ -29,27 +30,28 @@ pub(super) struct SuperContext {
 
 /// Whether the ES5 lowering covers this class; anything else keeps the
 /// diagnostic and the class unchanged.
-pub(super) fn es5_class_supported(class: &ClassDeclaration) -> bool {
-    class.decorators.is_empty()
+pub(super) fn es5_class_supported(class: &ClassDeclaration, decorators_lowered: bool) -> bool {
+    let undecorated = |decorators: &[DecoratorNode]| decorators_lowered || decorators.is_empty();
+    let undecorated_parameters = |parameters: &[ParameterNode]| {
+        decorators_lowered
+            || parameters
+                .iter()
+                .all(|parameter| parameter.data().decorators.is_empty())
+    };
+    undecorated(&class.decorators)
         && class.members.iter().all(|member| match member.data() {
             ClassMember::Constructor(constructor) => {
-                constructor.decorators.is_empty()
-                    && constructor
-                        .parameters
-                        .iter()
-                        .all(|parameter| parameter.data().decorators.is_empty())
+                undecorated(&constructor.decorators)
+                    && undecorated_parameters(&constructor.parameters)
             }
             ClassMember::Method(method) => {
-                method.function.decorators.is_empty()
+                undecorated(&method.function.decorators)
                     && !matches!(method.name, PropertyName::Private(_))
-                    && method
-                        .function
-                        .parameters
-                        .iter()
-                        .all(|parameter| parameter.data().decorators.is_empty())
+                    && undecorated_parameters(&method.function.parameters)
             }
             ClassMember::Property(property) => {
-                property.decorators.is_empty() && !matches!(property.name, PropertyName::Private(_))
+                undecorated(&property.decorators)
+                    && !matches!(property.name, PropertyName::Private(_))
             }
             ClassMember::AutoAccessor(_) => false,
             ClassMember::StaticBlock(_)
@@ -180,19 +182,29 @@ impl Rewriter<'_> {
         class: &ClassDeclaration,
         wrapper: ExportWrapper,
     ) -> Option<Vec<Stmt>> {
-        if !es5_class_supported(class) {
+        let decorators_lowered = self.options.experimental_decorators;
+        if !es5_class_supported(class, decorators_lowered) {
             return None;
         }
         let mut class = class.clone();
-        let name = match &class.name {
-            Some(name) => name.clone(),
+        let (name, name_text) = match &class.name {
+            Some(name) => (
+                name.clone(),
+                self.token_text(name.data().token()).to_owned(),
+            ),
             None => {
                 let name = self.ident("default_1");
                 class.name = Some(name.clone());
-                name
+                (name, String::from("default_1"))
             }
         };
-        let lowered = self.lower_class(&class, class_range, None);
+        let decorations = if decorators_lowered && is_decorated(&class) {
+            self.es5_class_decorations(&mut class, &name, &name_text, class_range)
+        } else {
+            Vec::new()
+        };
+        let mut lowered = self.lower_class(&class, class_range, None);
+        lowered.postlude.extend(decorations);
         let (mut statements, iife) = self.es5_class_iife(&name, lowered, class_range);
         let variable = self.class_variable(&name, iife, class_range);
         match wrapper {
@@ -224,7 +236,7 @@ impl Rewriter<'_> {
         expression: &Expr,
         class: &ClassDeclaration,
     ) -> Option<Expr> {
-        if !es5_class_supported(class) {
+        if !es5_class_supported(class, false) {
             return None;
         }
         let range = expression.range();

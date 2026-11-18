@@ -967,6 +967,8 @@ pub struct CompilerOptions {
     /// `emitDecoratorMetadata` and `reactNamespace` read imports the source scan
     /// cannot see, so emit cannot prove one unused.
     keeps_imports: bool,
+    experimental_decorators: bool,
+    emit_decorator_metadata: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -1092,6 +1094,16 @@ impl CompilerOptions {
     #[must_use]
     pub const fn keeps_imports(&self) -> bool {
         self.keeps_imports
+    }
+
+    #[must_use]
+    pub const fn experimental_decorators(&self) -> bool {
+        self.experimental_decorators
+    }
+
+    #[must_use]
+    pub const fn emit_decorator_metadata(&self) -> bool {
+        self.emit_decorator_metadata
     }
 
     #[must_use]
@@ -1289,6 +1301,10 @@ impl ProjectConfig {
                 .unwrap_or(false),
             keeps_imports: optional_bool(compiler, "emitDecoratorMetadata")?.unwrap_or(false)
                 || compiler.is_some_and(|options| options.get("reactNamespace").is_some()),
+            experimental_decorators: optional_bool(compiler, "experimentalDecorators")?
+                .unwrap_or(false),
+            emit_decorator_metadata: optional_bool(compiler, "emitDecoratorMetadata")?
+                .unwrap_or(false),
             import_helpers: optional_bool(compiler, "importHelpers")?,
             es_module_interop: optional_bool(compiler, "esModuleInterop")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
