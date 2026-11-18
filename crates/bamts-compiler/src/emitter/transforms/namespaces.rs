@@ -9,12 +9,12 @@
 use std::collections::BTreeSet;
 
 use crate::checker::{SemanticModel, SymbolId, SymbolKind};
-use crate::emitter::{enum_number_lexeme, enum_string_lexeme};
+use crate::emitter::{ModuleKind, enum_number_lexeme, enum_string_lexeme};
 use crate::enum_plan::{EnumMemberPlan, EnumScalar};
 use crate::source::{TextRange, Utf16Pos};
 use crate::syntax::*;
 
-use super::{RestExcludeKey, Rewriter, ScriptTarget, property_key_text};
+use super::{RestExcludeKey, Rewriter, ScriptTarget, module_specifier, property_key_text};
 
 /// One namespace body being lowered.
 pub(super) struct NamespaceFrame {
@@ -143,6 +143,9 @@ impl Rewriter<'_> {
         statement: &Stmt,
         import: &ImportEqualsDeclaration,
     ) -> Vec<Stmt> {
+        if self.node_esm_require(import) {
+            return self.lower_node_require_alias(statement, import);
+        }
         let ExternalModuleReference::Qualified(name) = &import.reference else {
             return vec![statement.clone()];
         };
@@ -161,6 +164,134 @@ impl Rewriter<'_> {
             return vec![statement.clone()];
         };
         vec![self.alias_declaration(import, value, range)]
+    }
+
+    /// Whether an import assignment lowers through a file-local require: a
+    /// Node module mode emits this file in ES module format, where `require`
+    /// is no binding, so one is built from `createRequire`.
+    pub(super) fn node_esm_require(&self, import: &ImportEqualsDeclaration) -> bool {
+        self.options.node_module_mode
+            && self.cjs.is_none()
+            && matches!(self.options.module_kind, Some(ModuleKind::EsNext))
+            && matches!(import.reference, ExternalModuleReference::Require(_))
+    }
+
+    /// `const x = __require("y");`, which is what an import assignment a
+    /// Node ES-format file keeps becomes.
+    fn lower_node_require_alias(
+        &mut self,
+        statement: &Stmt,
+        import: &ImportEqualsDeclaration,
+    ) -> Vec<Stmt> {
+        let ExternalModuleReference::Require(source) = &import.reference else {
+            return vec![statement.clone()];
+        };
+        if import.is_type_only {
+            return vec![statement.clone()];
+        }
+        vec![self.node_require_declaration(statement.range(), &import.local, source)]
+    }
+
+    /// The same declaration, then `export { x };`, which is how an export
+    /// assignment publishes the binding however the file reads it.
+    pub(super) fn lower_exported_node_require(
+        &mut self,
+        inner: &Stmt,
+        import: &ImportEqualsDeclaration,
+    ) -> Vec<Stmt> {
+        let ExternalModuleReference::Require(source) = &import.reference else {
+            return vec![inner.clone()];
+        };
+        if import.is_type_only {
+            return Vec::new();
+        }
+        let name = ModuleExportName::Identifier(import.local.clone());
+        let specifier = self.syn_node(
+            inner.range(),
+            ExportSpecifier {
+                mode: ExportSpecifierMode::Value,
+                local: name.clone(),
+                exported: name,
+            },
+        );
+        let export = self.syn_node(
+            inner.range(),
+            Statement::Export(ExportDeclaration::Named(
+                ExportNamedDeclaration::Specifiers {
+                    type_only: false,
+                    specifiers: vec![specifier],
+                    source: None,
+                    attributes: None,
+                },
+            )),
+        );
+        vec![
+            self.node_require_declaration(inner.range(), &import.local, source),
+            export,
+        ]
+    }
+
+    fn node_require_declaration(
+        &mut self,
+        range: TextRange,
+        local: &IdentifierNode,
+        source: &StringLiteralNode,
+    ) -> Stmt {
+        let (_, require) = self.node_require_names();
+        let callee = self.ident_expr(&require);
+        let specifier = self.string_literal(&module_specifier(self.file, source));
+        let argument = self.syn_node(range, Expression::Literal(Literal::String(specifier)));
+        let call = self.call_expression(range, callee, vec![argument]);
+        let declarator = self.make_declarator(local.clone(), Some(call), range);
+        self.syn_node(
+            range,
+            Statement::Variable(VariableDeclaration {
+                range,
+                kind: self.node_require_kind(),
+                declarations: vec![declarator],
+            }),
+        )
+    }
+
+    /// The prelude's `createRequire` import name and the require function it
+    /// defines, each kept out of the file's own names.
+    fn node_require_names(&mut self) -> (String, String) {
+        if self.node_require_names.is_none() {
+            self.node_require_names = Some((
+                self.unique_authored_name("_createRequire"),
+                self.unique_authored_name("__require"),
+            ));
+        }
+        self.node_require_names
+            .clone()
+            .expect("names allocated above")
+    }
+
+    /// The two prelude lines a Node ES-format file with a kept import
+    /// assignment prints: the `createRequire` import and the require it
+    /// builds, once per file.
+    pub(super) fn node_require_prelude(&self) -> String {
+        let Some((create, require)) = &self.node_require_names else {
+            return String::new();
+        };
+        format!(
+            "import {{ createRequire as {create} }} from \"module\";\n{declare} {require} = {create}(import.meta.url);\n",
+            declare = if self.node_require_kind() == VariableKind::Var {
+                "var"
+            } else {
+                "const"
+            },
+        )
+    }
+
+    /// `var` below ES2015, `const` above: the keyword tsc declares a kept
+    /// import assignment's binding with.
+    fn node_require_kind(&self) -> VariableKind {
+        if self.options.target <= ScriptTarget::Es5 {
+            VariableKind::Var
+        } else {
+            VariableKind::Const
+        }
     }
 
     /// An exported alias publishes its target, unless that only names a type.

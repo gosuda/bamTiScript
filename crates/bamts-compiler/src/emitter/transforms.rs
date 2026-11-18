@@ -508,6 +508,7 @@ pub fn emit_transformed(
     } else {
         String::new()
     };
+    let node_require_prelude = rewriter.node_require_prelude();
     let (head, tail) = if rewriter.cjs.is_some() {
         let tail = join_preludes(
             &join_preludes(&cjs_marker, &tslib_binding),
@@ -517,7 +518,10 @@ pub fn emit_transformed(
     } else {
         (
             join_preludes(&head, &runtime_prelude),
-            join_preludes(&cjs_marker, &tslib_binding),
+            join_preludes(
+                &join_preludes(&cjs_marker, &tslib_binding),
+                &node_require_prelude,
+            ),
         )
     };
     let mut output = print_with_jsx_plan(
@@ -544,6 +548,7 @@ pub fn emit_transformed(
             remove_comments: options.remove_comments,
             verbatim_module_syntax: options.verbatim_module_syntax,
             module_marker: runtime_prelude.is_empty()
+                && node_require_prelude.is_empty()
                 && is_module
                 && matches!(
                     effective_module_kind(options),
@@ -915,6 +920,9 @@ struct Rewriter<'a> {
     read_aliases: Option<BTreeSet<Utf16Pos>>,
     /// The parameter holding each alias a namespace body publishes.
     published_aliases: BTreeMap<crate::checker::SymbolId, String>,
+    /// The `createRequire` and require names a Node ES-format file's kept
+    /// import assignments lower through, allocated on the first one.
+    node_require_names: Option<(String, String)>,
 }
 
 /// What the arrows lowered below ES2015 capture from their enclosing
@@ -1087,6 +1095,7 @@ impl<'a> Rewriter<'a> {
             value_symbol_ranges: None,
             read_aliases: None,
             published_aliases: BTreeMap::new(),
+            node_require_names: None,
         }
     }
     /// Scans top-level module syntax into a CommonJS lowering plan.
@@ -1757,6 +1766,9 @@ impl<'a> Rewriter<'a> {
             Statement::ImportEquals(import) if is_qualified_alias(import) => {
                 return self.lower_exported_alias(inner, import, binding, statement.range());
             }
+            Statement::ImportEquals(import) if self.node_esm_require(import) => {
+                return self.lower_exported_node_require(inner, import);
+            }
             _ => {}
         }
         if self.cjs.is_some() {
@@ -2350,6 +2362,13 @@ impl<'a> Rewriter<'a> {
     /// The name tsc gives a captured `this` or `arguments`: the plain name
     /// unless the program already writes it.
     fn capture_name(&mut self, base: &str) -> IdentifierNode {
+        let name = self.unique_authored_name(base);
+        self.ident(&name)
+    }
+
+    /// The plain name unless the program already writes it, then `_1`, `_2`,
+    /// and so on: how tsc keeps a synthesized name out of the file's own.
+    fn unique_authored_name(&mut self, base: &str) -> String {
         let file = self.file;
         let occupied = self
             .occupied_names
@@ -2360,7 +2379,7 @@ impl<'a> Rewriter<'a> {
             suffix += 1;
             name = format!("{base}_{suffix}");
         }
-        self.ident(&name)
+        name
     }
 
     /// A `this` inside a lowered arrow reads the enclosing function's capture.
@@ -17943,5 +17962,121 @@ export var a: any, b: any, c: any, d: any, e: any, f: any;
         assert_eq!(code.matches("    constructor() { }").count(), 2, "{code}");
         assert!(code.contains("]() { }"), "{code}");
         assert!(code.contains("'constructors'() { }"), "{code}");
+    }
+
+    #[test]
+    fn node_esm_import_assignment_prints_the_create_require_prelude_once() {
+        let output = emit_with_options(
+            "import a = require(\"a\");\nimport b = require(\"b\");\na;\nb;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                node_module_mode: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "import { createRequire as _createRequire } from \"module\";\n\
+             const __require = _createRequire(import.meta.url);\n\
+             const a = __require(\"a\");\n\
+             const b = __require(\"b\");\n\
+             a;\n\
+             b;\n"
+        );
+    }
+
+    #[test]
+    fn node_esm_export_import_assignment_publishes_the_binding() {
+        let output = emit_with_options(
+            "export import fs2 = require(\"fs\");\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                node_module_mode: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "import { createRequire as _createRequire } from \"module\";\n\
+             const __require = _createRequire(import.meta.url);\n\
+             const fs2 = __require(\"fs\");\n\
+             export { fs2 };\n"
+        );
+    }
+
+    #[test]
+    fn node_esm_unused_import_assignment_prints_no_prelude() {
+        let output = emit_with_options(
+            "import fs = require(\"fs\");\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                node_module_mode: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(javascript(&output), "export {};\n");
+    }
+
+    #[test]
+    fn node_esm_require_names_stay_clear_of_authored_names() {
+        let output = emit_with_options(
+            "const __require = null;\nconst _createRequire = null;\n\
+             import fs = require(\"fs\");\nfs.readFile;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                node_module_mode: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "import { createRequire as _createRequire_1 } from \"module\";\n\
+             const __require_1 = _createRequire_1(import.meta.url);\n\
+             const __require = null;\n\
+             const _createRequire = null;\n\
+             const fs = __require_1(\"fs\");\n\
+             fs.readFile;\n"
+        );
+    }
+
+    #[test]
+    fn node_cjs_format_file_keeps_plain_require() {
+        let output = emit_with_options(
+            "import fs = require(\"fs\");\nfs.readFile;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2022,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                node_module_mode: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("const fs = require(\"fs\");"), "{code}");
+        assert!(!code.contains("_createRequire"), "{code}");
+        assert!(!code.contains("__require"), "{code}");
+    }
+
+    #[test]
+    fn node_esm_es5_target_declares_the_require_binding_with_var() {
+        let output = emit_with_options(
+            "import foo = require(\"foo\");\nfoo;\n",
+            EmitOptions {
+                target: ScriptTarget::Es5,
+                module: Some(crate::emitter::ModuleKind::EsNext),
+                node_module_mode: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript(&output),
+            "import { createRequire as _createRequire } from \"module\";\n\
+             var __require = _createRequire(import.meta.url);\n\
+             var foo = __require(\"foo\");\n\
+             foo;\n"
+        );
     }
 }
