@@ -880,6 +880,10 @@ const STANDARD_VALUES: &[LibEntry] = &[
         lib: Lib::Dom,
     },
     LibEntry {
+        name: "ResizeObserver",
+        lib: Lib::Dom,
+    },
+    LibEntry {
         name: "Notification",
         lib: Lib::Dom,
     },
@@ -1406,6 +1410,22 @@ const STANDARD_TYPES: &[LibEntry] = &[
     },
     LibEntry {
         name: "ResponseInit",
+        lib: Lib::Dom,
+    },
+    LibEntry {
+        name: "CustomEvent",
+        lib: Lib::Dom,
+    },
+    LibEntry {
+        name: "Element",
+        lib: Lib::Dom,
+    },
+    LibEntry {
+        name: "ResizeObserver",
+        lib: Lib::Dom,
+    },
+    LibEntry {
+        name: "ResizeObserverEntry",
         lib: Lib::Dom,
     },
     LibEntry {
