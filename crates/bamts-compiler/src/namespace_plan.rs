@@ -415,6 +415,13 @@ fn collect_runtime_exports(
                 identities,
             );
         }
+        Statement::Declare(ambient) => {
+            if let Statement::Variable(variable) = ambient.data() {
+                collect_variable_exports(variable, |identifier| {
+                    add_ambient_variable_identity(identifier, binding, model, source, identities);
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -469,6 +476,29 @@ fn add_export(
         container: binding.symbol,
         name,
         storage,
+        declaration_block: binding.declaration_id,
+    });
+}
+
+/// An `export declare var` has no runtime export of its own, yet a read of it
+/// inside the namespace is still a read of the container's property.
+fn add_ambient_variable_identity(
+    identifier: &crate::syntax::IdentifierNode,
+    binding: &NamespaceDeclarationBinding<'_>,
+    model: &SemanticModel,
+    source: &crate::syntax::SourceFile,
+    identities: &mut HashMap<SymbolId, Vec<ExportIdentity>>,
+) {
+    let Some(name) = source.identifier_text(identifier.data().token()) else {
+        return;
+    };
+    let Some(symbol) = model.scope(binding.export_scope).value(name.as_ref()) else {
+        return;
+    };
+    identities.entry(symbol).or_default().push(ExportIdentity {
+        container: binding.symbol,
+        name: EcmaString::encode(name.as_ref()),
+        storage: ExportStorage::Property,
         declaration_block: binding.declaration_id,
     });
 }
