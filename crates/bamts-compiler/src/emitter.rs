@@ -1885,6 +1885,10 @@ impl<'a> Emitter<'a> {
                 self.emit_block(block);
                 true
             }
+            Statement::Empty if statement.id().get() < self.synthesized_floor => {
+                self.raw(";");
+                true
+            }
             Statement::Empty => false,
             Statement::Expression(statement) => {
                 self.emit_expression_statement(statement);

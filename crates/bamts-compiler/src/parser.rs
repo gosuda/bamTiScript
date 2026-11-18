@@ -1232,7 +1232,6 @@ impl Parser {
             }
             let before = self.cursor;
             let statement = self.parse_statement();
-            statements.push(statement);
             if self.cursor == before {
                 let skipped = self.bump();
                 self.error_at(
@@ -1240,6 +1239,9 @@ impl Parser {
                     skipped.range(),
                     "this token was skipped during recovery",
                 );
+            }
+            if !matches!(statement.data(), Statement::Missing(_)) {
+                statements.push(statement);
             }
         }
         statements
