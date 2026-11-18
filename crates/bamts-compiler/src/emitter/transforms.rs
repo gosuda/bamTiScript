@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::checker::{SemanticModel, SymbolId};
+use crate::checker::{SemanticModel, SymbolId, SymbolKind};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::jsx_desugar::{
     JsxEmitOptions, JsxRuntimeBinding, JsxRuntimeImportStyle, JsxSourceDesugarPlan,
@@ -39,6 +39,7 @@ use super::{
 
 mod amd_module;
 mod decorator_metadata;
+mod es5_async;
 mod es5_class;
 mod legacy_decorators;
 mod namespaces;
@@ -924,6 +925,8 @@ struct Rewriter<'a> {
     disposal_environments: Vec<IdentifierNode>,
     /// Identifiers a generated name must avoid, once one is needed.
     occupied_names: Option<BTreeSet<String>>,
+    /// The `e_N` exception temps the machine catch segments hoisted.
+    catch_temp_count: usize,
     /// Where each value name is declared, once a namespace needs to know.
     value_symbol_ranges: Option<std::collections::HashMap<String, Vec<TextRange>>>,
     /// Where each alias read as a value is declared, once one needs to know.
@@ -947,6 +950,10 @@ struct CaptureScope {
     this_always: bool,
     this: Option<IdentifierNode>,
     arguments: Option<IdentifierNode>,
+    /// A `this` was rewritten in this function since the flag was last
+    /// cleared; an async arrow reads it to learn whether its body uses the
+    /// enclosing `this`.
+    reads_this: bool,
 }
 
 /// Exported names one `exports.a = exports.b = void 0;` statement may chain.
@@ -1104,6 +1111,7 @@ impl<'a> Rewriter<'a> {
             declared_names: Vec::new(),
             disposal_environments: Vec::new(),
             occupied_names: None,
+            catch_temp_count: 0,
             value_symbol_ranges: None,
             read_aliases: None,
             published_aliases: BTreeMap::new(),
@@ -2407,8 +2415,27 @@ impl<'a> Rewriter<'a> {
         name
     }
 
+    /// The next `e_N` exception temp: always suffixed, skipping names the
+    /// program already writes.
+    fn next_catch_temp_name(&mut self) -> String {
+        let file = self.file;
+        let occupied = self
+            .occupied_names
+            .get_or_insert_with(|| identifier_names(file));
+        loop {
+            self.catch_temp_count += 1;
+            let name = format!("e_{}", self.catch_temp_count);
+            if !occupied.contains(&name) {
+                return name;
+            }
+        }
+    }
+
     /// A `this` inside a lowered arrow reads the enclosing function's capture.
     fn rewrite_this(&mut self, expression: &Expr) -> Expr {
+        if let Some(scope) = self.capture_scopes.last_mut() {
+            scope.reads_this = true;
+        }
         if !self
             .capture_scopes
             .last()
@@ -6672,10 +6699,16 @@ impl<'a> Rewriter<'a> {
     }
 
     fn lower_async_function(&mut self, function: &FunctionLike, range: TextRange) -> FunctionLike {
+        let (renamed, arguments_capture) = match function.body.as_ref() {
+            Some(body) => {
+                let (body, capture) = self.capture_arguments_reads(body);
+                (Some(body), capture)
+            }
+            None => (None, None),
+        };
         let previous = self.replace_await;
         self.replace_await = true;
-        let inner_body = function
-            .body
+        let inner_body = renamed
             .as_ref()
             .map(|body| self.rewrite_body(body))
             .unwrap_or_else(|| {
@@ -6713,6 +6746,7 @@ impl<'a> Rewriter<'a> {
         } else {
             inner
         };
+        let inner = self.preserve_converted_body_lines(inner, renamed.as_ref());
         let inner_expr = self.syn_node(
             range,
             Expression::Function(FunctionExpression { function: inner }),
@@ -6720,6 +6754,11 @@ impl<'a> Rewriter<'a> {
         let awaiter = self.helper_ident(HelperKind::Awaiter);
         let this_arg = self.syn_node(range, Expression::This);
         let void_zero = self.void_zero(range);
+        let promise = if Self::needs(LanguageFeature::Generators, self.options) {
+            self.awaiter_promise_argument(function.return_type.as_ref(), range)
+        } else {
+            self.void_zero(range)
+        };
         let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
@@ -6729,7 +6768,7 @@ impl<'a> Rewriter<'a> {
                 arguments: vec![
                     CallArgument::Expression(Box::new(this_arg)),
                     CallArgument::Expression(Box::new(void_zero.clone())),
-                    CallArgument::Expression(Box::new(void_zero)),
+                    CallArgument::Expression(Box::new(promise)),
                     CallArgument::Expression(Box::new(inner_expr)),
                 ],
             }),
@@ -6740,17 +6779,152 @@ impl<'a> Rewriter<'a> {
                 argument: Some(Box::new(call)),
             }),
         );
+        let mut statements = Vec::new();
+        if let Some(temp) = &arguments_capture {
+            let arguments = self.ident_expr("arguments");
+            statements.push(self.make_temp_declaration(temp.clone(), arguments, range));
+        }
+        statements.push(return_stmt);
         FunctionLike {
             is_async: false,
             is_generator: false,
-            body: Some(FunctionBody::Block(self.syn_node(
-                range,
-                Block {
-                    statements: vec![return_stmt],
-                },
-            ))),
+            body: Some(FunctionBody::Block(
+                self.syn_node(range, Block { statements }),
+            )),
             ..function.clone()
         }
+    }
+
+    /// Rewraps a converted machine body in the original body's range so the
+    /// printer keeps an authored single-line body on one line, as tsc's
+    /// converted functions do; multi-line and missing bodies expand.
+    fn preserve_converted_body_lines(
+        &mut self,
+        mut lowered: FunctionLike,
+        original: Option<&FunctionBody>,
+    ) -> FunctionLike {
+        let Some(FunctionBody::Block(machine)) = lowered.body.as_ref() else {
+            return lowered;
+        };
+        let range = match original {
+            Some(FunctionBody::Block(block)) => block.range(),
+            Some(FunctionBody::Expression(expression)) => expression.range(),
+            None | Some(FunctionBody::Missing(_)) => return lowered,
+        };
+        if range.start() == range.end() {
+            return lowered;
+        }
+        let statements = machine.data().statements.clone();
+        lowered.body = Some(FunctionBody::Block(self.node(range, Block { statements })));
+        lowered
+    }
+
+    /// The body of an async function with its `arguments` reads moved to a
+    /// hoisted copy, and that copy's name. The reads end up inside the
+    /// generator closure, which has its own `arguments`. A body that never
+    /// reads `arguments` comes back unchanged with no name.
+    fn capture_arguments_reads(
+        &mut self,
+        body: &FunctionBody,
+    ) -> (FunctionBody, Option<IdentifierNode>) {
+        let probe = self.ident("arguments");
+        let probed = self.rename_arguments_in_body(body, &probe);
+        let reads = match (body, &probed) {
+            (FunctionBody::Block(before), FunctionBody::Block(after)) => {
+                before.data().statements != after.data().statements
+            }
+            (FunctionBody::Expression(before), FunctionBody::Expression(after)) => before != after,
+            _ => false,
+        };
+        if !reads {
+            return (body.clone(), None);
+        }
+        let capture = self.capture_arguments_for_awaiter();
+        (self.rename_arguments_in_body(body, &capture), Some(capture))
+    }
+
+    /// `__awaiter`'s promise constructor argument: the return type's name
+    /// when the annotation also names a value, `void 0` otherwise. The
+    /// intrinsic `Promise` reads as absent, and an imported name adopts its
+    /// CommonJS alias.
+    fn awaiter_promise_argument(
+        &mut self,
+        annotation: Option<&TypeAnnotationNode>,
+        range: TextRange,
+    ) -> Expr {
+        let named = annotation.and_then(|annotation| match annotation.data().type_node.data() {
+            TypeNode::Reference(reference) => match &reference.name {
+                EntityName::Identifier(ident) => Some(ident.clone()),
+                EntityName::Qualified { .. } | EntityName::Missing(_) => None,
+            },
+            _ => None,
+        });
+        let Some(ident) = named else {
+            return self.void_zero(range);
+        };
+        let symbol = self.model.and_then(|model| {
+            model
+                .symbol_references()
+                .iter()
+                .find(|(range, _)| *range == ident.range())
+                .map(|(_, symbol)| *symbol)
+        });
+        let Some(symbol) = symbol.filter(|symbol| self.promise_names_a_value(*symbol)) else {
+            return self.void_zero(range);
+        };
+        match self.promise_import_replacement(symbol, ident.range()) {
+            Some(replacement) => replacement,
+            None => self.node(ident.range(), Expression::Identifier(ident)),
+        }
+    }
+
+    /// Whether the annotation's symbol also carries a value: value kinds do
+    /// by themselves; type-only kinds need a same-named value declaration in
+    /// their scope; intrinsics never do.
+    fn promise_names_a_value(&self, symbol: SymbolId) -> bool {
+        let Some(model) = self.model else {
+            return false;
+        };
+        let declared = model.symbol(symbol);
+        match declared.kind() {
+            SymbolKind::Variable(_)
+            | SymbolKind::Function
+            | SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::EnumMember
+            | SymbolKind::Import
+            | SymbolKind::Namespace => true,
+            SymbolKind::IntrinsicType | SymbolKind::IntrinsicValue => false,
+            SymbolKind::TypeAlias
+            | SymbolKind::Interface
+            | SymbolKind::Parameter
+            | SymbolKind::TypeParameter => model
+                .lookup_value(declared.scope(), declared.name())
+                .is_some(),
+        }
+    }
+
+    /// `root` or `root.member` for an imported name, as value reads print.
+    fn promise_import_replacement(&mut self, symbol: SymbolId, range: TextRange) -> Option<Expr> {
+        let (root, property) = {
+            let plan = self.cjs.as_ref()?;
+            let reference = plan.imports.get(&symbol)?.clone();
+            (reference.root, reference.property)
+        };
+        let root_ident = self.ident(&root);
+        let object = self.node(range, Expression::Identifier(root_ident));
+        let Some(property) = property else {
+            return Some(object);
+        };
+        let property = self.named_or_computed(&property, range);
+        Some(self.node(
+            range,
+            Expression::Member(MemberExpression {
+                object: Box::new(object),
+                property,
+                optional: false,
+            }),
+        ))
     }
 
     fn void_zero(&mut self, range: TextRange) -> Expr {
@@ -6773,7 +6947,9 @@ impl<'a> Rewriter<'a> {
         let Some(FunctionBody::Block(block)) = function.body.as_ref() else {
             return function.clone();
         };
-        let Some((hoisted, state_name, temps, machine)) = self.generator_machine(block) else {
+        let Some((declarations, hoisted, state_name, temps, machine)) =
+            self.generator_machine(block)
+        else {
             return function.clone();
         };
         let range = block.range();
@@ -6835,10 +7011,10 @@ impl<'a> Rewriter<'a> {
                 argument: Some(Box::new(call)),
             }),
         );
-        let mut declarations = hoisted;
-        declarations.extend(temps.iter().cloned());
-        let mut statements = Vec::new();
-        if let Some(declaration) = self.temp_declaration(declarations, range) {
+        let mut names = hoisted;
+        names.extend(temps.iter().cloned());
+        let mut statements = declarations;
+        if let Some(declaration) = self.temp_declaration(names, range) {
             statements.push(declaration);
         }
         statements.push(return_stmt);
@@ -6859,10 +7035,11 @@ impl<'a> Rewriter<'a> {
         let mut ctx = MachineCtx::new(&state);
         self.machine_statements(block, &mut ctx)?;
         let range = block.range();
+        let declarations = ctx.declarations.clone();
         let hoisted = ctx.hoisted.clone();
         let temps = ctx.temps.clone();
         if ctx.segments.len() == 1 {
-            return Some((hoisted, state, temps, ctx.segments.pop()?));
+            return Some((declarations, hoisted, state, temps, ctx.segments.pop()?));
         }
         let state_expr = self.ident_expr(&state);
         let label_name = self.ident("label");
@@ -6885,7 +7062,7 @@ impl<'a> Rewriter<'a> {
                 cases,
             }),
         );
-        Some((hoisted, state, temps, vec![switch]))
+        Some((ctx.declarations, hoisted, state, temps, vec![switch]))
     }
 
     /// Rewrites the block's statements into machine segments. Evaluation
@@ -6903,85 +7080,7 @@ impl<'a> Rewriter<'a> {
             if ctx.terminated {
                 return None;
             }
-            match statement.data() {
-                Statement::Variable(declaration) if declaration.kind == VariableKind::Var => {
-                    for declarator in &declaration.declarations {
-                        let BindingPattern::Identifier(name) = declarator.data().binding.data()
-                        else {
-                            return None;
-                        };
-                        let name = name.clone();
-                        ctx.hoisted.push(name.clone());
-                        if let Some(initializer) = &declarator.data().initializer {
-                            let value = if contains_yield(initializer) {
-                                self.eval(initializer, ctx)?
-                            } else {
-                                initializer.as_ref().clone()
-                            };
-                            let assign = self.assign_statement(&name, value, range);
-                            ctx.push(assign);
-                        }
-                    }
-                }
-                Statement::Expression(expression) => {
-                    // A comma sequence in statement position flattens: each
-                    // element discards its value, so they become standalone
-                    // statements in order.
-                    if let Expression::Sequence(sequence) = expression.expression.data() {
-                        for element in &sequence.expressions {
-                            self.machine_emit_expression(element, ctx)?;
-                        }
-                    } else {
-                        self.machine_emit_expression(&expression.expression, ctx)?;
-                    }
-                }
-                Statement::If(if_statement) => {
-                    self.machine_emit_if(statement, if_statement, ctx)?;
-                }
-                Statement::While(while_statement) => {
-                    self.machine_emit_while(statement, while_statement, ctx)?;
-                }
-                Statement::DoWhile(do_statement) => {
-                    self.machine_emit_do(statement, do_statement, ctx)?;
-                }
-                Statement::For(for_statement) => {
-                    self.machine_emit_for(statement, for_statement, ctx)?;
-                }
-                Statement::Switch(switch_statement) => {
-                    self.machine_emit_switch(statement, switch_statement, ctx)?;
-                }
-                Statement::Labeled(labeled) => {
-                    let name = self.identifier_name(&labeled.label)?;
-                    ctx.loop_labels.push(name);
-                    let result = self.machine_emit_labeled(statement, &labeled.body, ctx);
-                    ctx.loop_labels.pop();
-                    result?;
-                }
-
-                Statement::Return(returned) => {
-                    let terminator = match &returned.argument {
-                        Some(value) if contains_yield(value) => {
-                            let evaluated = self.eval(value, ctx)?;
-                            let sentinel = self.number_expr("2 /*return*/");
-                            let array = self.array_literal(vec![sentinel, evaluated], range);
-                            self.machine_return(array, range)
-                        }
-                        Some(value) => {
-                            let sentinel = self.number_expr("2 /*return*/");
-                            let array =
-                                self.array_literal(vec![sentinel, value.as_ref().clone()], range);
-                            self.machine_return(array, range)
-                        }
-                        None => {
-                            let sentinel = self.return_sentinel(range);
-                            self.machine_return(sentinel, range)
-                        }
-                    };
-                    ctx.push(terminator);
-                    ctx.terminated = true;
-                }
-                _ => return None,
-            }
+            self.machine_statement(statement, range, ctx)?;
         }
         if !ctx.terminated {
             let sentinel = self.return_sentinel(range);
@@ -6991,7 +7090,9 @@ impl<'a> Rewriter<'a> {
         Some(())
     }
 
-    /// Emits one expression as a statement, splitting any suspension.
+    /// Emits one expression as a statement, splitting any suspension. A
+    /// comma sequence flattens only when it suspends: a clean sequence
+    /// keeps its commas, as the downleveled for-of init prints them.
     fn machine_emit_expression(&mut self, expression: &Expr, ctx: &mut MachineCtx) -> Option<()> {
         let range = expression.range();
         if !contains_yield(expression) {
@@ -7001,6 +7102,12 @@ impl<'a> Rewriter<'a> {
                     expression: Box::new(expression.clone()),
                 }),
             ));
+            return Some(());
+        }
+        if let Expression::Sequence(sequence) = expression.data() {
+            for element in &sequence.expressions {
+                self.machine_emit_expression(element, ctx)?;
+            }
             return Some(());
         }
         let value = self.eval(expression, ctx)?;
@@ -7109,6 +7216,10 @@ impl<'a> Rewriter<'a> {
         body: &Stmt,
         ctx: &mut MachineCtx,
     ) -> Option<()> {
+        let label_name = match statement.data() {
+            Statement::Labeled(labeled) => self.identifier_name(&labeled.label)?,
+            _ => return None,
+        };
         match body.data() {
             Statement::While(while_statement) => {
                 let body_block = block_statements(&while_statement.body)?;
@@ -7117,10 +7228,12 @@ impl<'a> Rewriter<'a> {
                     && !statements_contain_return(body_block)
                 {
                     // Clean loops stay inline, label attached.
-                    ctx.push(statement.clone());
+                    for rewritten in self.machine_prepare_verbatim(statement, ctx)? {
+                        ctx.push(rewritten);
+                    }
                     return Some(());
                 }
-                self.machine_emit_while(body, while_statement, ctx)
+                self.machine_emit_while(body, while_statement, Some(&label_name), ctx)
             }
             Statement::DoWhile(do_statement) => {
                 let body_block = block_statements(&do_statement.body)?;
@@ -7128,10 +7241,12 @@ impl<'a> Rewriter<'a> {
                     && count_branch_yields(body_block) == 0
                     && !statements_contain_return(body_block)
                 {
-                    ctx.push(statement.clone());
+                    for rewritten in self.machine_prepare_verbatim(statement, ctx)? {
+                        ctx.push(rewritten);
+                    }
                     return Some(());
                 }
-                self.machine_emit_do(body, do_statement, ctx)
+                self.machine_emit_do(body, do_statement, Some(&label_name), ctx)
             }
             Statement::For(for_statement) => {
                 let body_block = block_statements(&for_statement.body)?;
@@ -7141,28 +7256,21 @@ impl<'a> Rewriter<'a> {
                 {
                     let rebuilt =
                         self.inline_for_with_hoist(statement.range(), for_statement, ctx)?;
-                    let label = match statement.data() {
-                        Statement::Labeled(labeled) => labeled.label.clone(),
-                        _ => return None,
-                    };
-                    let labeled = self.node(
+                    let rebuilt = self.node(
                         statement.range(),
                         Statement::Labeled(LabeledStatement {
-                            label,
+                            label: match statement.data() {
+                                Statement::Labeled(labeled) => labeled.label.clone(),
+                                _ => return None,
+                            },
                             body: Box::new(rebuilt),
                         }),
                     );
-                    ctx.push(labeled);
+                    let rebuilt = self.machine_clean_jumps(rebuilt, ctx)?;
+                    ctx.push(rebuilt);
                     return Some(());
                 }
-                self.machine_emit_for(body, for_statement, ctx)
-            }
-            Statement::Labeled(labeled) => {
-                let name = self.identifier_name(&labeled.label)?;
-                ctx.loop_labels.push(name);
-                let result = self.machine_emit_labeled(body, &labeled.body, ctx);
-                ctx.loop_labels.pop();
-                result
+                self.machine_emit_for(body, for_statement, Some(&label_name), ctx)
             }
             _ => None,
         }
@@ -7178,6 +7286,7 @@ impl<'a> Rewriter<'a> {
         &mut self,
         statement: &Stmt,
         while_statement: &WhileStatement,
+        label: Option<&str>,
         ctx: &mut MachineCtx,
     ) -> Option<()> {
         let range = statement.range();
@@ -7185,7 +7294,9 @@ impl<'a> Rewriter<'a> {
         let test_resumes = count_yields(&while_statement.test);
         let body_resumes = count_branch_yields(body_block);
         if test_resumes == 0 && body_resumes == 0 && !statements_contain_return(body_block) {
-            ctx.push(statement.clone());
+            for rewritten in self.machine_prepare_verbatim(statement, ctx)? {
+                ctx.push(rewritten);
+            }
             return Some(());
         }
         if ctx.terminated {
@@ -7193,6 +7304,9 @@ impl<'a> Rewriter<'a> {
         }
         let head = ctx.segments.len() as u32 - 1;
         let exit_label = head + test_resumes + body_resumes + 1;
+        if let Some(name) = label {
+            ctx.loop_jumps.push((name.to_owned(), head, exit_label));
+        }
 
         let test = self.eval(&while_statement.test, ctx)?;
         let negated = self.node(
@@ -7239,6 +7353,7 @@ impl<'a> Rewriter<'a> {
         &mut self,
         statement: &Stmt,
         do_statement: &DoWhileStatement,
+        label: Option<&str>,
         ctx: &mut MachineCtx,
     ) -> Option<()> {
         let range = statement.range();
@@ -7246,7 +7361,9 @@ impl<'a> Rewriter<'a> {
         let test_resumes = count_yields(&do_statement.test);
         let body_resumes = count_branch_yields(body_block);
         if test_resumes == 0 && body_resumes == 0 && !statements_contain_return(body_block) {
-            ctx.push(statement.clone());
+            for rewritten in self.machine_prepare_verbatim(statement, ctx)? {
+                ctx.push(rewritten);
+            }
             return Some(());
         }
         if ctx.terminated {
@@ -7255,6 +7372,10 @@ impl<'a> Rewriter<'a> {
         let head = ctx.segments.len() as u32 - 1;
         let test_label = head + body_resumes + 1;
         let exit_label = test_label + test_resumes + 1;
+        if let Some(name) = label {
+            ctx.loop_jumps
+                .push((name.to_owned(), test_label, exit_label));
+        }
 
         self.machine_emit_loop_body(body_block, test_label, exit_label, ctx)?;
         let body_terminated = ctx
@@ -7353,6 +7474,7 @@ impl<'a> Rewriter<'a> {
         &mut self,
         statement: &Stmt,
         for_statement: &ForStatement,
+        label: Option<&str>,
         ctx: &mut MachineCtx,
     ) -> Option<()> {
         let range = statement.range();
@@ -7362,6 +7484,7 @@ impl<'a> Rewriter<'a> {
             && !statements_contain_return(body_block)
         {
             let rebuilt = self.inline_for_with_hoist(range, for_statement, ctx)?;
+            let rebuilt = self.machine_clean_jumps(rebuilt, ctx)?;
             ctx.push(rebuilt);
             return Some(());
         }
@@ -7395,11 +7518,13 @@ impl<'a> Rewriter<'a> {
         let guard_label = test_label + test_resumes;
         let update_label = guard_label + body_resumes + 1;
         let exit_label = update_label + update_resumes + 1;
+        if let Some(name) = label {
+            ctx.loop_jumps
+                .push((name.to_owned(), update_label, exit_label));
+        }
 
         match &for_statement.initializer {
-            Some(ForInitializer::Variable(declaration)) => {
-                // The declaration is plain data here; re-wrap it in a
-                // statement for the shared branch emitter.
+            Some(ForInitializer::Variable(declaration)) if init_resumes > 0 => {
                 let wrapper = self.node(
                     range,
                     Statement::Variable(VariableDeclaration {
@@ -7409,6 +7534,31 @@ impl<'a> Rewriter<'a> {
                     }),
                 );
                 self.machine_emit_branch(std::slice::from_ref(&wrapper), ctx)?;
+            }
+            Some(ForInitializer::Variable(declaration)) => {
+                let mut parts = Vec::new();
+                for declarator in &declaration.declarations {
+                    let BindingPattern::Identifier(name) = declarator.data().binding.data() else {
+                        return None;
+                    };
+                    let name = name.clone();
+                    ctx.hoisted.push(name.clone());
+                    if let Some(initializer) = &declarator.data().initializer {
+                        parts.push(self.assignment_expression(
+                            &name,
+                            initializer.as_ref().clone(),
+                            declarator.range(),
+                        ));
+                    }
+                }
+                if let Some(joined) = self.sequence_expression(parts, range) {
+                    ctx.push(self.node(
+                        range,
+                        Statement::Expression(ExpressionStatement {
+                            expression: Box::new(joined),
+                        }),
+                    ));
+                }
             }
             Some(ForInitializer::Expression(expression)) => {
                 self.machine_emit_expression(expression, ctx)?;
@@ -7497,7 +7647,9 @@ impl<'a> Rewriter<'a> {
             .iter()
             .any(|case| statements_contain_return(&case.data().consequent));
         if !disc_suspends && !any_test && !any_body && !any_return {
-            ctx.push(statement.clone());
+            for rewritten in self.machine_prepare_verbatim(statement, ctx)? {
+                ctx.push(rewritten);
+            }
             return Some(());
         }
         if disc_suspends && !any_test && !any_body && !any_return {
@@ -7731,14 +7883,16 @@ impl<'a> Rewriter<'a> {
             match statement.data() {
                 Statement::Continue(jump) => {
                     self.jump_label_matches(&jump.label, ctx)?;
+                    let target = self.jump_target(&jump.label, true, head, ctx);
                     let bank_range = self.bank.intern("continue");
-                    let back = self.break_to(head, bank_range);
+                    let back = self.break_to(target, bank_range);
                     ctx.push(back);
                 }
                 Statement::Break(jump) => {
                     self.jump_label_matches(&jump.label, ctx)?;
+                    let target = self.jump_target(&jump.label, false, exit, ctx);
                     let bank_range = self.bank.intern("break");
-                    let out = self.break_to(exit, bank_range);
+                    let out = self.break_to(target, bank_range);
                     ctx.push(out);
                 }
                 Statement::If(if_statement) if if_statement.alternate.is_none() => {
@@ -7814,6 +7968,34 @@ impl<'a> Rewriter<'a> {
                 }
             }
         }
+    }
+
+    /// A labeled jump targets the loop its label names; an unlabeled one
+    /// targets the innermost loop's own head or exit.
+    fn jump_target(
+        &self,
+        label: &Option<IdentifierNode>,
+        is_continue: bool,
+        innermost: u32,
+        ctx: &MachineCtx,
+    ) -> u32 {
+        let Some(label) = label else {
+            return innermost;
+        };
+        let Some(name) = self.identifier_name(label) else {
+            return innermost;
+        };
+        ctx.loop_jumps
+            .iter()
+            .rev()
+            .find(|(candidate, _, _)| candidate == &name)
+            .map_or(innermost, |(_, continue_target, break_target)| {
+                if is_continue {
+                    *continue_target
+                } else {
+                    *break_target
+                }
+            })
     }
     fn machine_emit_branch(&mut self, statements: &[Stmt], ctx: &mut MachineCtx) -> Option<()> {
         for statement in statements {
@@ -7926,7 +8108,10 @@ impl<'a> Rewriter<'a> {
                     }),
                 ))
             }
-            Expression::Logical(_) | Expression::Conditional(_) => None,
+            Expression::Logical(logical) => self.machine_logical(logical, ctx, range),
+            Expression::Conditional(conditional) => {
+                self.machine_conditional(conditional, ctx, range)
+            }
             Expression::Assignment(assignment) => {
                 match assignment.left.data() {
                     AssignmentTarget::Member(member) => {
@@ -8236,10 +8421,14 @@ impl<'a> Rewriter<'a> {
         for (index, element) in array.elements.iter().enumerate() {
             match element {
                 ArrayElement::Expression(value) => {
-                    let later = array.elements[index + 1..]
-                        .iter()
-                        .any(|element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)));
-                    let evaluated = self.eval_sibling(value, later, ctx)?;
+                    let evaluated = if index < first {
+                        self.eval(value, ctx)?
+                    } else {
+                        let later = array.elements[index + 1..]
+                            .iter()
+                            .any(|element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)));
+                        self.eval_sibling(value, later, ctx)?
+                    };
                     elements.push(ArrayElement::Expression(Box::new(evaluated)));
                 }
                 ArrayElement::Spread(_) if contains_yield_array(array) => return None,
@@ -8452,6 +8641,25 @@ impl<'a> Rewriter<'a> {
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(assignment),
+            }),
+        )
+    }
+
+    /// `<target> = <value>` as an expression, for comma-joined for-init
+    /// slots.
+    fn assignment_expression(
+        &mut self,
+        target: &IdentifierNode,
+        value: Expr,
+        range: TextRange,
+    ) -> Expr {
+        let left = self.node(target.range(), AssignmentTarget::Identifier(target.clone()));
+        self.node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
             }),
         )
     }
@@ -11371,92 +11579,6 @@ impl<'a> Rewriter<'a> {
         let index = self.number_expr(index);
         self.member_expr(frame, MemberProperty::Computed(Box::new(index)), range)
     }
-    /// Whether an arrow body references `this` or `arguments`, whose
-    /// lexical capture needs hoisting when the arrow becomes a function
-    /// expression. Unrecognized shapes report capture so the conversion
-    /// refuses them.
-    fn arrow_body_captures(&self, body: &FunctionBody) -> bool {
-        match body {
-            FunctionBody::Expression(expr) => self.expr_captures(expr),
-            FunctionBody::Block(block) => block
-                .data()
-                .statements
-                .iter()
-                .any(|s| self.stmt_captures(s)),
-            FunctionBody::Missing(_) => true,
-        }
-    }
-
-    fn stmt_captures(&self, statement: &Stmt) -> bool {
-        match statement.data() {
-            Statement::Expression(statement) => self.expr_captures(&statement.expression),
-            Statement::Return(returned) => returned
-                .argument
-                .as_deref()
-                .is_some_and(|value| self.expr_captures(value)),
-            Statement::Variable(declaration) => declaration.declarations.iter().any(|declarator| {
-                declarator
-                    .data()
-                    .initializer
-                    .as_deref()
-                    .is_some_and(|value| self.expr_captures(value))
-            }),
-            Statement::Block(block) => block
-                .data()
-                .statements
-                .iter()
-                .any(|s| self.stmt_captures(s)),
-            Statement::If(if_statement) => {
-                self.expr_captures(&if_statement.test)
-                    || self.stmt_captures(&if_statement.consequent)
-                    || if_statement
-                        .alternate
-                        .as_deref()
-                        .is_some_and(|alternate| self.stmt_captures(alternate))
-            }
-            _ => true,
-        }
-    }
-
-    fn expr_captures(&self, expression: &Expr) -> bool {
-        match expression.data() {
-            Expression::This => true,
-            Expression::Identifier(identifier) => {
-                self.identifier_name(identifier).as_deref() == Some("arguments")
-            }
-            Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
-            Expression::Call(call) => {
-                self.expr_captures(&call.callee)
-                    || call.arguments.iter().any(|argument| match argument {
-                        CallArgument::Expression(value) => self.expr_captures(value),
-                        _ => false,
-                    })
-            }
-            Expression::Member(member) => {
-                self.expr_captures(&member.object)
-                    || matches!(&member.property, MemberProperty::Computed(key) if self.expr_captures(key))
-            }
-            Expression::Object(object) => object.members.iter().any(|member| match member.data() {
-                ObjectMember::Property(property) => {
-                    self.expr_captures(&property.value)
-                        || matches!(&property.name, PropertyName::Computed(key) if self.expr_captures(key))
-                }
-                _ => true,
-            }),
-            Expression::Array(array) => array.elements.iter().any(|element| match element {
-                ArrayElement::Expression(value) => self.expr_captures(value),
-                _ => true,
-            }),
-            Expression::Unary(unary) => self.expr_captures(&unary.argument),
-            Expression::Yield(yielded) => yielded
-                .argument
-                .as_deref()
-                .is_some_and(|value| self.expr_captures(value)),
-            Expression::Await(awaited) => self.expr_captures(&awaited.argument),
-            Expression::Assignment(assignment) => self.expr_captures(&assignment.right),
-            _ => true,
-        }
-    }
 
     fn rewrite_arrow(&mut self, expression: &Expr, arrow: &ArrowFunction) -> Expr {
         let lowers_to_function = Self::needs(LanguageFeature::ArrowFunctions, self.options)
@@ -11467,9 +11589,19 @@ impl<'a> Rewriter<'a> {
         let (parameters, rest_decls) = self.rewrite_parameters(&arrow.parameters);
         self.pending_body_decls.push(rest_decls);
         if arrow.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
+            let lowers_arrow = Self::needs(LanguageFeature::ArrowFunctions, self.options);
+            let (renamed_body, arguments_capture) = if lowers_arrow {
+                self.capture_arguments_reads(&arrow.body)
+            } else {
+                (arrow.body.clone(), None)
+            };
             let previous = self.replace_await;
             self.replace_await = true;
-            let body = match &arrow.body {
+            let read_outside = self
+                .capture_scopes
+                .last_mut()
+                .is_some_and(|scope| std::mem::take(&mut scope.reads_this));
+            let body = match &renamed_body {
                 FunctionBody::Expression(expr) => {
                     self.expression_temp_scopes.push(Vec::new());
                     let rewritten = self.rewrite_expr(expr);
@@ -11498,6 +11630,13 @@ impl<'a> Rewriter<'a> {
                 other => self.rewrite_body(other),
             };
             self.replace_await = previous;
+            let reads_this = self.capture_scopes.last_mut().is_some_and(|scope| {
+                let read_inside = scope.reads_this;
+                scope.reads_this |= read_outside;
+                read_inside
+            });
+            let this_capture =
+                (lowers_arrow && reads_this).then(|| self.capture_this_for_awaiter());
             let inner = FunctionLike {
                 decorators: Vec::new(),
                 name: None,
@@ -11529,21 +11668,23 @@ impl<'a> Rewriter<'a> {
                 Expression::Function(FunctionExpression { function: inner }),
             );
             // ES5 has no arrows: the lowered arrow becomes a function
-            // expression returning the awaiter, whose receiver is `void 0`
-            // because arrows never bind `this`. Bodies that capture
-            // `this`/`arguments` need the hoisted-capture machinery and
-            // keep the arrow instead.
+            // expression returning the awaiter. The receiver is the
+            // captured `_this` when the body reads `this`, else `void 0`;
+            // a body reading `arguments` hoists `var arguments_N =
+            // arguments;` into the lowered function. A body with complex
+            // parameters keeps the arrow.
             let plain_parameters = arrow.parameters.iter().all(|parameter| {
                 matches!(
                     parameter.data().binding.data(),
                     BindingPattern::Identifier(_)
                 ) && parameter.data().initializer.is_none()
             });
-            let lower_to_function = Self::needs(LanguageFeature::ArrowFunctions, self.options)
-                && plain_parameters
-                && !self.arrow_body_captures(&arrow.body);
+            let lower_to_function = lowers_arrow && plain_parameters;
             let this_arg = if lower_to_function {
-                self.void_zero(expression.range())
+                match &this_capture {
+                    Some(name) => self.node(name.range(), Expression::Identifier(name.clone())),
+                    None => self.void_zero(expression.range()),
+                }
             } else {
                 self.syn_node(expression.range(), Expression::This)
             };
@@ -11564,17 +11705,56 @@ impl<'a> Rewriter<'a> {
                 }),
             );
             if lower_to_function {
-                // The expression body keeps tsc's converted-arrow layout:
-                // `function (params) { return awaiter; }` prints inline.
-                let function = FunctionLike {
-                    decorators: Vec::new(),
-                    name: None,
-                    is_async: false,
-                    is_generator: false,
-                    type_parameters: None,
-                    parameters,
-                    return_type: None,
-                    body: Some(FunctionBody::Expression(Box::new(call))),
+                let function = match &arguments_capture {
+                    Some(temp) => {
+                        // `var arguments_N = arguments;` precedes the
+                        // awaiter inside the lowered function, as tsc
+                        // reserves the name while the machine body would
+                        // otherwise shadow it.
+                        let arguments = self.ident_expr("arguments");
+                        let declaration =
+                            self.make_temp_declaration(temp.clone(), arguments, expression.range());
+                        let returned = self.syn_node(
+                            expression.range(),
+                            Statement::Return(ReturnStatement {
+                                argument: Some(Box::new(call)),
+                            }),
+                        );
+                        self.pending_body_decls.pop();
+                        let function = FunctionLike {
+                            decorators: Vec::new(),
+                            name: None,
+                            is_async: false,
+                            is_generator: false,
+                            type_parameters: None,
+                            parameters,
+                            return_type: None,
+                            body: Some(FunctionBody::Block(self.syn_node(
+                                expression.range(),
+                                Block {
+                                    statements: vec![declaration, returned],
+                                },
+                            ))),
+                        };
+                        return self.syn_node(
+                            expression.range(),
+                            Expression::Function(FunctionExpression { function }),
+                        );
+                    }
+                    None => {
+                        // The expression body keeps tsc's converted-arrow layout:
+                        // `function (params) { return awaiter; }` prints inline.
+                        FunctionLike {
+                            decorators: Vec::new(),
+                            name: None,
+                            is_async: false,
+                            is_generator: false,
+                            type_parameters: None,
+                            parameters,
+                            return_type: None,
+                            body: Some(FunctionBody::Expression(Box::new(call))),
+                        }
+                    }
                 };
                 self.pending_body_decls.pop();
                 return self.syn_node(
@@ -12229,9 +12409,16 @@ fn raw_token_text(file: &SourceFile, token: &Token) -> String {
         .to_owned()
 }
 
-/// The machine built from one generator body: hoisted user names, the
-/// state parameter name, temp names, and the machine statements.
-type MachineParts = (Vec<IdentifierNode>, String, Vec<IdentifierNode>, Vec<Stmt>);
+/// The machine built from one generator body: hoisted function
+/// declarations, hoisted user names, the state parameter name, temp names,
+/// and the machine statements.
+type MachineParts = (
+    Vec<Stmt>,
+    Vec<IdentifierNode>,
+    String,
+    Vec<IdentifierNode>,
+    Vec<Stmt>,
+);
 
 /// Builder state for one `__generator` machine pass.
 struct MachineCtx {
@@ -12241,6 +12428,11 @@ struct MachineCtx {
     terminated: bool,
     state: String,
     loop_labels: Vec<String>,
+    /// Function declarations hoisted above the machine, in source order.
+    declarations: Vec<Stmt>,
+    /// `(name, continue target, break target)` of the machine loops the
+    /// body's clean loops may jump out of.
+    loop_jumps: Vec<(String, u32, u32)>,
 }
 
 impl MachineCtx {
@@ -12251,6 +12443,8 @@ impl MachineCtx {
             segments: vec![Vec::new()],
             terminated: false,
             loop_labels: Vec::new(),
+            declarations: Vec::new(),
+            loop_jumps: Vec::new(),
             state: state.to_string(),
         }
     }
@@ -12425,6 +12619,16 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
                     case.data().test.as_deref().is_some_and(contains_await)
                         || statements_contain_await(&case.data().consequent)
                 })
+        }
+        Statement::Try(try_statement) => {
+            statements_contain_await(&try_statement.block.data().statements)
+                || try_statement.handler.as_ref().is_some_and(|handler| {
+                    statements_contain_await(&handler.data().body.data().statements)
+                })
+                || try_statement
+                    .finalizer
+                    .as_ref()
+                    .is_some_and(|finalizer| statements_contain_await(&finalizer.data().statements))
         }
         Statement::Labeled(labeled) => branch_awaits(&labeled.body),
         // Jumps and empties hold no expressions.

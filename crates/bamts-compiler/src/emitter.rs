@@ -8206,9 +8206,11 @@ export {};
     }
 
     #[test]
-    fn es5_async_arrow_with_this_keeps_the_arrow() {
-        // Bodies referencing `this` need the hoisted-capture machinery, so
-        // the conversion refuses and the arrow form stays.
+    fn es5_async_arrow_passes_the_captured_this_to_the_awaiter() {
+        // Authority: asyncArrowFunctionCapturesThis_es5(target=es5) binds
+        // `var _this = this;` and calls `__awaiter(_this, ...)`; only a body
+        // that reads `arguments` hoists `arguments_1`
+        // (asyncArrowFunctionCapturesArguments_es5).
         let options = EmitOptions {
             target: ScriptTarget::Es5,
             no_emit_helpers: true,
@@ -8222,11 +8224,12 @@ export {};
         ));
         let output = emit_output(parsed.product(), &options);
         let code = &javascript(&output).code;
-        assert!(code.contains("() => __awaiter(this"), "{code}");
+        assert!(code.contains("var _this = this;\n"), "{code}");
         assert!(
-            !code.contains("void 0, void 0, void 0, function () {\n    var"),
+            code.contains("__awaiter(_this, void 0, void 0, function () {"),
             "{code}"
         );
+        assert!(!code.contains("arguments_1"), "{code}");
     }
 
     #[test]
@@ -9346,12 +9349,12 @@ var c = () => 1;
             (
                 "conditional-expr-statement",
                 "declare var x: any, y: any;\nfunction* g() { return (yield x) ? y : (yield x); }\n",
-                false,
+                true,
             ),
             (
                 "logical-expr-statement",
                 "declare var x: any, y: any;\nfunction* g() { return (yield x) || (yield y); }\n",
-                false,
+                true,
             ),
             (
                 "import-expr-machine",
