@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+latchkey:
+  schema: 1
+
+jobs:
+  lint:
+    runs-on: small
+    steps:
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - if: always()
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: large
+    timeout-minutes: 60
+    env:
+      QUINT_HOME: /tmp/quint
+      TZ: UTC
+      LANG: C
+      LC_ALL: C
+      NO_COLOR: "1"
+    steps:
+      - name: Install Node 24.18.0 (the version the repo pins)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
+          sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+          command -v node && test "$(node --version)" = v24.18.0
+      - run: rustup toolchain install
+      - name: Install dependencies (npm, cargo, Quint)
+        run: |
+          npm ci
+          cargo fetch --locked
+          npm ci --prefix formal/quint
+          v=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
+          test "$v" = v0.6.0
+          d="$QUINT_HOME/rust-evaluator-$v"; mkdir -p "$d"
+          curl -fsSL --retry 3 -o /tmp/q.tgz "https://github.com/quint-co/quint/releases/download/evaluator/$v/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz"
+          echo "61755a09d5052d93a4e75e840059edfd0d3674aeda164b9d2464be3d6e21b1c2  /tmp/q.tgz" | sha256sum --check --strict
+          tar -xzf /tmp/q.tgz -C "$d" quint_evaluator && chmod +x "$d/quint_evaluator"
+      - name: Fetch pinned TypeScript test fixtures
+        run: cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+      - name: Test workspace (includes the corpus differential)
+        run: cargo test --workspace --locked --no-fail-fast
+
+  formal:
+    runs-on: medium
+    timeout-minutes: 45
+    env:
+      QUINT_HOME: /tmp/quint
+      V: cargo run --locked -q -p bamts-verification --bin bamts-verification --
+    steps:
+      - name: Install Node 24.18.0 (the version the repo pins)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
+          sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+          command -v node && test "$(node --version)" = v24.18.0
+      - run: rustup toolchain install
+      - name: Install Quint, Racket 9.2 and Lean while the verifier builds
+        run: |
+          (cargo fetch --locked -q && cargo build --locked -q -p bamts-verification --bin bamts-verification) & b=$!
+          npm ci --prefix formal/quint
+          v=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
+          test "$v" = v0.6.0
+          d="$QUINT_HOME/rust-evaluator-$v"; mkdir -p "$d"
+          curl -fsSL --retry 3 -o /tmp/q.tgz "https://github.com/quint-co/quint/releases/download/evaluator/$v/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz"
+          echo "61755a09d5052d93a4e75e840059edfd0d3674aeda164b9d2464be3d6e21b1c2  /tmp/q.tgz" | sha256sum --check --strict
+          tar -xzf /tmp/q.tgz -C "$d" quint_evaluator && chmod +x "$d/quint_evaluator"
+          curl -fsSLo /tmp/racket.sh https://download.racket-lang.org/installers/9.2/racket-9.2-x86_64-linux-cs.sh
+          sudo sh /tmp/racket.sh --create-dir --unix-style --dest /usr/local
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none --no-modify-path
+          sudo ln -sf ~/.elan/bin/* /usr/local/bin/
+          (cd formal/lean && lake build)
+          wait $b
+      - name: Fetch catalog authority
+        run: |
+          $V source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+          $V source fetch typescript-6.0-tests --dest target/authority/typescript-6.0.2-tests
+          $V source fetch typescript-compat-tests --dest target/authority/typescript-5.9.3-tests
+          $V source fetch test262 --dest target/authority/test262
+      - run: $V catalog regenerate --release typescript-7.0.2 --check
+      - run: $V formal audit --gates G1,G2,G5,G3,G4
+
+  conformance:
+    runs-on: medium
+    timeout-minutes: 60
+    env:
+      V: target/release/bamts-verification
+      BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
+    steps:
+      - name: Install Node 24.18.0 (the version the repo pins)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
+          sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+          command -v node && test "$(node --version)" = v24.18.0
+      - run: rustup toolchain install
+      - name: Build receipt tools, sync snapshot, audit ledger
+        run: |
+          npm ci
+          cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker --bin ts_conformance
+          target/release/ts_conformance sync --verify-pin --write-snapshot
+          target/release/ts_conformance audit-ledger --require-complete
+      - name: Fetch pinned TypeScript authority
+        run: |
+          $V source fetch typescript-7-compiler --dest target/authority/typescript-7.0.2
+          $V source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+      - name: Conformance receipts (4 parallel shards), merge and check
+        run: |
+          seq 0 3 | xargs -P4 -I{} $V suite run --catalog typescript-7.0.2 --shard "{}/4" \
+            --receipt "target/receipts/{}.jsonl" --runner compiler --platform x86_64-unknown-linux-gnu \
+            --workflow .latchkey/workflows/ci.yml --run-id "$LATCHKEY_CI_RUN_ID" \
+            --run-attempt "$LATCHKEY_CI_ATTEMPT" --source-sha "$(git rev-parse HEAD)" \
+            --job conformance --host ubuntu-24.04-x64 \
+            --runtime "node-$(node --version);rust-$(rustc --version)"
+          mkdir -p target/merged
+          $V suite merge --catalog typescript-7.0.2 --receipts target/receipts --out target/merged/receipt.jsonl
+          $V suite merge --catalog typescript-7.0.2 --receipts target/receipts --out target/merged/receipt.jsonl --check
+      - uses: latchkey/artifact-upload@1.0.0
+        with:
+          name: conformance-receipt
+          from: target/merged
+          path: .
