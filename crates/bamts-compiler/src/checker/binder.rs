@@ -47,7 +47,8 @@ use super::{
     MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION,
     NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
     PARAMETER_INITIALIZER_IN_SIGNATURE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
-    PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, REST_PARAMETER_NOT_LAST,
+    PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, REST_PARAMETER_ARRAY_TYPE,
+    REST_PARAMETER_NOT_LAST,
     SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
     STRICT_NULL_MEMBER_ACCESS, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
     SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
@@ -78,7 +79,8 @@ use super::{
     NON_VOID_FUNCTION_MUST_RETURN_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE,
     PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
-    PROPERTY_NOT_INITIALIZED_MESSAGE, REST_PARAMETER_NOT_LAST_MESSAGE,
+    PROPERTY_NOT_INITIALIZED_MESSAGE, REST_PARAMETER_ARRAY_TYPE_MESSAGE,
+    REST_PARAMETER_NOT_LAST_MESSAGE,
     SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
     STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
     SUPER_BEFORE_THIS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
@@ -15021,6 +15023,15 @@ impl<'src> Binder<'src> {
         let declared = annotation
             .or_else(|| initializer_type.map(|ty| self.types.widen(ty, false)))
             .unwrap_or(fallback);
+        let unannotated_rest = matches!(data.binding.data(), BindingPattern::Rest(_))
+            && data.type_annotation.is_none();
+        if unannotated_rest && !self.is_valid_rest_parameter_type(declared) {
+            self.emit(
+                REST_PARAMETER_ARRAY_TYPE,
+                parameter.range(),
+                REST_PARAMETER_ARRAY_TYPE_MESSAGE,
+            );
+        }
         self.assign_binding_pattern_types(&data.binding, declared, scope, annotation.is_some());
         if let BindingPattern::Identifier(name) = data.binding.data()
             && let Some(symbol) = self.scopes[scope.0 as usize]
@@ -17424,6 +17435,15 @@ impl<'src> Binder<'src> {
                         &member.property,
                         expression.range(),
                     );
+                    self.member_reference_recorded.insert(expression.id());
+                }
+                if let Some(object_symbol) = object_symbol
+                    && let MemberProperty::Named(identifier) = &member.property
+                    && self.symbols[object_symbol.get() as usize].kind == SymbolKind::IntrinsicValue
+                    && let Some(member_symbol) = self.intrinsic_static_member(object_symbol, identifier)
+                {
+                    self.symbol_references.push((identifier.range(), member_symbol));
+                    self.symbol_references.push((expression.range(), member_symbol));
                     self.member_reference_recorded.insert(expression.id());
                 }
                 if !self.member_reference_recorded.contains(&expression.id())
@@ -23395,6 +23415,30 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Gets or declares the dotted reference symbol for a static member of a
+    /// lib global (`Math.PI`, `DateConstructor.UTC`), so member accesses
+    /// record the same path, object, and property rows upstream shows.
+    fn intrinsic_static_member(
+        &mut self,
+        owner: SymbolId,
+        identifier: &IdentifierNode,
+    ) -> Option<SymbolId> {
+        let qualified = crate::checker::intrinsic_environment::intrinsic_static_member(
+            self.symbols[owner.get() as usize].name(),
+            &self.identifier_text(identifier),
+        )?;
+        let scope = self.module_scope;
+        if let Some(existing) = self.scopes[scope.0 as usize].values.get(qualified).copied() {
+            return Some(existing);
+        }
+        Some(self.declare(
+            qualified,
+            SymbolKind::IntrinsicValue,
+            scope,
+            NodeId::default(),
+            NodeId::default_range(),
+        ))
+    }
     /// Records the `.symbols` reference rows for a member access whose base
     /// resolves directly to a class or interface symbol (`this.n`, `C.s`).
     /// Named members land at the property identifier and the whole access
