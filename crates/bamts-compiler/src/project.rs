@@ -995,6 +995,13 @@ pub struct CompilerOptions {
     base_url: PathBuf,
     root_dir: Option<PathBuf>,
     out_dir: Option<PathBuf>,
+    /// Report an unused import binding with TS6133.
+    no_unused_locals: bool,
+    /// Report an unused parameter with TS6133.
+    no_unused_parameters: bool,
+    /// A classic JSX factory, fragment factory, or react namespace is configured,
+    /// so the checker cannot name the factory the classic transform reads.
+    jsx_custom_factory: bool,
     paths: Arc<[PathMapping]>,
     type_roots: Arc<[PathBuf]>,
 }
@@ -1105,8 +1112,23 @@ impl CompilerOptions {
     }
 
     #[must_use]
+    pub const fn no_unused_locals(&self) -> bool {
+        self.no_unused_locals
+    }
+
+    #[must_use]
+    pub const fn jsx_custom_factory(&self) -> bool {
+        self.jsx_custom_factory
+    }
+
+    #[must_use]
     pub const fn experimental_decorators(&self) -> bool {
         self.experimental_decorators
+    }
+
+    #[must_use]
+    pub const fn no_unused_parameters(&self) -> bool {
+        self.no_unused_parameters
     }
 
     #[must_use]
@@ -1340,6 +1362,13 @@ impl ProjectConfig {
             out_dir: optional_path(root, directory, compiler, "outDir")?,
             paths,
             type_roots: optional_path_array(root, directory, compiler, "typeRoots")?,
+            no_unused_locals: optional_bool(compiler, "noUnusedLocals")?.unwrap_or(false),
+            jsx_custom_factory: compiler.is_some_and(|options| {
+                options.get("jsxFactory").is_some()
+                    || options.get("jsxFragmentFactory").is_some()
+                    || options.get("reactNamespace").is_some()
+            }),
+            no_unused_parameters: optional_bool(compiler, "noUnusedParameters")?.unwrap_or(false),
         };
         Ok(Self {
             path,

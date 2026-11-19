@@ -44,6 +44,12 @@ pub mod relations;
 
 #[path = "checker/type_display.rs"]
 mod type_display;
+#[path = "checker/unused_imports.rs"]
+pub(crate) mod unused_imports;
+#[path = "checker/unused_locals.rs"]
+pub(crate) mod unused_locals;
+#[path = "checker/unused_reads.rs"]
+pub(crate) mod unused_reads;
 pub use type_display::{render_type, render_type_declaration};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -627,6 +633,14 @@ pub struct ProgramCheckOptions {
     /// to preserve the pre-lib-scoping behavior.
     libs: LibSet,
     check_js: bool,
+    /// Report an unused import binding with TS6133.
+    no_unused_locals: bool,
+    /// The JSX emit mode, for the classic factory read exemption.
+    jsx: Option<crate::source::JsxEmit>,
+    /// Report an unused parameter with TS6133.
+    no_unused_parameters: bool,
+    /// A custom classic JSX factory, fragment factory, or react namespace is configured.
+    jsx_custom_factory: bool,
 }
 
 impl ProgramCheckOptions {
@@ -643,6 +657,10 @@ impl ProgramCheckOptions {
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
+            no_unused_locals: false,
+            no_unused_parameters: false,
+            jsx: None,
+            jsx_custom_factory: false,
         }
     }
 
@@ -659,6 +677,10 @@ impl ProgramCheckOptions {
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
+            no_unused_locals: false,
+            no_unused_parameters: false,
+            jsx: None,
+            jsx_custom_factory: false,
         }
     }
 
@@ -760,6 +782,30 @@ impl ProgramCheckOptions {
     }
 
     #[must_use]
+    pub const fn with_no_unused_locals(mut self, value: bool) -> Self {
+        self.no_unused_locals = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_jsx(mut self, value: Option<crate::source::JsxEmit>) -> Self {
+        self.jsx = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_jsx_custom_factory(mut self, value: bool) -> Self {
+        self.jsx_custom_factory = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_no_unused_parameters(mut self, value: bool) -> Self {
+        self.no_unused_parameters = value;
+        self
+    }
+
+    #[must_use]
     pub const fn strict_null_checks(&self) -> bool {
         self.strict_null_checks
     }
@@ -799,6 +845,26 @@ impl ProgramCheckOptions {
     #[must_use]
     pub const fn check_js(&self) -> bool {
         self.check_js
+    }
+
+    #[must_use]
+    pub const fn no_unused_locals(&self) -> bool {
+        self.no_unused_locals
+    }
+
+    #[must_use]
+    pub const fn jsx(&self) -> Option<crate::source::JsxEmit> {
+        self.jsx
+    }
+
+    #[must_use]
+    pub const fn jsx_custom_factory(&self) -> bool {
+        self.jsx_custom_factory
+    }
+
+    #[must_use]
+    pub const fn no_unused_parameters(&self) -> bool {
+        self.no_unused_parameters
     }
 
     const fn environment(self) -> GlobalEnvironment {
@@ -1065,6 +1131,27 @@ pub fn check_program_with_options_and_cancel(
             Some(&program),
             levels,
         ));
+        if options.no_unused_locals() && checked_sources.contains(&source.source_id()) {
+            diagnostics.extend(unused_imports::unused_import_diagnostics(
+                source,
+                model,
+                unused_imports::UnusedImportOptions {
+                    jsx: options.jsx(),
+                    jsx_custom_factory: options.jsx_custom_factory(),
+                },
+            ));
+        }
+        if (options.no_unused_locals() || options.no_unused_parameters())
+            && checked_sources.contains(&source.source_id())
+        {
+            let unused = unused_locals::unused_diagnostics(source, model);
+            if options.no_unused_locals() {
+                diagnostics.extend(unused.locals);
+            }
+            if options.no_unused_parameters() {
+                diagnostics.extend(unused.params);
+            }
+        }
     }
     Ok(Recovered::new(program, diagnostics))
 }
