@@ -21,7 +21,8 @@ use std::{
 };
 
 use bamts_compiler::checker::{
-    DeclarationOccurrence, SemanticModel, SymbolId, SymbolKind, Type, TypeId, render_type,
+    DeclarationOccurrence, ScopeKind, SemanticModel, SymbolId, SymbolKind, Type, TypeId,
+    render_type,
 };
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
@@ -1722,13 +1723,14 @@ fn emit_unit_types(
         if range.start() == range.end() {
             continue;
         }
-        let type_id = model.symbol_type(SymbolId::new(index as u32));
+        let id = SymbolId::new(index as u32);
+        let type_id = model.symbol_type(id);
         if let Some(annotation) = annotation_for(
             source,
             range,
             symbol.name().to_owned(),
             render_type(model, type_id),
-            writes_caret(model, type_id, has_diagnostics),
+            writes_caret(model, source, type_id, has_diagnostics, Some(id), range),
         ) {
             records.push(annotation);
         }
@@ -1760,7 +1762,14 @@ fn emit_unit_types(
             range,
             slice_source(source, range),
             render_type(model, model.symbol_type(occurrence.symbol)),
-            writes_caret(model, model.symbol_type(occurrence.symbol), has_diagnostics),
+            writes_caret(
+                model,
+                source,
+                model.symbol_type(occurrence.symbol),
+                has_diagnostics,
+                Some(occurrence.symbol),
+                range,
+            ),
         ) {
             records.push(annotation);
         }
@@ -1773,7 +1782,7 @@ fn emit_unit_types(
             *range,
             display,
             render_type(model, *type_id),
-            writes_caret(model, *type_id, has_diagnostics),
+            writes_caret(model, source, *type_id, has_diagnostics, None, *range),
         ) {
             records.push(annotation);
         }
@@ -1826,8 +1835,92 @@ fn annotation_for(
     })
 }
 
-fn writes_caret(model: &SemanticModel, type_id: TypeId, has_diagnostics: bool) -> bool {
-    has_diagnostics || !matches!(model.types().get(type_id), Type::Error)
+fn writes_caret(
+    model: &SemanticModel,
+    source: &SourceText,
+    type_id: TypeId,
+    has_diagnostics: bool,
+    symbol: Option<SymbolId>,
+    range: TextRange,
+) -> bool {
+    if has_diagnostics {
+        return true;
+    }
+    let view = model.types().get(type_id);
+    if matches!(view, Type::Error) {
+        return false;
+    }
+    if !matches!(view, Type::Any) {
+        return true;
+    }
+    if let Some(id) = symbol {
+        let entry = model.symbol(id);
+        if matches!(entry.kind(), SymbolKind::Import) {
+            return true;
+        }
+        if matches!(model.scope(entry.scope()).kind(), ScopeKind::Catch) {
+            return true;
+        }
+    }
+    if is_access_site(source, range) {
+        return true;
+    }
+    if symbol.is_some() && is_binding_element(source, range) {
+        return true;
+    }
+    false
+}
+
+fn is_access_site(source: &SourceText, range: TextRange) -> bool {
+    matches!(prev_sigil(source, range), Some('.' | '<')) || next_starts_with_dot(source, range)
+}
+
+fn is_binding_element(source: &SourceText, range: TextRange) -> bool {
+    matches!(prev_sigil(source, range), Some('[' | ',' | '{'))
+        && matches!(next_sigil(source, range), Some(',' | ']' | '}'))
+}
+
+fn prev_sigil(source: &SourceText, range: TextRange) -> Option<char> {
+    let mut offset = source.utf16_to_byte(range.start()).ok()?;
+    let bytes = source.as_str().as_bytes();
+    while offset > 0 {
+        offset -= 1;
+        let byte = bytes[offset];
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        return byte.is_ascii().then_some(byte as char);
+    }
+    None
+}
+
+fn next_sigil(source: &SourceText, range: TextRange) -> Option<char> {
+    let mut offset = source.utf16_to_byte(range.end()).ok()?;
+    let bytes = source.as_str().as_bytes();
+    while offset < bytes.len() {
+        let byte = bytes[offset];
+        offset += 1;
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        return byte.is_ascii().then_some(byte as char);
+    }
+    None
+}
+
+fn next_starts_with_dot(source: &SourceText, range: TextRange) -> bool {
+    let Ok(offset) = source.utf16_to_byte(range.end()) else {
+        return false;
+    };
+    let bytes = source.as_str().as_bytes();
+    let mut cursor = offset;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) == Some(&b'.') {
+        return true;
+    }
+    bytes.get(cursor) == Some(&b'?') && bytes.get(cursor + 1) == Some(&b'.')
 }
 
 /// Slice the raw source text covered by a UTF-16 range.
@@ -4867,15 +4960,15 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
     /// `=== exportDefaultProperty2.ts ===`). A preamble holding code does
     /// keep the implicit case-named unit.
     #[test]
-    fn any_typed_records_keep_caret_line() {
-        let case_text = "var ANY: any;\nvar n: number;\n++ANY;\n";
+    fn clean_any_records_stay_bare() {
+        let case_text = "var ANY: any;\nvar n: number;\n";
         let units = split_case_units("tests/cases/compiler/anyCaretPin.ts", case_text);
         let entry = entry_virtual_path("tests/cases/compiler/anyCaretPin.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretPin.ts");
         assert!(
-            emitted.contains(">ANY : any\n>    : ^^^\n"),
-            "clean any keeps its caret, as jsxPreserveWithJsInput.types shows for >b : any: {emitted}"
+            emitted.contains(">ANY : any\nvar n: number;\n"),
+            "clean any drops its caret, as anyAsFunctionCall.types shows for >x : any: {emitted}"
         );
         assert!(
             emitted.contains(">n : number\n>  : ^^^^^^\n"),
@@ -4900,8 +4993,12 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
         let case = compile_case(&units, &entry).expect("case compiles");
         let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCaretCleanPin.ts");
         assert!(
-            emitted.contains(">p : any\n>  : ^^^\n"),
-            "clean any keeps its caret, as tsxEmitSpreadAttribute(target=es2015).types shows for >div : any (its >a : any parameter records are bare): {emitted}"
+            emitted.contains(">p : any\n"),
+            "the bare clean-any record itself still emits: {emitted}"
+        );
+        assert!(
+            !emitted.contains(">p : any\n>  : "),
+            "clean any drops its caret, as anyAsFunctionCall.types shows for >x : any: {emitted}"
         );
     }
 
@@ -4911,15 +5008,100 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
             "var x: any;\n",
             "tests/cases/compiler/errorBarePin.ts",
             |model| {
+                let source = SourceText::new("var x: any;\n").expect("source builds");
+                let symbol = model
+                    .symbols()
+                    .iter()
+                    .position(|symbol| symbol.name() == "x")
+                    .map(|index| SymbolId::new(index as u32))
+                    .expect("x is bound");
+                let range = model.symbol(symbol).range();
                 let any = model.types().any();
                 let error = model.types().error_type();
-                assert!(writes_caret(model, any, false));
-                assert!(writes_caret(model, any, true));
-                assert!(!writes_caret(model, error, false));
-                assert!(writes_caret(model, error, true));
+                assert!(!writes_caret(model, &source, any, false, Some(symbol), range));
+                assert!(writes_caret(model, &source, any, true, Some(symbol), range));
+                assert!(!writes_caret(model, &source, error, false, Some(symbol), range));
+                assert!(writes_caret(model, &source, error, true, Some(symbol), range));
             },
         );
     }
+
+    #[test]
+    fn clean_any_parameters_stay_bare() {
+        let case_text = "function f(a: any) { return a; }\n";
+        let units = split_case_units("tests/cases/compiler/anyParamPin.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyParamPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyParamPin.ts");
+        assert!(
+            emitted.contains(">a : any\n"),
+            "the bare clean-any parameter record still emits: {emitted}"
+        );
+        assert!(
+            !emitted.contains(">a : any\n>  : "),
+            "clean any drops its caret, as tsxEmitSpreadAttribute.types shows its >a : any parameter records bare: {emitted}"
+        );
+    }
+
+    #[test]
+    fn catch_binding_any_records_keep_caret() {
+        let case_text = "try {} catch (e) { e; }\n";
+        let units = split_case_units("tests/cases/compiler/anyCatchPin.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyCatchPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCatchPin.ts");
+        assert!(
+            emitted.contains(">e : any\n>  : ^^^\n"),
+            "catch-clause bindings keep their caret, as objectRestCatchES5.types shows for >a : any: {emitted}"
+        );
+    }
+
+    #[test]
+    fn ambient_destructured_any_records_keep_caret() {
+        let case_text = "declare var [a, b];\n";
+        let units = split_case_units("tests/cases/compiler/anyAmbientDestructurePin.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyAmbientDestructurePin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted =
+            emit_types_baseline(&case, "tests/cases/compiler/anyAmbientDestructurePin.ts");
+        assert!(
+            emitted.contains(">a : any\n>  : ^^^\n"),
+            "ambient destructured bindings keep their caret, as declarationInAmbientContext.types shows: {emitted}"
+        );
+        assert!(
+            emitted.contains(">b : any\n>  : ^^^\n"),
+            "ambient destructured bindings keep their caret, as declarationInAmbientContext.types shows: {emitted}"
+        );
+    }
+
+    #[test]
+    fn import_alias_any_records_keep_caret() {
+        let case_text = "// @filename: decl.d.ts\ndeclare module \"m\";\n// @filename: b.ts\nimport foo from \"m\";\n";
+        let units = split_case_units("tests/cases/compiler/anyImportPin.ts", case_text);
+        let entry = entry_virtual_path("tests/cases/compiler/anyImportPin.ts", &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyImportPin.ts");
+        assert!(
+            emitted.contains(">foo : any\n>    : ^^^\n"),
+            "import aliases keep their caret, as ambientShorthand.types shows for >foo : any: {emitted}"
+        );
+    }
+
+    #[test]
+    fn access_positions_keep_any_caret() {
+        let text = "var o: any;\nvar y = o.p;\n";
+        with_model(text, "tests/cases/compiler/anyAccessPin.ts", |model| {
+            let source = SourceText::new(text).expect("source builds");
+            let any = model.types().any();
+            let object = TextRange::new(Utf16Pos::new(20), Utf16Pos::new(21)).expect("range builds");
+            assert!(writes_caret(model, &source, any, false, None, object));
+            let name = TextRange::new(Utf16Pos::new(22), Utf16Pos::new(23)).expect("range builds");
+            assert!(writes_caret(model, &source, any, false, None, name));
+            let whole = TextRange::new(Utf16Pos::new(20), Utf16Pos::new(23)).expect("range builds");
+            assert!(!writes_caret(model, &source, any, false, None, whole));
+        });
+    }
+
     #[test]
     fn comment_only_preamble_is_not_a_unit() {
         let case = "\
@@ -5383,8 +5565,8 @@ export const a2 = 3;
     /// H4 pin: an annotated scalar case the checker fully types reproduces its
     /// upstream `.types` baseline (marker, section, source echo, `>expr : type`
     /// records, and underline widths) under `compare_types`. The declared-any
-    /// record keeps its caret, as the clean `ambientShorthand_reExport.types`
-    /// prints `>x : any` with a `>  : ^^^` underline.
+    /// record stays bare, as the clean `anyAsFunctionCall.types` prints
+    /// `>x : any` with no underline.
     #[test]
     fn emit_types_baseline_matches_fully_typed_scalar_case() {
         let logical = "tests/cases/compiler/scalarPin.ts";
@@ -5398,7 +5580,6 @@ export const a2 = 3;
             === scalarPin.ts ===\n\
             var x: any;\n\
             >x : any\n\
-            >  : ^^^\n\
             var s: string = \"hi\";\n\
             >s : string\n\
             >  : ^^^^^^\n\
@@ -5407,7 +5588,7 @@ export const a2 = 3;
         assert_eq!(
             compare_types(baseline, &emitted),
             FacetVerdict::Pass,
-            "clean any keeps its caret, as ambientShorthand_reExport.types shows for >x : any: emitted:\n{emitted}"
+            "clean any stays bare, as anyAsFunctionCall.types shows for >x : any: emitted:\n{emitted}"
         );
     }
 
@@ -5513,8 +5694,8 @@ export const a2 = 3;
     /// `var varInit = varInit;`: declaration name and resolving reference at
     /// different ranges are both legitimate records. Only exact (start, end,
     /// display, rendered) tuples collapse; text-identical records at distinct
-    /// positions stay. Each record keeps its caret, as `witness.types` prints
-    /// both `>varInit : any` records with a `>        : ^^^` underline.
+    /// positions stay. Records for a clean file stay bare, matching the
+    /// bare `>x : any` rows the clean `anyAsFunctionCall.types` prints.
     #[test]
     fn emit_types_baseline_keeps_distinct_position_records() {
         let logical = "tests/cases/conformance/types/witness/witnessPin.ts";
@@ -5527,13 +5708,11 @@ export const a2 = 3;
             === witnessPin.ts ===\n\
             var varInit = varInit; // any\n\
             >varInit : any\n\
-            >        : ^^^\n\
-            >varInit : any\n\
-            >        : ^^^\n";
+            >varInit : any\n";
         assert_eq!(
             compare_types(baseline, &emitted),
             FacetVerdict::Pass,
-            "distinct-position identical records must both stay, each with its caret as witness.types shows for >varInit : any; emitted:\n{emitted}"
+            "distinct-position identical records must both stay bare in a clean file: emitted:\n{emitted}"
         );
     }
 
