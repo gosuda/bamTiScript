@@ -15285,13 +15285,16 @@ impl<'src> Binder<'src> {
                     function_parameters.push(lowered);
                 }
             }
-            let function_type = self.types.function_with_parameter_bounds(
+            debug_assert_eq!(type_parameters.len(), type_parameter_bounds.len());
+            let function_type = self.types.intern(Type::Function(FunctionSignature {
                 type_parameters,
                 type_parameter_bounds,
-                function_parameters,
+                parameters: function_parameters,
                 return_type,
-                !self.is_typescript(),
-            );
+                declared_return: annotated_return_type,
+                declaring_types: Vec::new(),
+                javascript: !self.is_typescript(),
+            }));
             self.symbol_types[symbol.get() as usize] = function_type;
             if is_declaration && function.body.is_none() {
                 let Type::Function(signature) = self.types.get(function_type) else {
@@ -16767,6 +16770,7 @@ impl<'src> Binder<'src> {
             class.type_parameters.as_ref(),
             parameters,
             instance_type,
+            None,
             scope,
         );
         let Type::Function(signature) = self.types.get(signature_type) else {
@@ -25143,14 +25147,18 @@ impl<'src> Binder<'src> {
         function: &'src FunctionLike,
         scope: ScopeId,
     ) -> TypeId {
-        let return_type = match &function.return_type {
-            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
-            None => self.inferred_function_return_type(function, scope),
+        let (return_type, declared_return) = match &function.return_type {
+            Some(annotation) => {
+                let resolved = self.resolve_type(&annotation.data().type_node, scope);
+                (resolved, Some(resolved))
+            }
+            None => (self.inferred_function_return_type(function, scope), None),
         };
         self.signature_type_with_return(
             function.type_parameters.as_ref(),
             &function.parameters,
             return_type,
+            declared_return,
             scope,
         )
     }
@@ -25158,21 +25166,26 @@ impl<'src> Binder<'src> {
     fn type_of_arrow(&mut self, arrow: &'src ArrowFunction, parent: ScopeId) -> TypeId {
         let scope = self.new_scope(ScopeKind::Function, Some(parent));
         self.bind_type_parameters(arrow.type_parameters.as_ref(), scope);
-        let return_type = match &arrow.return_type {
-            Some(annotation) => self.resolve_type(&annotation.data().type_node, scope),
+        let (return_type, declared_return) = match &arrow.return_type {
+            Some(annotation) => {
+                let resolved = self.resolve_type(&annotation.data().type_node, scope);
+                (resolved, Some(resolved))
+            }
             None => {
                 let inferred = self.inferred_arrow_return_type(arrow, scope);
-                if arrow.is_async {
+                let inferred = if arrow.is_async {
                     self.promise_type(inferred)
                 } else {
                     inferred
-                }
+                };
+                (inferred, None)
             }
         };
         self.signature_type_with_return(
             arrow.type_parameters.as_ref(),
             &arrow.parameters,
             return_type,
+            declared_return,
             scope,
         )
     }
@@ -25182,6 +25195,7 @@ impl<'src> Binder<'src> {
         type_parameters: Option<&'src crate::syntax::TypeParameterList>,
         parameters: &'src [ParameterNode],
         return_type: TypeId,
+        declared_return: Option<TypeId>,
         scope: ScopeId,
     ) -> TypeId {
         let mut function_parameters: Vec<FunctionParameter> = Vec::with_capacity(parameters.len());
@@ -25192,13 +25206,16 @@ impl<'src> Binder<'src> {
         }
         let (type_parameters, type_parameter_bounds) =
             self.signature_type_parameters(type_parameters, scope);
-        self.types.function_with_parameter_bounds(
+        debug_assert_eq!(type_parameters.len(), type_parameter_bounds.len());
+        self.types.intern(Type::Function(FunctionSignature {
             type_parameters,
             type_parameter_bounds,
-            function_parameters,
+            parameters: function_parameters,
             return_type,
-            !self.is_typescript(),
-        )
+            declared_return,
+            declaring_types: Vec::new(),
+            javascript: !self.is_typescript(),
+        }))
     }
 
     fn statements_break_to_label(&self, statements: &'src [Stmt], label: &str) -> bool {
