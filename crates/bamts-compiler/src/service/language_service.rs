@@ -1,18 +1,20 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use crate::checker::binder::{PropertyAnchor, PropertyAnchorKind, PropertyId};
 use crate::{
-    checker::{SymbolId, SymbolKind, render_type},
+    checker::{
+        PropertyType, SemanticModel, SymbolId, SymbolKind, Type, TypeId, TypeTable,
+        render_type,
+    },
     diagnostic::DiagnosticSeverity,
     scanner,
     source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos},
-    syntax::{Token, TokenKind, VariableKind},
+    syntax::{Accessibility, Token, TokenKind, VariableKind},
 };
-
 use super::{DocumentSnapshot, ServiceError, ServiceState, filesystem::FileSystem};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +102,13 @@ impl QuickInfo {
 }
 
 impl<F: FileSystem> ServiceState<F> {
+    /// Completes the name in the slot at `position`. In a member slot
+    /// (`receiver.|` or `receiver.pre|`) the entries are the receiver
+    /// type's accessible members filtered by the typed prefix, matching the
+    /// fourslash member-completion rule (`isMemberCompletion`). Everywhere
+    /// else the entries are the in-scope symbols filtered by the typed
+    /// prefix, exactly as before. A member slot the model cannot resolve
+    /// keeps the symbol list, so unmodeled receivers behave as they did.
     pub fn completions(
         &mut self,
         path: impl AsRef<Path>,
@@ -108,6 +117,26 @@ impl<F: FileSystem> ServiceState<F> {
         let document = self.ensure_document(path.as_ref())?;
         validate_position(&document, position)?;
         let (prefix, replacement) = completion_prefix(&document, position);
+        if let Some(dot) = member_access_dot(&document, position)
+            && let Some(receiver) = member_receiver_type(document.semantic(), dot)
+        {
+            let members = member_entries(document.semantic().types(), receiver);
+            if !members.is_empty() {
+                let mut seen = BTreeSet::new();
+                let mut completions = members
+                    .into_iter()
+                    .filter(|(name, _)| name.starts_with(prefix.as_str()))
+                    .filter(|(name, _)| seen.insert(name.clone()))
+                    .map(|(name, kind)| Completion {
+                        name,
+                        kind,
+                        replacement,
+                    })
+                    .collect::<Vec<_>>();
+                completions.sort_by(|left, right| left.name.cmp(&right.name));
+                return Ok(completions);
+            }
+        }
         let mut seen = BTreeSet::new();
         let mut completions = document
             .semantic()
@@ -292,6 +321,117 @@ fn completion_prefix(document: &DocumentSnapshot, position: Utf16Pos) -> (String
         .expect("token boundary");
     let prefix = document.source().source_text().as_str()[start..end].to_owned();
     (prefix, token.range())
+}
+
+/// When `position` sits in a member-name slot (`receiver.|` or
+/// `receiver.pre|`), returns the range of the `.` or `?.` that opens the
+/// slot. Any other slot (including a receiver name before its dot) yields
+/// `None`, keeping the global symbol list.
+fn member_access_dot(document: &DocumentSnapshot, position: Utf16Pos) -> Option<TextRange> {
+    let tokens = document.source().tokens();
+    if let Some(token) = token_at(document, position)
+        && identifier_text(document, token).is_some()
+    {
+        let index = tokens
+            .iter()
+            .position(|candidate| candidate.range() == token.range())?;
+        let dot = tokens.get(index.checked_sub(1)?)?;
+        return matches!(dot.kind(), TokenKind::Dot | TokenKind::QuestionDot)
+            .then_some(dot.range());
+    }
+    let (index, dot) = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| {
+            !token.is_missing()
+                && matches!(token.kind(), TokenKind::Dot | TokenKind::QuestionDot)
+                && token.range().end() <= position
+        })
+        .last()?;
+    let blocked = tokens[index + 1..]
+        .iter()
+        .any(|token| !token.is_missing() && token.range().start() < position);
+    (!blocked).then_some(dot.range())
+}
+
+/// Resolves the receiver of the member slot opened by `dot`: the longest
+/// typed expression ending where the dot starts. `None` means the receiver
+/// has no recorded type and the slot keeps the symbol list.
+fn member_receiver_type(model: &SemanticModel, dot: TextRange) -> Option<TypeId> {
+    model
+        .typed_expressions()
+        .iter()
+        .filter(|(range, _)| range.start() < dot.start() && range.end() == dot.start())
+        .max_by_key(|(range, _)| range.len())
+        .map(|(_, type_id)| *type_id)
+}
+
+/// The closest existing symbol kind for a member entry. The `Completion`
+/// surface carries `SymbolKind`, so methods read as functions, `readonly`
+/// members as constants, and every other member as a mutable binding.
+fn member_kind(property: &PropertyType) -> SymbolKind {
+    if property.is_method() {
+        SymbolKind::Function
+    } else if property.readonly() {
+        SymbolKind::Variable(VariableKind::Const)
+    } else {
+        SymbolKind::Variable(VariableKind::Let)
+    }
+}
+
+/// Enumerates the accessible member names of `receiver` without mutating
+/// the type table, so this runs on the immutable service snapshot. Object
+/// types contribute their properties; class heads contribute their
+/// template members; constructor types contribute their static side; a
+/// union keeps the members every part shares (the checker's own
+/// property-read rule); an intersection offers every part's members.
+/// `private` members never complete outside the declaring class.
+/// Anything else (primitives, arrays, tuples, enums, aliases the table
+/// has not reduced) yields no entries and the slot keeps the symbol list.
+fn member_entries(table: &TypeTable, receiver: TypeId) -> Vec<(String, SymbolKind)> {
+    let view = table.named_structural_view(receiver);
+    match table.get(view) {
+        Type::ObjectType(object) => object
+            .properties()
+            .iter()
+            .filter(|property| !matches!(property.access(), Accessibility::Private))
+            .map(|property| (property.name().to_owned(), member_kind(property)))
+            .collect(),
+        Type::Named(symbol) | Type::AppliedClass { symbol, .. } => table
+            .class_template_properties(*symbol)
+            .iter()
+            .filter(|property| !matches!(property.access(), Accessibility::Private))
+            .map(|property| (property.name().to_owned(), member_kind(property)))
+            .collect(),
+        Type::ConstructorType { structural, .. } => member_entries(table, *structural),
+        Type::Union(members) => {
+            let mut parts = members.iter().map(|member| {
+                member_entries(table, *member)
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>()
+            });
+            let Some(mut common) = parts.next() else {
+                return Vec::new();
+            };
+            for entries in parts {
+                common.retain(|name, _| entries.contains_key(name));
+            }
+            common.into_iter().collect()
+        }
+        Type::Intersection(members) => {
+            let mut seen = BTreeSet::new();
+            let mut union = Vec::new();
+            for member in members {
+                for (name, kind) in member_entries(table, *member) {
+                    if seen.insert(name.clone()) {
+                        union.push((name, kind));
+                    }
+                }
+            }
+            union
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn symbol_at(
@@ -1119,6 +1259,94 @@ mod tests {
             [Utf16Pos::new(
                 source.find("value: \"x\"").expect("declaration key")
             )]
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn completions_after_dot_offer_receiver_members_not_globals() {
+        // Mirrors the fourslash `publicCompletions.ts` oracle:
+        // `const value = { field: 1 }; value./*1*/` with
+        // `verify.completions({ marker: "1", includes: "field" })`.
+        // Today the slot returns the in-scope globals; the member path
+        // returns the receiver's own members instead.
+        let (root, mut state) = state("const value = { field: 1 };\nvalue.");
+        let completions = state
+            .completions("a.ts", Utf16Pos::new(34))
+            .expect("completions");
+        assert_eq!(
+            completions
+                .iter()
+                .map(|item| (item.name.as_str(), item.kind))
+                .collect::<Vec<_>>(),
+            [("field", SymbolKind::Variable(VariableKind::Let))]
+        );
+        // The receiver name before its dot is not a member slot: it keeps
+        // the global symbol list.
+        let globals = state
+            .completions("a.ts", Utf16Pos::new(30))
+            .expect("receiver completions");
+        assert_eq!(
+            globals
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["value"]
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn completions_after_dot_filter_by_typed_prefix_and_report_method_kind() {
+        let source = "interface I { one: number; two(): void; }\ndeclare const x: I;\nx.t";
+        let (root, mut state) = state(source);
+        let completions = state
+            .completions("a.ts", Utf16Pos::new(65))
+            .expect("completions");
+        assert_eq!(
+            completions
+                .iter()
+                .map(|item| (item.name.as_str(), item.kind))
+                .collect::<Vec<_>>(),
+            [("two", SymbolKind::Function)]
+        );
+        assert_eq!(completions[0].replacement.start(), Utf16Pos::new(64));
+        assert_eq!(completions[0].replacement.end(), Utf16Pos::new(65));
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn completions_after_dot_keep_only_members_shared_by_every_union_part() {
+        // Mirrors `completionEntryForUnionMethod.ts`: a union receiver
+        // offers the members every part shares (`isMemberCompletion`).
+        let source = "declare const u: { a: number } | { a: number; b: string };\nu.";
+        let (root, mut state) = state(source);
+        let completions = state
+            .completions("a.ts", Utf16Pos::new(61))
+            .expect("completions");
+        assert_eq!(
+            completions
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a"]
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn completions_after_dot_hide_private_class_members() {
+        let source = "class C { pub = 1; private priv = 2; }\nconst c = new C();\nc.";
+        let (root, mut state) = state(source);
+        let completions = state
+            .completions("a.ts", Utf16Pos::new(60))
+            .expect("completions");
+        assert_eq!(
+            completions
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pub"]
         );
         fs::remove_dir_all(root).expect("remove root");
     }
