@@ -615,7 +615,7 @@ fn replace<H: Host>(
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     };
     let replacement = match template {
-        Some(template) => super::regexp_protocol::get_substitution(
+        Some(template) => super::regexp::get_substitution(
             machine,
             &needle,
             &string,
