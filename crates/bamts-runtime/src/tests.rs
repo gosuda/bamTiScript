@@ -171,40 +171,6 @@
         Program::link(modules, ModuleId::new(entry)).expect("valid linked test program")
     }
 
-    #[test]
-    fn run_with_telemetry_reports_wall_and_matches_run() {
-        let program = verified(
-            vec![],
-            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
-        );
-        let mut host = TestHost;
-        let (outcome, telemetry) =
-            super::run_with_telemetry(&program, &mut host, &Limits::default());
-        let outcome = outcome.expect("halt program runs");
-        assert_eq!(outcome.exit_code, 0);
-        // The interpreter wall is a finite, non-negative measurement.
-        assert!(telemetry.interpreter_wall_ms >= 0.0);
-        assert!(telemetry.interpreter_wall_ms.is_finite());
-        // The telemetry seam produces the same outcome as `run`.
-        let mut plain_host = TestHost;
-        let plain = super::run(&program, &mut plain_host, &Limits::default()).expect("halt runs");
-        assert_eq!(plain, outcome);
-    }
-
-    #[test]
-    fn run_with_telemetry_reports_peak_rss() {
-        let program = verified(
-            vec![],
-            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
-        );
-        let mut host = TestHost;
-        let (_, telemetry) = super::run_with_telemetry(&program, &mut host, &Limits::default());
-        assert!(
-            telemetry.rss_kb > 0,
-            "peak RSS should be read from the host"
-        );
-    }
-
     fn namespace_descriptor_entry() -> Function {
         function(
             0,

@@ -2645,45 +2645,6 @@ pub fn run<H: Host>(
         .map(|execution| execution.outcome)
 }
 
-/// Wall time and process peak memory observed while running a program.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct RunTelemetry {
-    /// Interpreter execution wall time, in fractional milliseconds.
-    pub interpreter_wall_ms: f64,
-    /// Process peak resident set size in KiB (`/proc/self/status` `VmHWM`);
-    /// `0` when the platform does not expose it.
-    pub rss_kb: u64,
-}
-
-/// Runs a program and reports interpreter wall time plus process peak RSS.
-///
-/// This is the telemetry seam over [`run`]: it times only the interpreter call,
-/// then reads best-effort process peak RSS. The returned [`ExecutionOutcome`]
-/// and every observable effect are exactly those of [`run`].
-pub fn run_with_telemetry<H: Host>(
-    program: &Program<Verified>,
-    host: &mut H,
-    limits: &Limits,
-) -> (Result<ExecutionOutcome, RuntimeError>, RunTelemetry) {
-    let started = std::time::Instant::now();
-    let outcome = run(program, host, limits);
-    let interpreter_wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    let telemetry = RunTelemetry {
-        interpreter_wall_ms,
-        rss_kb: peak_rss_kb().unwrap_or(0),
-    };
-    (outcome, telemetry)
-}
-
-/// Best-effort peak memory of this process, in KiB: the resident-set peak on
-/// Linux and the physical-footprint peak on macOS. Returns `None` when the host
-/// cannot say, such as a sandbox without `/proc`.
-fn peak_rss_kb() -> Option<u64> {
-    bamts_platform::peak_memory_bytes(std::process::id())
-        .ok()
-        .map(|bytes| bytes / 1024)
-}
-
 impl<'a, H: Host> Machine<'a, H> {
     #[must_use]
     pub fn new(program: &'a Program<Verified>, host: &'a mut H, limits: Limits) -> Self {
