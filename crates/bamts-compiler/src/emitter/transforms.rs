@@ -13270,7 +13270,7 @@ fn kept_import_clause(
 }
 
 /// What a module's own text exports.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ModuleExports {
     /// Names with no runtime form: types and const enums.
     pub(crate) types: BTreeSet<String>,
