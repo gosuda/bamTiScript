@@ -17,11 +17,10 @@ use std::{
     sync::Arc,
 };
 
-use sha2::{Digest, Sha256};
-
 use crate::{
     ErrorCode, Result, VerificationError,
     corpus::{self, OracleLimits, OracleOutcome},
+    schema::sha256_hex,
 };
 
 /// How virtual paths are confined when materializing a project.
@@ -230,19 +229,6 @@ impl ProcessBoundary for CorpusProcessBoundary {
             &invocation.limits,
         )
     }
-}
-
-/// SHA-256 of `bytes` as lowercase hex.
-#[must_use]
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in hash {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 /// Corpus-pinned environment pairs, in declaration order.

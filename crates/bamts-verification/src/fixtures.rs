@@ -13,8 +13,8 @@ use crate::{
     perf::{
         BenchmarkManifest, Fixture, FixtureGroup, FixtureOrigin, PerfError, PerfErrorCode, Result,
     },
-    schema::{TYPESCRIPT_SUITE_SOURCE, load_sources, required_source},
-    suite::{SuiteIndex, extract_archive, fetch_archive, sha256_hex, single_archive_root},
+    schema::{TYPESCRIPT_SUITE_SOURCE, load_sources, required_source, sha256_hex},
+    suite::{SuiteIndex, extract_archive, fetch_archive, single_archive_root},
 };
 
 const JSX_FIXTURE_ID: &str = "bench-jsx-complexity";

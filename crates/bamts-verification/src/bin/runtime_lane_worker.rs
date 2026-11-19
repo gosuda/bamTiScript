@@ -25,6 +25,7 @@ use bamts_verification::{
         test262::{self, ExecutionMode, OracleError, backend_runner, evaluate_in_mode},
         test262_harness::{FileHarnessLoader, load_harness_sources},
     },
+    schema::sha256_hex,
     shard::ExecutionMode as ShardExecutionMode,
 };
 
@@ -223,17 +224,6 @@ fn is_timeout_failure(detail: &str) -> bool {
         || detail.contains("fuel exhausted")
         || detail.contains("timeout")
         || detail.contains("Timeout")
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {

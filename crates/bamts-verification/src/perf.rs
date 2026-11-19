@@ -1420,7 +1420,7 @@ fn verify_bench_fixture_hashes(root: &Path, manifest: &BenchmarkManifest) -> Res
                 continue;
             }
         };
-        let actual = crate::suite::sha256_hex(&bytes);
+        let actual = crate::schema::sha256_hex(&bytes);
         if fixture.sha256.as_deref() != Some(actual.as_str())
             || fixture.bytes != Some(bytes.len() as u64)
         {
