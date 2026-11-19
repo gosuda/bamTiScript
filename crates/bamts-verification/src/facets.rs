@@ -52,7 +52,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 132] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 133] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -83,6 +83,7 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 132] = [
     "BAMTS-P017",
     "BAMTS-P018",
     "BAMTS-P019",
+    "BAMTS-P020",
     "BAMTS-C001",
     "BAMTS-C002",
     "BAMTS-C003",
@@ -3390,18 +3391,19 @@ interface A {
         assert_eq!(map.entries().count(), REQUIRED_BAMTS_DIAGNOSTIC_CODES.len());
 
         // S1 mapped scanner (L) codes and U2.6 mapped checker (C) codes;
-        // parser (P) codes are still unmapped and will be resolved by later
-        // slices. Checker codes emitted without a tsc-verified counterpart
-        // stay unmapped: the registry rows name their compiler constants
-        // (verification/diagnostic-code-map.json).
-        const UNMAPPED_CHECKER_CODES: [&str; 20] = [
+        // parser (P) codes stay unmapped except the two resolved parser
+        // correspondences below. Checker codes emitted without a tsc-verified
+        // counterpart stay unmapped: the registry rows name their compiler
+        // constants (verification/diagnostic-code-map.json).
+        const MAPPED_PARSER_CODES: [(&str, u32); 2] =
+            [("BAMTS-P017", 1163), ("BAMTS-P020", 1141)];
+        const UNMAPPED_CHECKER_CODES: [&str; 19] = [
             "BAMTS-C060",
             "BAMTS-C061",
             "BAMTS-C062",
             "BAMTS-C063",
             "BAMTS-C064",
             "BAMTS-C065",
-            "BAMTS-C067",
             "BAMTS-C068",
             "BAMTS-C069",
             "BAMTS-C073",
@@ -3425,6 +3427,14 @@ interface A {
                 assert!(entry.ts_code.is_none());
                 continue;
             }
+            if let Some((_, ts_code)) =
+                MAPPED_PARSER_CODES.iter().find(|(name, _)| *name == code)
+            {
+                assert_eq!(entry.status, DiagnosticMappingStatus::Mapped, "{code}");
+                assert_eq!(entry.ts_code, Some(*ts_code), "{code}");
+                mapped += 1;
+                continue;
+            }
             if code.starts_with("BAMTS-L") || code.starts_with("BAMTS-C") {
                 assert_eq!(
                     entry.status,
@@ -3443,6 +3453,52 @@ interface A {
             map.unmapped_count(),
             REQUIRED_BAMTS_DIAGNOSTIC_CODES.len() - mapped
         );
+    }
+
+    #[test]
+    fn excess_property_code_corresponds_to_ts2353() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let map = load_diagnostic_code_map(&root).expect("committed diagnostic code map");
+        assert_eq!(map.typescript_code("BAMTS-C067"), Some(2353));
+        let expected =
+            [diag(1, 31, DiagnosticCategory::Error, FacetSeverity::Error, "TS2353")];
+        let actual =
+            [diag(1, 31, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-C067")];
+        assert_eq!(compare_diagnostics(&expected, &actual, &map), FacetVerdict::Pass);
+        let suggested =
+            [diag(12, 20, DiagnosticCategory::Error, FacetSeverity::Error, "TS2561")];
+        let same_site =
+            [diag(12, 20, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-C067")];
+        assert!(compare_diagnostics(&suggested, &same_site, &map).is_fail());
+    }
+
+    #[test]
+    fn yield_outside_generator_code_corresponds_to_ts1163() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let map = load_diagnostic_code_map(&root).expect("committed diagnostic code map");
+        assert_eq!(map.typescript_code("BAMTS-P017"), Some(1163));
+        let expected =
+            [diag(2, 4, DiagnosticCategory::Error, FacetSeverity::Error, "TS1163")];
+        let actual =
+            [diag(2, 4, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-P017")];
+        assert_eq!(compare_diagnostics(&expected, &actual, &map), FacetVerdict::Pass);
+        let diverged =
+            [diag(3, 4, DiagnosticCategory::Error, FacetSeverity::Error, "TS2304")];
+        let same_site =
+            [diag(3, 4, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-P017")];
+        assert!(compare_diagnostics(&diverged, &same_site, &map).is_fail());
+    }
+
+    #[test]
+    fn non_string_module_name_code_corresponds_to_ts1141() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let map = load_diagnostic_code_map(&root).expect("committed diagnostic code map");
+        assert_eq!(map.typescript_code("BAMTS-P020"), Some(1141));
+        let expected =
+            [diag(1, 23, DiagnosticCategory::Error, FacetSeverity::Error, "TS1141")];
+        let actual =
+            [diag(1, 23, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-P020")];
+        assert_eq!(compare_diagnostics(&expected, &actual, &map), FacetVerdict::Pass);
     }
 
     #[test]

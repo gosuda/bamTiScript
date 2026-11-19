@@ -393,9 +393,9 @@
     },
     {
       "bamtsCode": "BAMTS-C067",
-      "evidence": "Emitted by bamts-compiler as EXCESS_PROPERTY (checker.rs) and NON_INSTANTIATED_NAMESPACE_VALUE_USE (checker/enum_namespace.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
-      "status": "unmapped",
-      "tsCode": null
+      "evidence": "EXCESS_PROPERTY (checker.rs) -> TS2353 in the TypeScript 7.0.2 authority baselines: contextualTyping2.ts(1,32), arrayLiteralTypeInference.ts (trueness/name rows), excessPropertyErrorForFunctionTypes.ts(4,44), typeSatisfaction.ts(12,20), usingDeclarationsWithObjectLiterals1.ts(15,62 and 36,7); 14 rows pair BAMTS-C067 with TS2353 at identical positions. nestedFreshLiteral.ts(12,21) pairs the same check with TS2561 (suggestion variant) and stays failing. NON_INSTANTIATED_NAMESPACE_VALUE_USE shares this code with no established counterpart (zero sweep rows; needs a code split).",
+      "status": "mapped",
+      "tsCode": 2353
     },
     {
       "bamtsCode": "BAMTS-C068",
@@ -669,9 +669,9 @@
     },
     {
       "bamtsCode": "BAMTS-P017",
-      "evidence": "Emitted by bamts-compiler as YIELD_OUTSIDE_GENERATOR (parser.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
-      "status": "unmapped",
-      "tsCode": null
+      "evidence": "YIELD_OUTSIDE_GENERATOR (parser.rs) -> TS1163 in the TypeScript 7.0.2 authority baselines: yieldStringLiteral.ts(2,5), YieldExpression16_es6.ts(3,5), YieldExpression20_es6.ts(3,8), generatorTypeCheck32.ts(2,29); message text identical to TS1163 and agrees with the compiler parse-code projection. YieldStarExpression2_es6 pairs the same code with TS2304 (error-choice divergence) and stays failing.",
+      "status": "mapped",
+      "tsCode": 1163
     },
     {
       "bamtsCode": "BAMTS-P018",
@@ -684,6 +684,12 @@
       "evidence": "Emitted by bamts-compiler as EARLY_ERROR (early_errors.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
       "status": "unmapped",
       "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P020",
+      "evidence": "MODULE_NAME_NOT_STRING (parser.rs) -> TS1141 in the TypeScript 7.0.2 authority baselines: exportDeclarationInInternalModule.ts(13,19), importTypeGeneric usage.ts(1,67 and 5,72), importTypeNested chainer.ts(1,24), importTypeNestedNoRef chainer.ts(1,24), importTypeNonString.ts(1,24); 6 rows, all TS1141 at identical positions, and agrees with the compiler parse-code projection.",
+      "status": "mapped",
+      "tsCode": 1141
     },
     {
       "bamtsCode": "BAMTS-C089",
