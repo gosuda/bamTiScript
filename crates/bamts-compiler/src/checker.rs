@@ -102,6 +102,15 @@ pub const IMPORTED_CONST_ENUM_CYCLE: DiagnosticCode = DiagnosticCode::new("BAMTS
 pub const IMPORTED_CONST_ENUM_NONCONSTANT: DiagnosticCode = DiagnosticCode::new("BAMTS-C015");
 /// Diagnostic emitted when a `with` statement appears in a context that forbids it.
 pub const WITH_STATEMENT_NOT_ALLOWED: DiagnosticCode = DiagnosticCode::new("BAMTS-C023");
+/// Diagnostic emitted when `eval` or `arguments` binds, assigns, or updates in
+/// strict code outside a class or module. Corresponds to TypeScript's TS1100.
+pub const EVAL_OR_ARGUMENTS_IN_STRICT_MODE: DiagnosticCode = DiagnosticCode::new("TS1100");
+/// Diagnostic emitted when `eval` or `arguments` binds, assigns, or updates
+/// inside a class body. Corresponds to TypeScript's TS1210.
+pub const EVAL_OR_ARGUMENTS_IN_CLASS: DiagnosticCode = DiagnosticCode::new("TS1210");
+/// Diagnostic emitted when `eval` or `arguments` binds, assigns, or updates in
+/// a module outside a class body. Corresponds to TypeScript's TS1215.
+pub const EVAL_OR_ARGUMENTS_IN_MODULE: DiagnosticCode = DiagnosticCode::new("TS1215");
 /// Diagnostic emitted when an export assignment is mixed with another export.
 pub const MIXED_EXPORT_ASSIGNMENT: DiagnosticCode = DiagnosticCode::new("BAMTS-C017");
 /// Diagnostic emitted when a parameter carries a decorator.

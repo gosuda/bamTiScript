@@ -15,6 +15,7 @@ use bamts_bytecode::{EcmaString, format_number};
 
 use super::AnalysisFacts;
 use super::ProgramCheckOptions;
+use super::diagnostic_messages::{Args, by_u32};
 use super::inference::{
     CandidateFreshness, InferenceContext, InferenceParameter, InferenceProvenance,
     InferredTypeArgument, InferredTypeArguments,
@@ -36,27 +37,28 @@ use super::{
     CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
     CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, CONSTRUCTOR_TYPE_PARAMETERS,
     DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-    DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION, EXCESS_PROPERTY,
-    EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
-    FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
-    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE,
-    IMPLICIT_ANY_FROM_INITIALIZER_CYCLE, IMPLICIT_ANY_RETURN_FROM_CYCLE,
-    IMPORT_CONFLICTS_WITH_LOCAL, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
-    INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE,
-    MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION,
-    NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION,
+    EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
+    EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
+    FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
+    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
+    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
+    IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE, IMPLICIT_ANY_FROM_INITIALIZER_CYCLE,
+    IMPLICIT_ANY_RETURN_FROM_CYCLE, IMPORT_CONFLICTS_WITH_LOCAL, INTERFACE_NAME_IS_PRIMITIVE,
+    INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE,
+    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
+    NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
     PARAMETER_INITIALIZER_IN_SIGNATURE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
     PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, REST_PARAMETER_ARRAY_TYPE,
-    REST_PARAMETER_NOT_LAST,
-    SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
-    STRICT_NULL_MEMBER_ACCESS, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
-    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
-    SUPER_PROPERTY_NOT_METHOD, SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER,
-    TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
-    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
-    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
+    REST_PARAMETER_NOT_LAST, SET_ACCESSOR_PARAMETER_INITIALIZER,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
+    SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_PROPERTY_NOT_METHOD,
+    SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, TYPE_ALIAS_CIRCULAR,
+    TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT,
+    UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN,
+    USING_DECLARATION_IN_FOR_IN, USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE,
+    WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
@@ -80,17 +82,16 @@ use super::{
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_INITIALIZER_IN_SIGNATURE_MESSAGE,
     PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
     PROPERTY_NOT_INITIALIZED_MESSAGE, REST_PARAMETER_ARRAY_TYPE_MESSAGE,
-    REST_PARAMETER_NOT_LAST_MESSAGE,
-    SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
-    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
-    SUPER_BEFORE_THIS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_PROPERTY_NOT_METHOD_MESSAGE,
-    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
-    TYPE_NESTING_TOO_DEEP_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
-    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
-    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, VALUE_CANNOT_BE_USED_HERE_MESSAGE,
-    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    REST_PARAMETER_NOT_LAST_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
+    SUPER_BEFORE_SUPER_PROPERTY_MESSAGE, SUPER_BEFORE_THIS_MESSAGE,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
+    SUPER_PROPERTY_NOT_METHOD_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
+    TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_NESTING_TOO_DEEP_MESSAGE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
+    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
+    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
+    VALUE_CANNOT_BE_USED_HERE_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -113,10 +114,6 @@ use crate::syntax::{
 
 /// Message text for the script-scope conflict with a built-in global
 /// (`globalThis` or `undefined`); the diagnostic code lives in `checker`.
-#[expect(
-    dead_code,
-    reason = "emitted by the WP-CHECK declaration-conflict drain in a later serialized binder step"
-)]
 const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL_MESSAGE: &str =
     "Declaration conflicts with a built-in global identifier.";
 
@@ -388,6 +385,10 @@ impl SymbolKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Symbol {
     name: String,
+    /// Source spelling of a non-identifier member name (`"foo"`, `0`,
+    /// `[Symbol.iterator]`), used for display and bracketed qualification.
+    /// Plain identifiers keep `None` and render from `name`.
+    display: Option<String>,
     kind: SymbolKind,
     scope: ScopeId,
     declaration: NodeId,
@@ -398,6 +399,12 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    /// Source spelling of a non-identifier member name, if any.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        self.display.as_deref()
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -467,6 +474,11 @@ pub struct PropertyType {
     /// what tells them apart (`super.x` reaches accessors on the
     /// prototype but never a field).
     accessor: bool,
+    /// Whether the member type came from an explicit type annotation. The
+    /// `.types` caret line blanks the printed type of declared members.
+    /// Participates in identity so a declared member never interns
+    /// identical to an inferred one of the same shape.
+    declared: bool,
 }
 
 impl PropertyType {
@@ -484,6 +496,7 @@ impl PropertyType {
             is_method: false,
             spreadable: false,
             accessor: false,
+            declared: false,
         }
     }
 
@@ -496,6 +509,12 @@ impl PropertyType {
     #[must_use]
     pub fn with_getter_only(mut self, getter_only: bool) -> Self {
         self.getter_only = getter_only;
+        self
+    }
+
+    #[must_use]
+    pub fn with_declared(mut self) -> Self {
+        self.declared = true;
         self
     }
 
@@ -595,6 +614,11 @@ impl PropertyType {
     }
 
     #[must_use]
+    pub const fn declared(&self) -> bool {
+        self.declared
+    }
+
+    #[must_use]
     pub const fn type_id(&self) -> TypeId {
         self.type_id
     }
@@ -628,6 +652,7 @@ impl PartialEq for PropertyType {
             && self.is_method == other.is_method
             && self.spreadable == other.spreadable
             && self.accessor == other.accessor
+            && self.declared == other.declared
     }
 }
 
@@ -646,6 +671,7 @@ impl std::hash::Hash for PropertyType {
         self.is_method.hash(state);
         self.spreadable.hash(state);
         self.accessor.hash(state);
+        self.declared.hash(state);
     }
 }
 
@@ -837,6 +863,12 @@ pub struct FunctionParameter {
     type_id: TypeId,
     optional: bool,
     rest: bool,
+    /// Whether the parameter carried an explicit type annotation. The
+    /// `.types` caret line blanks the printed type of declared parameters
+    /// and underlines it for inferred ones. Participates in identity so a
+    /// declared parameter never interns identical to a synthesized one of
+    /// the same shape.
+    declared: bool,
 }
 
 impl FunctionParameter {
@@ -847,6 +879,18 @@ impl FunctionParameter {
             type_id,
             optional,
             rest,
+            declared: false,
+        }
+    }
+
+    #[must_use]
+    pub fn new_declared(name: String, type_id: TypeId, optional: bool, rest: bool) -> Self {
+        Self {
+            name,
+            type_id,
+            optional,
+            rest,
+            declared: true,
         }
     }
 
@@ -868,6 +912,11 @@ impl FunctionParameter {
     #[must_use]
     pub const fn rest(&self) -> bool {
         self.rest
+    }
+
+    #[must_use]
+    pub const fn declared(&self) -> bool {
+        self.declared
     }
 }
 
@@ -953,7 +1002,7 @@ impl FunctionSignature {
 
     /// Returns the resolved written return annotation, when one was written.
     #[must_use]
-    pub(crate) const fn declared_return(&self) -> Option<TypeId> {
+    pub const fn declared_return(&self) -> Option<TypeId> {
         self.declared_return
     }
 
@@ -1060,6 +1109,28 @@ impl SignatureCandidate for ConstructEntry {
     fn is_abstract(&self) -> bool {
         self.is_abstract
     }
+}
+
+/// Whether a member lookup came from `o.name` or from a computed literal
+/// element access `o["name"]`/`o[0]`. Only the computed form treats a
+/// missing property as an implicit-any index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemberLookup {
+    Named,
+    Computed,
+}
+
+/// One member-type request: the object view, member name, source range,
+/// receiver for `this` projection, owner hint, and lookup kind travel
+/// together through every `property_type_for_member_raw` call.
+#[derive(Clone, Copy)]
+struct MemberRequest<'a> {
+    object_type: TypeId,
+    name: &'a str,
+    range: TextRange,
+    receiver: TypeId,
+    owner_hint: Option<SymbolId>,
+    lookup: MemberLookup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2189,7 +2260,11 @@ impl TypeTable {
     }
     #[must_use]
     pub fn type_query(&mut self, name: Box<str>, arguments: Vec<TypeId>, target: TypeId) -> TypeId {
-        self.intern(Type::TypeQuery { name, arguments, target })
+        self.intern(Type::TypeQuery {
+            name,
+            arguments,
+            target,
+        })
     }
     pub fn set_applied_alias_view(&mut self, head: TypeId, view: TypeId) {
         if head == view {
@@ -3252,9 +3327,7 @@ impl TypeTable {
             Type::AppliedAlias { .. } => self
                 .prepare_applied_alias_view(index)
                 .filter(|index_view| *index_view != index)
-                .and_then(|index_view| {
-                    self.try_resolve_concrete_indexed_access(view, index_view)
-                }),
+                .and_then(|index_view| self.try_resolve_concrete_indexed_access(view, index_view)),
             Type::TypeQuery { target, .. } => {
                 self.try_resolve_concrete_indexed_access(view, target)
             }
@@ -4520,12 +4593,17 @@ impl TypeTable {
             imported: &mut ImportedTypeMap,
             next_symbol: &mut u32,
         ) -> FunctionParameter {
-            FunctionParameter::new(
-                parameter.name,
-                copy(target, source, parameter.type_id, imported, next_symbol),
-                parameter.optional,
-                parameter.rest,
-            )
+            let copied = copy(target, source, parameter.type_id, imported, next_symbol);
+            if parameter.declared {
+                FunctionParameter::new_declared(
+                    parameter.name,
+                    copied,
+                    parameter.optional,
+                    parameter.rest,
+                )
+            } else {
+                FunctionParameter::new(parameter.name, copied, parameter.optional, parameter.rest)
+            }
         }
 
         fn copy_bounds(
@@ -4622,7 +4700,7 @@ pub(crate) struct ImportEqualsTarget {
 /// One imported binding's resolved value and type facts, carried across module
 /// boundaries so a target binder can install both source-table identities and
 /// materialize every synthetic symbol before it resolves statements.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ImportedSymbolType<'a> {
     pub symbol: SymbolId,
     pub source_model: &'a SemanticModel,
@@ -5425,6 +5503,29 @@ pub(crate) fn source_is_module(source: &SourceFile) -> bool {
         })
 }
 
+/// Returns whether the source text calls `import(` anywhere outside a member
+/// access. Such files check as strict modules upstream even without a
+/// top-level `import` or `export` declaration.
+fn file_has_dynamic_import(source: &SourceFile) -> bool {
+    let mut previous = None;
+    let mut import_after_dot = false;
+    for token in source.tokens() {
+        let kind = token.kind();
+        if matches!(
+            kind,
+            TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            continue;
+        }
+        if kind == TokenKind::LParen && previous == Some(TokenKind::KwImport) && !import_after_dot {
+            return true;
+        }
+        import_after_dot = kind == TokenKind::KwImport && previous == Some(TokenKind::Dot);
+        previous = Some(kind);
+    }
+    false
+}
+
 /// Returns whether the directive prologue of a statement list contains
 /// a `"use strict"` directive before any non-directive statement.
 fn directive_prologue_is_strict(source: &SourceFile, statements: &[Stmt]) -> bool {
@@ -5707,6 +5808,10 @@ pub struct SemanticModel {
     /// This is the range-indexed projection of `references`, which is keyed by
     /// node identity and so cannot itself place records against source lines.
     symbol_references: Vec<(TextRange, SymbolId)>,
+    /// Owner-qualified display names for member-reference rows whose symbol
+    /// renders bare at its declaration (namespace exports), keyed by the
+    /// referenced member symbol. Moved into the model by [`Binder::finish`].
+    reference_qualified_names: HashMap<SymbolId, String>,
     /// Interned property declarations and their recorded occurrences,
     /// feeding the language service's property rename path.
     property_sites: Vec<PropertySite>,
@@ -5800,9 +5905,17 @@ impl SemanticModel {
     #[must_use]
     pub fn qualified_name(&self, id: SymbolId) -> String {
         let symbol = self.symbol(id);
-        match symbol.parent {
-            Some(parent) => format!("{}.{}", self.qualified_name(parent), symbol.name),
-            None => symbol.name.clone(),
+        let leaf = symbol.display_name().unwrap_or_else(|| symbol.name());
+        let Some(parent) = symbol.parent else {
+            return leaf.to_owned();
+        };
+        let parent_name = self.qualified_name(parent);
+        if leaf.starts_with('[') {
+            format!("{parent_name}{leaf}")
+        } else if symbol.display_name().is_some() {
+            format!("{parent_name}[{leaf}]")
+        } else {
+            format!("{parent_name}.{leaf}")
         }
     }
 
@@ -5878,12 +5991,19 @@ impl SemanticModel {
     pub fn typed_expressions(&self) -> &[(TextRange, TypeId)] {
         &self.typed_expressions
     }
-
     /// Returns every resolved reference occurrence `(range, symbol)` in
     /// first-seen order, feeding the S2 `.symbols` baseline emitter.
     #[must_use]
     pub fn symbol_references(&self) -> &[(TextRange, SymbolId)] {
         &self.symbol_references
+    }
+
+    /// Returns the owner-qualified display name for a member-reference row
+    /// whose symbol renders bare at its declaration (namespace exports:
+    /// `m1` → `m1.m1`). `None` means the row renders `qualified_name`.
+    #[must_use]
+    pub fn reference_qualified_name(&self, id: SymbolId) -> Option<&str> {
+        self.reference_qualified_names.get(&id).map(String::as_str)
     }
 
     /// Returns every bound named interface member declaration occurrence in
@@ -6213,6 +6333,9 @@ pub(crate) struct Binder<'src> {
     optional_chain_links: HashMap<NodeId, (TypeId, bool)>,
     typed_expressions: Vec<(TextRange, TypeId)>,
     symbol_references: Vec<(TextRange, SymbolId)>,
+    /// Qualified display names for `.symbols` member-reference rows recorded
+    /// against namespace-owned members (`m1` of `m1` → `"m1.m1"`).
+    reference_qualified_names: HashMap<SymbolId, String>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     probing_contextual_type: bool,
     pending_constraint_checks: Vec<PendingConstraintCheck>,
@@ -6278,6 +6401,11 @@ pub(crate) struct Binder<'src> {
     /// Variable/parameter symbol → property owner, seeded at declaration so
     /// member accesses resolve to the annotated owner.
     symbol_anchor: HashMap<SymbolId, PropertyOwner>,
+    /// Strict-mode `eval`/`arguments` diagnostics already emitted, keyed by
+    /// identifier range. Bind and resolve passes declare the same function
+    /// and class names twice under one hoisted identity, so the second
+    /// declaration must not report again.
+    strict_eval_reported: HashSet<TextRange>,
     /// Namespace-export/static collisions already reported, keyed by
     /// constructor owner and member name. Fragments finalize
     /// independently over one accumulated export scope, so without this
@@ -6458,6 +6586,10 @@ pub(crate) struct Binder<'src> {
     /// Whether the source file is a `.d.ts`/`.d.mts`/`.d.cts` declaration file.
     /// Top-level statements in such files must be declarations.
     is_declaration_file: bool,
+    /// Whether the source file contains a dynamic `import()` call. Such
+    /// files check as strict modules upstream even without a top-level
+    /// `import` or `export` declaration.
+    file_has_dynamic_import: bool,
     /// Whether the source file is an external module. Script files expose
     /// top-level declarations to the global scope, where they can collide with
     /// built-in global identifiers (`globalThis`, `undefined`) per TS2397.
@@ -6509,6 +6641,7 @@ impl<'src> Binder<'src> {
             optional_chain_links: HashMap::new(),
             typed_expressions: Vec::new(),
             symbol_references: Vec::new(),
+            reference_qualified_names: HashMap::new(),
             interface_member_occurrences: Vec::new(),
             signature_parameter_symbols: HashMap::new(),
             diagnostics: Vec::new(),
@@ -6550,6 +6683,7 @@ impl<'src> Binder<'src> {
             property_anchor_index: HashMap::new(),
             literal_anchor: HashMap::new(),
             symbol_anchor: HashMap::new(),
+            strict_eval_reported: HashSet::new(),
             reported_static_collisions: HashSet::new(),
             ns_appended_statics: HashSet::new(),
             ns_propagated_statics: HashMap::new(),
@@ -6612,6 +6746,7 @@ impl<'src> Binder<'src> {
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
             is_module,
+            file_has_dynamic_import: file_has_dynamic_import(source),
             cancel: None,
         };
         let global_scope = checker.new_scope(ScopeKind::Global, None);
@@ -6770,10 +6905,6 @@ impl<'src> Binder<'src> {
         self.ensure_lexical_ready(scope)
     }
 
-    #[expect(
-        dead_code,
-        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
-    )]
     fn reserve_symbol(
         &mut self,
         name: &str,
@@ -6820,6 +6951,7 @@ impl<'src> Binder<'src> {
         let parent = self.scopes[scope.get() as usize].owner;
         self.symbols.push(Symbol {
             name: name.to_owned(),
+            display: None,
             kind,
             scope,
             declaration,
@@ -6867,10 +6999,6 @@ impl<'src> Binder<'src> {
         id
     }
 
-    #[expect(
-        dead_code,
-        reason = "stage-A lexical preparation; WP-CHECK consumers land in a later serialized binder step"
-    )]
     fn record_declaration_fact(
         &mut self,
         code: DiagnosticCode,
@@ -8017,15 +8145,13 @@ impl<'src> Binder<'src> {
         for member in &class.members {
             match member.data() {
                 crate::syntax::ClassMember::Method(method) => {
-                    let member_symbol = self.property_key(&method.name).map(|name| {
-                        self.reserve_symbol(
-                            &name,
-                            SymbolKind::Function,
-                            class_scope,
-                            member.id(),
-                            member.range(),
-                        )
-                    });
+                    let member_symbol = self.reserve_member_symbol(
+                        &method.name,
+                        SymbolKind::Function,
+                        class_scope,
+                        member.id(),
+                        member.range(),
+                    );
                     let member_owner = self.reserve_contributor(
                         member.id(),
                         member_symbol,
@@ -8108,15 +8234,13 @@ impl<'src> Binder<'src> {
                     )?;
                 }
                 crate::syntax::ClassMember::Property(property) => {
-                    let member_symbol = self.property_key(&property.name).map(|name| {
-                        self.reserve_symbol(
-                            &name,
-                            SymbolKind::Variable(VariableKind::Let),
-                            class_scope,
-                            member.id(),
-                            member.range(),
-                        )
-                    });
+                    let member_symbol = self.reserve_member_symbol(
+                        &property.name,
+                        SymbolKind::Variable(VariableKind::Let),
+                        class_scope,
+                        member.id(),
+                        member.range(),
+                    );
                     let member_owner = self.reserve_contributor(
                         member.id(),
                         member_symbol,
@@ -9229,11 +9353,9 @@ impl<'src> Binder<'src> {
             ],
             void,
         );
-        let time_log_signature = self.types.function_with_parameters(
-            Vec::new(),
-            vec![label, data],
-            void,
-        );
+        let time_log_signature =
+            self.types
+                .function_with_parameters(Vec::new(), vec![label, data], void);
         let raw = self.types.object_type(vec![
             PropertyType::new("assert", false, assert_signature).with_method(true),
             PropertyType::new("clear", false, no_args).with_method(true),
@@ -9707,6 +9829,7 @@ impl<'src> Binder<'src> {
 
             self.symbols.push(Symbol {
                 name: source_symbol_data.name().to_owned(),
+                display: source_symbol_data.display_name().map(str::to_owned),
                 kind: source_symbol_data.kind(),
                 scope: self.module_scope,
                 declaration: NodeId::default(),
@@ -9747,10 +9870,10 @@ impl<'src> Binder<'src> {
                 let occupies_value = symbol.kind().occupies_value();
                 let occupies_type = symbol.kind().occupies_type();
                 let module = self.module_scope;
-                let has_value = !occupies_value
-                    || self.scopes[module.0 as usize].values.contains_key(&name);
-                let has_type = !occupies_type
-                    || self.scopes[module.0 as usize].types.contains_key(&name);
+                let has_value =
+                    !occupies_value || self.scopes[module.0 as usize].values.contains_key(&name);
+                let has_type =
+                    !occupies_type || self.scopes[module.0 as usize].types.contains_key(&name);
                 if has_value && has_type {
                     continue;
                 }
@@ -9792,6 +9915,7 @@ impl<'src> Binder<'src> {
                 );
                 self.symbols.push(Symbol {
                     name: name.clone(),
+                    display: None,
                     kind: SymbolKind::Import,
                     scope: self.module_scope,
                     declaration: NodeId::default(),
@@ -9808,7 +9932,9 @@ impl<'src> Binder<'src> {
                     self.imported_type_planes.insert(id, type_id);
                 }
                 if !has_value {
-                    self.scopes[module.0 as usize].values.insert(name.clone(), id);
+                    self.scopes[module.0 as usize]
+                        .values
+                        .insert(name.clone(), id);
                 }
                 if !has_type {
                     self.scopes[module.0 as usize].types.insert(name, id);
@@ -9950,6 +10076,7 @@ impl<'src> Binder<'src> {
             node_types: self.node_types,
             typed_expressions: self.typed_expressions,
             symbol_references: self.symbol_references,
+            reference_qualified_names: self.reference_qualified_names,
             declaration_occurrences: self.interface_member_occurrences,
             signature_parameter_symbols: self.signature_parameter_symbols,
             generic_type_parameters,
@@ -10112,7 +10239,6 @@ impl<'src> Binder<'src> {
         }
         guards
     }
-
 
     /// Forks `parent` and refines the fork by `guards`.
     fn branch_guarded(&mut self, parent: FlowNodeId, guards: &[NarrowingGuard]) -> FlowNodeId {
@@ -10733,6 +10859,151 @@ impl<'src> Binder<'src> {
 
     // -- declaration binding ---------------------------------------------------
 
+    fn scope_enclosed_in_class(&self, scope: ScopeId) -> bool {
+        let mut current = Some(scope);
+        while let Some(id) = current {
+            let candidate = &self.scopes[id.0 as usize];
+            if candidate.kind == ScopeKind::Class {
+                let interface_owned = candidate.owner.is_some_and(|owner| {
+                    self.symbols[owner.get() as usize].kind == SymbolKind::Interface
+                });
+                if !interface_owned {
+                    return true;
+                }
+            }
+            current = candidate.parent;
+        }
+        false
+    }
+
+    fn scope_has_type_owner(&self, scope: ScopeId) -> bool {
+        self.scopes[scope.0 as usize].owner.is_some_and(|owner| {
+            matches!(
+                self.symbols[owner.get() as usize].kind,
+                SymbolKind::Class | SymbolKind::Interface
+            )
+        })
+    }
+
+    fn strict_eval_or_arguments_code(&self, scope: ScopeId) -> Option<(DiagnosticCode, u32)> {
+        if self.ambient_binding
+            || self.ambient_stack.last().copied().unwrap_or(false)
+            || self.is_declaration_file
+        {
+            return None;
+        }
+        if !self.scopes[scope.0 as usize].is_strict() && !self.file_has_dynamic_import {
+            return None;
+        }
+        if self.scope_enclosed_in_class(scope) {
+            return Some((EVAL_OR_ARGUMENTS_IN_CLASS, 1210));
+        }
+        if self.is_module {
+            return Some((EVAL_OR_ARGUMENTS_IN_MODULE, 1215));
+        }
+        Some((EVAL_OR_ARGUMENTS_IN_STRICT_MODE, 1100))
+    }
+
+    fn emit_strict_eval_or_arguments(&mut self, name: &str, scope: ScopeId, range: TextRange) {
+        if range.start().get() == range.end().get() {
+            return;
+        }
+        if !matches!(name, "eval" | "arguments") {
+            return;
+        }
+        let Some((code, numeric)) = self.strict_eval_or_arguments_code(scope) else {
+            return;
+        };
+        if !self.strict_eval_reported.insert(range) {
+            return;
+        }
+        let message = by_u32(numeric)
+            .and_then(|entry| entry.format(Args::new([name])).ok())
+            .unwrap_or_else(|| format!("Invalid use of '{name}' in strict mode."));
+        self.emit_with_message(code, range, message);
+    }
+
+    fn check_function_type_parameters(
+        &mut self,
+        parameters: &[crate::syntax::FunctionTypeParameter],
+        scope: ScopeId,
+    ) {
+        for parameter in parameters {
+            let name = self.identifier_text(&parameter.name);
+            if name.as_ref() == "this" {
+                continue;
+            }
+            self.emit_strict_eval_or_arguments(name.as_ref(), scope, parameter.name.range());
+        }
+    }
+
+    fn check_type_member_eval_or_arguments(
+        &mut self,
+        member: &'src crate::syntax::TypeMemberNode,
+        scope: ScopeId,
+        stack: &mut Vec<&'src Ty>,
+    ) {
+        match member.data() {
+            TypeMember::Call(call) => {
+                self.check_function_type_parameters(&call.function.parameters, scope);
+                stack.push(&call.function.return_type);
+            }
+            TypeMember::Construct(construct) => {
+                self.check_function_type_parameters(&construct.function.function.parameters, scope);
+                stack.push(&construct.function.function.return_type);
+            }
+            TypeMember::Method(method) => {
+                self.check_function_type_parameters(&method.function.parameters, scope);
+                stack.push(&method.function.return_type);
+            }
+            TypeMember::Property(property) => {
+                if let Some(annotation) = &property.type_annotation {
+                    stack.push(&annotation.data().type_node);
+                }
+            }
+            TypeMember::Index(index) => {
+                stack.push(&index.type_annotation.data().type_node);
+                for parameter in &index.parameters {
+                    stack.push(&parameter.type_annotation.data().type_node);
+                }
+            }
+            TypeMember::Missing(_) => {}
+        }
+    }
+
+    fn check_single_type_node_eval_or_arguments(
+        &mut self,
+        node: &'src Ty,
+        scope: ScopeId,
+        stack: &mut Vec<&'src Ty>,
+    ) {
+        match node.data() {
+            TypeNode::Function(function) => {
+                self.check_function_type_parameters(&function.parameters, scope);
+                stack.push(&function.return_type);
+            }
+            TypeNode::Constructor(constructor) => {
+                self.check_function_type_parameters(&constructor.function.parameters, scope);
+                stack.push(&constructor.function.return_type);
+            }
+            TypeNode::Object(object) => {
+                for member in &object.members {
+                    self.check_type_member_eval_or_arguments(member, scope, stack);
+                }
+            }
+            TypeNode::Parenthesized(inner) => stack.push(inner),
+            TypeNode::Union(members) | TypeNode::Intersection(members) => stack.extend(members),
+            _ => {}
+        }
+    }
+
+    fn check_type_node_eval_or_arguments(&mut self, node: &'src Ty, scope: ScopeId) {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            self.check_single_type_node_eval_or_arguments(current, scope, &mut stack);
+        }
+    }
+
     fn declare(
         &mut self,
         name: &str,
@@ -10850,6 +11121,17 @@ impl<'src> Binder<'src> {
                 return symbol;
             }
         }
+        if matches!(
+            kind,
+            SymbolKind::Variable(_)
+                | SymbolKind::Parameter
+                | SymbolKind::Function
+                | SymbolKind::Class
+                | SymbolKind::Import
+        ) && self.scopes[written_scope.0 as usize].kind != ScopeKind::Class
+        {
+            self.emit_strict_eval_or_arguments(name, written_scope, range);
+        }
         let merge = self.scopes[scope.0 as usize]
             .values
             .get(name)
@@ -10913,6 +11195,7 @@ impl<'src> Binder<'src> {
         let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol count fits in u32"));
         self.symbols.push(Symbol {
             name: name.to_owned(),
+            display: None,
             kind,
             scope,
             declaration,
@@ -11483,6 +11766,7 @@ impl<'src> Binder<'src> {
                 member.id(),
                 member.range(),
             );
+            self.note_member_spelling(member_symbol, &member.data().name);
             self.enum_member_symbols.insert(member.id(), member_symbol);
             self.enum_member_symbols_by_name
                 .entry(symbol)
@@ -11640,6 +11924,8 @@ impl<'src> Binder<'src> {
                     declaration_id,
                     lit.range(),
                 );
+                self.symbols[symbol.get() as usize].display =
+                    Some(self.text(lit.data().token()).to_owned());
                 self.ambient_modules.entry(key).or_insert(symbol);
                 let export_scope = self
                     .namespace_export_scopes
@@ -11949,11 +12235,7 @@ impl<'src> Binder<'src> {
         self.declare(name, kind, scope, declaration, range)
     }
 
-    fn bind_object_members(
-        &mut self,
-        member: &'src crate::syntax::TypeMemberNode,
-        scope: ScopeId,
-    ) {
+    fn bind_object_members(&mut self, member: &'src crate::syntax::TypeMemberNode, scope: ScopeId) {
         let owner = self
             .scopes
             .get(scope.0 as usize)
@@ -11961,7 +12243,7 @@ impl<'src> Binder<'src> {
             .map(PropertyOwner::Member);
         match member.data() {
             TypeMember::Property(property) => {
-                if let Some(name) = self.property_key(&property.name) {
+                if let Some(name) = self.member_binding_name(&property.name) {
                     self.declare_interface_member_occurrence(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
@@ -11983,7 +12265,7 @@ impl<'src> Binder<'src> {
                 }
             }
             TypeMember::Method(method) => {
-                if let Some(name) = self.property_key(&method.name) {
+                if let Some(name) = self.member_binding_name(&method.name) {
                     self.declare_interface_member_occurrence(
                         &name,
                         SymbolKind::Function,
@@ -12029,18 +12311,34 @@ impl<'src> Binder<'src> {
         member: &crate::syntax::TypeMemberNode,
         name_node: &PropertyName,
     ) {
+        self.declare_member_occurrence(name, kind, scope, member.id(), member.range(), name_node);
+    }
+
+    /// Declares one object literal, type literal, or accessor member and
+    /// records its source declaration occurrence. Members that share one
+    /// container scope merge into a single symbol (getter/setter pairs), so
+    /// every written occurrence renders with the unioned `Decl` list.
+    fn declare_member_occurrence(
+        &mut self,
+        name: &str,
+        kind: SymbolKind,
+        scope: ScopeId,
+        declaration: NodeId,
+        declaration_range: TextRange,
+        name_node: &PropertyName,
+    ) {
         let symbol = self.declare_member_unique(
             name,
             kind,
             scope,
-            member.id(),
+            declaration,
             Self::property_name_range(name_node),
         );
         let name_range = self.occurrence_name_range(name_node);
         self.interface_member_occurrences
             .push(DeclarationOccurrence {
-                declaration: member.id(),
-                declaration_range: member.range(),
+                declaration,
+                declaration_range,
                 symbol,
                 name_range,
             });
@@ -12173,6 +12471,7 @@ impl<'src> Binder<'src> {
             parameter.id(),
             identifier.range(),
         );
+        self.emit_strict_eval_or_arguments(&name, ctor_scope, identifier.range());
         self.scopes[ctor_scope.0 as usize]
             .values
             .entry(name)
@@ -12239,7 +12538,9 @@ impl<'src> Binder<'src> {
 
     fn bind_alias_object_members(&mut self, node: &'src Ty, scope: ScopeId) {
         match node.data() {
-            TypeNode::Object(object) => self.bind_literal_members(&object.members, node.id(), scope),
+            TypeNode::Object(object) => {
+                self.bind_literal_members(&object.members, node.id(), scope)
+            }
             TypeNode::Parenthesized(inner) => self.bind_alias_object_members(inner, scope),
             TypeNode::Union(members) | TypeNode::Intersection(members) => {
                 for member in members {
@@ -14516,6 +14817,175 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn is_spread_excluded(property: &PropertyType) -> bool {
+        property.access() != Accessibility::Public
+            || (property.declaring_class().is_some()
+                && (property.is_method() || property.accessor()))
+    }
+
+    /// Object.prototype member names, present on every object-typed value.
+    /// Used only for presence checks; the projected type stays unchanged.
+    fn is_object_prototype_member(name: &str) -> bool {
+        matches!(
+            name,
+            "constructor"
+                | "hasOwnProperty"
+                | "isPrototypeOf"
+                | "propertyIsEnumerable"
+                | "toLocaleString"
+                | "toString"
+                | "valueOf"
+        )
+    }
+
+    /// Computes the type an object-pattern rest element binds from `source`
+    /// after removing `excluded` sibling names. Class prototype members and
+    /// non-public members never spread, mirroring the object-literal spread
+    /// rule above. Sources that do not resolve to a concrete object shape
+    /// pass through unchanged.
+    fn rest_spread_source(&mut self, source: TypeId, excluded: &[String]) -> TypeId {
+        let mut view = self
+            .types
+            .prepare_applied_alias_view(source)
+            .unwrap_or(source);
+        if let Type::Named(symbol) = self.types.get(view).clone() {
+            if let Some(constraint) = self.types.type_parameter_constraint(symbol) {
+                if constraint != view {
+                    view = constraint;
+                }
+            } else {
+                let resolved = self.resolve_named_type_symbol(symbol);
+                if resolved != view {
+                    view = resolved;
+                }
+            }
+        }
+        if let Type::This { constraint, .. } = self.types.get(view).clone() {
+            view = constraint;
+        }
+        view = self.types.prepare_applied_class_view(view).unwrap_or(view);
+        let (structural, statics) = match self.types.get(view).clone() {
+            Type::ConstructorType { structural, .. } => (structural, true),
+            _ => (view, false),
+        };
+        let Type::ObjectType(object) = self.types.get(structural).clone() else {
+            return source;
+        };
+        if excluded.is_empty()
+            && !object.properties.iter().any(Self::is_spread_excluded)
+            && !statics
+        {
+            return source;
+        }
+        let mut properties = Vec::with_capacity(object.properties.len());
+        for property in &object.properties {
+            if excluded.iter().any(|name| name.as_str() == property.name()) {
+                continue;
+            }
+            if property.access() != Accessibility::Public {
+                continue;
+            }
+            if !statics
+                && property.declaring_class().is_some()
+                && (property.is_method() || property.accessor())
+            {
+                continue;
+            }
+            properties.push(property.clone());
+        }
+        let mut filtered = object.clone();
+        filtered.properties = properties;
+        self.types.object_type_with_members(filtered)
+    }
+
+    /// Whether `name` is absent from `source` for binding-pattern
+    /// destructuring. Returns false for sources the checker cannot
+    /// verify, keeping them silent as today.
+    fn binding_pattern_property_missing(&mut self, source: TypeId, name: &str) -> bool {
+        if Self::is_object_prototype_member(name) {
+            return false;
+        }
+        let view = self
+            .types
+            .prepare_applied_alias_view(source)
+            .unwrap_or(source);
+        match self.types.get(view).clone() {
+            Type::ObjectType(_) | Type::Record { .. } => {
+                self.types.read_property_type(view, name).is_none()
+            }
+            Type::ConstructorType { structural, .. } => match self.types.get(structural).clone() {
+                Type::ObjectType(_) => self.types.read_property_type(structural, name).is_none(),
+                _ => false,
+            },
+            Type::AppliedClass { .. } => match self.types.prepare_applied_class_view(view) {
+                Some(class_view) => self.binding_pattern_property_missing(class_view, name),
+                None => false,
+            },
+            Type::Named(symbol) => {
+                if let Some(constraint) = self.types.type_parameter_constraint(symbol) {
+                    if constraint == view {
+                        return false;
+                    }
+                    return self.binding_pattern_property_missing(constraint, name);
+                }
+                let resolved = self.resolve_named_type_symbol(symbol);
+                if resolved == view {
+                    return false;
+                }
+                self.binding_pattern_property_missing(resolved, name)
+            }
+            Type::This { constraint, .. } => {
+                self.binding_pattern_property_missing(constraint, name)
+            }
+            Type::Union(members) => {
+                for member in members {
+                    if Self::is_pattern_silent_member(self.types.get(member)) {
+                        continue;
+                    }
+                    if self.binding_pattern_property_missing(member, name) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Type::Null | Type::Undefined => true,
+            Type::Intersection(members) => {
+                if members
+                    .iter()
+                    .any(|member| matches!(self.types.get(*member), Type::Any | Type::Error))
+                {
+                    return false;
+                }
+                self.types.read_property_type(view, name).is_none()
+            }
+            _ => false,
+        }
+    }
+
+    /// Union constituents that can never prove a destructured name absent.
+    /// Nullish constituents do prove absence, matching the authority
+    /// treatment of destructuring over nullable unions.
+    fn is_pattern_silent_member(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Any
+                | Type::Error
+                | Type::Unknown
+                | Type::Never
+                | Type::Void
+                | Type::String
+                | Type::Number
+                | Type::Boolean
+                | Type::Symbol
+                | Type::BigInt
+                | Type::Function(_)
+                | Type::StringLiteral(_)
+                | Type::NumberLiteral(_)
+                | Type::BooleanLiteral(_)
+                | Type::BigIntLiteral(_)
+        )
+    }
+
     fn assign_binding_pattern_types(
         &mut self,
         pattern: &'src crate::syntax::Pattern,
@@ -14540,16 +15010,18 @@ impl<'src> Binder<'src> {
                         omitted.push(key);
                     }
                 }
-                let rename_rest = object.properties.iter().any(|property| {
-                    matches!(property.binding.data(), BindingPattern::Rest(_))
-                }) && object.properties.iter().any(|property| {
-                    matches!(property.name, PropertyName::Missing(_))
-                        && matches!(property.binding.data(), BindingPattern::Identifier(_))
-                });
+                let rename_rest = object
+                    .properties
+                    .iter()
+                    .any(|property| matches!(property.binding.data(), BindingPattern::Rest(_)))
+                    && object.properties.iter().any(|property| {
+                        matches!(property.name, PropertyName::Missing(_))
+                            && matches!(property.binding.data(), BindingPattern::Identifier(_))
+                    });
                 for property in &object.properties {
                     let binding = &property.binding;
                     if matches!(binding.data(), BindingPattern::Rest(_)) && !rename_rest {
-                        let rest = self.object_rest_type(source, &omitted);
+                        let rest = self.rest_spread_source(source, &omitted);
                         self.assign_binding_pattern_types(binding, rest, scope, keep_literal);
                         continue;
                     }
@@ -14557,9 +15029,22 @@ impl<'src> Binder<'src> {
                         && matches!(property.name, PropertyName::Missing(_))
                         && matches!(binding.data(), BindingPattern::Identifier(_))
                     {
-                        let rest = self.object_rest_type(source, &omitted);
+                        let rest = self.rest_spread_source(source, &omitted);
                         self.assign_binding_pattern_types(binding, rest, scope, keep_literal);
                         continue;
+                    }
+                    let has_default = matches!(binding.data(), BindingPattern::Assignment(_))
+                        || property.initializer.is_some();
+                    if !has_default
+                        && let Some(name) = self.property_key(&property.name)
+                        && self.binding_pattern_property_missing(source, &name)
+                    {
+                        let name_range = Self::property_name_range(&property.name);
+                        self.emit(
+                            PROPERTY_DOES_NOT_EXIST,
+                            name_range,
+                            PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                        );
                     }
                     let projected = self
                         .property_key(&property.name)
@@ -14585,33 +15070,6 @@ impl<'src> Binder<'src> {
             BindingPattern::Missing(_) => {}
         }
     }
-    fn object_rest_type(&mut self, source: TypeId, omitted: &[String]) -> TypeId {
-        let members = match self.types.get(source).clone() {
-            Type::Union(members) => members,
-            _ => vec![source],
-        };
-        let mut kept = Vec::new();
-        for member in members {
-            match self.types.get(member).clone() {
-                Type::Null | Type::Undefined => {}
-                Type::ObjectType(mut object) if !omitted.is_empty() => {
-                    object.properties.retain(|property| {
-                        !omitted.iter().any(|key| key.as_str() == property.name())
-                    });
-                    kept.push(self.types.object_type_with_members(object));
-                }
-                _ => kept.push(member),
-            }
-        }
-        if kept.is_empty() {
-            self.types.object_type(Vec::new())
-        } else if kept.len() == 1 {
-            kept[0]
-        } else {
-            self.types.union(&kept)
-        }
-    }
-
     fn binding_element_type(&mut self, source: TypeId, index: usize) -> TypeId {
         match self.types.get(source).clone() {
             Type::Tuple(shape) => self
@@ -15170,7 +15628,13 @@ impl<'src> Binder<'src> {
             },
             _ => format!("arg{index}"),
         };
-        Some(FunctionParameter::new(name, type_id, optional, rest))
+        let declared = data.type_annotation.is_some();
+        let parameter = if declared {
+            FunctionParameter::new_declared(name, type_id, optional, rest)
+        } else {
+            FunctionParameter::new(name, type_id, optional, rest)
+        };
+        Some(parameter)
     }
 
     fn this_parameter_type(
@@ -16863,7 +17327,7 @@ impl<'src> Binder<'src> {
                     anchor(self, &name, &accessor.name);
                 }
             }
-            ClassMember::Method(method) => {
+            ClassMember::Method(method) if method.modifier == PropertyModifier::None => {
                 if let Some(name) = self.member_symbol_key(&method.name) {
                     self.declare(
                         &name,
@@ -16873,6 +17337,23 @@ impl<'src> Binder<'src> {
                         Self::property_name_range(&method.name),
                     );
                     anchor(self, &name, &method.name);
+                }
+            }
+            ClassMember::Method(method)
+                if matches!(
+                    method.modifier,
+                    PropertyModifier::Get | PropertyModifier::Set
+                ) =>
+            {
+                if let Some(name) = self.member_symbol_key(&method.name) {
+                    self.declare_member_occurrence(
+                        &name,
+                        SymbolKind::Variable(VariableKind::Let),
+                        scope,
+                        member.id(),
+                        member.range(),
+                        &method.name,
+                    );
                 }
             }
             ClassMember::IndexSignature(index) => {
@@ -16887,11 +17368,13 @@ impl<'src> Binder<'src> {
                         parameter_scope,
                         parameter.id(),
                     ) {
-                        self.signature_parameter_symbols.insert(parameter.id(), symbol);
+                        self.signature_parameter_symbols
+                            .insert(parameter.id(), symbol);
                     }
                 }
             }
-            ClassMember::Constructor(_)
+            ClassMember::Method(_)
+            | ClassMember::Constructor(_)
             | ClassMember::StaticBlock(_)
             | ClassMember::Missing(_)
             | ClassMember::Semicolon => {}
@@ -16915,6 +17398,46 @@ impl<'src> Binder<'src> {
                 .unwrap_or_else(|| self.types.any());
             self.types.this_type(owner, instance)
         }
+    }
+
+    fn record_accessor_name(
+        &mut self,
+        modifier: PropertyModifier,
+        function: &'src FunctionLike,
+        name: &PropertyName,
+        inferred_return: Option<TypeId>,
+        scope: ScopeId,
+    ) {
+        if !matches!(modifier, PropertyModifier::Get | PropertyModifier::Set) {
+            return;
+        }
+        let outer_probing = self.probing_contextual_type;
+        self.probing_contextual_type = true;
+        let name_range = Self::property_name_range(name);
+        let accessor_type = match modifier {
+            PropertyModifier::Get => {
+                if let Some(annotation) = &function.return_type {
+                    self.resolve_type(&annotation.data().type_node, scope)
+                } else {
+                    inferred_return.unwrap_or_else(|| self.types.any())
+                }
+            }
+            _ => {
+                let mut accessor_type = self.types.any();
+                for parameter in &function.parameters {
+                    if self.is_this_parameter(parameter) {
+                        continue;
+                    }
+                    if let Some(annotation) = parameter.data().type_annotation.as_ref() {
+                        accessor_type = self.resolve_type(&annotation.data().type_node, scope);
+                    }
+                    break;
+                }
+                accessor_type
+            }
+        };
+        self.probing_contextual_type = outer_probing;
+        self.typed_expressions.push((name_range, accessor_type));
     }
 
     fn resolve_class_member(
@@ -17000,6 +17523,13 @@ impl<'src> Binder<'src> {
                             .insert(member.id(), signature.return_type());
                     }
                 }
+                self.record_accessor_name(
+                    method.modifier,
+                    &method.function,
+                    &method.name,
+                    self.inferred_member_returns.get(&member.id()).copied(),
+                    scope,
+                );
             }
             ClassMember::Constructor(constructor) => {
                 if ambient {
@@ -17108,6 +17638,8 @@ impl<'src> Binder<'src> {
                     derived,
                     is_static: property.modifiers.is_static,
                 });
+                let this_type = self.class_this_type(scope, property.modifiers.is_static);
+                self.this_context.push(this_type);
                 let type_id = self.class_property_type(
                     property.type_annotation.as_ref(),
                     property.initializer.as_deref(),
@@ -17115,6 +17647,7 @@ impl<'src> Binder<'src> {
                     scope,
                     true,
                 );
+                self.this_context.pop();
                 let popped_home = self.super_member_homes.pop();
                 debug_assert_eq!(
                     popped_home,
@@ -17123,7 +17656,7 @@ impl<'src> Binder<'src> {
                         is_static: property.modifiers.is_static
                     })
                 );
-                if let Some(name) = self.property_key(&property.name)
+                if let Some(name) = self.member_symbol_key(&property.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
                     self.symbol_types[symbol.get() as usize] = type_id;
@@ -17136,6 +17669,8 @@ impl<'src> Binder<'src> {
                     derived,
                     is_static: accessor.modifiers.is_static,
                 });
+                let this_type = self.class_this_type(scope, accessor.modifiers.is_static);
+                self.this_context.push(this_type);
                 let type_id = self.class_property_type(
                     accessor.type_annotation.as_ref(),
                     accessor.initializer.as_deref(),
@@ -17143,6 +17678,7 @@ impl<'src> Binder<'src> {
                     scope,
                     true,
                 );
+                self.this_context.pop();
                 let popped_home = self.super_member_homes.pop();
                 debug_assert_eq!(
                     popped_home,
@@ -17151,7 +17687,7 @@ impl<'src> Binder<'src> {
                         is_static: accessor.modifiers.is_static
                     })
                 );
-                if let Some(name) = self.property_key(&accessor.name)
+                if let Some(name) = self.member_symbol_key(&accessor.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
                     self.symbol_types[symbol.get() as usize] = type_id;
@@ -17184,9 +17720,12 @@ impl<'src> Binder<'src> {
                     derived,
                     is_static: true,
                 });
+                let this_type = self.class_this_type(scope, true);
+                self.this_context.push(this_type);
                 self.push_label_scope();
                 self.bind_statements(&block.data().statements, child);
                 self.resolve_statements(&block.data().statements, child);
+                self.this_context.pop();
                 self.pop_label_scope();
                 let popped_home = self.super_member_homes.pop();
                 debug_assert_eq!(
@@ -17246,8 +17785,9 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Object(object) => {
+                let member_scope = self.new_scope(ScopeKind::Class, Some(scope));
                 for member in &object.members {
-                    self.resolve_object_member(member.data(), scope);
+                    self.resolve_object_member(member, scope, member_scope);
                 }
             }
             Expression::Function(function) => {
@@ -17454,7 +17994,10 @@ impl<'src> Binder<'src> {
                 if let Some(object_symbol) = object_symbol
                     && matches!(
                         self.symbols[object_symbol.get() as usize].kind,
-                        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Namespace
+                        SymbolKind::Class
+                            | SymbolKind::Interface
+                            | SymbolKind::Enum
+                            | SymbolKind::Namespace
                     )
                     && !self.member_reference_recorded.contains(&expression.id())
                 {
@@ -17468,10 +18011,13 @@ impl<'src> Binder<'src> {
                 if let Some(object_symbol) = object_symbol
                     && let MemberProperty::Named(identifier) = &member.property
                     && self.symbols[object_symbol.get() as usize].kind == SymbolKind::IntrinsicValue
-                    && let Some(member_symbol) = self.intrinsic_static_member(object_symbol, identifier)
+                    && let Some(member_symbol) =
+                        self.intrinsic_static_member(object_symbol, identifier)
                 {
-                    self.symbol_references.push((identifier.range(), member_symbol));
-                    self.symbol_references.push((expression.range(), member_symbol));
+                    self.symbol_references
+                        .push((identifier.range(), member_symbol));
+                    self.symbol_references
+                        .push((expression.range(), member_symbol));
                     self.member_reference_recorded.insert(expression.id());
                 }
                 if !self.member_reference_recorded.contains(&expression.id())
@@ -17992,14 +18538,39 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn resolve_object_member(&mut self, member: &'src ObjectMember, scope: ScopeId) {
-        match member {
+    fn resolve_object_member(
+        &mut self,
+        member: &'src crate::syntax::ObjectMemberNode,
+        scope: ScopeId,
+        member_scope: ScopeId,
+    ) {
+        match member.data() {
             ObjectMember::Property(property) => {
                 self.resolve_property_name(&property.name, scope);
+                if let Some(name) = self.literal_member_name(&property.name) {
+                    self.declare_member_occurrence(
+                        &name,
+                        SymbolKind::Variable(VariableKind::Let),
+                        member_scope,
+                        member.id(),
+                        member.range(),
+                        &property.name,
+                    );
+                }
                 self.resolve_expr(&property.value, scope);
             }
             ObjectMember::Method(method) => {
                 self.resolve_property_name(&method.name, scope);
+                if let Some(name) = self.literal_member_name(&method.name) {
+                    self.declare_member_occurrence(
+                        &name,
+                        SymbolKind::Variable(VariableKind::Let),
+                        member_scope,
+                        member.id(),
+                        member.range(),
+                        &method.name,
+                    );
+                }
                 self.check_set_accessor_parameter_initializer(
                     method.modifier,
                     &method.function.parameters,
@@ -18018,6 +18589,13 @@ impl<'src> Binder<'src> {
                     false,
                     self.types.any(),
                     SuperMemberHome::ObjectMember,
+                );
+                self.record_accessor_name(
+                    method.modifier,
+                    &method.function,
+                    &method.name,
+                    None,
+                    scope,
                 );
             }
             ObjectMember::Spread(spread) => self.resolve_expr(&spread.argument, scope),
@@ -19136,6 +19714,105 @@ impl<'src> Binder<'src> {
         narrowing.refined_type_at(self.flow, &key)
     }
 
+    /// Types a `#name` member access. Undeclared private names report the
+    /// missing-property diagnostic, matching the authority treatment of
+    /// `#bar` on `any` and every `#name` on `never`. Declared names keep
+    /// the established silent `any` read.
+    fn type_of_private_member(
+        &mut self,
+        object: &'src Expr,
+        property: &'src MemberProperty,
+        scope: ScopeId,
+    ) -> (TypeId, bool) {
+        let MemberProperty::Private(identifier) = property else {
+            return (self.types.any(), false);
+        };
+        let object_type = self.legacy_type_of_expr(object, scope);
+        if matches!(self.types.get(object_type), Type::Never) {
+            self.emit(
+                PROPERTY_DOES_NOT_EXIST,
+                identifier.range(),
+                PROPERTY_DOES_NOT_EXIST_MESSAGE,
+            );
+            return (self.types.error_type(), false);
+        }
+        if matches!(self.types.get(object_type), Type::Any | Type::Unknown) {
+            let declared = self
+                .member_symbol_name(property)
+                .is_some_and(|name| self.private_name_declared(&name));
+            if !declared {
+                self.emit(
+                    PROPERTY_DOES_NOT_EXIST,
+                    identifier.range(),
+                    PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                );
+                return (self.types.error_type(), false);
+            }
+            return (self.types.any(), false);
+        }
+        if self
+            .private_member_owner(object, object_type)
+            .is_some_and(|owner| {
+                self.member_symbol(owner, &self.private_member_key(property))
+                    .is_some()
+            })
+        {
+            return (self.types.any(), false);
+        }
+        self.emit(
+            PROPERTY_DOES_NOT_EXIST,
+            identifier.range(),
+            PROPERTY_DOES_NOT_EXIST_MESSAGE,
+        );
+        (self.types.error_type(), false)
+    }
+
+    /// The `#`-prefixed lookup key for a private member reference, or an
+    /// empty key when the property is not a private name.
+    fn private_member_key(&self, property: &MemberProperty) -> EcmaString {
+        self.member_symbol_name(property)
+            .unwrap_or_else(EcmaString::default)
+    }
+
+    /// Whether `#name` is declared in any class member scope in the program.
+    /// Undeclared names cannot resolve on `any` receivers either.
+    fn private_name_declared(&self, name: &EcmaString) -> bool {
+        let key = name.to_utf8_lossy();
+        self.class_member_scopes
+            .values()
+            .any(|scope| self.scopes[scope.0 as usize].value(&key).is_some())
+    }
+
+    /// The class that owns `#name` lookup for this receiver, when the
+    /// receiver denotes a class instance, static side, or `this`.
+    fn private_member_owner(&self, object: &'src Expr, object_type: TypeId) -> Option<SymbolId> {
+        if let Some(symbol) = self.resolved_expression_reference(object) {
+            if self.symbols[symbol.get() as usize].kind == SymbolKind::Class {
+                return Some(symbol);
+            }
+        }
+        match self.types.get(object_type).clone() {
+            Type::AppliedClass { symbol, .. } => Some(symbol),
+            Type::ConstructorType { symbol, .. } => Some(symbol),
+            Type::This { owner, .. } => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// Whether `symbol` names a `const` enum declaration in this program.
+    fn is_const_enum(&self, symbol: SymbolId) -> bool {
+        self.enum_declarations
+            .iter()
+            .any(|binding| binding.symbol == symbol && binding.declaration.is_const)
+    }
+
+    /// Whether `name` is a declared member of enum `symbol`.
+    fn enum_has_member(&self, symbol: SymbolId, name: &EcmaString) -> bool {
+        self.enum_member_symbols_by_name
+            .get(&symbol)
+            .is_some_and(|members| members.contains_key(name))
+    }
+
     fn type_of_member(
         &mut self,
         object: &'src Expr,
@@ -19146,6 +19823,9 @@ impl<'src> Binder<'src> {
     ) -> (TypeId, bool) {
         let continuation = !optional && crate::early_errors::in_optional_chain(object);
         let Some(name) = enum_plan::cook_member_property_name(self.source, property) else {
+            if let MemberProperty::Private(_) = property {
+                return self.type_of_private_member(object, property, scope);
+            }
             let MemberProperty::Computed(expression) = property else {
                 return (self.types.any(), false);
             };
@@ -19225,6 +19905,24 @@ impl<'src> Binder<'src> {
                     .copied()
             {
                 return (self.symbol_types[member_symbol.get() as usize], false);
+            } else if kind == SymbolKind::Enum
+                && self.is_const_enum(object_symbol)
+                && self
+                    .enum_member_symbols_by_name
+                    .contains_key(&object_symbol)
+                && !self.enum_has_member(object_symbol, &name)
+            {
+                let name_range = match property {
+                    MemberProperty::Named(identifier) => identifier.range(),
+                    MemberProperty::Computed(expression) => expression.range(),
+                    MemberProperty::Private(identifier) => identifier.range(),
+                };
+                self.emit(
+                    PROPERTY_DOES_NOT_EXIST,
+                    name_range,
+                    PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                );
+                return (self.types.error_type(), false);
             } else if let Some(&member_scope) = self.namespace_export_scopes.get(&object_symbol) {
                 // Merged partners (function, class) keep their own kind,
                 // so the arms above miss them; their namespace half still
@@ -19322,14 +20020,22 @@ impl<'src> Binder<'src> {
         {
             return (narrowed, short_circuits);
         }
+        let lookup = if matches!(property, MemberProperty::Computed(_)) {
+            MemberLookup::Computed
+        } else {
+            MemberLookup::Named
+        };
         let type_id = self
             .property_type_for_member_raw(
-                lookup_type,
-                name_str.as_str(),
-                property_range,
+                MemberRequest {
+                    object_type: lookup_type,
+                    name: name_str.as_str(),
+                    range: property_range,
+                    receiver: object_type,
+                    owner_hint: None,
+                    lookup,
+                },
                 read,
-                object_type,
-                None,
             )
             .unwrap_or_else(|| self.types.any());
         (type_id, short_circuits)
@@ -19373,6 +20079,14 @@ impl<'src> Binder<'src> {
         } else {
             type_id
         }
+    }
+
+    fn missing_member_is_implicit_any(&self, lookup: MemberLookup) -> bool {
+        lookup == MemberLookup::Computed && !self.no_implicit_any
+    }
+
+    fn report_missing_member(&self, lookup: MemberLookup) -> bool {
+        self.is_typescript() && !self.missing_member_is_implicit_any(lookup)
     }
 
     fn is_member_accessible(&self, property: &PropertyType) -> bool {
@@ -19522,7 +20236,17 @@ impl<'src> Binder<'src> {
         range: TextRange,
         read: bool,
     ) -> Option<TypeId> {
-        self.property_type_for_member_raw(object_type, name, range, read, object_type, None)
+        self.property_type_for_member_raw(
+            MemberRequest {
+                object_type,
+                name,
+                range,
+                receiver: object_type,
+                owner_hint: None,
+                lookup: MemberLookup::Named,
+            },
+            read,
+        )
     }
 
     fn deferred_record_property_type(&mut self, key: TypeId, value: TypeId, name: &str) -> TypeId {
@@ -19535,16 +20259,29 @@ impl<'src> Binder<'src> {
 
     fn property_type_for_member_raw(
         &mut self,
-        object_type: TypeId,
-        name: &str,
-        range: TextRange,
+        request: MemberRequest,
         read: bool,
-        receiver: TypeId,
-        owner_hint: Option<SymbolId>,
     ) -> Option<TypeId> {
+        let MemberRequest {
+            object_type,
+            name,
+            range,
+            receiver,
+            owner_hint,
+            lookup,
+        } = request;
         if let Some(view) = self.types.prepare_applied_alias_view(object_type) {
-            return self
-                .property_type_for_member_raw(view, name, range, read, receiver, owner_hint);
+            return self.property_type_for_member_raw(
+                MemberRequest {
+                    object_type: view,
+                    name,
+                    range,
+                    receiver,
+                    owner_hint,
+                    lookup,
+                },
+                read,
+            );
         }
         match self.types.get(object_type).clone() {
             Type::Record { key, value } => {
@@ -19604,7 +20341,7 @@ impl<'src> Binder<'src> {
                 {
                     return Some(self.project_this_type(property, owner_hint, receiver));
                 }
-                if self.is_typescript() {
+                if self.report_missing_member(lookup) {
                     self.emit(
                         PROPERTY_DOES_NOT_EXIST,
                         range,
@@ -19622,12 +20359,15 @@ impl<'src> Binder<'src> {
                     None
                 } else {
                     self.property_type_for_member_raw(
-                        view,
-                        name,
-                        range,
+                        MemberRequest {
+                            object_type: view,
+                            name,
+                            range,
+                            receiver,
+                            owner_hint: Some(symbol),
+                            lookup,
+                        },
                         read,
-                        receiver,
-                        Some(symbol),
                     )
                 }
             }
@@ -19647,7 +20387,15 @@ impl<'src> Binder<'src> {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     let member_property = self.property_type_for_member_raw(
-                        member, name, range, read, receiver, owner_hint,
+                        MemberRequest {
+                            object_type: member,
+                            name,
+                            range,
+                            receiver,
+                            owner_hint,
+                            lookup,
+                        },
+                        read,
                     )?;
                     if member_property == self.types.error_type() {
                         return Some(self.types.error_type());
@@ -19734,57 +20482,78 @@ impl<'src> Binder<'src> {
                     self.types.property_type(object_type, name)
                 };
                 match property {
-                    Some(found) => {
-                        Some(self.project_this_type(found, owner_hint, receiver))
-                    }
+                    Some(found) => Some(self.project_this_type(found, owner_hint, receiver)),
                     None => self.array_prototype_member(object_type, name, range),
                 }
             }
-            Type::AppliedClass { symbol, .. } => {
-                if let Some(view) = self.types.prepare_applied_class_view(object_type) {
-                    return self.property_type_for_member_raw(
-                        view,
-                        name,
-                        range,
-                        read,
-                        receiver,
-                        Some(symbol),
-                    );
-                }
-                None
-            }
-            Type::ConstructorType { structural, .. } => self
-                .property_type_for_member_raw(structural, name, range, read, receiver, owner_hint),
-            Type::TypeQuery { .. } => self
-                .types
-                .type_query_target(object_type)
-                .and_then(|target| {
-                    self.property_type_for_member_raw(target, name, range, read, receiver, owner_hint)
-                }),
-            Type::This {
-                owner, constraint, ..
-            } => self.property_type_for_member_raw(
-                constraint,
-                name,
-                range,
-                read,
-                receiver,
-                Some(owner),
-            ),
-            Type::Function(signature) if name == "call" => {
-                let property = self.function_call_member_type(&signature);
-                Some(self.project_this_type(property, owner_hint, receiver))
-            }
-            Type::Boolean
-            | Type::Number
+            Type::Number
             | Type::BigInt
             | Type::String
             | Type::Symbol
             | Type::BooleanLiteral(_)
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_) => {
-                self.primitive_wrapper_member(object_type, name, range)
+            | Type::BigIntLiteral(_) => self.primitive_wrapper_member(object_type, name, range),
+            Type::AppliedClass { symbol, .. } => {
+                if let Some(view) = self.types.prepare_applied_class_view(object_type) {
+                    return self.property_type_for_member_raw(
+                        MemberRequest {
+                            object_type: view,
+                            name,
+                            range,
+                            receiver,
+                            owner_hint: Some(symbol),
+                            lookup,
+                        },
+                        read,
+                    );
+                }
+                None
+            }
+            Type::TypeQuery { .. } => {
+                self.types
+                    .type_query_target(object_type)
+                    .and_then(|target| {
+                        self.property_type_for_member_raw(
+                            MemberRequest {
+                                object_type: target,
+                                name,
+                                range,
+                                receiver,
+                                owner_hint,
+                                lookup,
+                            },
+                            read,
+                        )
+                    })
+            }
+            Type::ConstructorType { structural, .. } => self.property_type_for_member_raw(
+                MemberRequest {
+                    object_type: structural,
+                    name,
+                    range,
+                    receiver,
+                    owner_hint,
+                    lookup,
+                },
+                read,
+            ),
+            Type::This {
+                owner, constraint, ..
+            } => self.property_type_for_member_raw(
+                MemberRequest {
+                    object_type: constraint,
+                    name,
+                    range,
+                    receiver,
+                    owner_hint: Some(owner),
+                    lookup,
+                },
+                read,
+            ),
+            Type::Function(signature) if name == "call" => {
+                let property = self.function_call_member_type(&signature);
+                Some(self.project_this_type(property, owner_hint, receiver))
             }
             Type::Error
             | Type::Any
@@ -19793,6 +20562,7 @@ impl<'src> Binder<'src> {
             | Type::Void
             | Type::Null
             | Type::Undefined
+            | Type::Boolean
             | Type::Object
             | Type::Function(_)
             | Type::AppliedAlias { .. }
@@ -19857,6 +20627,7 @@ impl<'src> Binder<'src> {
         match target.data() {
             AssignmentTarget::Identifier(identifier) => {
                 let name = self.identifier_text(identifier);
+                self.emit_strict_eval_or_arguments(name.as_ref(), scope, identifier.range());
                 if let Some(symbol) = self.lookup_value(scope, &name) {
                     self.uninitialized_variables.remove(&symbol);
                 }
@@ -20269,6 +21040,7 @@ impl<'src> Binder<'src> {
             return self.types.error_type();
         }
         self.type_resolution_depth += 1;
+        self.check_type_node_eval_or_arguments(node, scope);
         let resolved = match node.data() {
             TypeNode::Keyword(keyword) => self.keyword_type(*keyword),
             TypeNode::Literal(literal) => self.literal_type(literal),
@@ -20466,11 +21238,7 @@ impl<'src> Binder<'src> {
         self.types.type_query(name, arguments, target)
     }
 
-    fn type_query_operand_symbol(
-        &mut self,
-        name: &EntityName,
-        scope: ScopeId,
-    ) -> Option<SymbolId> {
+    fn type_query_operand_symbol(&mut self, name: &EntityName, scope: ScopeId) -> Option<SymbolId> {
         match name {
             EntityName::Identifier(identifier) => {
                 let name = self.identifier_text(identifier);
@@ -21073,7 +21841,9 @@ impl<'src> Binder<'src> {
                     .any(|&argument| self.references_free_type_parameter(argument, visiting, bound))
                     || self.references_free_type_parameter(*structural, visiting, bound)
             }
-            Type::TypeQuery { arguments, target, .. } => {
+            Type::TypeQuery {
+                arguments, target, ..
+            } => {
                 arguments
                     .iter()
                     .any(|&argument| self.references_free_type_parameter(argument, visiting, bound))
@@ -22174,16 +22944,21 @@ impl<'src> Binder<'src> {
                         continue;
                     }
                     if let Some(name) = self.property_key(&property.name) {
+                        let declared = property.type_annotation.is_some();
                         let type_id = match &property.type_annotation {
                             Some(annotation) => {
                                 self.resolve_type(&annotation.data().type_node, scope)
                             }
                             None => self.types.any(),
                         };
-                        object.properties.push(
-                            PropertyType::new(name, property.optional, type_id)
-                                .with_readonly(property.readonly),
-                        );
+                        let member = PropertyType::new(name, property.optional, type_id)
+                            .with_readonly(property.readonly);
+                        let member = if declared {
+                            member.with_declared()
+                        } else {
+                            member
+                        };
+                        object.properties.push(member);
                     }
                 }
                 TypeMember::Method(method) => {
@@ -22262,7 +23037,7 @@ impl<'src> Binder<'src> {
                                 self.symbol_types[symbol.get() as usize] = type_id;
                                 self.type_state[symbol.get() as usize] = TypeState::Done(type_id);
                             }
-                            FunctionParameter::new(
+                            FunctionParameter::new_declared(
                                 self.identifier_text(&parameter.name).into_owned(),
                                 type_id,
                                 parameter.optional,
@@ -22325,7 +23100,7 @@ impl<'src> Binder<'src> {
                 self.symbol_types[nested.get() as usize] = type_id;
                 self.type_state[nested.get() as usize] = TypeState::Done(type_id);
             }
-            parameters.push(FunctionParameter::new(
+            parameters.push(FunctionParameter::new_declared(
                 self.identifier_text(&parameter.name).into_owned(),
                 type_id,
                 parameter.optional,
@@ -22427,6 +23202,74 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Source slice of an exact source range, for member-name spellings.
+    fn slice_source(&self, range: TextRange) -> Option<&str> {
+        let text = self.source.source_text();
+        let start = text.utf16_to_byte(range.start()).ok()?;
+        let end = text.utf16_to_byte(range.end()).ok()?;
+        text.as_str().get(start..end)
+    }
+
+    /// Display spelling of a member name for `.symbols` rows: `None` for
+    /// plain identifiers (rendered from the symbol name), otherwise the
+    /// exact source spelling with quotes, digits, or brackets intact.
+    fn member_display_spelling(&self, name: &PropertyName) -> Option<String> {
+        match name {
+            PropertyName::Identifier(_) | PropertyName::Private(_) | PropertyName::Missing(_) => {
+                None
+            }
+            PropertyName::String(literal) => Some(self.text(literal.data().token()).to_owned()),
+            PropertyName::Number(literal) => Some(self.text(literal.data().token()).to_owned()),
+            PropertyName::Computed(expression) => match expression.data() {
+                Expression::Literal(Literal::String(string)) => {
+                    Some(self.text(string.data().token()).to_owned())
+                }
+                Expression::Literal(Literal::Number(number)) => {
+                    Some(self.text(number.data().token()).to_owned())
+                }
+                _ => self
+                    .slice_source(expression.range())
+                    .map(|text| format!("[{text}]")),
+            },
+        }
+    }
+
+    /// Records a member symbol's display spelling when its name is not a
+    /// plain identifier.
+    fn note_member_spelling(&mut self, id: SymbolId, name: &PropertyName) {
+        if let Some(spelling) = self.member_display_spelling(name) {
+            self.symbols[id.get() as usize].display = Some(spelling);
+        }
+    }
+    /// Cooked name a member binds under: the plain `property_key`, or the
+    /// bracketed source spelling for computed members with a non-literal
+    /// expression (which no static lookup queries).
+    fn member_binding_name(&self, name: &PropertyName) -> Option<String> {
+        if let Some(cooked) = self.property_key(name) {
+            return Some(cooked);
+        }
+        match name {
+            PropertyName::Computed(_) => self.member_display_spelling(name),
+            _ => None,
+        }
+    }
+
+    /// Reserves a member symbol under its binding name and records a display
+    /// spelling when the name is not a plain identifier.
+    fn reserve_member_symbol(
+        &mut self,
+        name: &PropertyName,
+        kind: SymbolKind,
+        scope: ScopeId,
+        declaration: NodeId,
+        range: TextRange,
+    ) -> Option<SymbolId> {
+        let cooked = self.member_binding_name(name)?;
+        let id = self.reserve_symbol(&cooked, kind, scope, declaration, range);
+        self.note_member_spelling(id, name);
+        Some(id)
+    }
+
     /// The symbol-table key a container member declaration binds under.
     /// Private names bind under their `#`-prefixed source spelling so
     /// declarations and references render `Foo.#name` upstream; the ordinary
@@ -22438,6 +23281,33 @@ impl<'src> Binder<'src> {
                 Some(self.text(identifier.data().token()).to_owned())
             }
             other => self.property_key(other),
+        }
+    }
+
+    /// The symbol name an object literal or inline type literal member binds
+    /// under: the source spelling, quotes included for string keys and digits
+    /// for numeric keys, so rows render `Symbol("__", ...)` upstream. Bracket
+    /// spans cover computed keys; a member with no name yields nothing.
+    fn literal_member_name(&self, name: &PropertyName) -> Option<String> {
+        match name {
+            PropertyName::Identifier(identifier) => {
+                Some(self.identifier_text(identifier).into_owned())
+            }
+            PropertyName::Private(identifier) => {
+                Some(self.text(identifier.data().token()).to_owned())
+            }
+            PropertyName::String(literal) => Some(self.text(literal.data().token()).to_owned()),
+            PropertyName::Number(literal) => Some(self.text(literal.data().token()).to_owned()),
+            PropertyName::Computed(_) => {
+                let range = self.occurrence_name_range(name);
+                let source = self.source.source_text();
+                let (start, end) = (
+                    source.utf16_to_byte(range.start()).ok()?,
+                    source.utf16_to_byte(range.end()).ok()?,
+                );
+                source.as_str().get(start..end).map(str::to_owned)
+            }
+            PropertyName::Missing(_) => None,
         }
     }
 
@@ -22838,9 +23708,11 @@ impl<'src> Binder<'src> {
         }
         let result = self.legacy_compute_type_of_expr(expression, scope);
         if !self.probing_contextual_type
+            && !matches!(expression.data(), Expression::Literal(Literal::Null(_)))
             && self.node_types.insert(expression.id(), result).is_none()
         {
             self.typed_expressions.push((expression.range(), result));
+            self.record_import_specifier(expression, scope);
         }
         result
     }
@@ -22910,11 +23782,19 @@ impl<'src> Binder<'src> {
             _ => return self.legacy_type_of_expr(expression, scope),
         };
         if !self.probing_contextual_type
+            && !matches!(expression.data(), Expression::Literal(Literal::Null(_)))
             && self.node_types.insert(expression.id(), result).is_none()
         {
             self.typed_expressions.push((expression.range(), result));
+            self.record_import_specifier(expression, scope);
         }
         result
+    }
+
+    fn record_import_specifier(&mut self, expression: &'src Expr, scope: ScopeId) {
+        if let Expression::Import(import) = expression.data() {
+            self.legacy_type_of_expr(&import.source, scope);
+        }
     }
 
     fn contextual_array_target(&mut self, target: TypeId) -> (Option<TupleShape>, Option<TypeId>) {
@@ -23061,10 +23941,12 @@ impl<'src> Binder<'src> {
         let key = match self.property_key(name) {
             Some(key) => key,
             None => match name {
-                PropertyName::Computed(expression) => match self.object_member_source_slice(expression.range()) {
-                    Some(inner) => format!("[{inner}]"),
-                    None => return None,
-                },
+                PropertyName::Computed(expression) => {
+                    match self.object_member_source_slice(expression.range()) {
+                        Some(inner) => format!("[{inner}]"),
+                        None => return None,
+                    }
+                }
                 _ => return None,
             },
         };
@@ -23072,10 +23954,12 @@ impl<'src> Binder<'src> {
             PropertyName::Identifier(identifier) => self.identifier_text(identifier).into_owned(),
             PropertyName::String(literal) => self.text(literal.data().token()).to_owned(),
             PropertyName::Number(literal) => self.text(literal.data().token()).to_owned(),
-            PropertyName::Computed(expression) => match self.object_member_source_slice(expression.range()) {
-                Some(inner) => format!("[{inner}]"),
-                None => return None,
-            },
+            PropertyName::Computed(expression) => {
+                match self.object_member_source_slice(expression.range()) {
+                    Some(inner) => format!("[{inner}]"),
+                    None => return None,
+                }
+            }
             PropertyName::Private(_) | PropertyName::Missing(_) => return None,
         };
         Some((key, spelling))
@@ -23108,21 +23992,30 @@ impl<'src> Binder<'src> {
             let Some((key, spelling)) = self.object_member_spelling(name) else {
                 continue;
             };
-            let symbol =
-                match self.object_literal_members.get(&literal).and_then(|members| members.get(&key)).copied() {
-                    Some(existing) => existing,
-                    None => {
-                        let id = self.reserve_symbol(&spelling, kind, scope, member.id(), member.range());
-                        self.object_literal_members.entry(literal).or_default().insert(key, id);
-                        id
-                    }
-                };
-            self.interface_member_occurrences.push(DeclarationOccurrence {
-                declaration: member.id(),
-                declaration_range: member.range(),
-                symbol,
-                name_range: self.occurrence_name_range(name),
-            });
+            let symbol = match self
+                .object_literal_members
+                .get(&literal)
+                .and_then(|members| members.get(&key))
+                .copied()
+            {
+                Some(existing) => existing,
+                None => {
+                    let id =
+                        self.reserve_symbol(&spelling, kind, scope, member.id(), member.range());
+                    self.object_literal_members
+                        .entry(literal)
+                        .or_default()
+                        .insert(key, id);
+                    id
+                }
+            };
+            self.interface_member_occurrences
+                .push(DeclarationOccurrence {
+                    declaration: member.id(),
+                    declaration_range: member.range(),
+                    symbol,
+                    name_range: self.occurrence_name_range(name),
+                });
         }
     }
 
@@ -23181,10 +24074,12 @@ impl<'src> Binder<'src> {
         let key = match enum_plan::cook_member_property_name(self.source, property) {
             Some(name) => name.to_utf8_lossy().as_str().to_owned(),
             None => match property {
-                MemberProperty::Computed(expression) => match self.object_member_source_slice(expression.range()) {
-                    Some(inner) => format!("[{inner}]"),
-                    None => return,
-                },
+                MemberProperty::Computed(expression) => {
+                    match self.object_member_source_slice(expression.range()) {
+                        Some(inner) => format!("[{inner}]"),
+                        None => return,
+                    }
+                }
                 _ => return,
             },
         };
@@ -23203,22 +24098,21 @@ impl<'src> Binder<'src> {
             },
             MemberProperty::Private(_) => return,
         }
-        if !matches!(property, MemberProperty::Private(_) | MemberProperty::Computed(_)) {
+        if !matches!(
+            property,
+            MemberProperty::Private(_) | MemberProperty::Computed(_)
+        ) {
             self.symbol_references.push((path_range, member));
         }
         self.member_reference_recorded.insert(expression_id);
     }
 
-    fn suppress_shorthand_value_row(
-        &mut self,
-        literal: NodeId,
-        key: &str,
-        value_range: TextRange,
-    ) {
+    fn suppress_shorthand_value_row(&mut self, literal: NodeId, key: &str, value_range: TextRange) {
         let Some(member) = self.object_literal_member_symbol(literal, key) else {
             return;
         };
-        self.symbol_references.retain(|(range, symbol)| *range != value_range || *symbol == member);
+        self.symbol_references
+            .retain(|(range, symbol)| *range != value_range || *symbol == member);
     }
 
     fn type_of_object_literal(
@@ -23286,7 +24180,11 @@ impl<'src> Binder<'src> {
                             }
                         };
                         if property.shorthand {
-                            self.suppress_shorthand_value_row(literal_node, &name, property.value.range());
+                            self.suppress_shorthand_value_row(
+                                literal_node,
+                                &name,
+                                property.value.range(),
+                            );
                         }
                         upsert_property(
                             &mut properties,
@@ -23402,6 +24300,9 @@ impl<'src> Binder<'src> {
                                 async_iterator_property = Some(source_iterator);
                             }
                             for source_property in &object.properties {
+                                if Self::is_spread_excluded(source_property) {
+                                    continue;
+                                }
                                 let fresh = PropertyType::new(
                                     source_property.name.as_ref(),
                                     source_property.optional(),
@@ -23549,9 +24450,15 @@ impl<'src> Binder<'src> {
         property: &'src MemberProperty,
         path_range: TextRange,
     ) {
-        let identifier_range = match property {
+        let leaf_range = match property {
             MemberProperty::Named(identifier) => Some(identifier.range()),
-            MemberProperty::Private(_) | MemberProperty::Computed(_) => None,
+            MemberProperty::Computed(expression) => match expression.data() {
+                Expression::Literal(Literal::String(_) | Literal::Number(_)) => {
+                    Some(expression.range())
+                }
+                _ => None,
+            },
+            MemberProperty::Private(_) => None,
         };
         let Some(name) = self.member_symbol_name(property) else {
             return;
@@ -23559,10 +24466,26 @@ impl<'src> Binder<'src> {
         let Some(member_symbol) = self.member_symbol(owner, &name) else {
             return;
         };
-        if let Some(range) = identifier_range {
+        // Namespace exports render bare at their declarations, so access-path
+        // rows carry the owner-qualified display (`m1.m1`) while declaration
+        // rows keep `qualified_name`. Enum, class, and interface members
+        // already qualify through their scope owner.
+        if self.symbols[owner.get() as usize].kind == SymbolKind::Namespace {
+            let qualified = format!(
+                "{}.{}",
+                self.binder_qualified_name(owner),
+                self.symbols[member_symbol.get() as usize].name
+            );
+            self.reference_qualified_names
+                .entry(member_symbol)
+                .or_insert(qualified);
+        }
+        if let Some(range) = leaf_range {
             self.symbol_references.push((range, member_symbol));
         }
-        self.symbol_references.push((path_range, member_symbol));
+        if !matches!(property, MemberProperty::Computed(_)) {
+            self.symbol_references.push((path_range, member_symbol));
+        }
     }
 
     /// Records path and leaf rows for one member access unless the typing
@@ -23612,6 +24535,19 @@ impl<'src> Binder<'src> {
         None
     }
 
+    /// Dot-joined owner chain for a symbol, mirroring
+    /// `SemanticModel::qualified_name` for binder-side use during recording.
+    fn binder_qualified_name(&self, id: SymbolId) -> String {
+        match self.symbols[id.get() as usize].parent {
+            Some(parent) => format!(
+                "{}.{}",
+                self.binder_qualified_name(parent),
+                self.symbols[id.get() as usize].name
+            ),
+            None => self.symbols[id.get() as usize].name.clone(),
+        }
+    }
+
     /// Typing-phase counterpart: records rows when the base is typed as an
     /// applied class instance, an interface, or a `this` type, covering
     /// `instance.prop` accesses whose base carries no direct symbol. Nodes the
@@ -23633,7 +24569,10 @@ impl<'src> Binder<'src> {
             Some(symbol)
                 if matches!(
                     self.symbols[symbol.get() as usize].kind,
-                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Namespace
+                    SymbolKind::Class
+                        | SymbolKind::Interface
+                        | SymbolKind::Enum
+                        | SymbolKind::Namespace
                 ) =>
             {
                 Some(symbol)
@@ -24658,12 +25597,22 @@ impl<'src> Binder<'src> {
         let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
         for parameter in signature.parameters() {
             let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
-            instantiated_parameters.push(FunctionParameter::new(
-                parameter.name().to_owned(),
-                type_id,
-                parameter.optional(),
-                parameter.rest(),
-            ));
+            let instantiated = if parameter.declared() {
+                FunctionParameter::new_declared(
+                    parameter.name().to_owned(),
+                    type_id,
+                    parameter.optional(),
+                    parameter.rest(),
+                )
+            } else {
+                FunctionParameter::new(
+                    parameter.name().to_owned(),
+                    type_id,
+                    parameter.optional(),
+                    parameter.rest(),
+                )
+            };
+            instantiated_parameters.push(instantiated);
         }
         let instantiated_return = inferred.instantiate(&mut self.types, signature.return_type());
         Ok(FunctionSignature {
@@ -24725,12 +25674,22 @@ impl<'src> Binder<'src> {
         let mut instantiated_parameters = Vec::with_capacity(signature.parameters().len());
         for parameter in signature.parameters() {
             let type_id = inferred.instantiate(&mut self.types, parameter.type_id());
-            instantiated_parameters.push(FunctionParameter::new(
-                parameter.name().to_owned(),
-                type_id,
-                parameter.optional(),
-                parameter.rest(),
-            ));
+            let instantiated = if parameter.declared() {
+                FunctionParameter::new_declared(
+                    parameter.name().to_owned(),
+                    type_id,
+                    parameter.optional(),
+                    parameter.rest(),
+                )
+            } else {
+                FunctionParameter::new(
+                    parameter.name().to_owned(),
+                    type_id,
+                    parameter.optional(),
+                    parameter.rest(),
+                )
+            };
+            instantiated_parameters.push(instantiated);
         }
         let instantiated_return = inferred.instantiate(&mut self.types, signature.return_type());
         Some(FunctionSignature {
@@ -26719,8 +27678,12 @@ impl<'src> Binder<'src> {
                 let parameters = demand_ready!(self.function_parameters(&inventory));
                 let parameters = parameters
                     .into_iter()
-                    .map(|(name, type_id, optional, rest)| {
-                        FunctionParameter::new(name, type_id, optional, rest)
+                    .map(|(name, type_id, optional, rest, declared)| {
+                        if declared {
+                            FunctionParameter::new_declared(name, type_id, optional, rest)
+                        } else {
+                            FunctionParameter::new(name, type_id, optional, rest)
+                        }
                     })
                     .collect();
                 let (type_parameters, type_parameter_bounds) =
@@ -26810,7 +27773,7 @@ impl<'src> Binder<'src> {
     fn function_parameters(
         &mut self,
         inventory: &CallableInventory<'src>,
-    ) -> DemandResult<Vec<(String, TypeId, bool, bool)>> {
+    ) -> DemandResult<Vec<(String, TypeId, bool, bool, bool)>> {
         self.check_cancel()?;
         enum SourceParameters<'a> {
             Syntax(&'a [crate::syntax::ParameterNode]),
@@ -26874,7 +27837,8 @@ impl<'src> Binder<'src> {
                         None => self.types.any(),
                     };
                     let optional = data.optional || data.initializer.is_some();
-                    parameters.push((name, type_id, optional, rest));
+                    let declared = data.type_annotation.is_some();
+                    parameters.push((name, type_id, optional, rest, declared));
                 }
             }
             SourceParameters::Type(type_parameters) => {
@@ -26884,7 +27848,7 @@ impl<'src> Binder<'src> {
                     let type_id = demand_ready!(
                         self.resolve_type_demand(&parameter.type_annotation.data().type_node)
                     );
-                    parameters.push((name, type_id, parameter.optional, parameter.rest));
+                    parameters.push((name, type_id, parameter.optional, parameter.rest, true));
                 }
             }
         }
@@ -27779,6 +28743,7 @@ impl<'src> Binder<'src> {
             literal_anchor: HashMap<NodeId, PropertyOwner>,
             symbol_anchor: HashMap<SymbolId, PropertyOwner>,
             member_reference_recorded: HashSet<NodeId>,
+            reference_qualified_names: HashMap<SymbolId, String>,
             this_context: Vec<TypeId>,
             function_body_stack: Vec<NodeId>,
             return_contexts: Vec<ReturnContext>,
@@ -27824,6 +28789,7 @@ impl<'src> Binder<'src> {
             literal_anchor: std::mem::take(&mut self.literal_anchor),
             symbol_anchor: std::mem::take(&mut self.symbol_anchor),
             member_reference_recorded: std::mem::take(&mut self.member_reference_recorded),
+            reference_qualified_names: std::mem::take(&mut self.reference_qualified_names),
             this_context: std::mem::take(&mut self.this_context),
             function_body_stack: std::mem::take(&mut self.function_body_stack),
             return_contexts: std::mem::take(&mut self.return_contexts),
@@ -27876,6 +28842,7 @@ impl<'src> Binder<'src> {
         self.literal_anchor = isolated.literal_anchor;
         self.symbol_anchor = isolated.symbol_anchor;
         self.member_reference_recorded = isolated.member_reference_recorded;
+        self.reference_qualified_names = isolated.reference_qualified_names;
         self.this_context = isolated.this_context;
         self.function_body_stack = isolated.function_body_stack;
         self.return_contexts = isolated.return_contexts;
@@ -28031,16 +28998,17 @@ mod tests {
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
         CANNOT_FIND_TYPE, CONSTRUCTOR_TYPE_PARAMETERS, ConstructEntry,
-        DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
-        FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-        FunctionParameter, FunctionSignature, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-        MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, ObjectType,
-        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
-        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
-        SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeId, TypeParameterBounds,
-        TypeTable, bind_source,
+        DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION,
+        EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
+        EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
+        FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, FunctionParameter, FunctionSignature,
+        GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
+        NAMESPACE_NO_EXPORTED_MEMBER, ObjectType, PROPERTY_NOT_INITIALIZED, PropertyType,
+        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
+        TupleShape, Type, TypeId, TypeParameterBounds, TypeTable, bind_source,
     };
-    use crate::diagnostic::Diagnostic;
+    use crate::diagnostic::{Diagnostic, DiagnosticCode};
     use crate::source::{ScriptKind, SourceId, SourceText};
     use crate::syntax::VariableKind;
     use std::borrow::Cow;
@@ -28065,6 +29033,230 @@ mod tests {
         assert_eq!(codes, [CANNOT_FIND_NAME]);
         let (_, diagnostics) = bound("var known: number[] = [];\n[...known] = known;\n");
         assert_eq!(diagnostics.len(), 0, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn bare_null_literal_produces_no_typed_expression_record() {
+        let (model, _) = bound("var x = null;\nvar y = 1;\n");
+        let spans: Vec<(usize, usize)> = model
+            .typed_expressions()
+            .iter()
+            .map(|(range, _)| (range.start().get(), range.end().get()))
+            .collect();
+        assert!(
+            !spans.contains(&(8, 12)),
+            "bare null gets no record: {spans:?}"
+        );
+        assert!(
+            spans.contains(&(22, 23)),
+            "other literals keep records: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn getter_name_records_declared_return_type() {
+        let (model, _) = bound("class C { get x(): string { return \"\"; } }");
+        let found: Vec<TypeId> = model
+            .typed_expressions()
+            .iter()
+            .filter(|(range, _)| range.start().get() == 14 && range.end().get() == 15)
+            .map(|(_, type_id)| *type_id)
+            .collect();
+        assert_eq!(found.len(), 1, "getter name gets one record");
+        assert!(matches!(model.types().get(found[0]), Type::String));
+    }
+
+    #[test]
+    fn setter_name_records_first_parameter_type() {
+        let (model, _) = bound("class C { set x(v: number) {} }");
+        let found: Vec<TypeId> = model
+            .typed_expressions()
+            .iter()
+            .filter(|(range, _)| range.start().get() == 14 && range.end().get() == 15)
+            .map(|(_, type_id)| *type_id)
+            .collect();
+        assert_eq!(found.len(), 1, "setter name gets one record");
+        assert!(matches!(model.types().get(found[0]), Type::Number));
+    }
+
+    #[test]
+    fn dynamic_import_records_specifier_literal() {
+        let (model, _) = bound("const p = import(\"./m\");");
+        let spans: Vec<(usize, usize)> = model
+            .typed_expressions()
+            .iter()
+            .map(|(range, _)| (range.start().get(), range.end().get()))
+            .collect();
+        assert!(
+            spans.contains(&(17, 22)),
+            "specifier keeps its record: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn private_getter_name_records_declared_return_type() {
+        let (model, _) = bound("class C { get #p(): string { return \"\"; } }");
+        let found: Vec<TypeId> = model
+            .typed_expressions()
+            .iter()
+            .filter(|(range, _)| range.start().get() == 14 && range.end().get() == 16)
+            .map(|(_, type_id)| *type_id)
+            .collect();
+        assert_eq!(found.len(), 1, "private getter name gets one record");
+        assert!(matches!(model.types().get(found[0]), Type::String));
+    }
+
+    #[test]
+    fn getter_name_records_inferred_return_type() {
+        let (model, _) = bound("class C { get x() { return 1; } }");
+        let found: Vec<TypeId> = model
+            .typed_expressions()
+            .iter()
+            .filter(|(range, _)| range.start().get() == 14 && range.end().get() == 15)
+            .map(|(_, type_id)| *type_id)
+            .collect();
+        assert_eq!(found.len(), 1, "getter name gets one record");
+        assert!(matches!(model.types().get(found[0]), Type::Number));
+    }
+    fn has_strict_eval(diagnostics: &[Diagnostic], code: DiagnosticCode) -> bool {
+        diagnostics.iter().any(|d| d.code() == code)
+    }
+
+    #[test]
+    fn strict_module_param_named_arguments_reports_ts1215() {
+        let (_, diagnostics) = bound("export {};\nfunction f(arguments: number) {}\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_var_named_eval_reports_ts1100() {
+        let (_, diagnostics) = bound("\"use strict\";\nvar eval;\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_property_named_arguments_is_silent() {
+        let (_, diagnostics) = bound("\"use strict\";\nvar o = { arguments: 1 };\n");
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_class_method_param_named_arguments_reports_ts1210() {
+        let (_, diagnostics) = bound("class C {\nfoo(arguments: number) {}\n}\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_catch_binding_named_eval_reports_ts1100() {
+        let (_, diagnostics) = bound("\"use strict\";\ntry {} catch (eval) {}\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_assignment_to_arguments_reports_ts1100() {
+        let (_, diagnostics) = bound("\"use strict\";\narguments = 1;\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_ambient_function_named_eval_is_silent() {
+        let (_, diagnostics) = bound("\"use strict\";\ndeclare function eval(): void;\n");
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_interface_method_param_named_arguments_reports_ts1100() {
+        let (_, diagnostics) =
+            bound("\"use strict\";\ninterface I {\nfoo(arguments: number): void;\n}\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_module_without_eval_or_arguments_is_silent() {
+        let (_, diagnostics) = bound(
+            "export {};\nfunction f(a: number) { return a; }\nclass C {\nmethod(x: string) { return x; }\n}\n",
+        );
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
+                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_type_literal_param_named_arguments_reports_ts1100_once() {
+        let (_, diagnostics) = bound("\"use strict\";\nvar v: (arguments: number) => void;\n");
+        let count = diagnostics
+            .iter()
+            .filter(|d| d.code() == EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
+            .count();
+        assert_eq!(count, 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn strict_dynamic_import_script_function_named_arguments_reports_ts1100() {
+        let (_, diagnostics) = bound("var p = import('./x');\nfunction arguments() {}\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn strict_constructor_param_property_named_arguments_reports_ts1210() {
+        let (_, diagnostics) = bound("class C {\nconstructor(public arguments: number) {}\n}\n");
+        assert!(
+            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS),
+            "{diagnostics:?}"
+        );
     }
 
     fn bound(text: &str) -> (super::SemanticModel, Vec<Diagnostic>) {
@@ -28990,6 +30182,24 @@ mod tests {
             "expected C038 for namespace b, inner g c, and top-level d"
         );
     }
+
+    #[test]
+    fn static_initializer_this_reads_declared_static_type() {
+        let (model, diagnostics) =
+            bound_strict("class C { static a = 1; static b = this.a + 1; }\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let b = value_symbol(&model, "b");
+        assert_eq!(model.symbol_type(b), model.types().number());
+    }
+
+    #[test]
+    fn static_private_field_keeps_initializer_type() {
+        let (model, diagnostics) = bound_strict("class C { static #x = 123; }\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let x = value_symbol(&model, "#x");
+        assert_eq!(model.symbol_type(x), model.types().number());
+    }
+
     #[test]
     fn class_property_initialized_in_constructor() {
         let (_, diagnostics) = bound_strict(
@@ -30884,6 +32094,45 @@ namespace undefined { export var x = 42; }",
         );
     }
 
+    #[test]
+    fn object_literal_members_record_declaration_occurrences() {
+        let (model, diagnostics) = bound("var o = { value: 0, done: false };\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let value = symbol_named(&model, "value");
+        let done = symbol_named(&model, "done");
+        let occurrences = model.declaration_occurrences();
+        assert!(
+            occurrences
+                .iter()
+                .any(|occurrence| occurrence.symbol == value),
+            "{occurrences:?}"
+        );
+        assert!(
+            occurrences
+                .iter()
+                .any(|occurrence| occurrence.symbol == done),
+            "{occurrences:?}"
+        );
+    }
+
+    #[test]
+    fn class_accessors_record_declaration_occurrences() {
+        let (model, diagnostics) =
+            bound("class C {\n get x() { return 1; }\n set x(v: number) { }\n}\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let x = symbol_named(&model, "x");
+        let occurrences = model.declaration_occurrences();
+        assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+        assert!(
+            occurrences.iter().all(|occurrence| occurrence.symbol == x),
+            "{occurrences:?}"
+        );
+        assert_ne!(
+            occurrences[0].declaration, occurrences[1].declaration,
+            "{occurrences:?}"
+        );
+    }
+
     /// T1: duplicate interface member declarations share one canonical
     /// symbol while each written occurrence keeps its own declaration node
     /// and name range.
@@ -30919,8 +32168,7 @@ namespace undefined { export var x = 42; }",
     /// (`>a : Symbol(a, ...)`).
     #[test]
     fn alias_object_literal_members_declare_occurrences() {
-        let (model, diagnostics) =
-            bound("type T = {\n    x: number;\n    m(s: string): void;\n}");
+        let (model, diagnostics) = bound("type T = {\n    x: number;\n    m(s: string): void;\n}");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let x = symbol_named(&model, "x");
         let m = symbol_named(&model, "m");
@@ -31080,9 +32328,26 @@ namespace undefined { export var x = 42; }",
         };
         assert_eq!(object.properties.len(), 20);
         for name in [
-            "assert", "clear", "count", "countReset", "debug", "dir", "dirxml", "error",
-            "group", "groupCollapsed", "groupEnd", "info", "log", "table", "time", "timeEnd",
-            "timeLog", "timeStamp", "trace", "warn",
+            "assert",
+            "clear",
+            "count",
+            "countReset",
+            "debug",
+            "dir",
+            "dirxml",
+            "error",
+            "group",
+            "groupCollapsed",
+            "groupEnd",
+            "info",
+            "log",
+            "table",
+            "time",
+            "timeEnd",
+            "timeLog",
+            "timeStamp",
+            "trace",
+            "warn",
         ] {
             let property = object
                 .properties
@@ -31092,7 +32357,11 @@ namespace undefined { export var x = 42; }",
             let Type::Function(signature) = model.types().get(property.type_id()) else {
                 panic!("Console member `{name}` is a function");
             };
-            assert_eq!(signature.return_type(), model.types().void(), "member `{name}`");
+            assert_eq!(
+                signature.return_type(),
+                model.types().void(),
+                "member `{name}`"
+            );
         }
     }
 
