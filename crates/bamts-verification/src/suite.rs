@@ -5937,7 +5937,7 @@ var s: string = \"hi\";\n\
     const PROJECT_TRACE_BASELINE: &str = "\
 ======== Resolving module './util.js' from 'tests/cases/projects/trace/main.ts'. ========\n\
 Module resolution kind is not specified, using 'Bundler'.\n\
-Resolving in ESM mode with conditions 'import', 'types'.\n\
+Resolving in CJS mode with conditions 'import', 'types'.\n\
 Loading module as file / folder, candidate module location 'tests/cases/projects/trace/util.js', target file types: TypeScript, JavaScript, Declaration, JSON.\n\
 File name 'tests/cases/projects/trace/util.js' has a '.js' extension - stripping it.\n\
 File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution result.\n\

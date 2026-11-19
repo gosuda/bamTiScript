@@ -1645,6 +1645,85 @@ fn find_nearest_package_json(
     }
 }
 
+/// Resolves a `/// <reference types="name" />` target against the configured
+/// `typeRoots`, probing `<typeRoot>/<name>/index.d.ts` and then a
+/// `<typeRoot>/<name>/package.json` types entry. Names are used literally;
+/// the `@types` scope mangling of the default walk does not apply here.
+fn try_type_roots(
+    context: (&ProjectRoot, &CompilerOptions),
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let (root, options) = context;
+    for type_root in options.type_roots() {
+        if let Some(resolved) = probe_type_root(
+            (root, options),
+            type_root,
+            specifier,
+            strategy,
+            host,
+            trace,
+        )? {
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(None)
+}
+
+/// Probes one configured type root for a type package.
+fn probe_type_root(
+    context: (&ProjectRoot, &CompilerOptions),
+    type_root: &Path,
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<Option<ResolvedModule>, ResolutionError> {
+    let (root, options) = context;
+    let (kind, mode) = strategy;
+    let flavor = ResolutionFlavor::Types;
+    let package_root = type_root.join(specifier);
+    let index = package_root.join("index.d.ts");
+    trace.push(ResolutionTraceStep::TypesFallback {
+        package: Arc::from(specifier),
+        path: index.clone(),
+    });
+    if host.file_exists(&index) {
+        let confined = root.confine(&index)?;
+        return Ok(Some(ResolvedModule {
+            path: confined,
+            kind,
+            mode,
+            package_json: Some(package_root.join("package.json")),
+            trace: ResolutionTrace::default(),
+        }));
+    }
+    let package_json = package_root.join("package.json");
+    if root.confine(&package_json).is_err() {
+        return Ok(None);
+    }
+    let Some(source) = host.read_file(&package_json) else {
+        return Ok(None);
+    };
+    let package = PackageJson::parse(root, &package_json, &source)?;
+    let conditions = conditions_for(kind, mode, flavor);
+    let Ok(target) = package.resolve_export(root, ".", PackageMode::Types, &conditions) else {
+        return Ok(None);
+    };
+    finalize_package_target(
+        (root, options),
+        &package_json,
+        &target,
+        (kind, mode, flavor),
+        Some(package_json.clone()),
+        host,
+        trace,
+    )
+}
+
+
 fn try_types_package(
     context: (&ProjectRoot, &CompilerOptions),
     containing: &Path,
@@ -1655,6 +1734,14 @@ fn try_types_package(
 ) -> Result<Option<ResolvedModule>, ResolutionError> {
     let (root, options) = context;
     let (kind, mode) = strategy;
+    let rooted = if options.type_roots().is_empty() {
+        None
+    } else {
+        try_type_roots((root, options), specifier, (kind, mode), host, trace)?
+    };
+    if let Some(resolved) = rooted {
+        return Ok(Some(resolved));
+    }
     let types_name = types_package_name(specifier);
     let mut directory = containing.to_path_buf();
     loop {
@@ -2405,6 +2492,89 @@ mod tests {
         )
         .expect("config");
         config.options().clone()
+    }
+    fn options_with_type_roots(roots: &str) -> CompilerOptions {
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            &format!(r#"{{"compilerOptions":{{"typeRoots":{roots}}}}}"#),
+        )
+        .expect("config");
+        config.options().clone()
+    }
+
+    #[test]
+    fn type_roots_probe_resolves_named_package_first() {
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/types/lib/index.d.ts"),
+            "declare const x: number;\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/@types/lib/index.d.ts"),
+            "declare const y: number;\n",
+        );
+        let options = options_with_type_roots(r#"["types"]"#);
+        let mut cache = ResolutionCache::new();
+        let resolved = resolve_type_reference(
+            &root(),
+            &options,
+            abs("/workspace/app.ts"),
+            "lib",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("typeRoots probe resolves");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/types/lib/index.d.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn type_roots_miss_falls_back_to_at_types_walk() {
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/@types/beep__boop/index.d.ts"),
+            "export const y: number;\n",
+        );
+        let options = options_with_type_roots(r#"["types"]"#);
+        let mut cache = ResolutionCache::new();
+        let resolved = resolve_type_reference(
+            &root(),
+            &options,
+            abs("/workspace/a.ts"),
+            "@beep/boop",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("at-types fallback still resolves");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/@types/beep__boop/index.d.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn type_roots_miss_without_at_types_stays_unresolved() {
+        let host = MemoryHost::default();
+        let options = options_with_type_roots(r#"["types"]"#);
+        let mut cache = ResolutionCache::new();
+        let outcome = resolve_type_reference(
+            &root(),
+            &options,
+            abs("/workspace/a.ts"),
+            "mangled",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        );
+        assert!(matches!(
+            outcome,
+            Err(ResolutionError::NotFound { .. })
+        ));
     }
 
     #[test]
