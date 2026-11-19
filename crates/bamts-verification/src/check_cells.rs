@@ -6088,6 +6088,91 @@ export var v = 1;
         );
     }
 
+    /// Object literal members bind declaration rows named by first spelling:
+    /// `var v = {a: 1, b: 2}` renders `>a : Symbol(a, ...)` per member.
+    /// Cited baselines: `objectLiteral1.symbols`, `objectLiteralErrors.symbols`.
+    #[test]
+    fn emit_symbols_records_object_literal_member_declarations() {
+        let logical = "tests/cases/compiler/objectLiteralPin.ts";
+        let case_text = "var v = {a: 1, b: 2};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        for display in [">a : Symbol(a, Decl(objectLiteralPin.ts, 0, 9))", ">b : Symbol(b, Decl(objectLiteralPin.ts, 0, 14))"] {
+            assert!(
+                emitted.lines().any(|l| l.starts_with(display)),
+                "missing object literal member row {display}:\n{emitted}"
+            );
+        }
+    }
+
+    /// Quoted and numeric keys merge under the first spelling with unioned
+    /// anchors: `{ a: 0, 'a': 0 }` renders `>a` and `>'a'`, both
+    /// `Symbol(a, Decl(0, 9), Decl(0, 15))`. Cited baseline:
+    /// `objectLiteralErrors.symbols` (`e6`).
+    #[test]
+    fn emit_symbols_merges_quoted_object_literal_members() {
+        let logical = "tests/cases/compiler/objectLiteralQuotedPin.ts";
+        let case_text = "var e = { a: 0, 'a': 0 };\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        for display in [">a : Symbol(a, Decl(objectLiteralQuotedPin.ts, 0, 9), Decl(objectLiteralQuotedPin.ts, 0, 15))", ">'a' : Symbol(a, Decl(objectLiteralQuotedPin.ts, 0, 9), Decl(objectLiteralQuotedPin.ts, 0, 15))"] {
+            assert!(
+                emitted.lines().any(|l| l.starts_with(display)),
+                "missing merged quoted member row {display}:\n{emitted}"
+            );
+        }
+    }
+
+    /// Computed keys bind bracketed (`>[n] : Symbol([n], ...)`), and dot
+    /// reads through a literal-typed variable emit path plus leaf rows.
+    /// Cited baselines: `duplicateObjectLiteralProperty_computedName2.symbols`,
+    /// `collisionCodeGenModuleWithMemberVariable.symbols` (namespace analog).
+    #[test]
+    fn emit_symbols_records_computed_object_literal_members() {
+        let logical = "tests/cases/compiler/objectLiteralComputedPin.ts";
+        let case_text = "const n = 1;\nvar t = { [n]: 1 };\nvar s = { item: 1 };\nvar w = s.item;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">[n] : Symbol([n], Decl(objectLiteralComputedPin.ts, 1, 9))")),
+            "missing computed member row:\n{emitted}"
+        );
+        for display in [">s.item : Symbol(item, Decl(objectLiteralComputedPin.ts, 2, 9))", ">item : Symbol(item, Decl(objectLiteralComputedPin.ts, 2, 9))"] {
+            assert!(
+                emitted.lines().any(|l| l.starts_with(display)),
+                "missing object literal access row {display}:\n{emitted}"
+            );
+        }
+    }
+
+    /// Shorthand members show only the member row: `var o = {a}` renders
+    /// `>a : Symbol(a, Decl(..., 1, 9))` once, with no outer-binding use row
+    /// at the shorthand span. Cited baseline: `typeGuardFunctionOfFormThis.symbols`.
+    #[test]
+    fn emit_symbols_shorthand_member_hides_outer_use_row() {
+        let logical = "tests/cases/compiler/objectLiteralShorthandPin.ts";
+        let case_text = "var a = 1;\nvar o = {a};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 1, 9))")),
+            "missing shorthand member row:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 0, 4))")).count(),
+            1,
+            "outer binding must appear only at its declaration:\n{emitted}"
+        );
+    }
+
     /// Namespace export declarations render bare (`Symbol(x, ...)`), guarding
     /// against declare-time over-qualification: upstream qualifies namespace
     /// members only at access-path reference sites, which this emitter does not
