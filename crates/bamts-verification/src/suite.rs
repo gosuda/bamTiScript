@@ -1974,7 +1974,13 @@ pub fn shard_index(shard_key: &str, n: u32) -> Result<u32> {
             format!("shard key `{shard_key}` is too short"),
         ));
     }
-    let prefix = u32::from_str_radix(&shard_key[..8], 16).map_err(|error| {
+    let Some(prefix_text) = shard_key.get(..8) else {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!("shard key `{shard_key}` splits a character in its first 8 bytes"),
+        ));
+    };
+    let prefix = u32::from_str_radix(prefix_text, 16).map_err(|error| {
         VerificationError::new(
             ErrorCode::Usage,
             format!("invalid shard key prefix `{shard_key}`: {error}"),
@@ -4471,6 +4477,15 @@ mod tests {
         let n = 4;
         let index = shard_index(&key, n).unwrap();
         assert!(index < n);
+    }
+
+    #[test]
+    fn shard_index_rejects_a_key_that_splits_a_character() {
+        let key = format!("a{}", "\u{e9}".repeat(4));
+        assert_eq!(key.len(), 9);
+        let error = shard_index(&key, 4).expect_err("non-boundary prefix is a usage error");
+        assert!(error.to_string().contains("splits a character"), "{error}");
+        assert_eq!(shard_index("0000000f", 4).unwrap(), 3);
     }
 
     #[test]
