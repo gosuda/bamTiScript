@@ -44,11 +44,30 @@ impl ModuleResolutionKind {
         }
     }
 
-    /// Resolves the kind from compiler options, defaulting to `NodeNext` when unset.
+    /// Resolves the kind from compiler options, defaulting per the module
+    /// format when `moduleResolution` is unset: `amd`, `system`, and `umd`
+    /// default to `Classic` (upstream probes the importing file's directory
+    /// for bare names under those formats), everything else to `NodeNext`.
     pub fn from_options(options: &CompilerOptions) -> Result<Self, ResolutionError> {
         match options.module_resolution() {
             Some(value) => Self::parse(value),
-            None => Ok(Self::NodeNext),
+            None => Ok(Self::default_for_module(options.module())),
+        }
+    }
+
+    /// Default kind for an unset `moduleResolution`, keyed off the module
+    /// format alone. Matching is case-insensitive and ignores padding.
+    fn default_for_module(module: Option<&str>) -> Self {
+        let classic = module.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "amd" | "system" | "umd"
+            )
+        });
+        if classic {
+            Self::Classic
+        } else {
+            Self::NodeNext
         }
     }
 
@@ -2377,6 +2396,108 @@ mod tests {
         let _mappings: &[PathMapping] = options.paths();
         let _object_ty: Option<&JsonObject> = None;
         let _value_ty: Option<&JsonValue> = None;
+    }
+    fn options_with_module(module: &str) -> CompilerOptions {
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            &format!(r#"{{"compilerOptions":{{"module":"{module}"}}}}"#),
+        )
+        .expect("config");
+        config.options().clone()
+    }
+
+    #[test]
+    fn from_options_defaults_classic_for_legacy_module_formats() {
+        for module in ["amd", "AMD", " system ", "umd", "UMD"] {
+            let options = options_with_module(module);
+            assert_eq!(
+                ModuleResolutionKind::from_options(&options).unwrap(),
+                ModuleResolutionKind::Classic,
+                "module `{module}` defaults to classic"
+            );
+        }
+        for module in ["commonjs", "CommonJS", "node16", "preserve"] {
+            let options = options_with_module(module);
+            assert_eq!(
+                ModuleResolutionKind::from_options(&options).unwrap(),
+                ModuleResolutionKind::NodeNext,
+                "module `{module}` keeps the NodeNext default"
+            );
+        }
+        let unset = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{}}"#,
+        )
+        .expect("config")
+        .options()
+        .clone();
+        assert_eq!(
+            ModuleResolutionKind::from_options(&unset).unwrap(),
+            ModuleResolutionKind::NodeNext
+        );
+        let explicit = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"amd","moduleResolution":"nodenext"}}"#,
+        )
+        .expect("config")
+        .options()
+        .clone();
+        assert_eq!(
+            ModuleResolutionKind::from_options(&explicit).unwrap(),
+            ModuleResolutionKind::NodeNext
+        );
+    }
+
+    #[test]
+    fn amd_default_resolves_bare_sibling_import() {
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/m1.ts"), "export const m1 = 1;\n");
+        host.file(
+            abs("/workspace/m2.ts"),
+            "import m1 = require('m1');\nexport const v = m1;\n",
+        );
+        let options = options_with_module("amd");
+        let kind = ModuleResolutionKind::from_options(&options).unwrap();
+        let mut cache = ResolutionCache::new();
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/m2.ts"),
+            "m1",
+            (kind, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        )
+        .expect("bare sibling import resolves under the amd classic default");
+        assert_eq!(resolved.path(), abs("/workspace/m1.ts").as_path());
+    }
+
+    #[test]
+    fn amd_default_keeps_missing_bare_import_unresolved() {
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/m2.ts"),
+            "import m1 = require('m2');\nexport const v = m1;\n",
+        );
+        let options = options_with_module("system");
+        let kind = ModuleResolutionKind::from_options(&options).unwrap();
+        let mut cache = ResolutionCache::new();
+        let outcome = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/m2.ts"),
+            "m2",
+            (kind, ResolutionMode::Require),
+            &host,
+            &mut cache,
+        );
+        assert!(matches!(
+            outcome,
+            Err(ResolutionError::NotFound { .. })
+        ));
     }
     #[test]
     fn trace_kind_line_marks_unspecified_resolution_kind() {
