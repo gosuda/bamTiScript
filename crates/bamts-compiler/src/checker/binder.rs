@@ -8939,6 +8939,7 @@ impl<'src> Binder<'src> {
         let mut set_value = None;
         let mut map_value = None;
         let mut date_value = None;
+        let mut console_value = None;
         for name in self
             .intrinsics
             .values()
@@ -8960,6 +8961,9 @@ impl<'src> Binder<'src> {
             }
             if *name == "Date" {
                 date_value = Some(id);
+            }
+            if *name == "console" {
+                console_value = Some(id);
             }
             if *name == "undefined" {
                 self.symbol_types[id.get() as usize] = self.types.undefined_type();
@@ -8985,6 +8989,7 @@ impl<'src> Binder<'src> {
             }
         }
         let mut date_type = None;
+        let mut console_type = None;
         for name in self.intrinsics.types().iter() {
             let id = self.declare(
                 name,
@@ -9009,6 +9014,9 @@ impl<'src> Binder<'src> {
             }
             if *name == "Date" {
                 date_type = Some(id);
+            }
+            if *name == "Console" {
+                console_type = Some(id);
             }
             if *name == "RegExp" {
                 self.types.declare_class(id, Vec::new());
@@ -9052,6 +9060,9 @@ impl<'src> Binder<'src> {
         if let (Some(type_symbol), Some(value_symbol)) = (date_type, date_value) {
             self.bind_intrinsic_date(type_symbol, value_symbol);
         }
+        if let (Some(type_symbol), Some(value_symbol)) = (console_type, console_value) {
+            self.bind_intrinsic_console(type_symbol, value_symbol);
+        }
         if let (
             Some(set_value),
             Some(map_value),
@@ -9072,6 +9083,80 @@ impl<'src> Binder<'src> {
                 readonly_map_type,
             });
         }
+    }
+
+    fn bind_intrinsic_console(&mut self, type_symbol: SymbolId, value_symbol: SymbolId) {
+        self.types.declare_class(type_symbol, Vec::new());
+        let any = self.types.any();
+        let string = self.types.string();
+        let boolean = self.types.boolean();
+        let void = self.types.void();
+        let any_array = self.types.array(any);
+        let string_array = self.types.array(string);
+        let data = FunctionParameter::new("data".to_owned(), any_array, false, true);
+        let label = FunctionParameter::new("label".to_owned(), string, true, false);
+        let no_args = self.types.function(Vec::new(), void);
+        let data_rest = self
+            .types
+            .function_with_parameters(Vec::new(), vec![data.clone()], void);
+        let labelled = self
+            .types
+            .function_with_parameters(Vec::new(), vec![label.clone()], void);
+        let assert_signature = self.types.function_with_parameters(
+            Vec::new(),
+            vec![
+                FunctionParameter::new("condition".to_owned(), boolean, true, false),
+                data.clone(),
+            ],
+            void,
+        );
+        let dir_signature = self.types.function_with_parameters(
+            Vec::new(),
+            vec![
+                FunctionParameter::new("item".to_owned(), any, true, false),
+                FunctionParameter::new("options".to_owned(), any, true, false),
+            ],
+            void,
+        );
+        let table_signature = self.types.function_with_parameters(
+            Vec::new(),
+            vec![
+                FunctionParameter::new("tabularData".to_owned(), any, true, false),
+                FunctionParameter::new("properties".to_owned(), string_array, true, false),
+            ],
+            void,
+        );
+        let time_log_signature = self.types.function_with_parameters(
+            Vec::new(),
+            vec![label, data],
+            void,
+        );
+        let raw = self.types.object_type(vec![
+            PropertyType::new("assert", false, assert_signature).with_method(true),
+            PropertyType::new("clear", false, no_args).with_method(true),
+            PropertyType::new("count", false, labelled).with_method(true),
+            PropertyType::new("countReset", false, labelled).with_method(true),
+            PropertyType::new("debug", false, data_rest).with_method(true),
+            PropertyType::new("dir", false, dir_signature).with_method(true),
+            PropertyType::new("dirxml", false, data_rest).with_method(true),
+            PropertyType::new("error", false, data_rest).with_method(true),
+            PropertyType::new("group", false, data_rest).with_method(true),
+            PropertyType::new("groupCollapsed", false, data_rest).with_method(true),
+            PropertyType::new("groupEnd", false, no_args).with_method(true),
+            PropertyType::new("info", false, data_rest).with_method(true),
+            PropertyType::new("log", false, data_rest).with_method(true),
+            PropertyType::new("table", false, table_signature).with_method(true),
+            PropertyType::new("time", false, labelled).with_method(true),
+            PropertyType::new("timeEnd", false, labelled).with_method(true),
+            PropertyType::new("timeLog", false, time_log_signature).with_method(true),
+            PropertyType::new("timeStamp", false, labelled).with_method(true),
+            PropertyType::new("trace", false, data_rest).with_method(true),
+            PropertyType::new("warn", false, data_rest).with_method(true),
+        ]);
+        self.types.publish_final_class_template(type_symbol, raw);
+        let applied = self.types.applied_class(type_symbol, Vec::new());
+        self.class_instance_types.insert(value_symbol, applied);
+        self.symbol_types[value_symbol.get() as usize] = applied;
     }
 
     fn bind_collection_intrinsics(&mut self, symbols: CollectionIntrinsicSymbols) {
@@ -30515,6 +30600,46 @@ namespace undefined { export var x = 42; }",
     /// distinctly, while identical unannotated signatures dedup. This pins
     /// the interning surface only; the same-semantic distinction lands with
     /// projection in T4a.
+    #[test]
+    fn console_intrinsic_members_are_void_functions() {
+        let (model, diagnostics) = bound(
+            "console.log('x', 1);\nconsole.error('x');\nconsole.warn('x');\n\
+             console.dir({});\nconsole.time('t');\nconsole.timeEnd('t');",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let console = value_symbol(&model, "console");
+        let Type::AppliedClass { symbol, .. } = model.types().get(model.symbol_type(console))
+        else {
+            panic!("console resolves to the Console applied class");
+        };
+        assert_eq!(model.symbol(*symbol).name(), "Console");
+        let console_type = type_symbol(&model, "Console");
+        assert_eq!(*symbol, console_type);
+        let view = model
+            .types()
+            .applied_class_view(model.symbol_type(console))
+            .expect("Console view materializes");
+        let Type::ObjectType(object) = model.types().get(view) else {
+            panic!("Console view is an object type");
+        };
+        assert_eq!(object.properties.len(), 20);
+        for name in [
+            "assert", "clear", "count", "countReset", "debug", "dir", "dirxml", "error",
+            "group", "groupCollapsed", "groupEnd", "info", "log", "table", "time", "timeEnd",
+            "timeLog", "timeStamp", "trace", "warn",
+        ] {
+            let property = object
+                .properties
+                .iter()
+                .find(|property| property.name() == name)
+                .unwrap_or_else(|| panic!("Console member `{name}`"));
+            let Type::Function(signature) = model.types().get(property.type_id()) else {
+                panic!("Console member `{name}` is a function");
+            };
+            assert_eq!(signature.return_type(), model.types().void(), "member `{name}`");
+        }
+    }
+
     #[test]
     fn declared_return_participates_in_signature_identity() {
         let mut table = TypeTable::new();

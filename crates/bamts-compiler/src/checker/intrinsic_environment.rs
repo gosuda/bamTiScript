@@ -1341,6 +1341,10 @@ const STANDARD_TYPES: &[LibEntry] = &[
         lib: Lib::Dom,
     },
     LibEntry {
+        name: "Console",
+        lib: Lib::Dom,
+    },
+    LibEntry {
         name: "TextEncoder",
         lib: Lib::Dom,
     },
