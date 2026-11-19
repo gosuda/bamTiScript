@@ -50,7 +50,7 @@ pub(crate) mod unused_imports;
 pub(crate) mod unused_locals;
 #[path = "checker/unused_reads.rs"]
 pub(crate) mod unused_reads;
-pub use type_display::{render_type, render_type_declaration};
+pub use type_display::{render_type, render_type_annotated, render_type_declaration};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
