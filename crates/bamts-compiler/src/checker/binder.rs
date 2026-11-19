@@ -10900,14 +10900,6 @@ impl<'src> Binder<'src> {
         false
     }
 
-    fn scope_has_type_owner(&self, scope: ScopeId) -> bool {
-        self.scopes[scope.0 as usize].owner.is_some_and(|owner| {
-            matches!(
-                self.symbols[owner.get() as usize].kind,
-                SymbolKind::Class | SymbolKind::Interface
-            )
-        })
-    }
 
     fn strict_eval_or_arguments_code(&self, scope: ScopeId) -> Option<(DiagnosticCode, u32)> {
         if self.ambient_binding
