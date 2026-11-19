@@ -63,7 +63,6 @@ pub use binder::{
     DeclarationOccurrence, PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol,
     SymbolId, SymbolKind, Type, TypeId, TypeTable,
 };
-pub use intrinsic_environment::{global_lib_decl_file, lib_decl_files_for_global};
 pub(crate) use binder::{
     EnumBindingView, EnumSourceInventory, ImportedSymbolType, bind_source_with_cancel,
     bind_source_with_environment_and_cancel, bind_source_with_environment_and_imports_with_cancel,
@@ -73,6 +72,7 @@ pub use inference::{
     InferenceContext, InferenceParameter, InferencePriority, InferenceProvenance,
     InferredTypeArgument, InferredTypeArguments,
 };
+pub use intrinsic_environment::{global_lib_decl_file, lib_decl_files_for_global};
 pub use narrowing::{
     FlowKey, FlowNodeId, GuardResolver, NarrowingContext, NarrowingGuard, TypeofName,
 };
@@ -3751,7 +3751,8 @@ mod tests {
     }
     #[test]
     fn resize_observer_resolves_as_value_and_type() {
-        let result = check_text("var entry: ResizeObserverEntry; var ro = new ResizeObserver(() => {});");
+        let result =
+            check_text("var entry: ResizeObserverEntry; var ro = new ResizeObserver(() => {});");
         assert!(checker_codes(&result).is_empty());
     }
     #[test]
@@ -4355,6 +4356,106 @@ function check(options: Options = {}) {
         assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
     }
 
+    #[test]
+    fn object_rest_drops_class_prototype_and_private_members() {
+        let result = check_text(
+            "class A {\
+                 constructor(public pub: string, private priv: string, protected prot: string) {}\
+                 method() { return 1; }\
+                 get value() { return 1; }\
+             }\
+             declare const a: A;\
+             const { ...rest } = a;\
+             rest.pub; rest.method; rest.priv;",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [
+                PROPERTY_DOES_NOT_EXIST.as_str(),
+                PROPERTY_DOES_NOT_EXIST.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn binding_pattern_reports_missing_property() {
+        let result = check_text(
+            "declare const t: { s: string } | undefined;\n\
+             const { s } = t;",
+        );
+        assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+    }
+
+    #[test]
+    fn private_name_access_reports_undeclared_name() {
+        let result =
+            check_text("class A { #foo = true; method(thing: any) { thing.#foo; thing.#bar; } }");
+        assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+    }
+
+    #[test]
+    fn binding_pattern_with_default_does_not_report_missing_property() {
+        let result = check_text(
+            "declare const t: { s: string } | undefined;\n\
+             const { s = \"fallback\" } = t;\n\
+             const { q = 1 } = {} as { p?: number };",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn const_enum_objects_report_missing_members() {
+        let result = check_text(
+            "const enum E {}\n\
+             E.constructor;\n\
+             E.missing;",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [
+                PROPERTY_DOES_NOT_EXIST.as_str(),
+                PROPERTY_DOES_NOT_EXIST.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn const_enum_declared_members_stay_silent() {
+        let result =
+            check_text("const enum E { A = 1, B = 2 }\nconst a = E.A;\nconst b = E[\"B\"];");
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn member_access_on_never_reports_missing_property() {
+        let result = check_text("declare const n: never;\nconst x = n.foo;");
+        assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+    }
+
+    #[test]
+    fn computed_literal_member_access_uses_implicit_any_index() {
+        let result = check_text(
+            "const list: {} = {}; const value = list['one']; const n = list[0];\
+             const u: { a: number } | { b: string } = { a: 1 }; const v = u['a'];",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
+    }
+
+    #[test]
+    fn computed_literal_member_access_reports_under_no_implicit_any() {
+        let result = check_text_with(
+            "const list: {} = {}; const value = list['one'];",
+            ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert_eq!(
+            checker_codes_of(&result),
+            [PROPERTY_DOES_NOT_EXIST.as_str().to_owned()]
+        );
+    }
     #[test]
     fn failed_overload_contextual_probes_emit_one_call_diagnostic() {
         let result = check_text(
@@ -12650,7 +12751,11 @@ class B extends A {
     fn string_wrapper_char_at_resolves_with_exact_signature() {
         let text = "declare const s: string; s.charAt;";
         let result = check_text(text);
-        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
         let model = result.product();
         let member = member_expression_id(0, text, 1);
         let type_id = model.node_type(member).expect("member is typed");
@@ -12664,7 +12769,11 @@ class B extends A {
     fn number_wrapper_to_exponential_resolves_with_exact_signature() {
         let text = "declare const n: number; n.toExponential;";
         let result = check_text(text);
-        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
         let model = result.product();
         let member = member_expression_id(0, text, 1);
         let type_id = model.node_type(member).expect("member is typed");
@@ -12678,8 +12787,7 @@ class B extends A {
     fn primitive_wrapper_missing_members_report() {
         let missing_on_number = check_text("declare const n: number; n.charAt(0);");
         assert_eq!(checker_codes(&missing_on_number), ["BAMTS-C057"]);
-        let missing_on_string =
-            check_text("declare const s: string; s.toExponential(0);");
+        let missing_on_string = check_text("declare const s: string; s.toExponential(0);");
         assert_eq!(checker_codes(&missing_on_string), ["BAMTS-C057"]);
     }
 
@@ -12687,7 +12795,11 @@ class B extends A {
     fn array_wrapper_push_and_length_resolve() {
         let text = "declare const a: string[]; a.push;";
         let result = check_text(text);
-        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
         let model = result.product();
         let member = member_expression_id(0, text, 1);
         let type_id = model.node_type(member).expect("member is typed");
@@ -12720,7 +12832,11 @@ class B extends A {
         assert_eq!(program_codes(&old), ["BAMTS-C057"]);
         let text = "declare const a: string[]; a.includes;";
         let current = check_text(text);
-        assert!(checker_codes(&current).is_empty(), "{:?}", checker_codes(&current));
+        assert!(
+            checker_codes(&current).is_empty(),
+            "{:?}",
+            checker_codes(&current)
+        );
         let model = current.product();
         let member = member_expression_id(0, text, 1);
         let type_id = model.node_type(member).expect("member is typed");
@@ -12733,7 +12849,11 @@ class B extends A {
     #[test]
     fn string_literal_receiver_resolves_lib_member() {
         let result = check_text("\"\".padStart(2);");
-        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
         let model = result.product();
         let parsed = parsed(0, "\"\".padStart(2);");
         let Statement::Expression(statement) = parsed.product().statements()[0].data() else {
@@ -12754,21 +12874,37 @@ class B extends A {
     #[test]
     fn const_enum_scalar_chains_stay_silent() {
         let result = check_text("const enum E { A = 7, B = 9 } E.A.B;");
-        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            checker_codes(&result)
+        );
     }
 
     #[test]
     fn boolean_symbol_and_bigint_wrappers_resolve() {
         let boolean = check_text("declare const b: boolean; b.toString();");
-        assert!(checker_codes(&boolean).is_empty(), "{:?}", checker_codes(&boolean));
+        assert!(
+            checker_codes(&boolean).is_empty(),
+            "{:?}",
+            checker_codes(&boolean)
+        );
         let symbol = check_text("declare const sy: symbol; sy.description;");
-        assert!(checker_codes(&symbol).is_empty(), "{:?}", checker_codes(&symbol));
+        assert!(
+            checker_codes(&symbol).is_empty(),
+            "{:?}",
+            checker_codes(&symbol)
+        );
         let model = symbol.product();
         let member = member_expression_id(0, "declare const sy: symbol; sy.description;", 1);
         let type_id = model.node_type(member).expect("member is typed");
         assert_eq!(super::render_type(model, type_id), "symbol | undefined");
         let bigint = check_text("declare const bi: bigint; bi.toString(16);");
-        assert!(checker_codes(&bigint).is_empty(), "{:?}", checker_codes(&bigint));
+        assert!(
+            checker_codes(&bigint).is_empty(),
+            "{:?}",
+            checker_codes(&bigint)
+        );
     }
 
     #[test]
@@ -12779,9 +12915,8 @@ class B extends A {
 
     #[test]
     fn destructured_parameter_with_annotation_types_names() {
-        let result = check_text(
-            "function f({ a, b }: { a: string, b: number }) { const s: string = b; }",
-        );
+        let result =
+            check_text("function f({ a, b }: { a: string, b: number }) { const s: string = b; }");
         assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
     }
 
@@ -12818,8 +12953,6 @@ class B extends A {
         let result = check_text("try {} catch (e) { const s: string = e; }");
         assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
     }
-
-
 
     #[test]
     fn index_signatures_supply_member_types_and_readonly_rules() {
