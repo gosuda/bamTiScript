@@ -994,6 +994,7 @@ pub struct CompilerOptions {
     root_dir: Option<PathBuf>,
     out_dir: Option<PathBuf>,
     paths: Arc<[PathMapping]>,
+    type_roots: Arc<[PathBuf]>,
 }
 
 impl CompilerOptions {
@@ -1015,6 +1016,11 @@ impl CompilerOptions {
     #[must_use]
     pub fn module_resolution(&self) -> Option<&str> {
         self.module_resolution.as_deref()
+    }
+
+    #[must_use]
+    pub fn type_roots(&self) -> &[PathBuf] {
+        &self.type_roots
     }
 
     #[must_use]
@@ -1331,6 +1337,7 @@ impl ProjectConfig {
             root_dir: optional_path(root, directory, compiler, "rootDir")?,
             out_dir: optional_path(root, directory, compiler, "outDir")?,
             paths,
+            type_roots: optional_path_array(root, directory, compiler, "typeRoots")?,
         };
         Ok(Self {
             path,
@@ -1481,6 +1488,33 @@ fn optional_path(
                 .map_err(ConfigError::from)
         })
         .transpose()
+}
+fn optional_path_array(
+    root: &ProjectRoot,
+    directory: &Path,
+    object: Option<&JsonObject>,
+    key: &'static str,
+) -> Result<Arc<[PathBuf]>, ConfigError> {
+    let Some(object) = object else {
+        return Ok(Arc::from([]));
+    };
+    let Some(value) = object.get(key) else {
+        return Ok(Arc::from([]));
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_field(key, "an array of path strings"))?;
+    values
+        .iter()
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| invalid_field(key, "an array of path strings"))?;
+            root.resolve_from(directory, value)
+                .map_err(ConfigError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Arc::from)
 }
 
 fn string_list(object: &JsonObject, key: &'static str) -> Result<Arc<[Arc<str>]>, ConfigError> {
@@ -2447,6 +2481,30 @@ mod tests {
         assert_eq!(config.module(), Some("NodeNext"));
         assert_eq!(config.module_resolution(), Some("NodeNext"));
         assert_eq!(config.paths()[0].pattern(), "@app/*");
+    }
+    #[test]
+    fn project_config_resolves_type_roots_under_config_directory() {
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/corpus/tsconfig.json"),
+            r#"{"compilerOptions":{"typeRoots":["types","./more"]}}"#,
+        )
+        .expect("typeRoots parse");
+        assert_eq!(
+            config.options().type_roots(),
+            [
+                abs("/workspace/corpus/types"),
+                abs("/workspace/corpus/more")
+            ]
+            .as_slice()
+        );
+        let unset = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/corpus/tsconfig.json"),
+            r#"{"compilerOptions":{}}"#,
+        )
+        .expect("empty options parse");
+        assert!(unset.options().type_roots().is_empty());
     }
 
     #[test]

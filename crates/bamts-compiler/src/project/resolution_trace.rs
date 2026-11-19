@@ -1,6 +1,7 @@
 //! Upstream-compatible module-resolution trace rendering.
 //!
-//! The rendered ESM/CJS mode word follows [`ResolutionMode`], and candidate
+//! The file/folder path renders unconditionally in CJS mode (upstream never
+//! prints ESM there), with a `node` condition under Node16/NodeNext; candidate
 //! narration follows [`ResolutionFlavor`] so it matches the order the resolver
 //! actually probes.
 use super::{
@@ -124,13 +125,18 @@ impl ResolutionTraceLog {
                     strategy.0.trace_name()
                 ));
             }
+            // Upstream renders the file/folder path unconditionally in CJS
+            // mode: every `Loading module as file / folder` baseline is
+            // preceded by `Resolving in CJS mode`, including Bundler `import`
+            // resolutions. Node16/NodeNext append the `node` condition.
+            let conditions = match strategy.0 {
+                ModuleResolutionKind::Node16 | ModuleResolutionKind::NodeNext => {
+                    format!("'{}', 'types', 'node'", strategy.1.as_str())
+                }
+                _ => format!("'{}', 'types'", strategy.1.as_str()),
+            };
             self.lines.push(format!(
-                "Resolving in {} mode with conditions '{}', 'types'.",
-                match strategy.1 {
-                    ResolutionMode::Import => "ESM",
-                    ResolutionMode::Require => "CJS",
-                },
-                strategy.1.as_str()
+                "Resolving in CJS mode with conditions {conditions}."
             ));
             self.lines.push(format!(
                 "Loading module as file / folder, candidate module location '{}', target file types: TypeScript, JavaScript, Declaration, JSON.",
