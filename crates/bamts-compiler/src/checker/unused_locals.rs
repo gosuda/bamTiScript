@@ -974,11 +974,18 @@ mod tests {
             .map(|diagnostic| diagnostic.message().to_owned())
             .collect()
     }
+    fn codes(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect()
+    }
 
     #[test]
     fn write_only_variable_is_reported() {
         let outcome = check("function f() { var x = 0; x = 1; return 0; }");
         assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
         let texts = messages(&outcome.locals);
         assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
         assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
@@ -1032,6 +1039,7 @@ mod tests {
     fn hash_private_unused_reports() {
         let outcome = check("class C { #x = 1; }");
         assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
         assert_eq!(
             outcome.locals[0].message(),
             "'#x' is declared but its value is never read."
@@ -1041,7 +1049,8 @@ mod tests {
     #[test]
     fn hash_private_used_is_clean() {
         let outcome = check("class C { #x = 1; m() { return this.#x; } } export const c = new C();");
-        assert!(outcome.locals.is_empty(), "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
+        assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
     }
 
     #[test]
@@ -1055,19 +1064,22 @@ mod tests {
         let file = parsed.product();
         let (model, _) = bind_source(file);
         let outcome = unused_diagnostics(file, &model);
-        assert!(outcome.locals.is_empty(), "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
+        assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
     }
 
     #[test]
     fn exported_local_is_clean() {
         let outcome = check("export const x = 1;");
-        assert!(outcome.locals.is_empty(), "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
+        assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
     }
 
     #[test]
     fn partial_object_pattern_reports_only_unused() {
         let outcome = check("function f() { const o = { a: 1, b: 2 }; const { a, b } = o; return a; }");
         assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
         let texts = messages(&outcome.locals);
         assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
         assert!(texts.contains(&"'b' is declared but its value is never read.".to_owned()));
@@ -1077,7 +1089,10 @@ mod tests {
     #[test]
     fn partial_array_pattern_reports_only_unused() {
         let outcome = check("function f() { const [a, b] = [1, 2]; return a; }");
+        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
         let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
         assert!(texts.contains(&"'b' is declared but its value is never read.".to_owned()));
         assert!(!texts.iter().any(|m| m.contains("destructured")), "{outcome:?}");
     }
@@ -1085,29 +1100,43 @@ mod tests {
     #[test]
     fn for_of_unused_binding_reports() {
         let outcome = check("function f() { const arr = [1]; for (const x of arr) { } }");
+        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
         let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
         assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
     }
 
     #[test]
     fn compound_assignment_counts_as_read() {
         let outcome = check("function f() { var x = 0; x += 1; return 1; }");
-        let texts = messages(&outcome.locals);
-        assert!(!texts.iter().any(|m| m.contains("'x'")), "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
     }
 
     #[test]
     fn update_counts_as_read() {
         let outcome = check("function f() { var x = 0; x++; return 1; }");
-        let texts = messages(&outcome.locals);
-        assert!(!texts.iter().any(|m| m.contains("'x'")), "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
     }
 
     #[test]
     fn destructuring_assignment_target_is_write_only() {
         let outcome = check("function f() { var x = 0; [x] = [1]; return 0; }");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
         let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
         assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        assert!(outcome.params.is_empty(), "{outcome:?}");
     }
     #[test]
     fn auto_accessor_initializer_read_keeps_seed_clean() {
@@ -1120,6 +1149,7 @@ mod tests {
     fn auto_accessor_initializer_nested_body_reports_unused() {
         let outcome = check("class C { accessor p = () => { var z = 1; }; }");
         assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
         assert_eq!(
             outcome.locals[0].message(),
             "'z' is declared but its value is never read."
@@ -1131,14 +1161,30 @@ mod tests {
     fn private_getter_setter_pair_reports_getter_only() {
         let outcome = check("class C { get #x() { return 1; } set #x(v: number) {} }");
         assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
         assert_eq!(
             outcome.locals[0].message(),
             "'#x' is declared but its value is never read."
         );
         assert_eq!(outcome.params.len(), 1, "{outcome:?}");
+        assert_eq!(codes(&outcome.params), ["6133"], "{outcome:?}");
         assert_eq!(
             outcome.params[0].message(),
             "'v' is declared but its value is never read."
         );
     }
+    #[test]
+    fn unused_catch_binding_is_clean() {
+        let outcome = check("try {} catch (e) {}");
+        assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
+        assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
+    }
+
+    #[test]
+    fn used_catch_binding_is_clean() {
+        let outcome = check("try {} catch (e) { throw e; }");
+        assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
+        assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
+    }
+
 }
