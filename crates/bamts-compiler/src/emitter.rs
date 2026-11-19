@@ -5664,11 +5664,18 @@ impl<'a> Emitter<'a> {
                 self.emit_type(interface);
             }
         }
-        self.raw(" ");
+        if let Some(brace) = self.source_pos_of(range, '{') {
+            let space = Utf16Pos::new(brace.get().saturating_sub(1));
+            self.raw_mapped_token(" ", space, 1);
+        } else {
+            self.raw(" ");
+        }
         self.emit_class_body_decl(&class.members, range);
     }
+
     fn emit_class_body_decl(&mut self, members: &[ClassMemberNode], range: TextRange) {
         self.raw("{");
+        self.last_mapped_end = None;
         let has_private_name = members
             .iter()
             .any(|member| Self::member_has_private_name(member.data()));
@@ -5932,6 +5939,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_interface_decl(&mut self, interface: &InterfaceDeclaration) {
+        let iface = self.anchor;
         let start = self.anchor.start();
         self.raw_decl_leading("interface ", start);
         self.emit_ident(&interface.name);
@@ -5945,7 +5953,13 @@ impl<'a> Emitter<'a> {
                 self.emit_type_reference(reference);
             }
         }
-        self.raw(" ");
+        if let Some(brace) = self.source_pos_of(self.anchor, '{') {
+            let space = Utf16Pos::new(brace.get().saturating_sub(1));
+            self.raw_mapped_token(" ", space, 1);
+        } else {
+            self.raw(" ");
+        }
+        self.last_mapped_end = None;
         if interface.members.is_empty() {
             // Authority: importTag16 a.d.ts expands tight-authored
             // `export interface I {}` to `{\n}` (0 tight / 21 expand in
@@ -5954,9 +5968,15 @@ impl<'a> Emitter<'a> {
             self.raw("{");
             self.newline();
             self.raw("}");
-            return;
+        } else {
+            self.emit_type_members_block(&interface.members);
         }
-        self.emit_type_members_block(&interface.members);
+        if let Some(close) = self.source_pos_of_last(iface, '}') {
+            let end = Utf16Pos::new(close.get().saturating_add(1));
+            if let Ok(range) = TextRange::new(close, end) {
+                self.last_mapped_end = Some(range);
+            }
+        }
     }
 
     fn emit_type_alias_decl(&mut self, alias: &TypeAliasDeclaration) {
@@ -6022,13 +6042,20 @@ impl<'a> Emitter<'a> {
                 self.raw_decl_leading("global", start);
             }
         }
-        self.raw(" {");
+        if let Some(brace) = self.source_pos_of(self.anchor, '{') {
+            let space = Utf16Pos::new(brace.get().saturating_sub(1));
+            self.raw_mapped_token(" ", space, 1);
+            self.raw_mapped_token("{", brace, 1);
+            self.last_mapped_end = None;
+        } else {
+            self.raw(" {");
+        }
         let body = namespace.body.data();
         if body.statements.is_empty() {
             if !matches!(namespace.name, NamespaceName::StringLiteral(_)) {
                 self.newline();
             }
-            self.raw("}");
+            self.raw_mapped_eol("}", self.anchor, '}');
             return;
         }
         self.newline();
@@ -6056,7 +6083,7 @@ impl<'a> Emitter<'a> {
         self.current_scope = saved_scope;
         self.decl_ambient = saved_ambient;
         self.indent -= 1;
-        self.raw("}");
+        self.raw_mapped_eol("}", self.anchor, '}');
     }
 
     // ---- types ------------------------------------------------------------
@@ -6337,9 +6364,11 @@ impl<'a> Emitter<'a> {
             return;
         }
         self.raw("{");
+        self.last_mapped_end = None;
         self.newline();
         self.indent += 1;
         for member in members {
+            self.anchor = member.range();
             self.emit_type_member(member.data());
             self.newline();
         }
@@ -6402,7 +6431,8 @@ impl<'a> Emitter<'a> {
 
     fn emit_function_type_body_arrow(&mut self, function: &FunctionType) {
         self.emit_type_parameters(&function.type_parameters);
-        self.raw("(");
+        let start = self.anchor.start();
+        self.raw_decl_leading("(", start);
         self.emit_function_type_parameters(&function.parameters);
         self.raw(") => ");
         self.emit_type(&function.return_type);
@@ -6410,7 +6440,8 @@ impl<'a> Emitter<'a> {
 
     fn emit_function_type_body(&mut self, function: &FunctionType) {
         self.emit_type_parameters(&function.type_parameters);
-        self.raw("(");
+        let start = self.anchor.start();
+        self.raw_decl_leading("(", start);
         self.emit_function_type_parameters(&function.parameters);
         self.raw("): ");
         self.emit_type(&function.return_type);
