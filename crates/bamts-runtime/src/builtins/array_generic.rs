@@ -154,7 +154,6 @@ pub(crate) fn is_array<H: Host>(
     }
 }
 
-/// `ArraySpeciesCreate`.
 fn array_species_create<H: Host>(
     machine: &mut Machine<'_, H>,
     original: Value,
