@@ -772,6 +772,7 @@ pub(crate) fn print_with_jsx_plan(
         decl_ambient: false,
         current_scope: model.module_scope(),
         decl_drop_member_export: false,
+        decl_first_start: None,
         decl_source_is_js: matches!(
             file.script_kind(),
             crate::source::ScriptKind::JavaScript | crate::source::ScriptKind::JavaScriptReact
@@ -904,6 +905,7 @@ pub(crate) fn print_json_value(
         decl_ambient: false,
         current_scope: model.module_scope(),
         decl_drop_member_export: false,
+        decl_first_start: None,
         decl_source_is_js: false,
         authored_len: Utf16Pos::new(utf16_len(original_content)),
         synthesized,
@@ -1076,6 +1078,11 @@ struct Emitter<'a> {
     /// `export` modifier from member declarations (the namespace itself is
     /// the only public surface). String-named `module "..."` bodies keep it.
     decl_drop_member_export: bool,
+    /// Source start an outer declaration wrapper recorded for its first
+    /// keyword when the wrapper itself writes no keyword. A dropped `export`
+    /// leaves the generated column at the line start, so the inner kind
+    /// keyword consumes this start instead of its own range.
+    decl_first_start: Option<Utf16Pos>,
     /// True when the declaration is generated from a JavaScript source
     /// (`allowJs`). tsc does not add `declare` to exported declarations of a
     /// JS file, while it does for a TypeScript source.
@@ -1770,6 +1777,19 @@ impl<'a> Emitter<'a> {
             LineColumn::new(line, column),
             None,
         );
+    }
+
+    fn raw_decl_leading(&mut self, text: &str, start: Utf16Pos) {
+        self.flush_indent();
+        if self.generated_column == self.current_indent_spaces() {
+            let anchor = self.decl_first_start.take().unwrap_or(start);
+            let end = Utf16Pos::new(anchor.get().saturating_add(utf16_len(text)));
+            if let Ok(range) = TextRange::new(anchor, end) {
+                self.raw_mapped(text, range);
+                return;
+            }
+        }
+        self.raw(text);
     }
 
     fn diag(&mut self, code: DiagnosticCode, message: &'static str, range: TextRange) {
@@ -2675,7 +2695,12 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        self.raw("import ");
+        if keep_types {
+            let start = self.anchor.start();
+            self.raw_decl_leading("import ", start);
+        } else {
+            self.raw("import ");
+        }
         if keep_types && import.type_only {
             self.raw("type ");
         }
@@ -5173,7 +5198,12 @@ impl<'a> Emitter<'a> {
                 self.emit_namespace_decl(statement.id(), namespace);
                 true
             }
-            Statement::Declare(inner) => self.emit_declaration(inner),
+            Statement::Declare(inner) => {
+                let saved = self.decl_first_start.replace(self.anchor.start());
+                let emitted = self.emit_declaration(inner);
+                self.decl_first_start = saved;
+                emitted
+            }
             Statement::Missing(_) => {
                 self.diag_here(
                     codes::MISSING_STATEMENT,
@@ -5205,13 +5235,15 @@ impl<'a> Emitter<'a> {
 
     fn emit_declare_prefix(&mut self) {
         if self.decl_ambient {
-            self.raw("declare ");
+            let start = self.anchor.start();
+            self.raw_decl_leading("declare ", start);
         }
     }
 
     fn emit_import_equals_decl(&mut self, import: &ImportEqualsDeclaration) {
         self.emit_declare_prefix();
-        self.raw("import ");
+        let start = self.anchor.start();
+        self.raw_decl_leading("import ", start);
         if import.is_type_only {
             self.raw("type ");
         }
@@ -5258,17 +5290,28 @@ impl<'a> Emitter<'a> {
                 } else {
                     "export "
                 };
+                let saved_first = self.decl_first_start.take();
                 if let Statement::Class(class) = inner.data() {
                     self.emit_decorators_block(&class.decorators);
-                    self.raw(export_keyword);
+                    if export_keyword.is_empty() {
+                        self.decl_first_start = Some(self.anchor.start());
+                    } else {
+                        self.raw_decl_leading(export_keyword, self.anchor.start());
+                    }
                     self.emit_declare_prefix();
                     self.emit_class_core_decl(class);
                     self.decl_ambient = saved_ambient;
+                    self.decl_first_start = saved_first;
                     return true;
                 }
-                self.raw(export_keyword);
+                if export_keyword.is_empty() {
+                    self.decl_first_start = Some(self.anchor.start());
+                } else {
+                    self.raw_decl_leading(export_keyword, self.anchor.start());
+                }
                 let emitted = self.emit_declaration(inner);
                 self.decl_ambient = saved_ambient;
+                self.decl_first_start = saved_first;
                 emitted
             }
             ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
@@ -5277,7 +5320,8 @@ impl<'a> Emitter<'a> {
                 source,
                 attributes,
             }) => {
-                self.raw("export ");
+                let start = self.anchor.start();
+                self.raw_decl_leading("export ", start);
                 if *type_only {
                     self.raw("type ");
                 }
@@ -5304,7 +5348,8 @@ impl<'a> Emitter<'a> {
                 true
             }
             ExportDeclaration::All(all) => {
-                self.raw("export ");
+                let start = self.anchor.start();
+                self.raw_decl_leading("export ", start);
                 if all.type_only {
                     self.raw("type ");
                 }
@@ -5324,22 +5369,26 @@ impl<'a> Emitter<'a> {
             }
             ExportDeclaration::Default(default) => match &default.value {
                 ExportDefaultValue::Function(function) => {
-                    self.raw("export default ");
+                    let start = self.anchor.start();
+                    self.raw_decl_leading("export default ", start);
                     self.emit_function_signature_decl(function);
                     true
                 }
                 ExportDefaultValue::Class(class) => {
-                    self.raw("export default ");
+                    let start = self.anchor.start();
+                    self.raw_decl_leading("export default ", start);
                     self.emit_class_core_decl(class);
                     true
                 }
                 ExportDefaultValue::Interface(interface) => {
-                    self.raw("export default ");
+                    let start = self.anchor.start();
+                    self.raw_decl_leading("export default ", start);
                     self.emit_interface_decl(interface);
                     true
                 }
                 ExportDefaultValue::Expression(expression) => {
-                    self.raw("export default ");
+                    let start = self.anchor.start();
+                    self.raw_decl_leading("export default ", start);
                     self.emit_expression_prec(expression, P_ASSIGN);
                     self.raw(";");
                     true
@@ -5353,7 +5402,8 @@ impl<'a> Emitter<'a> {
                 }
             },
             ExportDeclaration::Assignment(expression) => {
-                self.raw("export = ");
+                let start = self.anchor.start();
+                self.raw_decl_leading("export = ", start);
                 self.emit_expression_prec(expression, P_ASSIGN);
                 self.raw(";");
                 true
@@ -5451,8 +5501,8 @@ impl<'a> Emitter<'a> {
 
     fn emit_variable_decl(&mut self, declaration: &VariableDeclaration) {
         self.emit_declare_prefix();
-        self.raw(variable_kind_str(declaration.kind));
-        self.raw(" ");
+        let start = self.anchor.start();
+        self.raw_decl_leading(variable_kind_str(declaration.kind), start);
         for (index, declarator) in declaration.declarations.iter().enumerate() {
             if index > 0 {
                 self.raw(", ");
@@ -5528,7 +5578,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_function_signature_decl(&mut self, function: &FunctionLike) {
-        self.raw("function");
+        let start = self.anchor.start();
+        self.raw_decl_leading("function", start);
         if let Some(name) = &function.name {
             self.raw(" ");
             self.emit_ident(name);
@@ -5588,10 +5639,11 @@ impl<'a> Emitter<'a> {
 
     fn emit_class_core_decl(&mut self, class: &ClassDeclaration) {
         let range = self.anchor;
+        let start = self.anchor.start();
         if class.modifiers.is_abstract {
-            self.raw("abstract ");
+            self.raw_decl_leading("abstract ", start);
         }
-        self.raw("class");
+        self.raw_decl_leading("class", start);
         if let Some(name) = &class.name {
             self.raw(" ");
             self.emit_ident(name);
@@ -5694,23 +5746,33 @@ impl<'a> Emitter<'a> {
     fn emit_class_member_decl(&mut self, member: &ClassMemberNode) -> bool {
         match member.data() {
             ClassMember::Constructor(constructor) => {
+                self.anchor = member.range();
                 if let Some(accessibility) = constructor.modifiers.accessibility
                     && accessibility != Accessibility::Public
                 {
-                    self.raw(accessibility_str(accessibility));
+                    let start = self.anchor.start();
+                    self.raw_decl_leading(accessibility_str(accessibility), start);
                     self.raw(" ");
                 }
-                self.raw("constructor");
+                let start = self.anchor.start();
+                self.raw_decl_leading("constructor", start);
                 self.emit_params_decl(&constructor.parameters);
                 self.raw(";");
                 true
             }
             ClassMember::Method(method) => {
+                self.anchor = member.range();
                 if method.modifiers.accessibility == Some(Accessibility::Private) {
                     self.emit_member_modifiers_decl(&method.modifiers);
                     match method.modifier {
-                        PropertyModifier::Get => self.raw("get "),
-                        PropertyModifier::Set => self.raw("set "),
+                        PropertyModifier::Get => {
+                            let start = self.anchor.start();
+                            self.raw_decl_leading("get ", start);
+                        }
+                        PropertyModifier::Set => {
+                            let start = self.anchor.start();
+                            self.raw_decl_leading("set ", start);
+                        }
                         PropertyModifier::None => {}
                     }
                     self.emit_property_name(&method.name);
@@ -5728,8 +5790,14 @@ impl<'a> Emitter<'a> {
                 }
                 self.emit_member_modifiers_decl(&method.modifiers);
                 match method.modifier {
-                    PropertyModifier::Get => self.raw("get "),
-                    PropertyModifier::Set => self.raw("set "),
+                    PropertyModifier::Get => {
+                        let start = self.anchor.start();
+                        self.raw_decl_leading("get ", start);
+                    }
+                    PropertyModifier::Set => {
+                        let start = self.anchor.start();
+                        self.raw_decl_leading("set ", start);
+                    }
                     PropertyModifier::None => {}
                 }
                 self.emit_property_name(&method.name);
@@ -5753,6 +5821,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::Property(property) => {
+                self.anchor = member.range();
                 if property.modifiers.accessibility == Some(Accessibility::Private) {
                     self.emit_member_modifiers_decl(&property.modifiers);
                     self.emit_property_name(&property.name);
@@ -5784,15 +5853,18 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::AutoAccessor(accessor) => {
+                self.anchor = member.range();
                 if accessor.modifiers.accessibility == Some(Accessibility::Private) {
                     self.emit_member_modifiers_decl(&accessor.modifiers);
-                    self.raw("accessor ");
+                    let start = self.anchor.start();
+                    self.raw_decl_leading("accessor ", start);
                     self.emit_property_name(&accessor.name);
                     self.raw(";");
                     return true;
                 }
                 self.emit_member_modifiers_decl(&accessor.modifiers);
-                self.raw("accessor ");
+                let start = self.anchor.start();
+                self.raw_decl_leading("accessor ", start);
                 self.emit_property_name(&accessor.name);
                 if let Some(annotation) = &accessor.type_annotation {
                     self.raw(": ");
@@ -5802,8 +5874,10 @@ impl<'a> Emitter<'a> {
                 true
             }
             ClassMember::IndexSignature(signature) => {
+                self.anchor = member.range();
                 if signature.readonly {
-                    self.raw("readonly ");
+                    let start = self.anchor.start();
+                    self.raw_decl_leading("readonly ", start);
                 }
                 self.raw("[");
                 self.emit_params_decl_inner(&signature.parameters);
@@ -5838,22 +5912,27 @@ impl<'a> Emitter<'a> {
         if let Some(accessibility) = modifiers.accessibility
             && accessibility != Accessibility::Public
         {
-            self.raw(accessibility_str(accessibility));
+            let start = self.anchor.start();
+            self.raw_decl_leading(accessibility_str(accessibility), start);
             self.raw(" ");
         }
         if modifiers.is_static {
-            self.raw("static ");
+            let start = self.anchor.start();
+            self.raw_decl_leading("static ", start);
         }
         if modifiers.is_abstract {
-            self.raw("abstract ");
+            let start = self.anchor.start();
+            self.raw_decl_leading("abstract ", start);
         }
         if modifiers.is_readonly {
-            self.raw("readonly ");
+            let start = self.anchor.start();
+            self.raw_decl_leading("readonly ", start);
         }
     }
 
     fn emit_interface_decl(&mut self, interface: &InterfaceDeclaration) {
-        self.raw("interface ");
+        let start = self.anchor.start();
+        self.raw_decl_leading("interface ", start);
         self.emit_ident(&interface.name);
         self.emit_type_parameters(&interface.type_parameters);
         if !interface.extends.is_empty() {
@@ -5880,7 +5959,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_type_alias_decl(&mut self, alias: &TypeAliasDeclaration) {
-        self.raw("type ");
+        let start = self.anchor.start();
+        self.raw_decl_leading("type ", start);
         self.emit_ident(&alias.name);
         self.emit_type_parameters(&alias.type_parameters);
         self.raw(" = ");
@@ -5891,9 +5971,11 @@ impl<'a> Emitter<'a> {
     fn emit_enum_decl(&mut self, declaration: &EnumDeclaration) {
         self.emit_declare_prefix();
         if declaration.is_const {
-            self.raw("const ");
+            let start = self.anchor.start();
+            self.raw_decl_leading("const ", start);
         }
-        self.raw("enum ");
+        let start = self.anchor.start();
+        self.raw_decl_leading("enum ", start);
         self.emit_ident(&declaration.name);
         self.raw(" ");
         if declaration.members.is_empty() {
@@ -5924,15 +6006,20 @@ impl<'a> Emitter<'a> {
         self.emit_declare_prefix();
         match &namespace.name {
             NamespaceName::Identifier { name, keyword } => {
-                self.raw(keyword.as_str());
+                let start = self.anchor.start();
+                self.raw_decl_leading(keyword.as_str(), start);
                 self.raw(" ");
                 self.emit_ident(name);
             }
             NamespaceName::StringLiteral(name) => {
-                self.raw("module ");
+                let start = self.anchor.start();
+                self.raw_decl_leading("module ", start);
                 self.emit_string(name);
             }
-            NamespaceName::Global { .. } => self.raw("global"),
+            NamespaceName::Global { .. } => {
+                let start = self.anchor.start();
+                self.raw_decl_leading("global", start);
+            }
         }
         self.raw(" {");
         let body = namespace.body.data();

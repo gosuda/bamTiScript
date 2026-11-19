@@ -1777,4 +1777,61 @@ mod tests {
             ";AAAA;;GAEG;AACH,IAAI,CAAC,GAAG,CAAC,CAAC"
         );
     }
+    #[test]
+    fn declaration_namespace_maps_leading_declare() {
+        let source = "namespace m2 {\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        assert_eq!(segments.first(), Some(&(0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn declaration_exported_class_maps_leading_export() {
+        let source = "export class Foo {\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        assert_eq!(segments.first(), Some(&(0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn declaration_dropped_export_maps_member_kind_to_export() {
+        let source = "namespace m2 {\n    export interface I {\n    }\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let member = segments.iter().find(|(line, _, _, _)| *line == 1);
+        assert_eq!(member, Some(&(1, 4, 1, 4)));
+    }
 }
