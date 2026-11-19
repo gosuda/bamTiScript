@@ -1450,7 +1450,7 @@ impl Emitter<'_> {
             .partition_point(|token| token.range().start() < found);
         if !self.tokens[start..end]
             .iter()
-            .all(|token| Self::is_trivia(token))
+            .all(Self::is_trivia)
         {
             return;
         }
