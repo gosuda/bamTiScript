@@ -1347,43 +1347,90 @@ fn resolve_export_for_type(
     }
 }
 
-/// Collects the value members of a module namespace for a namespace-style
-/// import (`import * as ns`, `import ns = require(...)`). Each member pairs
-/// its exported name with its source-table type; the binder translates them
-/// into the importing table and wraps them in a `typeof` constructor named
-/// after the alias. Unresolvable members are skipped.
+fn namespace_export_names(
+    target: SourceId,
+    direct_index: &HashMap<SourceId, Vec<EcmaString>>,
+    ns_index: &HashMap<SourceId, Vec<EcmaString>>,
+    export_stars: &ExportStars,
+) -> Vec<EcmaString> {
+    let default_name = EcmaString::encode("default");
+    let mut seen_sources = HashSet::new();
+    let mut seen_names = HashSet::new();
+    let mut names = Vec::new();
+    let mut stack = vec![target];
+    while let Some(source) = stack.pop() {
+        if !seen_sources.insert(source) {
+            continue;
+        }
+        let is_target = source == target;
+        if let Some(direct) = direct_index.get(&source) {
+            for name in direct {
+                if !is_target && *name == default_name {
+                    continue;
+                }
+                if seen_names.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        if let Some(aliased) = ns_index.get(&source) {
+            for name in aliased {
+                if !is_target && *name == default_name {
+                    continue;
+                }
+                if seen_names.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        if let Some(targets) = export_stars.targets.get(&source) {
+            for next in targets {
+                if !seen_sources.contains(next) {
+                    stack.push(*next);
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 fn namespace_member_types(
     target: SourceId,
     files: &BTreeMap<SourceId, SemanticModel>,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
+    direct_index: &HashMap<SourceId, Vec<EcmaString>>,
+    ns_index: &HashMap<SourceId, Vec<EcmaString>>,
+    cache: &mut HashMap<SourceId, Vec<(EcmaString, TypeId)>>,
 ) -> Vec<(EcmaString, TypeId)> {
-    let mut names: Vec<&EcmaString> = exports
-        .keys()
-        .filter(|(source, _)| *source == target)
-        .map(|(_, name)| name)
-        .collect();
-    names.sort_by(|left, right| left.to_utf8_lossy().cmp(&right.to_utf8_lossy()));
+    if let Some(cached) = cache.get(&target) {
+        return cached.clone();
+    }
+    let names = namespace_export_names(target, direct_index, ns_index, export_stars);
     let mut members = Vec::with_capacity(names.len());
     for name in names {
         let mut visited = HashSet::new();
         let resolution = resolve_export_candidates(
             target,
-            name,
+            &name,
             imports,
             exports,
             export_stars,
             files,
             &mut visited,
         );
-
-        let Some(linked) = resolution.candidates.iter().find_map(|candidate| match candidate {
-            ExportCandidate::Value(linked) => Some(*linked),
-            _ => None,
-        }) else {
+        let mut values = HashSet::new();
+        for candidate in &resolution.candidates {
+            if let ExportCandidate::Value(linked) = candidate {
+                values.insert(*linked);
+            }
+        }
+        if values.len() != 1 {
             continue;
-        };
+        }
+        let linked = values.into_iter().next().expect("one value candidate");
         let Some(source_model) = files.get(&linked.source) else {
             continue;
         };
@@ -1391,8 +1438,9 @@ fn namespace_member_types(
         if matches!(source_model.types().get(value), Type::Error) {
             continue;
         }
-        members.push((name.clone(), value));
+        members.push((name, value));
     }
+    cache.insert(target, members.clone());
     members
 }
 
@@ -1413,6 +1461,15 @@ fn collect_imported_types_for_source<'a>(
     let Some(model) = files.get(&source_id) else {
         return Vec::new();
     };
+    let mut direct_index: HashMap<SourceId, Vec<EcmaString>> = HashMap::new();
+    for ((source, name), _) in exports.iter() {
+        direct_index.entry(*source).or_default().push(name.clone());
+    }
+    let mut ns_index: HashMap<SourceId, Vec<EcmaString>> = HashMap::new();
+    for ((source, name), _) in export_stars.namespace_exports.iter() {
+        ns_index.entry(*source).or_default().push(name.clone());
+    }
+    let mut member_cache: HashMap<SourceId, Vec<(EcmaString, TypeId)>> = HashMap::new();
     let mut imported_types = Vec::new();
     for statement in source.statements() {
         if let Statement::ImportEquals(import) = statement.data() {
@@ -1430,8 +1487,16 @@ fn collect_imported_types_for_source<'a>(
                 continue;
             };
             let target_source = *target_source;
-            let members =
-                namespace_member_types(target_source, files, imports, exports, export_stars);
+            let members = namespace_member_types(
+                target_source,
+                files,
+                imports,
+                exports,
+                export_stars,
+                &direct_index,
+                &ns_index,
+                &mut member_cache,
+            );
             if members.is_empty() {
                 continue;
             }
@@ -1494,6 +1559,9 @@ fn collect_imported_types_for_source<'a>(
                         imports,
                         exports,
                         export_stars,
+                        &direct_index,
+                        &ns_index,
+                        &mut member_cache,
                     ),
                 });
             }
@@ -6482,6 +6550,39 @@ function check(options: Options = {}) {
                 .unwrap()
                 .to_f64(),
             3.0
+        );
+    }
+    #[test]
+    fn namespace_import_sees_star_transitive_members() {
+        let checked = linked(
+            &[
+                "export const x: number = 1;",
+                "export * from \"./b\";",
+                "import * as ns from \"./a\"; const y: string = ns.x;",
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert!(
+            !program_codes(&checked).is_empty(),
+            "star-transitive ns.x must keep its number type, so assigning to string must fail: {:?}",
+            program_codes(&checked)
+        );
+    }
+
+    #[test]
+    fn namespace_import_skips_ambiguous_star_members() {
+        let checked = linked(
+            &[
+                "export const x: number = 1; export const ok: number = 1;",
+                "export const x: number = 2;",
+                "export * from \"./b\"; export * from \"./c\";",
+                "import * as ns from \"./a\"; const y = ns.x; const z: number = ns.ok;",
+            ],
+            &[(2, 0, 0), (2, 1, 1), (3, 0, 2)],
+        );
+        assert!(
+            !program_codes(&checked).is_empty(),
+            "ambiguous ns.x must not resolve silently"
         );
     }
 
