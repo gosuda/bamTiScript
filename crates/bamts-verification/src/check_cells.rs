@@ -7871,6 +7871,43 @@ class C {\n\
             "emitted:\n{emitted}"
         );
     }
+    /// Class getter/setter pairs declare one merged member symbol: each of
+    /// `abstract get readonlyProp` and `abstract set readonlyProp` in
+    /// `abstractPropertyBasics.symbols` renders `>readonlyProp :
+    /// Symbol(B.readonlyProp, Decl(8, 33), Decl(9, 40))`, and `get arguments`
+    /// in `argumentsReferenceInConstructor3_Js.symbols` renders `>arguments :
+    /// Symbol(A.arguments, Decl(a.js, 0, 9))`. The class header on the same
+    /// path stays bare (`classExtendingClass.symbols` prints `>C :
+    /// Symbol(C, ...)`; this pin prints `>B : Symbol(B, ...)`).
+    #[test]
+    fn emit_symbols_binds_class_accessor_declarations() {
+        let logical = "tests/cases/compiler/classAccessorSymbolsPin.ts";
+        let case_text = "class B {\n    get readonlyProp(): string { return \"\"; }\n    set readonlyProp(val: string) { }\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains(">B : Symbol(B,"),
+            "class header on the same path stays bare; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">readonlyProp : Symbol(B.readonlyProp,"),
+            "getter/setter pair must declare the merged member; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">val : Symbol(val,"),
+            "setter parameter keeps its row; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted
+                .lines()
+                .filter(|line| line.starts_with(">readonlyProp :"))
+                .count(),
+            2,
+            "get and set each keep their row with the merged Decl list; emitted:\n{emitted}"
+        );
+    }
 
     /// Qualification rule 2: interface member declarations render with the
     /// parent-qualified symbol name (`Symbol(I.a, ...)`), not bare.

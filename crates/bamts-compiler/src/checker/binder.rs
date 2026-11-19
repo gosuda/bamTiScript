@@ -16550,7 +16550,7 @@ impl<'src> Binder<'src> {
                     anchor(self, &name, &accessor.name);
                 }
             }
-            ClassMember::Method(method) if method.modifier == PropertyModifier::None => {
+            ClassMember::Method(method) => {
                 if let Some(name) = self.member_symbol_key(&method.name) {
                     self.declare(
                         &name,
@@ -16579,8 +16579,7 @@ impl<'src> Binder<'src> {
                     );
                 }
             }
-            ClassMember::Method(_)
-            | ClassMember::Constructor(_)
+            ClassMember::Constructor(_)
             | ClassMember::StaticBlock(_)
             | ClassMember::Missing(_)
             | ClassMember::Semicolon => {}
