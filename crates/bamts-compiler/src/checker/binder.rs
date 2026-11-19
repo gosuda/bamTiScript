@@ -4707,6 +4707,11 @@ pub(crate) struct ImportedSymbolType<'a> {
     pub value_type_id: TypeId,
     pub type_parameters: &'a [SymbolId],
     pub type_plane_id: Option<TypeId>,
+    /// Member names and source-table types for a namespace-style import
+    /// (`import * as ns`, `import ns = require(...)`). The importing binder
+    /// translates each member and wraps them in a `typeof` constructor named
+    /// after the alias, so the value renders as upstream prints it.
+    pub namespace_members: Vec<(EcmaString, TypeId)>,
 }
 
 /// A named type definition kept by reference for lazy, memoized resolution.
@@ -9739,6 +9744,25 @@ impl<'src> Binder<'src> {
                 .entry(source_key)
                 .or_insert(imported.source_model);
             let identities = imported_by_source.entry(source_key).or_default();
+            if !imported.namespace_members.is_empty() {
+                let mut members = Vec::with_capacity(imported.namespace_members.len());
+                for (name, member) in &imported.namespace_members {
+                    let (translated, _) = self.types.import_type(
+                        source_types,
+                        *member,
+                        imported.type_parameters,
+                        identities,
+                        &mut next_imported_symbol,
+                    );
+                    members.push((name.to_utf8_lossy(), translated));
+                }
+                let constructor =
+                    constructor_with_members_in(&mut self.types, imported.symbol, members, false);
+                self.symbol_types[imported.symbol.get() as usize] = constructor;
+                self.type_state[imported.symbol.get() as usize] = TypeState::Done(constructor);
+                continue;
+            }
+
             let (value_type_id, type_parameters) = self.types.import_type(
                 source_types,
                 imported.value_type_id,
