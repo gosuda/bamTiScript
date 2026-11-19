@@ -1435,6 +1435,8 @@ impl Emitter<'_> {
     }
     /// A newline before a list separator or closer that starts past the
     /// previous element's line, so multiline lists keep their line breaks.
+    /// With `removeComments` a newline inside a removed comment does not
+    /// break: only whitespace outside the removed comments counts.
     fn emit_list_break_before(&mut self, from: Utf16Pos, limit: Utf16Pos, closer: char) {
         let comma = TextRange::new(from, limit)
             .ok()
@@ -1454,10 +1456,19 @@ impl Emitter<'_> {
         {
             return;
         }
-        let newline = TextRange::new(from, found)
-            .ok()
-            .and_then(|window| self.source_slice(window))
-            .is_some_and(|text| text.contains('\n'));
+        let newline = if self.options.remove_comments {
+            self.tokens[start..end].iter().any(|token| {
+                token.kind() == TokenKind::Whitespace
+                    && self
+                        .source_slice(token.range())
+                        .is_some_and(|text| text.contains('\n'))
+            })
+        } else {
+            TextRange::new(from, found)
+                .ok()
+                .and_then(|window| self.source_slice(window))
+                .is_some_and(|text| text.contains('\n'))
+        };
         if newline {
             self.newline();
         }

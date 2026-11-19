@@ -1261,6 +1261,31 @@ export {};
     }
 
     #[test]
+    fn removecomments_ignores_newlines_inside_removed_param_comments() {
+        // Oracle (tsc 7.0.2, `removeComments: true`): the comment is removed
+        // and the `)` stays on the parameter line, `function f(a) { }`.
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: true,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("function f(a /* c\nc */) { }\n"),
+            "function f(a) { }\n"
+        );
+    }
+
+    #[test]
     fn declare_function_keeps_param_comment() {
         let input = "declare function f1(/**param a*/ a: number): number;\n";
         let parsed = crate::parser::parse(crate::scanner::scan(
