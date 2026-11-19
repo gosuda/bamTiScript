@@ -10464,6 +10464,12 @@ impl<'a> Rewriter<'a> {
             Expression::Assignment(assignment) => {
                 if self.private_lowering_active()
                     && let Some(lowered) =
+                        self.lower_private_destructured_assignment(expression, assignment)
+                {
+                    return lowered;
+                }
+                if self.private_lowering_active()
+                    && let Some(lowered) =
                         self.lower_private_member_assignment(expression, assignment)
                 {
                     return lowered;

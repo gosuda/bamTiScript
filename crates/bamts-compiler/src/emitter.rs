@@ -3857,6 +3857,12 @@ impl<'a> Emitter<'a> {
             Expression::Template(template) => self.emit_template(template),
             Expression::TaggedTemplate(tagged) => {
                 self.emit_expression_prec(&tagged.tag, P_CALL_MEMBER);
+                if matches!(
+                    self.unwrap_expression(&tagged.tag).data(),
+                    Expression::Call(_) | Expression::New(_)
+                ) {
+                    self.raw(" ");
+                }
                 self.emit_template(&tagged.template);
             }
             Expression::Array(array) => self.emit_array(array, expression.id()),
