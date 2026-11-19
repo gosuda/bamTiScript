@@ -1261,6 +1261,190 @@ impl Emitter<'_> {
             .collect();
     }
 
+    /// The comments that lead a parameter-list or argument-list element.
+    /// Unlike statements, an element keeps same-line comments after `(` or
+    /// `,`; those tokens never steal a comment the way a statement's
+    /// predecessor does.
+    fn list_element_leading_comments(&self, start: Utf16Pos) -> Vec<TextRange> {
+        let (comments, previous) = self.comments_after_previous_token(start);
+        let trailing_line = match previous {
+            Some(token)
+                if matches!(
+                    token.kind(),
+                    TokenKind::LParen | TokenKind::Comma
+                ) =>
+            {
+                None
+            }
+            Some(token) if token.kind() != TokenKind::LBrace => {
+                self.source_line(token.range().end())
+            }
+            _ => None,
+        };
+        comments
+            .into_iter()
+            .filter(|comment| {
+                trailing_line.is_none() || self.source_line(comment.start()) != trailing_line
+            })
+            .collect()
+    }
+
+    /// Prints the source gap between two positions: a newline when the gap
+    /// spans lines, the gap text verbatim otherwise.
+    fn emit_comment_gap(&mut self, from: Utf16Pos, to: Utf16Pos) {
+        let gap = TextRange::new(from, to)
+            .ok()
+            .and_then(|range| self.source_slice(range));
+        match gap {
+            Some(gap) if gap.contains('\n') => self.newline(),
+            Some(gap) => self.raw(&gap.to_owned()),
+            None => self.raw(" "),
+        }
+    }
+
+    /// Prints the comments that lead a list element with source-faithful
+    /// spacing, then leaves the cursor past them. A run that starts on the
+    /// anchor's line stays on one line; a run reaching past it keeps its
+    /// line breaks.
+    fn emit_leading_element_comments(&mut self, element_start: Utf16Pos) {
+        if self.options.remove_comments || element_start > self.authored_len {
+            return;
+        }
+        let comments = self.list_element_leading_comments(element_start);
+        if comments.is_empty() {
+            self.comment_cursor = self.comment_cursor.max(element_start);
+            return;
+        }
+        let mut anchor_end = self
+            .comments_after_previous_token(element_start)
+            .1
+            .map_or(element_start, |token| token.range().end());
+        let mut multiline = false;
+        let mut first = true;
+        for comment in &comments {
+            let newline = TextRange::new(anchor_end, comment.start())
+                .ok()
+                .and_then(|range| self.source_slice(range))
+                .is_some_and(|text| text.contains('\n'));
+            if newline && (first || multiline) {
+                self.newline();
+                multiline = true;
+            } else if !newline {
+                let gap = TextRange::new(anchor_end, comment.start())
+                    .ok()
+                    .and_then(|range| self.source_slice(range))
+                    .unwrap_or(" ");
+                self.raw(&gap.to_owned());
+            } else {
+                self.raw(" ");
+            }
+            self.write_comment(*comment);
+            self.comment_cursor = self.comment_cursor.max(comment.end());
+            anchor_end = comment.end();
+            first = false;
+        }
+        let newline = TextRange::new(anchor_end, element_start)
+            .ok()
+            .and_then(|range| self.source_slice(range))
+            .is_some_and(|text| text.contains('\n'));
+        if newline && multiline {
+            self.newline();
+        } else if !newline {
+            let gap = TextRange::new(anchor_end, element_start)
+                .ok()
+                .and_then(|range| self.source_slice(range))
+                .unwrap_or(" ");
+            self.raw(&gap.to_owned());
+        } else {
+            self.raw(" ");
+        }
+        self.comment_cursor = self.comment_cursor.max(element_start);
+    }
+
+    /// The comments that trail a parameter-list or argument-list element:
+    /// the comment run starting at `after` and stopping at the separator,
+    /// closer, or a comment on a later line, so `f(a /* c */, b)` keeps its
+    /// block comment without stealing comments that lead `b`.
+    fn trailing_element_comments(&self, after: Utf16Pos) -> Vec<TextRange> {
+        let start = self
+            .tokens
+            .partition_point(|token| token.range().end() <= after);
+        let line = self.source_line(after);
+        let mut comments = Vec::new();
+        for token in self.tokens[start..].iter() {
+            if !Self::is_trivia(token) {
+                break;
+            }
+            if !Self::is_comment(token) {
+                continue;
+            }
+            if comments
+                .last()
+                .is_some_and(|_| self.source_line(token.range().start()) != line)
+            {
+                break;
+            }
+            comments.push(token.range());
+        }
+        comments
+    }
+
+    /// Prints trailing comments of a list element with source-faithful
+    /// spacing. The separator or closer the caller prints next follows
+    /// directly.
+    fn emit_trailing_element_comments(&mut self, after: Utf16Pos) {
+        if self.options.remove_comments {
+            return;
+        }
+        let comments = self.trailing_element_comments(after);
+        let mut anchor_end = after;
+        for comment in &comments {
+            self.emit_comment_gap(anchor_end, comment.start());
+            self.write_comment(*comment);
+            self.comment_cursor = self.comment_cursor.max(comment.end());
+            anchor_end = comment.end();
+        }
+    }
+
+    /// Prints the comments inside an empty parameter or argument list, which
+    /// carry no element to lead or trail (`a( /*1*/)`).
+    fn emit_empty_paren_comments(&mut self, open_end: Utf16Pos, close_start: Utf16Pos) {
+        if self.options.remove_comments
+            || open_end > self.authored_len
+            || close_start > self.authored_len
+        {
+            return;
+        }
+        let mut anchor_end = open_end;
+        for comment in self.trailing_element_comments(open_end) {
+            if comment.start() >= close_start {
+                break;
+            }
+            self.emit_comment_gap(anchor_end, comment.start());
+            self.write_comment(comment);
+            self.comment_cursor = self.comment_cursor.max(comment.end());
+            anchor_end = comment.end();
+        }
+        self.emit_comment_gap(anchor_end, close_start);
+    }
+
+    /// A newline before a list separator or closer that starts past the
+    /// previous element's line, so multiline lists keep their line breaks.
+    fn emit_list_break_before(&mut self, from: Utf16Pos, limit: Utf16Pos, closer: char) {
+        let comma = TextRange::new(from, limit)
+            .ok()
+            .and_then(|window| self.source_pos_of(window, closer));
+        let newline = comma.is_some_and(|pos| {
+            TextRange::new(from, pos)
+                .ok()
+                .and_then(|window| self.source_slice(window))
+                .is_some_and(|text| text.contains('\n'))
+        });
+        if newline {
+            self.newline();
+        }
+    }
+
     /// Prints the comments that close a file.
     fn write_closing_comments(&mut self) {
         self.queue_leading_comments(self.authored_len);
@@ -3141,7 +3325,19 @@ impl<'a> Emitter<'a> {
             .iter()
             .any(|parameter| !self.is_this_parameter(parameter.data()));
         if !has_params {
-            self.raw("()");
+            match self.source_pos_of(window, '(') {
+                Some(open) => {
+                    let open_end = Utf16Pos::new(open.get().saturating_add(1));
+                    let close = TextRange::new(open_end, window.end())
+                        .ok()
+                        .and_then(|after| self.source_pos_of(after, ')'))
+                        .unwrap_or(open_end);
+                    self.raw("(");
+                    self.emit_empty_paren_comments(open_end, close);
+                    self.raw(")");
+                }
+                None => self.raw("()"),
+            }
             return;
         }
         let open = self.source_pos_of(window, '(').unwrap_or(window.start());
@@ -3156,9 +3352,16 @@ impl<'a> Emitter<'a> {
             }
             if !first {
                 let limit = parameter.binding.range().start();
+                self.emit_trailing_element_comments(last_end);
+                self.emit_list_break_before(cursor, limit, ',');
                 self.mapped_list_separator_from(cursor, limit);
             }
             first = false;
+            let element_start = parameter.decorators.first().map_or_else(
+                || parameter.binding.range().start(),
+                |decorator| decorator.range().start(),
+            );
+            self.emit_leading_element_comments(element_start);
             self.emit_decorators_inline(&parameter.decorators);
             self.emit_pattern(&parameter.binding);
             if let Some(initializer) = &parameter.initializer {
@@ -3171,15 +3374,16 @@ impl<'a> Emitter<'a> {
             );
             cursor = last_end;
         }
+        self.emit_trailing_element_comments(last_end);
         let close = self
             .source_pos_of(
                 TextRange::new(last_end, window.end()).unwrap_or(window),
                 ')',
             )
             .unwrap_or(last_end);
+        self.emit_list_break_before(last_end, close, ')');
         self.raw_mapped_token(")", close, 1);
     }
-
     fn is_this_parameter(&self, parameter: &Parameter) -> bool {
         if let BindingPattern::Identifier(ident) = parameter.binding.data() {
             matches!(self.text(ident.data().token()), Some("this"))
@@ -4213,8 +4417,10 @@ impl<'a> Emitter<'a> {
         } else {
             self.raw_mapped_token("(", open_pos, 1);
         }
-        self.emit_arguments(&call.arguments);
+        let open_end =
+            Utf16Pos::new(open_pos.get().saturating_add(if call.optional { 2 } else { 1 }));
         let close_pos = self.source_pos_of_last(range, ')').unwrap_or(range.end());
+        self.emit_arguments(&call.arguments, open_end, close_pos);
         self.raw_mapped_token(")", close_pos, 1);
     }
 
@@ -4239,24 +4445,40 @@ impl<'a> Emitter<'a> {
         if authored && new.arguments.is_empty() && open_pos.is_none() {
             return;
         }
-        self.raw_mapped_token("(", open_pos.unwrap_or(callee.range().end()), 1);
-        self.emit_arguments(&new.arguments);
+        let open_pos = open_pos.unwrap_or(callee.range().end());
+        self.raw_mapped_token("(", open_pos, 1);
+        let open_end = Utf16Pos::new(open_pos.get().saturating_add(1));
         let close_pos = self.source_pos_of_last(range, ')').unwrap_or(range.end());
+        self.emit_arguments(&new.arguments, open_end, close_pos);
         self.raw_mapped_token(")", close_pos, 1);
     }
 
-    fn emit_arguments(&mut self, arguments: &[CallArgument]) {
+    fn emit_arguments(
+        &mut self,
+        arguments: &[CallArgument],
+        open_end: Utf16Pos,
+        close_start: Utf16Pos,
+    ) {
+        if arguments.is_empty() {
+            self.emit_empty_paren_comments(open_end, close_start);
+            return;
+        }
         let mut previous_end: Option<Utf16Pos> = None;
         for (index, argument) in arguments.iter().enumerate() {
             let argument_range = call_argument_range(argument);
             if index > 0 {
                 match (previous_end, argument_range) {
                     (Some(end), Some(next)) => {
+                        self.emit_trailing_element_comments(end);
+                        self.emit_list_break_before(end, next.start(), ',');
                         self.mapped_list_separator_from(end, next.start());
                     }
                     (Some(end), None) => self.raw_mapped_pos(", ", end),
                     (None, _) => {}
                 }
+            }
+            if let Some(range) = argument_range {
+                self.emit_leading_element_comments(range.start());
             }
             match argument {
                 CallArgument::Expression(expression) => {
@@ -4274,6 +4496,10 @@ impl<'a> Emitter<'a> {
                 }
             }
             previous_end = argument_range.map(|range| range.end());
+        }
+        if let Some(end) = previous_end {
+            self.emit_trailing_element_comments(end);
+            self.emit_list_break_before(end, close_start, ')');
         }
     }
 
@@ -5560,10 +5786,15 @@ impl<'a> Emitter<'a> {
 
     fn emit_params_decl(&mut self, parameters: &[ParameterNode]) {
         self.raw("(");
+        let mut last_end: Option<Utf16Pos> = None;
         for (index, parameter) in parameters.iter().enumerate() {
             if index > 0 {
+                if let Some(end) = last_end {
+                    self.emit_trailing_element_comments(end);
+                }
                 self.raw(", ");
             }
+            self.emit_leading_element_comments(parameter.range().start());
             let parameter = parameter.data();
             if let Some(accessibility) = parameter.modifiers.accessibility {
                 self.raw(accessibility_str(accessibility));
@@ -5579,8 +5810,12 @@ impl<'a> Emitter<'a> {
             if let Some(annotation) = &parameter.type_annotation {
                 self.raw(": ");
                 self.emit_type(&annotation.data().type_node);
-            } else if matches!(parameter.binding.data(), BindingPattern::Rest(_)) {
-                self.raw(": any[]");
+                last_end = Some(annotation.range().end());
+            } else {
+                if matches!(parameter.binding.data(), BindingPattern::Rest(_)) {
+                    self.raw(": any[]");
+                }
+                last_end = Some(parameter.binding.range().end());
             }
         }
         self.raw(")");
@@ -5821,15 +6056,23 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_params_decl_inner(&mut self, parameters: &[ParameterNode]) {
+        let mut last_end: Option<Utf16Pos> = None;
         for (index, parameter) in parameters.iter().enumerate() {
             if index > 0 {
+                if let Some(end) = last_end {
+                    self.emit_trailing_element_comments(end);
+                }
                 self.raw(", ");
             }
+            self.emit_leading_element_comments(parameter.range().start());
             let parameter = parameter.data();
             self.emit_pattern(&parameter.binding);
             if let Some(annotation) = &parameter.type_annotation {
                 self.raw(": ");
                 self.emit_type(&annotation.data().type_node);
+                last_end = Some(annotation.range().end());
+            } else {
+                last_end = Some(parameter.binding.range().end());
             }
         }
     }
@@ -7840,6 +8083,171 @@ export {};
             "if (a) {\n    /* a\n       b */\n    f();\n}\n"
         );
         assert_eq!(emit("// above\nvar x; // t\n// end\n", true), "var x;\n");
+    }
+
+    #[test]
+    fn leading_param_comments_survive_in_javascript() {
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: false,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("function foo(/*c1*/ x, /*d1*/ y, /*e1*/ w) { }\n"),
+            "function foo(/*c1*/ x, /*d1*/ y, /*e1*/ w) { }\n"
+        );
+        assert_eq!(
+            emit("function foo(/**hm*/ a) { }\n"),
+            "function foo(/**hm*/ a) { }\n"
+        );
+    }
+
+    #[test]
+    fn trailing_param_comments_survive_in_javascript() {
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: false,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("function commentedParameters(a /* parameter a */, b /* parameter b */) { }\n"),
+            "function commentedParameters(a /* parameter a */, b /* parameter b */) { }\n"
+        );
+        assert_eq!(
+            emit("function foo2(greeting, ...restGreetings /* more greeting */) { }\n"),
+            "function foo2(greeting, ...restGreetings /* more greeting */) { }\n"
+        );
+    }
+
+    #[test]
+    fn call_argument_comments_survive_in_javascript() {
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: false,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("foo(/*c1*/ x, y /*c2*/);\n"),
+            "foo(/*c1*/ x, y /*c2*/);\n"
+        );
+        assert_eq!(emit("foo(0 /* E.A */);\n"), "foo(0 /* E.A */);\n");
+    }
+
+    #[test]
+    fn empty_paren_comments_survive_in_javascript() {
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: false,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(emit("a( /*1*/);\n"), "a( /*1*/);\n");
+        assert_eq!(
+            emit("function foo( /** nothing */) { }\n"),
+            "function foo( /** nothing */) { }\n"
+        );
+    }
+
+    #[test]
+    fn multiline_param_comments_keep_line_breaks() {
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: false,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("function commentedParameters(\n/* Parameter a */\na\n/* End of parameter a */\n/* Parameter b */\n,\nb\n/* End of parameter b */\n) { }\n"),
+            "function commentedParameters(\n/* Parameter a */\na\n/* End of parameter a */\n/* Parameter b */\n, b\n/* End of parameter b */\n) { }\n"
+        );
+    }
+
+    #[test]
+    fn removecomments_drops_param_comments_in_javascript() {
+        let emit = |input: &str| {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty());
+            let options = EmitOptions {
+                remove_comments: true,
+                ..EmitOptions::default()
+            };
+            javascript(&emit_output(parsed.product(), &options))
+                .code
+                .clone()
+        };
+        assert_eq!(
+            emit("function foo(/*c*/ x, y /*d*/) { }\n"),
+            "function foo(x, y) { }\n"
+        );
+        assert_eq!(emit("a( /*1*/);\n"), "a();\n");
+    }
+
+    #[test]
+    fn declare_function_keeps_param_comment() {
+        let input = "declare function f1(/**param a*/ a: number): number;\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_declaration(parsed.product());
+        assert_eq!(
+            declaration(&output).code,
+            "declare function f1(/**param a*/ a: number): number;\n"
+        );
     }
 
     #[test]
