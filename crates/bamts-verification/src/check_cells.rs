@@ -761,23 +761,53 @@ fn shared_lib_target(value: &str) -> Option<&str> {
 }
 
 /// Every `/.lib/` reference target one unit text names, in sorted order.
+///
+/// Only the prologue counts, mirroring the compiler's own loader
+/// (`collect_reference_directives` stops at the first statement and
+/// rejects a fourth slash): a `////` line is content, a directive after
+/// the first compiled line is inert, and block-comment bodies never name
+/// a target.
 fn shared_lib_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
+    let mut in_block_comment = false;
     for line in text.lines() {
-        if !line.trim_start().starts_with("///") {
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
             continue;
         }
-        for (name, value) in directive_attributes(line) {
-            if name != "path" {
-                continue;
-            }
-            let Some(target) = shared_lib_target(value) else {
-                continue;
-            };
-            if !refs.iter().any(|existing| existing == target) {
-                refs.push(target.to_owned());
-            }
+        if trimmed.is_empty() {
+            continue;
         }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("///") {
+            if trimmed.as_bytes().get(3) == Some(&b'/') {
+                continue;
+            }
+            for (name, value) in directive_attributes(line) {
+                if name != "path" {
+                    continue;
+                }
+                let Some(target) = shared_lib_target(value) else {
+                    continue;
+                };
+                if !refs.iter().any(|existing| existing == target) {
+                    refs.push(target.to_owned());
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        break;
     }
     refs.sort();
     refs
@@ -6122,11 +6152,20 @@ import { everywhere, onlyInA } from \"b.foo\"; // Error
 
     #[test]
     fn shared_lib_refs_ignore_non_directives_and_escapes() {
-        let text = "const marker = \"/.lib/react.d.ts\";\n/// <reference path=\"/.lib/react18/global.d.ts\" />\n/// <reference path=\"/.lib/../secret.d.ts\" />\n/// <reference types=\"/.lib/react.d.ts\" />\n";
+        let text = "/// <reference path=\"/.lib/react18/global.d.ts\" />\n/// <reference path=\"/.lib/../secret.d.ts\" />\n/// <reference types=\"/.lib/react.d.ts\" />\nconst marker = \"/.lib/react.d.ts\";\n";
         assert_eq!(
             shared_lib_refs(text),
             vec!["react18/global.d.ts".to_owned()]
         );
+    }
+
+    #[test]
+    fn shared_lib_refs_ignore_quadruple_slash_and_post_statement_targets() {
+        // The compiler's own loader honors a `///` prologue directive only
+        // before the first statement and rejects a fourth slash, so the
+        // harness loads support files for neither of these.
+        let text = "//// <reference path=\"/.lib/react.d.ts\" />\nlet x = 1;\n/// <reference path=\"/.lib/react.d.ts\" />\n";
+        assert!(shared_lib_refs(text).is_empty());
     }
 
     #[test]
