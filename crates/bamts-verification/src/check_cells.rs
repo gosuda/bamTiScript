@@ -763,54 +763,84 @@ fn shared_lib_target(value: &str) -> Option<&str> {
 /// Every `/.lib/` reference target one unit text names, in sorted order.
 ///
 /// Only the prologue counts, mirroring the compiler's own loader
-/// (`collect_reference_directives` stops at the first statement and
-/// rejects a fourth slash): a `////` line is content, a directive after
-/// the first compiled line is inert, and block-comment bodies never name
-/// a target.
+/// (`collect_reference_directives` scans tokens up to the first statement
+/// and honors only `LineComment` tokens, rejecting a fourth slash): a
+/// `////` line is inert, a directive after the first compiled line is
+/// inert, and block-comment bodies never name a target. The scan is a
+/// small state machine over the prologue: a `#!` shebang counts only as
+/// the first line, block comments may span lines, closing `*/` resumes
+/// scanning the same line, and the first other content ends the prologue.
 fn shared_lib_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    let mut in_block_comment = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start_matches('\u{feff}').trim();
-        if in_block_comment {
-            if trimmed.contains("*/") {
-                in_block_comment = false;
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    if text.starts_with('\u{feff}') {
+        pos = 3;
+    }
+    if bytes.get(pos) == Some(&b'#') && bytes.get(pos + 1) == Some(&b'!') {
+        while pos < bytes.len() && bytes[pos] != b'\n' {
+            pos += 1;
+        }
+    }
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            pos += 1;
+            continue;
+        }
+        if bytes[pos..].starts_with("\u{feff}".as_bytes()) {
+            pos += 3;
+            continue;
+        }
+        if byte == b'/' && bytes.get(pos + 1) == Some(&b'/') {
+            let start = pos;
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            let comment = &text[start..pos];
+            let comment_bytes = comment.as_bytes();
+            if comment_bytes.get(2) == Some(&b'/')
+                && comment_bytes.get(3) != Some(&b'/')
+            {
+                push_directive_refs(comment, &mut refs);
             }
             continue;
         }
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with("/*") {
-            if !trimmed.contains("*/") {
-                in_block_comment = true;
-            }
-            continue;
-        }
-        if trimmed.starts_with("///") {
-            if trimmed.as_bytes().get(3) == Some(&b'/') {
-                continue;
-            }
-            for (name, value) in directive_attributes(line) {
-                if name != "path" {
-                    continue;
+        if byte == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+            pos += 2;
+            let mut closed = false;
+            while pos < bytes.len() {
+                if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+                    pos += 2;
+                    closed = true;
+                    break;
                 }
-                let Some(target) = shared_lib_target(value) else {
-                    continue;
-                };
-                if !refs.iter().any(|existing| existing == target) {
-                    refs.push(target.to_owned());
-                }
+                pos += 1;
             }
-            continue;
-        }
-        if trimmed.starts_with("//") {
+            if !closed {
+                break;
+            }
             continue;
         }
         break;
     }
     refs.sort();
     refs
+}
+
+/// Every `/.lib/` target a `/// <reference ... />` comment names.
+fn push_directive_refs(comment: &str, refs: &mut Vec<String>) {
+    for (name, value) in directive_attributes(comment) {
+        if name != "path" {
+            continue;
+        }
+        let Some(target) = shared_lib_target(value) else {
+            continue;
+        };
+        if !refs.iter().any(|existing| existing == target) {
+            refs.push(target.to_owned());
+        }
+    }
 }
 
 /// Every `(name, value)` attribute of a `/// <reference ... />` directive.

@@ -6652,3 +6652,33 @@ interface I {
             .collect();
         assert_eq!(codes, vec![("BAMTS-C002".to_owned(), 8)]);
     }
+
+    #[test]
+    fn shebang_line_does_not_end_the_reference_prologue() {
+        let text = "#!/usr/bin/env node\n/// <reference path=\"/.lib/react.d.ts\" />\nvar x = 1;\n";
+        assert_eq!(shared_lib_refs(text), vec!["react.d.ts".to_owned()]);
+    }
+
+    #[test]
+    fn code_after_a_closed_block_comment_ends_the_prologue() {
+        let text = "/* c */ var x = 1;\n/// <reference path=\"/.lib/a.d.ts\" />\n";
+        assert_eq!(shared_lib_refs(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn directive_after_a_closed_block_comment_on_one_line_counts() {
+        let text = "/* c */ /// <reference path=\"/.lib/b.d.ts\" />\nvar x = 1;\n";
+        assert_eq!(shared_lib_refs(text), vec!["b.d.ts".to_owned()]);
+    }
+
+    #[test]
+    fn multiline_block_comment_before_a_directive_counts() {
+        let text = "/*\nline one\nline two\n*/\n/// <reference path=\"/.lib/c.d.ts\" />\nvar x = 1;\n";
+        assert_eq!(shared_lib_refs(text), vec!["c.d.ts".to_owned()]);
+    }
+
+    #[test]
+    fn directive_inside_a_block_comment_body_is_inert() {
+        let text = "/* /// <reference path=\"/.lib/d.d.ts\" /> */\nvar x = 1;\n";
+        assert_eq!(shared_lib_refs(text), Vec::<String>::new());
+    }
