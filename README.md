@@ -36,7 +36,7 @@ The `hello.ts` input is created in [Quick start](#quick-start).
 - Direct source-file compilation emits a native host executable through `--outDir` instead of JavaScript (`docs/reference/cli.md`).
 - Unsupported compiler options fail closed with `TS5047` and exit status 5 rather than being silently ignored (`docs/reference/cli.md`).
 - The runtime stores ECMAScript strings as exact UTF-16 code units, including lone surrogates (`docs/explanation/architecture.md`).
-- Interpreter, JIT, and AOT consume the same verified bytecode program (`docs/explanation/architecture.md`); execution-target selection is not a public CLI flag.
+- Interpreter, JIT, and AOT consume the same verified bytecode program (`docs/explanation/architecture.md`); the execution tier is selected with `bamts --run` plus `--jit`, `--aot`, or `--target <aot|jit>`.
 - The workspace defaults to `unsafe_code = "forbid"`, with documented exceptions in the codegen, native, FFI, and Node-API crates (`Cargo.toml`). This is a source policy, not an end-to-end memory-safety proof.
 
 ## Quick start
@@ -83,7 +83,7 @@ bamts --project ./tsconfig.json    # pick a configuration explicitly
 bamts --build                      # build a composite project
 ```
 
-Direct compilation writes `<outDir>/<entrypoint-name>`; with `--declaration` or `--sourceMap` (and emit enabled) the same path emits JavaScript artifacts instead of a native executable. One source file is limited to 16 MiB and a session to 256 MiB (`BAMTS-R001`, `BAMTS-R002`). The former `check`, `run`, `compile`, `explain`, `--target jit`, and `--target aot` forms are not public commands.
+Direct compilation writes `<outDir>/<entrypoint-name>`; with `--declaration` or `--sourceMap` (and emit enabled) the same path emits JavaScript artifacts instead of a native executable. One source file is limited to 16 MiB and a session to 256 MiB (`BAMTS-R001`, `BAMTS-R002`). The `check`, `run`, `compile`, and `explain` subcommand forms are not public commands; programs run under the `bamts --run` flag documented above.
 
 ## Documentation
 
