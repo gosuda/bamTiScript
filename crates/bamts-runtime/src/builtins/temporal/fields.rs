@@ -48,7 +48,6 @@ fn to_number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64,
     Ok(value_number(machine.coerce_number_observable(value)?))
 }
 
-/// ToIntegerWithTruncation.
 pub(super) fn to_integer_with_truncation<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -60,7 +59,6 @@ pub(super) fn to_integer_with_truncation<H: Host>(
     Ok(number.trunc() + 0.0)
 }
 
-/// ToPositiveIntegerWithTruncation.
 fn to_positive_integer_with_truncation<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -318,7 +316,6 @@ impl CalendarFields {
     }
 }
 
-/// ToMonthCode.
 fn to_month_code<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -716,7 +713,7 @@ fn read_overflow<H: Host>(machine: &mut Machine<'_, H>, options: Value) -> Resul
     Ok(())
 }
 
-/// ToTemporalDate. `options` is `undefined` when the caller has none.
+/// `options` is `undefined` when the caller has none.
 pub(super) fn to_temporal_date<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -757,7 +754,6 @@ pub(super) fn to_temporal_date<H: Host>(
     Ok((date, calendar))
 }
 
-/// ToTemporalDateTime.
 pub(super) fn to_temporal_date_time<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -801,7 +797,6 @@ pub(super) fn to_temporal_date_time<H: Host>(
     Ok((value, calendar))
 }
 
-/// ToTemporalTime.
 pub(super) fn to_temporal_time<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -838,7 +833,6 @@ pub(super) fn to_temporal_time<H: Host>(
     Ok(time)
 }
 
-/// ToTemporalYearMonth.
 pub(super) fn to_temporal_year_month<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -881,7 +875,6 @@ pub(super) fn to_temporal_year_month<H: Host>(
     Ok((value, calendar))
 }
 
-/// ToTemporalMonthDay.
 pub(super) fn to_temporal_month_day<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -955,7 +948,6 @@ pub(super) fn interpret_offset<H: Host>(
     .or_throw(machine)
 }
 
-/// ToTemporalZonedDateTime.
 pub(super) fn to_temporal_zoned_date_time<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -1074,7 +1066,6 @@ fn zoned_from_parsed<H: Host>(
     )
 }
 
-/// ToTemporalInstant.
 pub(super) fn to_temporal_instant<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,
@@ -1092,7 +1083,6 @@ pub(super) fn to_temporal_instant<H: Host>(
     Instant::parse(&text).or_throw(machine)
 }
 
-/// ToTemporalDuration.
 pub(in crate::intrinsics::builtins) fn to_temporal_duration<H: Host>(
     machine: &mut Machine<'_, H>,
     item: Value,

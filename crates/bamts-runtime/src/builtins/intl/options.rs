@@ -16,7 +16,6 @@ use crate::{EvalFailure, Host, Machine};
 /// object of `undefined`, which no read can observe.
 pub(super) type Options = Option<Value>;
 
-/// GetOptionsObject.
 pub(super) fn get_options_object<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -30,7 +29,6 @@ pub(super) fn get_options_object<H: Host>(
     }
 }
 
-/// CoerceOptionsToObject.
 pub(super) fn coerce_options_to_object<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -112,7 +110,6 @@ pub(super) const fn matcher_name(matcher: LocaleMatcher) -> &'static str {
     }
 }
 
-/// DefaultNumberOption.
 pub(super) fn default_number_option<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,

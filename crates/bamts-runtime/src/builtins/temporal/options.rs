@@ -18,7 +18,6 @@ use crate::{EvalFailure, Host, Machine};
 /// object of `GetOptionsObject(undefined)`, which no read can observe.
 pub(super) type Options = Option<Value>;
 
-/// GetOptionsObject.
 pub(super) fn get_options_object<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,

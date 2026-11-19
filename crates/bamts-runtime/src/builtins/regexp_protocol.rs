@@ -210,7 +210,6 @@ pub(super) fn symbol_search<H: Host>(
     .map(BuiltinOutcome::Value)
 }
 
-/// `SpeciesConstructor`.
 pub(super) fn species_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
