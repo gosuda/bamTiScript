@@ -11,7 +11,6 @@ use bamts_verification::{
     suite::{
         BackendFilter, CiMode, CiOptions, FailureClass, RunFilterOptions, StatusFilter,
         SuiteRunReport, SyncOptions, audit_ledger, parse_shards, run_ci, run_suite, sync_suite,
-        write_suite_ledger,
     },
     ts_ledger::Backend,
 };
@@ -22,18 +21,6 @@ enum Command {
         write_snapshot: bool,
         workspace_root: PathBuf,
         snapshot_root: PathBuf,
-    },
-    Classify {
-        workspace_root: PathBuf,
-        snapshot_root: PathBuf,
-        ledger_out: PathBuf,
-    },
-    SyncAndClassify {
-        verify_pin: bool,
-        write_snapshot: bool,
-        workspace_root: PathBuf,
-        snapshot_root: PathBuf,
-        ledger_out: PathBuf,
     },
     AuditLedger {
         require_complete: bool,
@@ -52,57 +39,6 @@ enum Command {
         workspace_root: PathBuf,
         snapshot_root: PathBuf,
     },
-}
-
-enum ClassifySync {
-    SnapshotIfMissing,
-    Always {
-        verify_pin: bool,
-        write_snapshot: bool,
-    },
-}
-
-fn classify_suite(
-    workspace_root: PathBuf,
-    snapshot_root: PathBuf,
-    ledger_out: PathBuf,
-    sync: ClassifySync,
-) -> Result<()> {
-    match sync {
-        ClassifySync::SnapshotIfMissing => {
-            if !snapshot_root.join("snapshot.sha256").exists() {
-                sync_suite(&SyncOptions {
-                    verify_pin: true,
-                    write_snapshot: true,
-                    workspace_root,
-                    snapshot_root: snapshot_root.clone(),
-                    extracted_suite_root: None,
-                })?;
-            }
-        }
-        ClassifySync::Always {
-            verify_pin,
-            write_snapshot,
-        } => {
-            sync_suite(&SyncOptions {
-                verify_pin,
-                write_snapshot,
-                workspace_root,
-                snapshot_root: snapshot_root.clone(),
-                extracted_suite_root: None,
-            })?;
-        }
-    }
-    let ledger = write_suite_ledger(&snapshot_root, &ledger_out)?;
-    println!(
-        "ledger_written path={} entries={} included={} deferred={} excluded={}",
-        ledger_out.display(),
-        ledger.entries.len(),
-        ledger.totals.included,
-        ledger.totals.deferred,
-        ledger.totals.excluded,
-    );
-    Ok(())
 }
 
 fn main() {
@@ -131,31 +67,6 @@ fn run() -> Result<()> {
             println!("snapshot.sha256={}", snapshot.digest);
             Ok(())
         }
-        Command::Classify {
-            workspace_root,
-            snapshot_root,
-            ledger_out,
-        } => classify_suite(
-            workspace_root,
-            snapshot_root,
-            ledger_out,
-            ClassifySync::SnapshotIfMissing,
-        ),
-        Command::SyncAndClassify {
-            verify_pin,
-            write_snapshot,
-            workspace_root,
-            snapshot_root,
-            ledger_out,
-        } => classify_suite(
-            workspace_root,
-            snapshot_root,
-            ledger_out,
-            ClassifySync::Always {
-                verify_pin,
-                write_snapshot,
-            },
-        ),
         Command::AuditLedger {
             require_complete,
             ledger,
@@ -275,96 +186,12 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
 
     match command.as_str() {
         "sync" => parse_sync(&mut arguments, cwd),
-        "classify" => parse_classify(&mut arguments, cwd),
-        "sync-and-classify" => parse_sync_and_classify(&mut arguments, cwd),
         "audit-ledger" => parse_audit_ledger(&mut arguments, cwd),
         "run" => parse_run(&mut arguments, cwd),
         "ci" => parse_ci(&mut arguments, cwd),
         _ if command.starts_with("--") => Err(usage(format!("unknown flag `{command}`"))),
         _ => Err(usage(format!("unknown command `{command}`"))),
     }
-}
-
-fn parse_classify(arguments: &mut impl Iterator<Item = OsString>, cwd: PathBuf) -> Result<Command> {
-    let mut write_ledger = false;
-    let mut workspace_root = cwd.clone();
-    let mut snapshot_root = cwd.join("verification/ts-suite");
-    let mut ledger_out = cwd.join("verification/ts-suite-ledger.json");
-
-    while let Some(raw) = arguments.next() {
-        let flag = raw
-            .into_string()
-            .map_err(|_| usage("flag must be valid UTF-8"))?;
-        match flag.as_str() {
-            "--write-ledger" => write_ledger = true,
-            "--workspace" => {
-                workspace_root = PathBuf::from(flag_value_from(&mut *arguments, "--workspace")?)
-            }
-            "--snapshot" => {
-                snapshot_root = PathBuf::from(flag_value_from(&mut *arguments, "--snapshot")?)
-            }
-            "--ledger-out" => {
-                ledger_out = PathBuf::from(flag_value_from(&mut *arguments, "--ledger-out")?)
-            }
-            _ if flag.starts_with("--") => return Err(usage(format!("unknown flag `{flag}`"))),
-            _ => return Err(usage(format!("unexpected argument `{flag}`"))),
-        }
-    }
-
-    if !write_ledger {
-        return Err(usage("classify requires `--write-ledger`"));
-    }
-    Ok(Command::Classify {
-        workspace_root,
-        snapshot_root,
-        ledger_out,
-    })
-}
-
-fn parse_sync_and_classify(
-    arguments: &mut impl Iterator<Item = OsString>,
-    cwd: PathBuf,
-) -> Result<Command> {
-    let mut verify_pin = false;
-    let mut write_snapshot = false;
-    let mut workspace_root = cwd.clone();
-    let mut snapshot_root = cwd.join("verification/ts-suite");
-    let mut ledger_out = cwd.join("verification/ts-suite-ledger.json");
-
-    while let Some(raw) = arguments.next() {
-        let flag = raw
-            .into_string()
-            .map_err(|_| usage("flag must be valid UTF-8"))?;
-        match flag.as_str() {
-            "--verify-pin" => verify_pin = true,
-            "--write-snapshot" => write_snapshot = true,
-            "--workspace" => {
-                workspace_root = PathBuf::from(flag_value_from(&mut *arguments, "--workspace")?)
-            }
-            "--snapshot" => {
-                snapshot_root = PathBuf::from(flag_value_from(&mut *arguments, "--snapshot")?)
-            }
-            "--ledger-out" => {
-                ledger_out = PathBuf::from(flag_value_from(&mut *arguments, "--ledger-out")?)
-            }
-            _ if flag.starts_with("--") => return Err(usage(format!("unknown flag `{flag}`"))),
-            _ => return Err(usage(format!("unexpected argument `{flag}`"))),
-        }
-    }
-
-    if !verify_pin {
-        return Err(usage("sync-and-classify requires `--verify-pin`"));
-    }
-    if !write_snapshot {
-        return Err(usage("sync-and-classify requires `--write-snapshot`"));
-    }
-    Ok(Command::SyncAndClassify {
-        verify_pin,
-        write_snapshot,
-        workspace_root,
-        snapshot_root,
-        ledger_out,
-    })
 }
 
 fn parse_sync(arguments: &mut impl Iterator<Item = OsString>, cwd: PathBuf) -> Result<Command> {
