@@ -73,7 +73,7 @@ The source build above is the only path that runs the current tree.
 ## Usage
 
 ```bash
-bamts --help                       # help; --help --all prints every option
+bamts --help                       # help (--help --all prints the same summary)
 bamts --version                    # reports Version 7.0.2
 bamts --init                       # write a recommended tsconfig.json
 bamts app.ts --outDir out          # native executable at out/app
