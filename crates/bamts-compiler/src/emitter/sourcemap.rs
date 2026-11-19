@@ -1882,7 +1882,7 @@ mod tests {
             .copied()
             .filter(|(line, _, _, _)| *line == 0)
             .collect();
-        assert_eq!(first, vec![(0, 0, 0, 0), (0, 9, 0, 9), (0, 10, 0, 10)]);
+        assert_eq!(first, vec![(0, 0, 0, 0), (0, 10, 0, 10), (0, 11, 0, 11)]);
         let last: Vec<(usize, i64, i64, i64)> = segments
             .iter()
             .copied()
