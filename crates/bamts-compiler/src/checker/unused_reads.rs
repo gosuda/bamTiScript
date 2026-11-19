@@ -821,3 +821,133 @@ pub(crate) fn unused_variables_diagnostic(source: &SourceFile, range: TextRange)
         message,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::super::binder::bind_source;
+    use super::super::unused_locals::{UnusedDiagnostics, unused_diagnostics};
+    use crate::diagnostic::Diagnostic;
+    use crate::source::{SourceId, SourceText};
+
+    fn check(text: &str) -> UnusedDiagnostics {
+        let source_text = Arc::new(SourceText::new(text).expect("test source fits the budget"));
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            crate::source::ScriptKind::TypeScript,
+            source_text,
+        ));
+        let file = parsed.product();
+        let (model, _) = bind_source(file);
+        unused_diagnostics(file, &model)
+    }
+
+    fn codes(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect()
+    }
+
+    fn messages(diagnostics: &[Diagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn plain_assign_target_is_write_only() {
+        let outcome = check("function f() { var x = 0; x = 1; return 0; }");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
+        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn destructuring_assignment_target_is_write_only() {
+        let outcome = check("function f() { var x = 0; [x] = [1]; return 0; }");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn for_head_assignment_is_write_only() {
+        let outcome = check("function f() { var x = 0; for (x = 0;;) { break; } return 0; }");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn compound_assignment_counts_as_read() {
+        let outcome = check("function f() { var x = 0; x += 1; return 1; }");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn update_expression_counts_as_read() {
+        let outcome = check("function f() { var x = 0; x++; return 1; }");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn read_in_later_initializer_counts_as_read() {
+        let outcome = check("function f() { var x = 1; var y = x; return y; }");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn read_in_nested_function_counts_as_read() {
+        let outcome = check("function f() { var x = 1; function g() { return x; } return g; }");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn read_as_computed_key_counts_as_read() {
+        let outcome = check("function f() { var x = 0; var y = { [x]: 1 }; return y; }");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn write_inside_enum_initializer_counts_as_read() {
+        let outcome = check("function f() { var x = 0; enum E { A = (x = 1) } return E; }");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'f' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+}
