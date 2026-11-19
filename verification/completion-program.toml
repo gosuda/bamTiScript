@@ -239,103 +239,103 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C1.1"
 cluster = "C1"
-owns = ["crates/bamts-runtime/src/builtins/bigint.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/bigint.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C1.2"
 cluster = "C1"
-owns = ["crates/bamts-runtime/src/builtins/number_format.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/number_format.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C1.3"
 cluster = "C1"
-owns = ["crates/bamts-runtime/src/builtins/math_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/math_edge.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C2.1"
 cluster = "C2"
-owns = ["crates/bamts-runtime/src/builtins/proxy.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/proxy.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C2.2"
 cluster = "C2"
-owns = ["crates/bamts-runtime/src/builtins/reflect.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/reflect.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C2.3"
 cluster = "C2"
-owns = ["crates/bamts-runtime/src/builtins/property_descriptor.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/property_descriptor.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C2.4"
 cluster = "C2"
-owns = ["crates/bamts-runtime/src/builtins/object_statics.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/object_statics.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.1"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/array_es2023.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/array_es2023.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.2"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/typedarray_all.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/typedarray_all.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.3"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/dataview.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/dataview.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.4"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/arraybuffer.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/arraybuffer.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.5"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/atomics.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/atomics.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.6"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/set_methods.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/set_methods.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C3.7"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/builtins/map_set_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/map_set_edge.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C4.1"
 cluster = "C4"
-owns = ["crates/bamts-runtime/src/builtins/string_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/string_edge.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C4.2"
 cluster = "C4"
-owns = ["crates/bamts-runtime/src/builtins/regexp_v/"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/regexp_v/"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C4.3"
 cluster = "C4"
-owns = ["crates/bamts-runtime/src/builtins/uri.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/uri.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
@@ -359,7 +359,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C5.4"
 cluster = "C5"
-owns = ["crates/bamts-runtime/src/builtins/error_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/error_edge.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
@@ -383,7 +383,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C7.1"
 cluster = "C7"
-owns = ["crates/bamts-runtime/src/builtins/weakref_finalization.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/weakref_finalization.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
@@ -395,25 +395,25 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C8.1"
 cluster = "C8"
-owns = ["crates/bamts-runtime/src/builtins/json_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/json_edge.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C8.2"
 cluster = "C8"
-owns = ["crates/bamts-runtime/src/builtins/date_full.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/date_full.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C8.3"
 cluster = "C8"
-owns = ["crates/bamts-runtime/src/builtins/structured_clone.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/structured_clone.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C9"
 cluster = "C9"
-owns = ["crates/bamts-runtime/src/builtins/annex_b.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/annex_b.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
