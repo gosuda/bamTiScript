@@ -42,6 +42,7 @@ use crate::oracle_pins::{
     NPM_INTEGRITY, NPM_SPECIFIER, OraclePins, SUITE_COMMIT, SUITE_DIGEST, SUITE_REPOSITORY,
     SUITE_URL, verify_oracle_pins,
 };
+use crate::schema::sha256_hex;
 use crate::shard::{ExecutionMode, ObligationKey};
 use crate::ts_ledger::{
     Backend, CompilerOracle, Confidence, Entry, EvidenceRecord, Facet, LEDGER_SCHEMA_VERSION,
@@ -2587,10 +2588,6 @@ fn sort_json_keys(value: &mut serde_json::Value) {
         }
         _ => {}
     }
-}
-
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    hex_encode(Sha256::digest(bytes))
 }
 
 fn sha256_hex_concat(parts: &[&[u8]]) -> String {

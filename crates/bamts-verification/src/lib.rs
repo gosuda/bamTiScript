@@ -20,7 +20,7 @@ pub mod oracle_pins;
 pub mod oracles;
 pub mod perf;
 pub mod rebuild;
-pub(crate) mod schema;
+pub mod schema;
 pub mod shard;
 pub mod source_fetch;
 pub mod suite;

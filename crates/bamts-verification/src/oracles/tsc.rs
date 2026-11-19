@@ -1123,7 +1123,8 @@ fn complete_observation(response: DriverResponse) -> OracleObservation {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::oracles::{ReportedAuthority, env_stable_oracle_probe, sha256_hex, shared_process};
+    use crate::oracles::{ReportedAuthority, env_stable_oracle_probe, shared_process};
+    use crate::schema::sha256_hex;
     use serde_json::json;
     use std::{ffi::OsString, sync::Mutex};
 
