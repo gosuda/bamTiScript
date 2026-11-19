@@ -548,9 +548,11 @@ impl Walker<'_> {
                 }
             }
         }
-        if object.properties.len() >= 2 && all_dead && reports.is_empty() {
-            reports.push(unused_elements_diagnostic(self.source, pattern.range()));
-            return (reports, true);
+        if object.properties.len() >= 2 && all_dead {
+            return (
+                vec![unused_elements_diagnostic(self.source, pattern.range())],
+                true,
+            );
         }
         (reports, all_dead)
     }
@@ -592,7 +594,13 @@ impl Walker<'_> {
                 }
             }
         }
-        (reports, total > 0 && dead == total)
+        if total >= 2 && dead == total {
+            return (
+                vec![unused_elements_diagnostic(self.source, pattern.range())],
+                true,
+            );
+        }
+        (reports, dead == total && total > 0)
     }
 
     fn check_identifier_element(
