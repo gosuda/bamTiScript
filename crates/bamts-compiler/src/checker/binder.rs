@@ -17247,9 +17247,11 @@ impl<'src> Binder<'src> {
     /// Declares one class member under its binding key and records the
     /// display spelling for quoted, numeric, and computed names, so
     /// `.symbols` rows render `C["foo"]`, `C[0]`, and `Test[x]`.
-    /// Computed keys no static lookup queries bind under their bracketed
-    /// source spelling through the merging path, which reports no
-    /// duplicate diagnostic.
+    /// Dynamic computed keys bind under a scope key unique to the member
+    /// node, so two distinct `[k]` members never alias one symbol and no
+    /// duplicate diagnostic is reported; the symbol keeps the plain
+    /// bracketed spelling for display. Get/set accessor pairs keep merging
+    /// through `declare_member_occurrence`.
     fn declare_class_member(
         &mut self,
         name: &str,
@@ -17266,7 +17268,10 @@ impl<'src> Binder<'src> {
             Self::property_name_range(name_node)
         };
         let symbol = if dynamic {
-            self.declare_member_unique(name, kind, scope, member.id(), range)
+            let unique = format!("\0#dynamic-class-member#{}", member.id().get());
+            let id = self.declare(&unique, kind, scope, member.id(), range);
+            self.symbols[id.get() as usize].name = name.to_owned();
+            id
         } else {
             self.declare(name, kind, scope, member.id(), range)
         };
@@ -17340,14 +17345,34 @@ impl<'src> Binder<'src> {
                     .member_binding_name(&method.name)
                     .or_else(|| self.member_symbol_key(&method.name))
                 {
-                    let symbol = self.declare_member_occurrence(
-                        &name,
-                        SymbolKind::Variable(VariableKind::Let),
-                        scope,
-                        member.id(),
-                        member.range(),
-                        &method.name,
-                    );
+                    let dynamic = matches!(method.name, PropertyName::Computed(_))
+                        && self.property_key(&method.name).is_none();
+                    let symbol = if dynamic {
+                        let pair = format!(
+                            "\0#dynamic-class-accessor#{}#{}",
+                            u8::from(method.modifiers.is_static),
+                            name
+                        );
+                        let symbol = self.declare_member_occurrence(
+                            &pair,
+                            SymbolKind::Variable(VariableKind::Let),
+                            scope,
+                            member.id(),
+                            member.range(),
+                            &method.name,
+                        );
+                        self.symbols[symbol.get() as usize].name = name.clone();
+                        symbol
+                    } else {
+                        self.declare_member_occurrence(
+                            &name,
+                            SymbolKind::Variable(VariableKind::Let),
+                            scope,
+                            member.id(),
+                            member.range(),
+                            &method.name,
+                        )
+                    };
                     self.note_member_spelling(symbol, &method.name);
                 }
             }
@@ -28976,13 +29001,92 @@ mod tests {
 
     #[test]
     fn union_object_rest_drops_excluded_names_per_member() {
-        let (_, diagnostics) = bound(
+        let (model, diagnostics) = bound(
             "declare const u: { a: number, b: number } | { a: number, c: number };\n\
              const { a, ...rest } = u;\n\
              const n: number = rest.a;\n",
         );
         let codes: Vec<_> = diagnostics.iter().map(Diagnostic::code).collect();
         assert_eq!(codes, [PROPERTY_DOES_NOT_EXIST]);
+        let rest = value_symbol(&model, "rest");
+        let Type::Union(members) = model.types().get(model.symbol_type(rest)) else {
+            panic!("rest of a union is a union type");
+        };
+        assert_eq!(members.len(), 2, "{members:?}");
+        let mut kept: Vec<Vec<String>> = Vec::with_capacity(members.len());
+        for member in members {
+            let Type::ObjectType(object) = model.types().get(*member) else {
+                panic!("rest union member is an object type");
+            };
+            for property in &object.properties {
+                assert_eq!(
+                    property.type_id(),
+                    model.types().number(),
+                    "kept member keeps its number type",
+                );
+            }
+            let mut names: Vec<String> =
+                object.properties.iter().map(|property| property.name().to_owned()).collect();
+            names.sort();
+            kept.push(names);
+        }
+        kept.sort();
+        assert_eq!(kept, [vec!["b".to_owned()], vec!["c".to_owned()]]);
+    }
+
+    #[test]
+    fn object_rest_from_nullable_union_skips_null_member() {
+        let (model, diagnostics) = bound(
+            "declare const v: { a: number, b: number } | null;\n\
+             const { a, ...rest } = v;\n\
+             const mb: number = rest.b;\n",
+        );
+        let codes: Vec<_> = diagnostics.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [PROPERTY_DOES_NOT_EXIST]);
+        assert_eq!(
+            (
+                diagnostics[0].range().start().get(),
+                diagnostics[0].range().end().get()
+            ),
+            (58, 59),
+            "the only diagnostic is on the `a` binding, as in tsc: `rest.b` stays silent",
+        );
+        let rest = value_symbol(&model, "rest");
+        let Type::ObjectType(object) = model.types().get(model.symbol_type(rest)) else {
+            panic!("rest past a null member is a single object type");
+        };
+        let mut names: Vec<String> =
+            object.properties.iter().map(|property| property.name().to_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["b"]);
+        assert_eq!(object.properties[0].type_id(), model.types().number());
+    }
+
+    #[test]
+    fn object_rest_all_excluded_yields_empty_object() {
+        let (model, diagnostics) = bound(
+            "declare const w: { a: number } | { a: string };\n\
+             const { a, ...rest } = w;\n\
+             const check: {} = rest;\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let rest = value_symbol(&model, "rest");
+        let rest_type = model.symbol_type(rest);
+        assert_ne!(
+            rest_type,
+            model.types().error_type(),
+            "all-excluded rest is present, not the error type",
+        );
+        let members = match model.types().get(rest_type) {
+            Type::Union(members) => members.clone(),
+            _ => vec![rest_type],
+        };
+        for member in members {
+            let Type::ObjectType(object) = model.types().get(member) else {
+                panic!("empty rest member is an object type");
+            };
+            assert!(object.properties.is_empty(), "{object:?}");
+        }
     }
 
     #[test]
@@ -32279,6 +32383,24 @@ namespace undefined { export var x = 42; }",
         assert_ne!(occurrences[1].symbol, occurrences[2].symbol);
     }
 
+    #[test]
+    fn class_member_display_spellings_match_symbols_baselines() {
+        let (model, diagnostics) = bound(
+            "declare const x: string;\nclass C {\n    \"foo\" = 1;\n    [0] = 2;\n    [x] = 3;\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class = value_symbol(&model, "C");
+        let mut rendered: Vec<String> = model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(class))
+            .map(|(index, _)| model.qualified_name(SymbolId::new(index as u32)))
+            .collect();
+        rendered.sort();
+        assert_eq!(rendered, ["C[\"foo\"]", "C[0]", "C[x]"]);
+    }
+
     /// T1: interface signature parameter name nodes map to their bound
     /// `Parameter` symbols, for method signatures and index signatures.
     #[test]
@@ -32319,6 +32441,164 @@ namespace undefined { export var x = 42; }",
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let symbol = symbol_named(&model, "s");
         assert_eq!(model.symbol_type(symbol), model.types().symbol_type());
+    }
+
+    #[test]
+    fn dynamic_computed_class_members_bind_distinct_symbols() {
+        let (model, diagnostics) = bound(
+            "declare const k: any;\nclass C {\n    [k] = 1;\n    [k]() { return 2; }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class = value_symbol(&model, "C");
+        let members: Vec<SymbolId> = model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(class))
+            .map(|(index, _)| SymbolId::new(index as u32))
+            .collect();
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert_ne!(members[0], members[1]);
+        for member in &members {
+            assert_eq!(model.qualified_name(*member), "C[k]");
+        }
+    }
+
+    #[test]
+    fn dynamic_computed_accessor_pair_shares_one_symbol() {
+        let (model, diagnostics) = bound(
+            "declare const k: any;\nclass C {\n    get [k]() { return 1; }\n    set [k](value: any) {}\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class = value_symbol(&model, "C");
+        let members: Vec<SymbolId> = model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(class))
+            .map(|(index, _)| SymbolId::new(index as u32))
+            .collect();
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(model.qualified_name(members[0]), "C[k]");
+        let occurrences = model.declaration_occurrences();
+        assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+        assert_eq!(occurrences[0].symbol, occurrences[1].symbol);
+        assert_eq!(occurrences[0].symbol, members[0]);
+    }
+
+    #[test]
+    fn dynamic_computed_member_key_survives_literal_collision() {
+        let probe = "declare const k: any;\nclass C {\n    [k] = 2;\n    [\"placeholder\"] = 1;\n}";
+        let (probe_model, _) = bound(probe);
+        let probe_class = value_symbol(&probe_model, "C");
+        let probe_dynamic = probe_model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(probe_class))
+            .map(|(index, _)| SymbolId::new(index as u32))
+            .find(|id| probe_model.qualified_name(*id) == "C[k]")
+            .expect("dynamic member bound");
+        let node_id = probe_model.symbol(probe_dynamic).declaration().get();
+        let text = format!(
+            "declare const k: any;\nclass C {{\n    [k] = 2;\n    [\"[k]#{node_id}\"] = 1;\n}}"
+        );
+        let (model, diagnostics) = bound(&text);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class = value_symbol(&model, "C");
+        let members: Vec<SymbolId> = model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(class))
+            .map(|(index, _)| SymbolId::new(index as u32))
+            .collect();
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert_ne!(members[0], members[1]);
+        let dynamic = members
+            .iter()
+            .find(|id| model.qualified_name(**id) == "C[k]")
+            .expect("dynamic member keeps its plain spelling");
+        assert_eq!(
+            model.symbol(*dynamic).declaration().get(),
+            node_id,
+            "probe and final sources assign the dynamic member the same node id"
+        );
+        let mut rendered: Vec<String> = members
+            .iter()
+            .map(|member| model.qualified_name(*member))
+            .collect();
+        rendered.sort();
+        assert_eq!(
+            rendered,
+            [format!("C[\"[k]#{node_id}\"]"), "C[k]".to_owned()]
+        );
+        for symbol in model.symbols() {
+            assert!(
+                !symbol.name().contains('\0'),
+                "internal scope key never surfaces as a symbol name"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_accessor_pair_does_not_alias_bracket_literal() {
+        let (model, diagnostics) = bound(
+            "declare const k: any;\nclass C {\n    [\"[k]\"] = 1;\n    get [k]() { return 1; }\n    set [k](v: any) {}\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class = value_symbol(&model, "C");
+        let members: Vec<SymbolId> = model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(class))
+            .map(|(index, _)| SymbolId::new(index as u32))
+            .collect();
+        assert_eq!(members.len(), 2, "{members:?}");
+        let mut rendered: Vec<String> = members
+            .iter()
+            .map(|member| model.qualified_name(*member))
+            .collect();
+        rendered.sort();
+        assert_eq!(rendered, ["C[\"[k]\"]", "C[k]"]);
+        let occurrences = model.declaration_occurrences();
+        assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+        assert_eq!(occurrences[0].symbol, occurrences[1].symbol);
+        assert_eq!(model.qualified_name(occurrences[0].symbol), "C[k]");
+        for symbol in model.symbols() {
+            assert!(
+                !symbol.name().contains('\0'),
+                "internal scope key never surfaces as a symbol name"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_accessor_pair_splits_on_static_bit() {
+        let (model, diagnostics) = bound(
+            "declare const k: any;\nclass C {\n    get [k]() { return 1; }\n    static set [k](v: any) {}\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class = value_symbol(&model, "C");
+        let members: Vec<SymbolId> = model
+            .symbols()
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.parent() == Some(class))
+            .map(|(index, _)| SymbolId::new(index as u32))
+            .collect();
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert_ne!(members[0], members[1]);
+        for member in &members {
+            assert_eq!(model.qualified_name(*member), "C[k]");
+        }
+        for symbol in model.symbols() {
+            assert!(
+                !symbol.name().contains('\0'),
+                "internal scope key never surfaces as a symbol name"
+            );
+        }
     }
 
     /// T1: `declared_return` carries the resolved written annotation and is
