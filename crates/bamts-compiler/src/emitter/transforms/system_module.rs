@@ -159,7 +159,7 @@ impl SystemPlan {
         let name = self
             .module_name
             .as_ref()
-            .map(|name| format!("\"{name}\", "))
+            .map(|name| format!("{}, ", super::quote_string(name)))
             .unwrap_or_default();
         format!(
             "System.register({name}[{}], function (exports_1, context_1) {{",

@@ -244,7 +244,7 @@ impl AmdPlan {
         let quoted: Vec<String> = directives
             .dependencies
             .iter()
-            .map(|(path, _)| format!("\"{path}\""))
+            .map(|(path, _)| super::quote_string(path))
             .collect();
         for ((_, name), path) in directives.dependencies.iter().zip(&quoted) {
             match name {
@@ -266,7 +266,7 @@ impl AmdPlan {
             .module_name
             .as_ref()
             .or(self.module_name.as_ref())
-            .map(|name| format!("\"{name}\", "))
+            .map(|name| format!("{}, ", super::quote_string(name)))
             .unwrap_or_default();
         let head = if self.umd {
             [

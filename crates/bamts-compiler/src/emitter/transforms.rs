@@ -1150,11 +1150,20 @@ impl<'a> Rewriter<'a> {
                 _ => None,
             },
             system: match options.module_kind {
-                Some(ModuleKind::System) => Some(SystemPlan {
-                    module_name: amd_module::source_directives(file.source_text().as_str())
-                        .module_name,
-                    ..SystemPlan::default()
-                }),
+                Some(ModuleKind::System) => {
+                    let directive =
+                        amd_module::source_directives(file.source_text().as_str()).module_name;
+                    let module_name = directive.or_else(|| {
+                        options
+                            .bundle_module_name
+                            .as_ref()
+                            .map(|name| name.to_string())
+                    });
+                    Some(SystemPlan {
+                        module_name,
+                        ..SystemPlan::default()
+                    })
+                }
                 _ => None,
             },
             ..CjsPlan::default()
@@ -17171,6 +17180,76 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
                 "define(\"ref/m1\", [\"require\", \"exports\", \"./a\"], function (require, exports, a) {",
             ),
             "{code}"
+        );
+    }
+    #[test]
+    fn amd_bundle_name_with_quote_cannot_break_the_wrapper() {
+        let output = emit_with_options(
+            "import a = require('./a');\nexport var x = a.v;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                bundle_module_name: Some(Arc::from("x\";globalThis.PWNED=1;//")),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("x\\\";globalThis.PWNED=1;//"),
+            "quote is escaped: {code}"
+        );
+        assert!(
+            !code.contains("define(\"x\";"),
+            "raw quote must not terminate the literal: {code}"
+        );
+        let directed = emit_with_options(
+            "///<amd-dependency path='a\"b' name='e'/>\nimport a = require('./a');\nexport var x = a.v;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                ..EmitOptions::default()
+            },
+        );
+        let directed_code = javascript(&directed);
+        assert!(
+            directed_code.contains("a\\\"b"),
+            "directive path quote is escaped: {directed_code}"
+        );
+        assert!(
+            !directed_code.contains("\"a\"b\""),
+            "raw directive quote must not terminate the literal: {directed_code}"
+        );
+    }
+
+    #[test]
+    fn system_bundle_names_the_module_in_the_wrapper() {
+        let output = emit_with_options(
+            "import a from './a';\nexport var x = a;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::System),
+                bundle_module_name: Some(Arc::from("ref/m1")),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("System.register(\"ref/m1\", ["),
+            "bundle name reaches System.register: {code}"
+        );
+        let directed = emit_with_options(
+            "///<amd-module name='Named'/>\nimport a from './a';\nexport var x = a;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::System),
+                bundle_module_name: Some(Arc::from("ref/m1")),
+                ..EmitOptions::default()
+            },
+        );
+        let directed_code = javascript(&directed);
+        assert!(
+            directed_code.contains("System.register(\"Named\", ["),
+            "directive wins over the bundle name: {directed_code}"
         );
     }
 
