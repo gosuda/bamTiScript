@@ -291,6 +291,54 @@
     }
 
     #[test]
+    fn nodenext_import_resolves_bare_package_index_without_manifest() {
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.ts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("bare package without a manifest resolves to its directory index");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/index.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn node16_import_resolves_bare_package_index_without_manifest() {
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("node16");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.ts"),
+            "dep",
+            (ModuleResolutionKind::Node16, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("bare package without a manifest resolves to its directory index");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/index.ts").as_path()
+        );
+    }
+
+    #[test]
     fn paths_longest_prefix_wins_with_star_substitution() {
         let mut host = MemoryHost::default();
         host.file(abs("/workspace/lib/foo/bar.ts"), "export {};\n");
