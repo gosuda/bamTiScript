@@ -18,37 +18,23 @@
 //! props checking live in [`jsx`]; this module keeps the public entry points
 //! and linked multi-file checking.
 
-#[path = "checker/binder.rs"]
 pub(crate) mod binder;
-#[path = "checker/conditional_types.rs"]
 pub mod conditional_types;
-#[path = "checker/decorators.rs"]
 pub mod decorators;
 #[rustfmt::skip]
 #[path = "generated/diagnostic_messages.rs"]
 pub mod diagnostic_messages;
-#[path = "checker/enum_namespace.rs"]
 pub mod enum_namespace;
-#[path = "checker/inference.rs"]
 pub mod inference;
-#[path = "checker/intrinsic_environment.rs"]
 pub(crate) mod intrinsic_environment;
-#[path = "checker/jsx.rs"]
 pub mod jsx;
-#[path = "checker/narrowing.rs"]
 pub mod narrowing;
-#[path = "checker/overloads.rs"]
 pub mod overloads;
-#[path = "checker/relations.rs"]
 pub mod relations;
 
-#[path = "checker/type_display.rs"]
 mod type_display;
-#[path = "checker/unused_imports.rs"]
 pub(crate) mod unused_imports;
-#[path = "checker/unused_locals.rs"]
 pub(crate) mod unused_locals;
-#[path = "checker/unused_reads.rs"]
 pub(crate) mod unused_reads;
 pub use type_display::{render_type, render_type_annotated, render_type_declaration};
 
