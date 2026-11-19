@@ -133,6 +133,10 @@ impl FailureClass {
 }
 
 /// Snapshot asset classification.
+///
+/// `SupportFile` covers shared inputs that are neither cases nor baselines:
+/// the `tests/lib/*.d.ts` files cases pull in through `/.lib/` reference
+/// directives. Support files are readable blobs but carry no obligations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AssetKind {
@@ -140,6 +144,7 @@ pub enum AssetKind {
     BaselineFacet,
     DifferenceRecord,
     LicenseNotice,
+    SupportFile,
 }
 
 impl AssetKind {
@@ -149,6 +154,7 @@ impl AssetKind {
             Self::BaselineFacet => "baselineFacet",
             Self::DifferenceRecord => "differenceRecord",
             Self::LicenseNotice => "licenseNotice",
+            Self::SupportFile => "supportFile",
         }
     }
 }
@@ -1262,6 +1268,12 @@ pub fn classify_logical_path(logical_path: &str) -> Result<PathClassification> {
         }
         return Ok(None);
     }
+    if let Some(rest) = logical_path.strip_prefix("tests/lib/") {
+        if rest.to_ascii_lowercase().ends_with(".d.ts") {
+            return Ok(Some((AssetKind::SupportFile, None, None)));
+        }
+        return Ok(None);
+    }
 
     if logical_path.starts_with("tests/baselines/reference/")
         || logical_path.starts_with("testdata/baselines/reference/")
@@ -1470,7 +1482,7 @@ fn materialize_snapshot(
 
     for asset in assets.values() {
         match asset.kind {
-            AssetKind::CaseInput => {
+            AssetKind::CaseInput | AssetKind::SupportFile => {
                 store_blob(&cases_dir, &asset.digest_hex, &asset.bytes)?;
             }
             AssetKind::BaselineFacet => {
@@ -2177,7 +2189,7 @@ fn read_verified_index_entry(snapshot_root: &Path, entry: &IndexEntry) -> Result
         ));
     }
     let dir = match entry.asset_kind {
-        AssetKind::CaseInput => snapshot_root.join("cases"),
+        AssetKind::CaseInput | AssetKind::SupportFile => snapshot_root.join("cases"),
         AssetKind::BaselineFacet | AssetKind::DifferenceRecord => snapshot_root.join("baselines"),
         AssetKind::LicenseNotice => {
             return Err(VerificationError::new(
@@ -4527,6 +4539,52 @@ mod tests {
             .expect("case input");
         assert!(matches!(ok.0, AssetKind::CaseInput));
         assert!(matches!(ok.1, Some(Partition::Compiler)));
+    }
+    #[test]
+    fn shared_lib_declaration_files_classify_as_support_files() {
+        for path in [
+            "tests/lib/react.d.ts",
+            "tests/lib/react16.d.ts",
+            "tests/lib/react18/global.d.ts",
+            "tests/lib/react18/react18.d.ts",
+        ] {
+            let ok = classify_logical_path(path).unwrap().expect("support file");
+            assert!(matches!(ok.0, AssetKind::SupportFile));
+            assert!(ok.1.is_none());
+            assert!(ok.2.is_none());
+        }
+        assert!(classify_logical_path("tests/lib/readme.md").unwrap().is_none());
+        assert!(classify_logical_path("tests/lib/react.d.ts.map").unwrap().is_none());
+    }
+
+    #[test]
+    fn support_files_round_trip_without_ledger_obligations() {
+        let suite = TestDir::new("support-extracted");
+        let case = suite.path().join("tests/cases/compiler/a.ts");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        fs::write(&case, b"export const answer = 42;\n").unwrap();
+        let lib = suite.path().join("tests/lib/react16.d.ts");
+        fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        fs::write(&lib, b"declare module \"react\" {}\n").unwrap();
+        let snap = TestDir::new("support-snap");
+        let snapshot = materialize_from_extracted(snap.path(), suite.path()).unwrap();
+        let entry = snapshot
+            .index
+            .entries
+            .get("tests/lib/react16.d.ts")
+            .expect("support file indexed");
+        assert!(matches!(entry.asset_kind, AssetKind::SupportFile));
+        let bytes =
+            read_verified_snapshot_asset(&snapshot, "tests/lib/react16.d.ts").unwrap();
+        assert_eq!(bytes, b"declare module \"react\" {}\n");
+        assert!(
+            snapshot
+                .ledger
+                .entries
+                .iter()
+                .all(|entry| entry.input != "tests/lib/react16.d.ts"),
+            "support files carry no ledger obligations"
+        );
     }
 
     #[test]
