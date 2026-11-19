@@ -1220,7 +1220,15 @@ impl<'a> NarrowingContext<'a> {
                 TypeofName::BigInt => self.table.bigint(),
                 TypeofName::Symbol => self.table.symbol_type(),
                 TypeofName::Undefined => self.table.undefined_type(),
-                _ => ty,
+                TypeofName::Object => {
+                    let object = self.table.object();
+                    let null = self.table.null_type();
+                    self.table.union(&[object, null])
+                }
+                TypeofName::Function => {
+                    let unknown = self.table.unknown();
+                    self.table.function(vec![], unknown)
+                }
             };
         }
         self.filter(ty, &|table, candidate| match candidate {
@@ -2562,6 +2570,10 @@ mod tests {
         let a = table.string_literal("a");
         let union = table.union(&[string, number]);
         let intersection = table.intersection(vec![string, number]);
+        let any = table.any();
+        let error = table.error_type();
+        let never = table.never();
+        let void = table.void();
         let mut facts = FlowFacts::new();
         let mut context = NarrowingContext::new(&mut table, &mut facts);
 
@@ -2590,6 +2602,26 @@ mod tests {
             unknown
         );
         assert_eq!(
+            context.narrow_equality(unknown, any, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, unknown, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, error, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, never, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, void, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
             context.narrow_equality(unknown, a, false, EqualityMode::Loose),
             unknown
         );
@@ -2602,7 +2634,15 @@ mod tests {
     #[test]
     fn typeof_narrows_unknown_to_the_primitive_type() {
         let mut table = TypeTable::new();
-        let (unknown, string, number) = (table.unknown(), table.string(), table.number());
+        let unknown = table.unknown();
+        let string = table.string();
+        let number = table.number();
+        let boolean = table.boolean();
+        let bigint = table.bigint();
+        let symbol = table.symbol_type();
+        let undefined = table.undefined_type();
+        let object_or_null = table.union(&[table.object(), table.null_type()]);
+        let function = table.function(vec![], table.unknown());
         let mut facts = FlowFacts::new();
         let mut context = NarrowingContext::new(&mut table, &mut facts);
 
@@ -2615,13 +2655,41 @@ mod tests {
             number
         );
         assert_eq!(
-            context.narrow_typeof(unknown, TypeofName::String, true),
-            unknown
+            context.narrow_typeof(unknown, TypeofName::Boolean, false),
+            boolean
+        );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::BigInt, false),
+            bigint
+        );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::Symbol, false),
+            symbol
+        );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::Undefined, false),
+            undefined
         );
         assert_eq!(
             context.narrow_typeof(unknown, TypeofName::Object, false),
-            unknown
+            object_or_null
         );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::Function, false),
+            function
+        );
+        for name in [
+            TypeofName::String,
+            TypeofName::Number,
+            TypeofName::Boolean,
+            TypeofName::BigInt,
+            TypeofName::Symbol,
+            TypeofName::Undefined,
+            TypeofName::Object,
+            TypeofName::Function,
+        ] {
+            assert_eq!(context.narrow_typeof(unknown, name, true), unknown);
+        }
     }
 
     // ---- in narrowing -------------------------------------------------------
