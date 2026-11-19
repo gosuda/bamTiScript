@@ -30,9 +30,11 @@ jobs:
       LC_ALL: C
       NO_COLOR: "1"
     steps:
-      - uses: latchkey/setup-node@1.0.1
-        with:
-          node-version: 24.18.0
+      - name: Install Node 24.18.0 (the version the repo pins)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
+          sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+          command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
       - name: Install dependencies (npm, cargo, Quint)
         run: |
@@ -57,10 +59,15 @@ jobs:
       QUINT_HOME: /tmp/quint
       V: cargo run --locked -q -p bamts-verification --bin bamts-verification --
     steps:
+      - name: Install Node 24.18.0 (the version the repo pins)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
+          sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+          command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
       - name: Install Quint, Racket 9.2 and Lean while the verifier builds
         run: |
-          (cargo fetch --locked && cargo build --locked -p bamts-verification --bin bamts-verification) & b=$!
+          (cargo fetch --locked -q && cargo build --locked -q -p bamts-verification --bin bamts-verification) & b=$!
           npm ci --prefix formal/quint
           v=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
           test "$v" = v0.6.0
@@ -90,9 +97,11 @@ jobs:
       V: target/release/bamts-verification
       BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
     steps:
-      - uses: latchkey/setup-node@1.0.1
-        with:
-          node-version: 24.18.0
+      - name: Install Node 24.18.0 (the version the repo pins)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
+          sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+          command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
       - name: Build receipt tools, sync snapshot, audit ledger
         run: |
