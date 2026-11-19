@@ -465,13 +465,10 @@ pub fn parse_case_pragmas(text: &str) -> CasePragmas {
     let mut options = Vec::new();
     let mut no_types_and_symbols = false;
     for line in text.lines() {
-        let Some(directive) = directive_body(line) else {
+        let Some((name, value)) = directive_parts(line) else {
             continue;
         };
-        let Some((name, value)) = directive.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
+        let name = name.to_ascii_lowercase();
         let value = value.trim();
         if name == "filename" {
             continue;
@@ -493,16 +490,34 @@ pub fn parse_case_pragmas(text: &str) -> CasePragmas {
     }
 }
 
-/// Returns the body of a whole-line `// @name: …` directive, if the line is one.
-fn directive_body(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
+/// Split one whole-line directive into its `(name, value)` pair under
+/// upstream's option-directive grammar `^//\s*@\w+\s*:`: exactly two leading
+/// slashes, a single ASCII-word option name, then a colon. This is the one
+/// grammar pragma parsing, unit splitting, and directive stripping share,
+/// so `///` reference directives, `////` lines, and multi-word `@param x:`
+/// forms are content on every path. The value keeps its post-colon spacing;
+/// callers trim it.
+fn directive_parts(line: &str) -> Option<(&str, &str)> {
     // A leading U+FEFF (BOM) may precede the `//` in files saved with a
     // byte-order mark; strip it before the directive test so coordinates
     // are not shifted by the invisible character.
-    let trimmed = trimmed.strip_prefix('\u{feff}').unwrap_or(trimmed);
-    let rest = trimmed.strip_prefix("//")?;
-    let rest = rest.trim_start_matches('/').trim_start();
-    rest.strip_prefix('@')
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+    let rest = line.strip_prefix("//")?;
+    // A third leading slash is a `///` directive, not a `// @option`.
+    if rest.starts_with('/') {
+        return None;
+    }
+    let body = rest.trim_start().strip_prefix('@')?;
+    let name_len = body
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let (name, rest) = body.split_at(name_len);
+    let value = rest.trim_start().strip_prefix(':')?;
+    Some((name, value))
 }
 
 /// Strip every whole-line `// @name: value` compiler-option directive from a
@@ -543,29 +558,10 @@ fn strip_directive_lines(text: &str) -> String {
 /// `^//\s*@\w+\s*:` — exactly two leading slashes, a single ASCII-word option
 /// name, then a colon. This is the exact set upstream strips from unit content;
 /// `///` reference directives and `@word` lines without a colon are kept.
+/// Shares its grammar with pragma parsing and unit splitting through
+/// [`directive_parts`], so the three paths cannot diverge.
 fn is_option_directive_line(line: &str) -> bool {
-    // A leading U+FEFF (BOM) may precede the `//` in files saved with a
-    // byte-order mark; strip it before the directive test.
-    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
-    let Some(rest) = line.strip_prefix("//") else {
-        return false;
-    };
-    // A third leading slash is a `///` directive, not a `// @option`.
-    if rest.starts_with('/') {
-        return false;
-    }
-    let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix('@') else {
-        return false;
-    };
-    let name_len = rest
-        .bytes()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        .count();
-    if name_len == 0 {
-        return false;
-    }
-    rest[name_len..].trim_start().starts_with(':')
+    directive_parts(line).is_some()
 }
 
 /// The preamble text is directive-stripped already, so only comments,
@@ -626,13 +622,12 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
     for line in text.split_inclusive('\n') {
         let line_start = offset;
         offset += line.len();
-        let body = directive_body(line.trim_end_matches(['\n', '\r']));
-        let name = body.and_then(|body| {
-            let (name, value) = body.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("filename")
-                .then(|| value.trim().to_owned())
-        });
+        let name = directive_parts(line.trim_end_matches(['\n', '\r'])).and_then(
+            |(name, value)| {
+                name.eq_ignore_ascii_case("filename")
+                    .then(|| value.trim().to_owned())
+            },
+        );
         if let Some(name) = name.filter(|name| !name.is_empty()) {
             markers.push((line_start, name));
         }
@@ -9777,22 +9772,43 @@ function wrap<U, T>(x: T): T { return x; }\n\
     #[test]
     fn bom_prefixed_directive_is_stripped() {
         let source = "\u{feff}// @target: es2015\nvar x = 1;";
-        // is_option_directive_line must recognise the BOM-prefixed line.
         assert!(
             is_option_directive_line("\u{feff}// @target: es2015"),
             "BOM-prefixed directive line must be recognised"
         );
-        // strip_directive_lines must remove it, leaving `var x = 1;`.
         let stripped = strip_directive_lines(source);
         assert_eq!(
             stripped, "var x = 1;",
             "BOM-prefixed directive must be stripped, got: {stripped:?}"
         );
-        // directive_body must also recognise the BOM-prefixed line.
         assert_eq!(
-            directive_body("\u{feff}// @target: es2015"),
-            Some("target: es2015"),
-            "directive_body must strip BOM"
+            directive_parts("\u{feff}// @target: es2015"),
+            Some(("target", " es2015")),
+            "directive_parts must strip BOM"
+        );
+    }
+
+    /// A `///` or `////` option-styled line is content on every path: it
+    /// creates no unit, records no option, and stays in compiled content so
+    /// positions cannot shift versus the baselines.
+    #[test]
+    fn triple_slash_lines_are_never_option_directives() {
+        assert_eq!(directive_parts("/// @filename: b.ts"), None);
+        assert_eq!(directive_parts("//// @target: es5"), None);
+        assert_eq!(directive_parts("// @param x: number"), None);
+        assert!(!is_option_directive_line("/// @filename: b.ts"));
+        assert!(!is_option_directive_line("//// @target: es5"));
+        let logical = "tests/cases/compiler/tripleSlashPin.ts";
+        let case_text = "/// @filename: b.ts\nvar b = 1;\n";
+        let units = split_case_units(logical, case_text);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].text, case_text);
+        assert!(parse_case_pragmas(case_text).options.is_empty());
+        assert!(
+            parse_case_pragmas("/// @target: es5\nvar b = 1;\n")
+                .options
+                .is_empty(),
+            "a `/// @option` line records no pragma"
         );
     }
 
