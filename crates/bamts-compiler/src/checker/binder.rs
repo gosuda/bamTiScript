@@ -6152,9 +6152,9 @@ pub(crate) struct Binder<'src> {
     /// so member symbols render bare like namespace exports.
     object_literal_scopes: HashMap<NodeId, ScopeId>,
     object_literal_members: HashMap<NodeId, HashMap<String, SymbolId>>,
-    /// Bound named member declaration occurrences in source order, moved
-    /// into the model by [`Binder::finish`]. Interface members and object
-    /// literal members share this vec; the emitter sorts by position.
+    /// Bound named type-object member declaration occurrences in source
+    /// order (interface members, alias literal members, and object literal
+    /// members), moved into the model by [`Binder::finish`].
     interface_member_occurrences: Vec<DeclarationOccurrence>,
     /// Interface signature parameter name node to its bound `Parameter`
     /// symbol, moved into the model by [`Binder::finish`].
@@ -6172,6 +6172,11 @@ pub(crate) struct Binder<'src> {
     class_member_scopes: HashMap<SymbolId, ScopeId>,
     /// Interface member scopes keyed by their owning interface symbol.
     interface_member_scopes: HashMap<SymbolId, ScopeId>,
+    /// Member scopes for type alias object literals, keyed by the literal
+    /// type node. One scope per literal keeps union branches distinct so
+    /// each branch's members publish their own types. Scopes carry no owner
+    /// so literal member names render bare, matching upstream `.symbols`.
+    literal_member_scopes: HashMap<NodeId, ScopeId>,
     /// Member accesses whose `.symbols` reference rows are already recorded,
     /// so the typing-phase recorder never duplicates resolve-phase rows.
     member_reference_recorded: HashSet<NodeId>,
@@ -6450,6 +6455,7 @@ impl<'src> Binder<'src> {
             namespace_qualified_type_paths: HashMap::new(),
             class_member_scopes: HashMap::new(),
             interface_member_scopes: HashMap::new(),
+            literal_member_scopes: HashMap::new(),
             member_reference_recorded: HashSet::new(),
             property_sites: Vec::new(),
             property_site_index: HashMap::new(),
@@ -11828,7 +11834,7 @@ impl<'src> Binder<'src> {
         };
         self.set_scope_owner(member_scope, id);
         for member in &interface.members {
-            self.bind_interface_member(member, member_scope);
+            self.bind_object_members(member, member_scope);
         }
         self.interface_merges.entry(id).or_default().push(interface);
         self.type_defs.entry(id).or_insert(TypeDef::Interface {
@@ -11856,7 +11862,7 @@ impl<'src> Binder<'src> {
         self.declare(name, kind, scope, declaration, range)
     }
 
-    fn bind_interface_member(
+    fn bind_object_members(
         &mut self,
         member: &'src crate::syntax::TypeMemberNode,
         scope: ScopeId,
@@ -12141,6 +12147,46 @@ impl<'src> Binder<'src> {
                 node: &alias.type_node,
             },
         );
+        self.bind_alias_object_members(&alias.type_node, scope);
+    }
+
+    fn bind_alias_object_members(&mut self, node: &'src Ty, scope: ScopeId) {
+        match node.data() {
+            TypeNode::Object(object) => self.bind_literal_members(&object.members, node.id(), scope),
+            TypeNode::Parenthesized(inner) => self.bind_alias_object_members(inner, scope),
+            TypeNode::Union(members) | TypeNode::Intersection(members) => {
+                for member in members {
+                    self.bind_alias_object_members(member, scope);
+                }
+            }
+            TypeNode::Array(element) => self.bind_alias_object_members(element, scope),
+            _ => {}
+        }
+    }
+
+    fn bind_literal_members(
+        &mut self,
+        members: &'src [crate::syntax::TypeMemberNode],
+        literal: NodeId,
+        scope: ScopeId,
+    ) {
+        if !members
+            .iter()
+            .any(|member| !matches!(member.data(), TypeMember::Missing(_)))
+        {
+            return;
+        }
+        let member_scope = match self.literal_member_scopes.get(&literal).copied() {
+            Some(existing) => existing,
+            None => {
+                let created = self.new_scope(ScopeKind::Class, Some(scope));
+                self.literal_member_scopes.insert(literal, created);
+                created
+            }
+        };
+        for member in members {
+            self.bind_object_members(member, member_scope);
+        }
     }
 
     fn bind_import(
@@ -20124,7 +20170,7 @@ impl<'src> Binder<'src> {
                 let element = self.resolve_type(element, scope);
                 self.types.array(element)
             }
-            TypeNode::Object(object) => self.resolve_object_type(&object.members, scope),
+            TypeNode::Object(object) => self.resolve_object_type(node.id(), &object.members, scope),
             TypeNode::Function(function) => self.resolve_function_type(function, scope),
             TypeNode::Constructor(constructor) => {
                 let signature = self.resolve_function_signature(&constructor.function, scope);
@@ -21680,6 +21726,10 @@ impl<'src> Binder<'src> {
         let Some(member_scope) = self.interface_member_scopes.get(&symbol).copied() else {
             return;
         };
+        self.publish_member_types_in_scope(member_scope, structure);
+    }
+
+    fn publish_member_types_in_scope(&mut self, member_scope: ScopeId, structure: TypeId) {
         let properties = match self.types.get(structure) {
             Type::ObjectType(object) => object.properties.clone(),
             _ => return,
@@ -21840,13 +21890,17 @@ impl<'src> Binder<'src> {
 
     fn resolve_object_type(
         &mut self,
+        literal: NodeId,
         members: &'src [crate::syntax::TypeMemberNode],
         scope: ScopeId,
     ) -> TypeId {
         let object = self.resolve_type_members(members, scope);
-        self.types.object_type_with_members(object)
+        let published = self.types.object_type_with_members(object);
+        if let Some(member_scope) = self.literal_member_scopes.get(&literal).copied() {
+            self.publish_member_types_in_scope(member_scope, published);
+        }
+        published
     }
-
     fn resolve_type_members(
         &mut self,
         members: &'src [crate::syntax::TypeMemberNode],
@@ -30568,6 +30622,34 @@ namespace undefined { export var x = 42; }",
                 "name range sits inside the member range: {occurrence:?}"
             );
         }
+    }
+    /// Alias object literal members declare occurrences like interface
+    /// members: `type T = { x: number; m(s: string): void }` records one
+    /// occurrence each for `x` and `m`, verified against
+    /// `DeclarationErrorsNoEmitOnError.symbols` (`>x : Symbol(x, ...)`) and
+    /// `computedPropertyBindingElementDeclarationNoCrash1.symbols`
+    /// (`>a : Symbol(a, ...)`).
+    #[test]
+    fn alias_object_literal_members_declare_occurrences() {
+        let (model, diagnostics) =
+            bound("type T = {\n    x: number;\n    m(s: string): void;\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let x = symbol_named(&model, "x");
+        let m = symbol_named(&model, "m");
+        assert_ne!(x, m);
+        let occurrences = model.declaration_occurrences();
+        assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+        assert_eq!(occurrences[0].symbol, x);
+        assert_eq!(occurrences[1].symbol, m);
+        let (union_model, union_diagnostics) =
+            bound("type U = {\n    p: number;\n} | {\n    p: string;\n};");
+        assert!(union_diagnostics.is_empty(), "{union_diagnostics:?}");
+        let union_occurrences = union_model.declaration_occurrences();
+        assert_eq!(union_occurrences.len(), 2, "{union_occurrences:?}");
+        assert_ne!(
+            union_occurrences[0].symbol, union_occurrences[1].symbol,
+            "union branches keep distinct member symbols: {union_occurrences:?}"
+        );
     }
 
     /// T1: occurrence name ranges are exact UTF-16 spans — quotes included
