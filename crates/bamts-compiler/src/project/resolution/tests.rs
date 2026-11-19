@@ -1055,28 +1055,31 @@
     }
     #[test]
     fn trace_log_matches_upstream_bundler_relative_blob() {
-        // Lines pinned byte-for-byte to the upstream baseline blob
-        // sha256 1170256ebc7a95579edb54bfe7ce1b8c6ffd8ffcf8a219318822605ad58fdda3
-        // (tests/baselines/reference/bundlerRelative1(module=bundler).trace.json,
-        // indices 12..=31) plus its cache-hit re-resolution template. The mode
-        // word follows the per-import ResolutionMode: Import renders ESM.
+        // Lines pinned byte-for-byte to the upstream baselines
+        // `bundlerRelative1(module=esnext).trace.json` and
+        // `bundlerRelative1(module=preserve).trace.json` (byte-identical; the
+        // `./dir/index`, `./dir/index.js`, and `./dir/index.ts` blocks) plus
+        // the cache-hit re-resolution template. Upstream renders Bundler
+        // resolutions in CJS mode even for `import` conditions: every
+        // `bundler*.trace.json` baseline prints `Resolving in CJS mode`, and
+        // ESM mode appears only under Node16/NodeNext.
         let expected: &[&str] = &[
             "======== Resolving module './dir/index' from '/main.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",
-            "Resolving in ESM mode with conditions 'import', 'types'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
             "Loading module as file / folder, candidate module location '/dir/index', target file types: TypeScript, JavaScript, Declaration, JSON.",
             "File '/dir/index.ts' exists - use it as a name resolution result.",
             "======== Module name './dir/index' was successfully resolved to '/dir/index.ts'. ========",
             "======== Resolving module './dir/index.js' from '/main.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",
-            "Resolving in ESM mode with conditions 'import', 'types'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
             "Loading module as file / folder, candidate module location '/dir/index.js', target file types: TypeScript, JavaScript, Declaration, JSON.",
             "File name '/dir/index.js' has a '.js' extension - stripping it.",
             "File '/dir/index.ts' exists - use it as a name resolution result.",
             "======== Module name './dir/index.js' was successfully resolved to '/dir/index.ts'. ========",
             "======== Resolving module './dir/index.ts' from '/main.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",
-            "Resolving in ESM mode with conditions 'import', 'types'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
             "Loading module as file / folder, candidate module location '/dir/index.ts', target file types: TypeScript, JavaScript, Declaration, JSON.",
             "File name '/dir/index.ts' has a '.ts' extension - stripping it.",
             "File '/dir/index.ts' exists - use it as a name resolution result.",
@@ -1147,7 +1150,10 @@
         assert!(log.unsupported().is_empty());
     }
     #[test]
-    fn trace_mode_word_follows_resolution_mode() {
+    fn trace_bundler_mode_word_is_cjs_for_both_modes() {
+        // Upstream renders Bundler resolutions in CJS mode for both `import`
+        // and `require` conditions (no `bundler*.trace.json` baseline prints
+        // ESM mode); only the condition word follows the resolution mode.
         let fs_root = ProjectRoot::new(abs("/")).expect("absolute root");
         let config = ProjectConfig::parse(
             &fs_root,
@@ -1160,7 +1166,7 @@
         host.file(abs("/dir/index.ts"), "export {};\n");
 
         for (mode, word) in [
-            (ResolutionMode::Import, "ESM"),
+            (ResolutionMode::Import, "CJS"),
             (ResolutionMode::Require, "CJS"),
         ] {
             let mut cache = ResolutionCache::new();
