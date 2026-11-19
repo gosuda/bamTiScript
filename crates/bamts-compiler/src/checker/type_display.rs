@@ -1224,6 +1224,118 @@ mod tests {
         assert_eq!(render_type(model, s_id), "string");
     }
 
+    /// A parameterized alias that uses its parameter only inside `Record`
+    /// keeps its written `Name<args>` form. tsc prints `R<number>`, never
+    /// the expanded `Record<string, number>`.
+    #[test]
+    fn record_alias_using_parameter_only_inside_record_keeps_written_name() {
+        let text = "type R<T> = Record<string, T>;\n\
+                    declare var r: R<number>;\n\
+                    let z = r;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let r_id = typed_expression_of(model, &source, "r", text.find("let z").unwrap());
+        assert_eq!(render_type(model, r_id), "R<number>");
+        assert_eq!(render_type_declaration(model, r_id, 0), "R<number>");
+    }
+
+    /// A parameterized alias that uses its parameter only in a function
+    /// return keeps its written `Name<args>` form. tsc prints `F<number>`.
+    #[test]
+    fn function_alias_using_parameter_only_in_return_keeps_written_name() {
+        let text = "type F<T> = () => T;\n\
+                    declare var f: F<number>;\n\
+                    let z = f;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let f_id = typed_expression_of(model, &source, "f", text.find("let z").unwrap());
+        assert_eq!(render_type(model, f_id), "F<number>");
+        assert_eq!(render_type_declaration(model, f_id, 0), "F<number>");
+    }
+
+    /// A `keyof` alias never keeps its written name, even for an unresolved
+    /// parameter. tsc prints `<T>(x: keyof T) => void`, never `K<T>`.
+    #[test]
+    fn keyof_alias_with_unresolved_parameter_renders_keyof_form() {
+        let text = "type K<T> = keyof T;\n\
+                    declare function f<T>(x: K<T>): void;\n\
+                    let g = f;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let f_id = typed_expression_of(model, &source, "f", text.find("let g").unwrap());
+        assert_eq!(render_type(model, f_id), "<T>(x: keyof T) => void");
+    }
+
+    /// A resolved `keyof` alias expands to the evaluated key union.
+    /// Upstream baseline: `keyofAndIndexedAccess.types` row
+    /// `>K21 : string | number` for `type K21 = KeyOf<Dictionary<Shape>>`.
+    /// (`declare const` avoids the mutable-binding widening of literal
+    /// constituents, which tsc does not perform on annotated declarations.)
+    #[test]
+    fn keyof_alias_over_object_literal_expands_to_key_union() {
+        let text = "type K<T> = keyof T;\n\
+                    declare const k: K<{ a: number; b: string }>;\n\
+                    let out = k;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let k_id = typed_expression_of(model, &source, "k", text.find("let out").unwrap());
+        assert_eq!(render_type(model, k_id), "\"a\" | \"b\"");
+    }
+
+    /// An indexed-access alias keeps its written name while the access
+    /// cannot resolve. Upstream baseline: `computedPropertyNamesContextualType6_ES5.types`
+    /// rows `>foo : <T>(obj: I<T>) => T` and `>obj : I<T>`.
+    #[test]
+    fn indexed_alias_with_unresolved_parameter_keeps_written_name() {
+        let text = "type G<T extends { a: number }> = T[\"a\"];\n\
+                    declare function h<U extends { a: number }>(y: G<U>): void;\n\
+                    let go = h;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let h_id = typed_expression_of(model, &source, "h", text.find("let go").unwrap());
+        assert_eq!(
+            render_type(model, h_id),
+            "<U extends { a: number; }>(y: G<U>) => void"
+        );
+    }
+
+    /// A mention that passes through a nested alias counts only when the
+    /// nested alias observes that argument: `Wrap<T> = Strange<T>` ignores
+    /// `T`, so tsc prints `Wrap<number>` as `string`.
+    #[test]
+    fn nested_alias_ignoring_argument_expands_to_view() {
+        let text = "type Strange<T> = string;\n\
+                    type Wrap<T> = Strange<T>;\n\
+                    declare var w: Wrap<number>;\n\
+                    let out = w;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let w_id = typed_expression_of(model, &source, "w", text.find("let out").unwrap());
+        assert_eq!(render_type(model, w_id), "string");
+    }
+
+    /// The same nesting keeps its written name when the inner alias observes
+    /// the argument: `Wrap2<T> = Pair<T>` prints as `Wrap2<number>`.
+    #[test]
+    fn nested_alias_using_argument_through_inner_alias_keeps_written_name() {
+        let text = "type Pair<T> = [T, T];\n\
+                    type Wrap2<T> = Pair<T>;\n\
+                    declare var w: Wrap2<number>;\n\
+                    let out = w;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let w_id = typed_expression_of(model, &source, "w", text.find("let out").unwrap());
+        assert_eq!(render_type(model, w_id), "Wrap2<number>");
+        assert_eq!(render_type_declaration(model, w_id, 0), "Wrap2<number>");
+    }
+
     /// A `typeof` query renders its written spelling for nominal operands and
     /// resolves plain variables to their target. Upstream baselines:
     /// `castTest.types` row `>Point : typeof Point`,

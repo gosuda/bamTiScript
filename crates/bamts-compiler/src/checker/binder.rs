@@ -2266,6 +2266,11 @@ impl TypeTable {
     /// name. Baseline proof: `genericTypeAliases.types` rows
     /// `>tree : Tree<number>`, `>ls : Lazy<string>`, `>x : Foo<string>` keep
     /// the name, while `>s : string` (for `Strange<number>`) expands it.
+    /// A mention that passes through a nested alias counts only when the
+    /// nested alias observes that argument, so `Wrap<T> = Strange<T>`
+    /// expands `Wrap<number>` to `string` exactly as tsc prints it.
+    /// `keyof` never counts: baseline proof `keyofAndIndexedAccess.types`
+    /// rows `>K20 : keyof Shape` and `>K21 : string | number`.
     #[must_use]
     pub fn alias_target_uses_parameters(&self, symbol: SymbolId) -> bool {
         let Some(template) = self.alias_template_raw(symbol) else {
@@ -2328,13 +2333,24 @@ impl TypeTable {
                 arguments.iter().copied()
                     .any(|argument| self.template_mentions_parameter(argument, parameters, visiting))
             }
-            Type::AppliedAlias { arguments, .. } => {
+            Type::AppliedAlias { symbol, arguments } => {
                 let arguments = arguments.clone();
-                arguments.iter().copied()
-                    .any(|argument| self.template_mentions_parameter(argument, parameters, visiting))
-            }
-            Type::Keyof(operand) => {
-                self.template_mentions_parameter(*operand, parameters, visiting)
+                let nested = *symbol;
+                let Some(nested_template) = self.alias_template_raw(nested) else {
+                    return arguments.iter().copied().any(|argument| {
+                        self.template_mentions_parameter(argument, parameters, visiting)
+                    });
+                };
+                let nested_parameters = self.alias_type_parameters(nested).to_vec();
+                arguments.iter().enumerate().any(|(index, argument)| {
+                    if !self.template_mentions_parameter(*argument, parameters, visiting) {
+                        return false;
+                    }
+                    let Some(nested_parameter) = nested_parameters.get(index).copied() else {
+                        return true;
+                    };
+                    self.template_mentions_parameter(nested_template, &[nested_parameter], visiting)
+                })
             }
             Type::IndexedAccess { object, index } => {
                 self.template_mentions_parameter(*object, parameters, visiting)
@@ -31291,6 +31307,33 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn expression_body_arrow_return_widens_fresh_literal() {
+        // `const f = () => "x"` infers `() => string`: the fresh literal
+        // widens in the inferred return position, so calling `f` is not
+        // assignable to the literal type `"x"`.
+        let (_, diagnostics) = bound("const f = () => \"x\";\nconst y: \"x\" = f();\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
+            "expected string not assignable to \"x\": {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn block_body_function_return_widens_fresh_literal() {
+        // A block body with a single `return "x"` widens the same way, so
+        // calling `h` is not assignable to `"x"` either.
+        let (_, diagnostics) = bound("function h() { return \"x\"; }\nconst z: \"x\" = h();\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == TYPE_NOT_ASSIGNABLE),
+            "expected string not assignable to \"x\": {diagnostics:?}"
         );
     }
 
