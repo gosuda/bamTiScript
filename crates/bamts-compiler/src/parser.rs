@@ -6861,6 +6861,34 @@ impl Parser {
         name
     }
 
+    fn parse_type_accessor_signature(&mut self, start: Utf16Pos) -> Option<TypeMemberNode> {
+        if !matches!(self.kind(), TokenKind::KwGet | TokenKind::KwSet) {
+            return None;
+        }
+        if self.has_newline_before_nth(1) {
+            return None;
+        }
+        if !self.object_member_name_follows(1) {
+            return None;
+        }
+        let checkpoint = self.checkpoint();
+        self.bump();
+        let name = self.parse_property_name();
+        if !self.at(TokenKind::LParen) && !self.at_less_like() {
+            self.rollback(checkpoint);
+            return None;
+        }
+        let function = self.parse_function_type_signature(false);
+        Some(self.node(
+            start,
+            TypeMember::Method(TypeMethodSignature {
+                name,
+                optional: false,
+                function,
+            }),
+        ))
+    }
+
     fn parse_type_members(&mut self) -> Vec<TypeMemberNode> {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
@@ -6939,6 +6967,9 @@ impl Parser {
             );
         }
 
+        if !readonly && let Some(member) = self.parse_type_accessor_signature(start) {
+            return member;
+        }
         let name = self.parse_property_name();
         let optional = self.eat(TokenKind::Question).is_some();
         if self.at(TokenKind::LParen) || self.at_less_like() {
@@ -8040,6 +8071,54 @@ mod tests {
         };
         assert_eq!(method.modifier, PropertyModifier::Get);
         assert!(method.function.body.is_none());
+    }
+
+    #[test]
+    fn type_member_accessor_signatures_parse_cleanly() {
+        for source in [
+            "interface I { get foo(): string; set foo(v: string); }",
+            "type T = { get foo(): string; set foo(v: string); };",
+            "interface I { get [k](): string; set [k](v: string); }",
+            "declare const c: { get foo(): typeof c.foo; };",
+            "type T = { get foo(): string, set foo(v: string) };",
+            "interface I {\n get foo(): number\n set foo(v: number)\n}",
+        ] {
+            assert_clean(source);
+        }
+    }
+
+    #[test]
+    fn type_member_accessor_signatures_parse_as_methods() {
+        let recovered =
+            assert_clean("type T = { get foo(): string; set foo(v: string); };");
+        let Statement::TypeAlias(alias) = recovered.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Object(object) = alias.type_node.data() else {
+            panic!("expected an object type");
+        };
+        let [first, second] = object.members.as_slice() else {
+            panic!("expected two members");
+        };
+        assert!(matches!(first.data(), TypeMember::Method(_)));
+        assert!(matches!(second.data(), TypeMember::Method(_)));
+    }
+
+    #[test]
+    fn type_member_plain_get_name_still_parses() {
+        for source in [
+            "interface I { get: string; }",
+            "type T = { get: string; set: number; };",
+            "interface I { get(): void; }",
+        ] {
+            assert_clean(source);
+        }
+    }
+
+    #[test]
+    fn type_member_accessor_with_body_still_reports() {
+        let recovered = parse_ts("type T = { get foo() { return 0 } };");
+        assert!(!errors(&recovered).is_empty());
     }
 
     #[test]
