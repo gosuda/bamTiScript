@@ -113,7 +113,7 @@ pub(super) fn install<H: Host>(
         crate::intrinsics::BuiltinDef {
             name: "get [Symbol.species]",
             length: 0,
-            handler: super::regexp_protocol::species_getter::<H>,
+            handler: super::regexp::species_getter::<H>,
         },
     );
     super::define_symbol_property(

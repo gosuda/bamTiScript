@@ -33,11 +33,9 @@ pub(crate) mod dataview;
 mod disposable_stack;
 mod error;
 pub(crate) use error::initialize_error;
-mod map_set_edge;
 mod math;
 mod number_format;
 pub(crate) use number_format::string_to_number;
-mod regexp_protocol;
 pub(crate) mod regexp_v;
 mod set_methods;
 mod string;
@@ -85,7 +83,7 @@ pub(crate) fn install<H: Host>(
         builtins,
         options.script_compiler,
     );
-    map_set_edge::install(heap, atoms, shapes, globals, builtins);
+    collections::install_collection_edge(heap, atoms, shapes, globals, builtins);
     date::install(heap, atoms, shapes, globals, builtins);
     object::install(heap, atoms, shapes, globals, builtins);
     array::install(heap, atoms, shapes, globals, builtins);

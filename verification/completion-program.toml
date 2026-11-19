@@ -317,7 +317,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C3.7"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/map_set_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/collections.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
