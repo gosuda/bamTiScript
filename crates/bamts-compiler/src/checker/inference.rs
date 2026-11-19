@@ -562,6 +562,14 @@ impl InferredTypeArguments {
                     .collect();
                 table.intern_substituted_alias(symbol, arguments)
             }
+            Type::TypeQuery { name, arguments, target } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|&argument| self.instantiate_inner(table, argument))
+                    .collect();
+                let target = self.instantiate_inner(table, target);
+                table.type_query(name, arguments, target)
+            }
             Type::Keyof(operand) => {
                 let operand = self.instantiate_inner(table, operand);
                 table.keyof(operand)

@@ -1304,6 +1304,9 @@ impl<'a> NarrowingContext<'a> {
         {
             return self.narrow_discriminant(view, property, literal, negated);
         }
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.narrow_discriminant(target, property, literal, negated);
+        }
         match self.table.get(ty).clone() {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => ty,
             Type::Union(members) => {
@@ -1329,6 +1332,7 @@ impl<'a> NarrowingContext<'a> {
                 }
             }
             Type::AppliedAlias { .. } => ty,
+            Type::TypeQuery { .. } => ty,
             _ if self.discriminant_keeps(ty, property, literal, negated) => ty,
             Type::Never
             | Type::Void
@@ -1379,6 +1383,9 @@ impl<'a> NarrowingContext<'a> {
         {
             return self.contextual_function(view, parameters, body_return, is_async);
         }
+        if let Some(target) = self.table.type_query_target(contextual) {
+            return self.contextual_function(target, parameters, body_return, is_async);
+        }
         let contextual_signature = match self.table.get(contextual) {
             Type::This { constraint, .. } => {
                 return self.contextual_function(*constraint, parameters, body_return, is_async);
@@ -1414,7 +1421,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
-            | Type::ConstructorType { .. } => None,
+            | Type::ConstructorType { .. }
+            | Type::TypeQuery { .. } => None,
         };
         let parameters: Vec<FunctionParameter> = parameters
             .iter()
@@ -1461,6 +1469,9 @@ impl<'a> NarrowingContext<'a> {
         {
             return self.contextual_element_type(view);
         }
+        if let Some(target) = self.table.type_query_target(contextual) {
+            return self.contextual_element_type(target);
+        }
         match self.table.get(contextual).clone() {
             Type::This { constraint, .. } => self.contextual_element_type(constraint),
             Type::Array(element) => Some(element),
@@ -1500,7 +1511,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
-            | Type::ConstructorType { .. } => None,
+            | Type::ConstructorType { .. }
+            | Type::TypeQuery { .. } => None,
         }
     }
 
@@ -1520,6 +1532,9 @@ impl<'a> NarrowingContext<'a> {
             && view != ty
         {
             return self.awaited_type(view);
+        }
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.awaited_type(target);
         }
         match self.table.get(ty).clone() {
             Type::Union(members) => {
@@ -1560,7 +1575,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
             | Type::This { .. }
-            | Type::ConstructorType { .. } => ty,
+            | Type::ConstructorType { .. }
+            | Type::TypeQuery { .. } => ty,
         }
     }
 
@@ -1613,6 +1629,9 @@ impl<'a> NarrowingContext<'a> {
         {
             return self.property_type(view, name);
         }
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.property_type(target, name);
+        }
         if let Some(view) = self.table.prepare_applied_class_view(ty) {
             return self.property_type(view, name);
         }
@@ -1659,6 +1678,9 @@ impl<'a> NarrowingContext<'a> {
             && view != ty
         {
             return self.filter(view, decide);
+        }
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.filter(target, decide);
         }
         match self.table.get(ty).clone() {
             Type::This { constraint, .. } => match decide(self.table, self.table.get(constraint)) {
@@ -1714,7 +1736,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
-            | Type::ConstructorType { .. } => match decide(self.table, self.table.get(ty)) {
+            | Type::ConstructorType { .. }
+            | Type::TypeQuery { .. } => match decide(self.table, self.table.get(ty)) {
                 Narrow::Keep => ty,
                 Narrow::Drop => self.table.never(),
                 Narrow::Replace(replacement) => replacement,
@@ -1728,6 +1751,12 @@ impl<'a> NarrowingContext<'a> {
     /// inputs are returned unrefined, both as whole types and as union
     /// members.
     fn intersect(&mut self, ty: TypeId, other: TypeId) -> TypeId {
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.intersect(target, other);
+        }
+        if let Some(target) = self.table.type_query_target(other) {
+            return self.intersect(ty, target);
+        }
         if matches!(self.table.get(ty), Type::AppliedAlias { .. }) {
             let Some(view) = self.table.prepare_applied_alias_view(ty) else {
                 return ty;
@@ -1818,7 +1847,8 @@ impl<'a> NarrowingContext<'a> {
                 | Type::IndexedAccess { .. }
                 | Type::Record { .. }
                 | Type::This { .. }
-                | Type::ConstructorType { .. },
+                | Type::ConstructorType { .. }
+                | Type::TypeQuery { .. },
                 _,
             ) => self.table.never(),
         }
@@ -1831,6 +1861,12 @@ impl<'a> NarrowingContext<'a> {
     /// provably, so the input passes through unchanged, and `error` union
     /// members are never dropped.
     fn subtract(&mut self, ty: TypeId, excluded: TypeId) -> TypeId {
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.subtract(target, excluded);
+        }
+        if let Some(target) = self.table.type_query_target(excluded) {
+            return self.subtract(ty, target);
+        }
         if matches!(self.table.get(excluded), Type::AppliedAlias { .. }) {
             let Some(view) = self.table.prepare_applied_alias_view(excluded) else {
                 return ty;
@@ -1879,7 +1915,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
             | Type::This { .. }
-            | Type::ConstructorType { .. } => {}
+            | Type::ConstructorType { .. }
+            | Type::TypeQuery { .. } => {}
         }
         match self.table.get(ty).clone() {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown | Type::Never => ty,
@@ -1921,6 +1958,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::IndexedAccess { .. }
             | Type::This { .. }
             | Type::Record { .. }
+            | Type::TypeQuery { .. }
             | Type::ConstructorType { .. } => ty,
         }
     }

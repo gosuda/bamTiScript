@@ -573,6 +573,10 @@ impl<'table> ConditionalTypeEvaluator<'table> {
                 .into_iter()
                 .try_for_each(|argument| self.check_type_depth(argument, child_depth, visiting))
                 .and_then(|()| self.check_type_depth(structural, child_depth, visiting)),
+            Type::TypeQuery { arguments, target, .. } => arguments
+                .into_iter()
+                .try_for_each(|argument| self.check_type_depth(argument, child_depth, visiting))
+                .and_then(|()| self.check_type_depth(target, child_depth, visiting)),
             Type::IndexedAccess { object, index } => self
                 .check_type_depth(object, child_depth, visiting)
                 .and_then(|()| self.check_type_depth(index, child_depth, visiting)),

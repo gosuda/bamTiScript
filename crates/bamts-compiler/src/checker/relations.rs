@@ -447,8 +447,14 @@ impl<'table> TypeRelations<'table> {
         // either application with a different argument pair.
         let source_class = matches!(self.table.get(source), Type::AppliedClass { .. });
         let target_class = matches!(self.table.get(target), Type::AppliedClass { .. });
-        let source_alias = matches!(self.table.get(source), Type::AppliedAlias { .. });
-        let target_alias = matches!(self.table.get(target), Type::AppliedAlias { .. });
+        let source_alias = matches!(
+            self.table.get(source),
+            Type::AppliedAlias { .. } | Type::TypeQuery { .. }
+        );
+        let target_alias = matches!(
+            self.table.get(target),
+            Type::AppliedAlias { .. } | Type::TypeQuery { .. }
+        );
         let source_applied = source_class || source_alias;
         let target_applied = target_class || target_alias;
         let identical_application = matches!(
@@ -771,6 +777,15 @@ impl<'table> TypeRelations<'table> {
                 }
                 let structural_reach = self.type_reaches_free_symbol(*structural, symbol, search);
                 Self::combine_reachability(arguments_reach, structural_reach)
+            }
+            Type::TypeQuery { arguments, target, .. } => {
+                let arguments_reach = self
+                    .any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
+                if arguments_reach == Some(true) {
+                    return Some(true);
+                }
+                let target_reach = self.type_reaches_free_symbol(*target, symbol, search);
+                Self::combine_reachability(arguments_reach, target_reach)
             }
             Type::Error
             | Type::Any
@@ -1349,6 +1364,12 @@ impl<'table> TypeRelations<'table> {
             (Type::ConstructorType { structural, .. }, _) => {
                 self.relates(*structural, target, strictness)
             }
+            (Type::TypeQuery {
+                target: inner, ..
+            }, _) => self.relates(*inner, target, strictness),
+            (_, Type::TypeQuery {
+                target: inner, ..
+            }) => self.relates(source, *inner, strictness),
             (_, Type::ConstructorType { structural, .. }) => {
                 self.relates(source, *structural, strictness)
             }
@@ -1773,13 +1794,23 @@ impl<'table> TypeRelations<'table> {
     /// view as the alias's nominal identity.
     fn relation_alias_view(&self, mut type_id: TypeId) -> Option<TypeId> {
         let mut visiting = HashSet::new();
-        while matches!(self.table.get(type_id), Type::AppliedAlias { .. }) {
-            if !visiting.insert(type_id) {
-                return None;
+        loop {
+            match self.table.get(type_id) {
+                Type::AppliedAlias { .. } => {
+                    if !visiting.insert(type_id) {
+                        return None;
+                    }
+                    type_id = self.table.applied_alias_view(type_id)?;
+                }
+                Type::TypeQuery { target, .. } => {
+                    if !visiting.insert(type_id) {
+                        return None;
+                    }
+                    type_id = *target;
+                }
+                _ => return Some(type_id),
             }
-            type_id = self.table.applied_alias_view(type_id)?;
         }
-        Some(type_id)
     }
 
     fn contains_undefined(&self, type_id: TypeId) -> bool {
@@ -1812,6 +1843,12 @@ impl<'table> TypeRelations<'table> {
             }
             Type::ConstructorType { structural, .. } => {
                 self.contains_undefined_inner(*structural, visiting_aliases)
+            }
+            Type::TypeQuery { target, .. } => {
+                if !visiting_aliases.insert(type_id) {
+                    return false;
+                }
+                self.contains_undefined_inner(*target, visiting_aliases)
             }
             Type::Error
             | Type::Intersection(_)
