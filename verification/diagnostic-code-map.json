@@ -798,6 +798,12 @@
       "evidence": "Emitted by bamts-compiler as IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE (checker.rs); No repository or typescript 7.0.2 evidence establishes a one-to-one correspondence yet..",
       "status": "unmapped",
       "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P021",
+      "evidence": "REST_PARAMETER_INITIALIZER (parser.rs) -> TS1048 in the TypeScript 7.0.2 authority baselines: parserParameterList10.ts(2,11), restParamAsOptional.ts(2,16), destructuringParameterDeclaration4.ts(15,16), fatarrowfunctionsOptionalArgsErrors1.ts(4,5).",
+      "status": "mapped",
+      "tsCode": 1048
     }
   ]
 }

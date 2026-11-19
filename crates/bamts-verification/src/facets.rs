@@ -52,7 +52,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 133] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 134] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -84,6 +84,7 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 133] = [
     "BAMTS-P018",
     "BAMTS-P019",
     "BAMTS-P020",
+    "BAMTS-P021",
     "BAMTS-C001",
     "BAMTS-C002",
     "BAMTS-C003",
@@ -3395,8 +3396,8 @@ interface A {
         // correspondences below. Checker codes emitted without a tsc-verified
         // counterpart stay unmapped: the registry rows name their compiler
         // constants (verification/diagnostic-code-map.json).
-        const MAPPED_PARSER_CODES: [(&str, u32); 2] =
-            [("BAMTS-P017", 1163), ("BAMTS-P020", 1141)];
+        const MAPPED_PARSER_CODES: [(&str, u32); 3] =
+            [("BAMTS-P017", 1163), ("BAMTS-P020", 1141), ("BAMTS-P021", 1048)];
         const UNMAPPED_CHECKER_CODES: [&str; 19] = [
             "BAMTS-C060",
             "BAMTS-C061",

@@ -12792,6 +12792,18 @@ class B extends A {
     }
 
     #[test]
+    fn rest_parameter_with_default_types_from_initializer() {
+        let result = check_text("function foo(...bar = 0) { const s: string = bar; }");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn rest_parameter_empty_array_default_types_as_any_array() {
+        let result = check_text("function f2(...x = []) { const s: string = x; }");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
     fn array_named_properties_report_missing_members() {
         let result =
             check_text("declare const values: number[]; const label: string = values.tag;");
