@@ -778,9 +778,11 @@ impl<'table> TypeRelations<'table> {
                 let structural_reach = self.type_reaches_free_symbol(*structural, symbol, search);
                 Self::combine_reachability(arguments_reach, structural_reach)
             }
-            Type::TypeQuery { arguments, target, .. } => {
-                let arguments_reach = self
-                    .any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
+            Type::TypeQuery {
+                arguments, target, ..
+            } => {
+                let arguments_reach =
+                    self.any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
                 if arguments_reach == Some(true) {
                     return Some(true);
                 }
@@ -1099,11 +1101,21 @@ impl<'table> TypeRelations<'table> {
                 if matches!(strictness, Strictness::Assignable | Strictness::StrictNull)
                     && self.table.type_parameter_constraint(*symbol).is_some() =>
             {
-                let constraint = self
-                    .table
-                    .type_parameter_constraint(*symbol)
-                    .expect("guard checked constraint");
-                constraint != target && self.relates(source, constraint, strictness)
+                match self.table.get(source) {
+                    Type::Named(source_symbol)
+                        if self
+                            .table
+                            .type_parameter_constraint(*source_symbol)
+                            .is_some() =>
+                    {
+                        let constraint = self
+                            .table
+                            .type_parameter_constraint(*source_symbol)
+                            .expect("guard checked constraint");
+                        self.relates(constraint, target, strictness)
+                    }
+                    _ => false,
+                }
             }
             // `unknown` is the top type: everything flows in, nothing flows out.
             (_, Type::Unknown) => true,
@@ -1364,12 +1376,8 @@ impl<'table> TypeRelations<'table> {
             (Type::ConstructorType { structural, .. }, _) => {
                 self.relates(*structural, target, strictness)
             }
-            (Type::TypeQuery {
-                target: inner, ..
-            }, _) => self.relates(*inner, target, strictness),
-            (_, Type::TypeQuery {
-                target: inner, ..
-            }) => self.relates(source, *inner, strictness),
+            (Type::TypeQuery { target: inner, .. }, _) => self.relates(*inner, target, strictness),
+            (_, Type::TypeQuery { target: inner, .. }) => self.relates(source, *inner, strictness),
             (_, Type::ConstructorType { structural, .. }) => {
                 self.relates(source, *structural, strictness)
             }
@@ -2890,6 +2898,32 @@ mod tests {
         assert!(relations.assignable(constrained_intersection, propertyless));
         assert!(relations.assignable(propertyless, recovery_intersection));
         assert!(!relations.assignable(unconstrained_intersection, propertyless));
+    }
+
+    #[test]
+    fn distinct_type_parameters_with_shared_constraint_are_not_assignable() {
+        let mut table = TypeTable::new();
+        let foo_constraint =
+            table.object_type(vec![PropertyType::new("foo", false, table.string())]);
+        let t_symbol = SymbolId::new(711);
+        let u_symbol = SymbolId::new(712);
+        let v_symbol = SymbolId::new(713);
+        table.set_type_parameter_constraint(t_symbol, foo_constraint);
+        table.set_type_parameter_constraint(u_symbol, foo_constraint);
+        let v_constraint = table.named(t_symbol);
+        table.set_type_parameter_constraint(v_symbol, v_constraint);
+        let (t, u, v) = (
+            table.named(t_symbol),
+            table.named(u_symbol),
+            table.named(v_symbol),
+        );
+        let relations = TypeRelations::new(&table);
+
+        assert!(!relations.assignable(u, t));
+        assert!(!relations.assignable(t, u));
+        assert!(relations.assignable(v, t));
+        assert!(!relations.assignable(foo_constraint, t));
+        assert!(relations.assignable(t, t));
     }
 
     #[test]
