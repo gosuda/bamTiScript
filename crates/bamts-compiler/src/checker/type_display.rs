@@ -112,38 +112,30 @@ fn render_type_grouped(
             }
         }
         Type::AppliedAlias { symbol, arguments } => {
-            // A registered alias that declares no type parameters is an identity,
-            // not an application: its written name is the display form whether or
-            // not a structural view has been materialized for it. Parameterized
-            // aliases keep the view-first expansion below.
-            if arguments.is_empty()
-                && model.types().has_alias(*symbol)
-                && model.types().alias_type_parameters(*symbol).is_empty()
-            {
-                return model.symbol(*symbol).name().to_owned();
-            }
-            if !visiting_aliases.contains(symbol)
-                && let Some(view) = model.types().applied_alias_view(type_id)
-            {
-                visiting_aliases.push(*symbol);
-                let rendered = render_type_grouped(model, view, group, visiting_aliases);
-                visiting_aliases.pop();
-                rendered
+            let name = model.symbol(*symbol).name();
+            if arguments.is_empty() {
+                name.to_owned()
             } else {
-                let name = model.symbol(*symbol).name();
-                if arguments.is_empty() {
-                    name.to_owned()
-                } else {
-                    let arguments = arguments
-                        .iter()
-                        .map(|argument| {
-                            render_type_grouped(model, *argument, false, visiting_aliases)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{name}<{arguments}>")
-                }
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| render_type_grouped(model, *argument, false, visiting_aliases))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}<{arguments}>")
             }
+        }
+        Type::TypeQuery { name, arguments, .. } => {
+            let body = if arguments.is_empty() {
+                format!("typeof {name}")
+            } else {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| render_type_grouped(model, *argument, false, visiting_aliases))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("typeof {name}<{arguments}>")
+            };
+            if group { format!("({body})") } else { body }
         }
         Type::Keyof(operand) => {
             let body = format!(
@@ -1034,11 +1026,12 @@ mod tests {
         assert_eq!(render_type(model, v_id), "R");
     }
 
-    /// Parameterized aliases keep their existing expansion: a bare reference
-    /// to a generic alias still renders the substituted structure, so the
-    /// zero-parameter name policy did not widen into generic aliases.
+    /// Parameterized aliases render as their written name with arguments,
+    /// never as the substituted structure. Upstream baselines print the
+    /// reference (`Tuple<T>`, `Pair<string, number>`); expanding here would
+    /// inline the cached materialized view instead.
     #[test]
-    fn parameterized_alias_reference_still_expands() {
+    fn parameterized_alias_reference_renders_its_name() {
         let text = "type Pair<T> = [T, T];\n\
                     declare var p: Pair<string>;\n\
                     let z = p;\n";
@@ -1046,6 +1039,43 @@ mod tests {
         let model = checked.product();
 
         let p_id = typed_expression_of(model, &source, "p", text.find("let z").unwrap());
-        assert_eq!(render_type(model, p_id), "[string, string]");
+        assert_eq!(render_type(model, p_id), "Pair<string>");
+    }
+
+    #[test]
+    fn object_shaped_parameterized_alias_renders_its_name() {
+        let text = "type Box<T> = { value: T };\n\
+                    declare var b: Box<number>;\n\
+                    let z = b;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let b_id = typed_expression_of(model, &source, "b", text.find("let z").unwrap());
+        assert_eq!(render_type(model, b_id), "Box<number>");
+    }
+    #[test]
+    fn typeof_query_renders_written_name() {
+        let text = "function foo() { return null; }\n\
+                    declare var q: typeof foo;\n\
+                    let z = q;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let q_id = typed_expression_of(model, &source, "q", text.find("let z").unwrap());
+        assert_eq!(render_type(model, q_id), "typeof foo");
+    }
+    #[test]
+    fn qualified_typeof_query_renders_written_path() {
+        let text = "namespace m1 {\n\
+                    export class c {\n\
+                    }\n\
+                    }\n\
+                    declare var q: typeof m1.c;\n\
+                    let z = q;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let q_id = typed_expression_of(model, &source, "q", text.find("let z").unwrap());
+        assert_eq!(render_type(model, q_id), "typeof m1.c");
     }
 }

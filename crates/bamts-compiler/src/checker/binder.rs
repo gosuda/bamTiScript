@@ -1396,6 +1396,13 @@ pub enum Type {
         arguments: Vec<TypeId>,
         structural: TypeId,
     },
+    /// A `typeof X` query with its written spelling. The target is the
+    /// resolved meaning for checking; display renders `typeof <spelling>`.
+    TypeQuery {
+        name: Box<str>,
+        arguments: Vec<TypeId>,
+        target: TypeId,
+    },
 }
 
 #[derive(Debug)]
@@ -1676,6 +1683,9 @@ impl TypeTable {
             Type::AppliedAlias { .. } => self
                 .prepare_applied_alias_view(ty)
                 .and_then(|view| self.property_type(view, name)),
+            Type::TypeQuery { .. } => self
+                .type_query_target(ty)
+                .and_then(|target| self.property_type(target, name)),
             _ => None,
         }
     }
@@ -1716,6 +1726,9 @@ impl TypeTable {
             Type::AppliedAlias { .. } => self
                 .prepare_applied_alias_view(ty)
                 .and_then(|view| self.generator_return_type(view)),
+            Type::TypeQuery { .. } => self
+                .type_query_target(ty)
+                .and_then(|target| self.generator_return_type(target)),
             _ => None,
         }
     }
@@ -1745,6 +1758,9 @@ impl TypeTable {
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.iterator_property_of(view, protocol)),
+            Type::TypeQuery { .. } => self
+                .type_query_target(ty)
+                .and_then(|target| self.iterator_property_of(target, protocol)),
             Type::AppliedAlias { .. } => self
                 .prepare_applied_alias_view(ty)
                 .and_then(|view| self.iterator_property_of(view, protocol)),
@@ -2168,6 +2184,41 @@ impl TypeTable {
             return None;
         }
         self.applied_alias_views.get(&type_id).copied()
+    }
+    #[must_use]
+    pub fn type_query(&mut self, name: Box<str>, arguments: Vec<TypeId>, target: TypeId) -> TypeId {
+        self.intern(Type::TypeQuery { name, arguments, target })
+    }
+    pub fn set_applied_alias_view(&mut self, head: TypeId, view: TypeId) {
+        if head == view {
+            if let Type::AppliedAlias { symbol, .. } = self.get(head).clone() {
+                self.circular_aliases.insert(symbol);
+            }
+        }
+        self.applied_alias_views.insert(head, view);
+    }
+    #[must_use]
+    pub fn type_query_target(&self, type_id: TypeId) -> Option<TypeId> {
+        match self.get(type_id) {
+            Type::TypeQuery { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+    #[must_use]
+    pub fn underlying_type(&self, type_id: TypeId) -> TypeId {
+        let mut current = type_id;
+        for _ in 0..32 {
+            let next = match self.get(current) {
+                Type::AppliedAlias { .. } => self.applied_alias_view(current),
+                Type::TypeQuery { target, .. } => Some(*target),
+                _ => None,
+            };
+            match next {
+                Some(next) if next != current => current = next,
+                _ => break,
+            }
+        }
+        current
     }
 
     fn materialize_applied_alias_view(&mut self, type_id: TypeId) {
@@ -4297,6 +4348,18 @@ impl TypeTable {
                         .map(|argument| copy(target, source, argument, imported, next_symbol))
                         .collect();
                     target.applied_alias(symbol, arguments)
+                }
+                Type::TypeQuery {
+                    name,
+                    arguments,
+                    target: inner,
+                } => {
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|argument| copy(target, source, argument, imported, next_symbol))
+                        .collect();
+                    let inner = copy(target, source, inner, imported, next_symbol);
+                    target.type_query(name, arguments, inner)
                 }
                 Type::NumericEnum(symbol) => {
                     let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
@@ -18442,6 +18505,9 @@ impl<'src> Binder<'src> {
         if let Some(view) = self.types.prepare_applied_alias_view(type_id) {
             return self.call_signature_groups_for_type_raw(view, receiver);
         }
+        if let Some(target) = self.types.type_query_target(type_id) {
+            return self.call_signature_groups_for_type_raw(target, receiver);
+        }
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
             return self.call_signature_groups_for_type_raw(view, receiver);
         }
@@ -18518,6 +18584,9 @@ impl<'src> Binder<'src> {
     ) -> Vec<Vec<ConstructEntry>> {
         if let Some(view) = self.types.prepare_applied_alias_view(type_id) {
             return self.construct_signature_groups_for_type_raw(view, receiver);
+        }
+        if let Some(target) = self.types.type_query_target(type_id) {
+            return self.construct_signature_groups_for_type_raw(target, receiver);
         }
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
             return self.construct_signature_groups_for_type_raw(view, receiver);
@@ -19638,6 +19707,12 @@ impl<'src> Binder<'src> {
             }
             Type::ConstructorType { structural, .. } => self
                 .property_type_for_member_raw(structural, name, range, read, receiver, owner_hint),
+            Type::TypeQuery { .. } => self
+                .types
+                .type_query_target(object_type)
+                .and_then(|target| {
+                    self.property_type_for_member_raw(target, name, range, read, receiver, owner_hint)
+                }),
             Type::This {
                 owner, constraint, ..
             } => self.property_type_for_member_raw(
@@ -20244,14 +20319,7 @@ impl<'src> Binder<'src> {
                 }
                 self.types.tuple_shape(shape)
             }
-            TypeNode::Query(query) => {
-                if let Some(arguments) = &query.type_arguments {
-                    for argument in &arguments.arguments {
-                        let _ = self.resolve_type(argument, scope);
-                    }
-                }
-                self.resolve_type_query(query, scope, node.range())
-            }
+            TypeNode::Query(query) => self.resolve_type_query(query, scope, node.range()),
             TypeNode::IndexedAccess(indexed) => {
                 let object_type = self.resolve_type(&indexed.object_type, scope);
                 self.resolve_indexed_access(object_type, &indexed.index_type, scope, node.range())
@@ -20324,7 +20392,44 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         _range: TextRange,
     ) -> TypeId {
-        self.resolve_type_query_name(&query.name, scope)
+        let target = self.resolve_type_query_name(&query.name, scope);
+        if target == self.types.error_type()
+            || target == self.types.any()
+            || self.query_name_is_this_rooted(&query.name)
+        {
+            return target;
+        }
+        let arguments = query
+            .type_arguments
+            .as_ref()
+            .map(|list| {
+                list.arguments
+                    .iter()
+                    .map(|argument| self.resolve_type(argument, scope))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let name = self.entity_name_spelling(&query.name).into_boxed_str();
+        self.types.type_query(name, arguments, target)
+    }
+    fn entity_name_spelling(&self, name: &EntityName) -> String {
+        match name {
+            EntityName::Identifier(identifier) => self.identifier_text(identifier).into_owned(),
+            EntityName::Qualified { left, right } => {
+                let left = self.entity_name_spelling(left);
+                format!("{left}.{}", self.identifier_text(right).as_ref())
+            }
+            EntityName::Missing(_) => String::new(),
+        }
+    }
+    fn query_name_is_this_rooted(&self, name: &EntityName) -> bool {
+        match name {
+            EntityName::Identifier(identifier) => {
+                self.identifier_text(identifier).as_ref() == "this"
+            }
+            EntityName::Qualified { left, .. } => self.query_name_is_this_rooted(left),
+            EntityName::Missing(_) => false,
+        }
     }
 
     fn resolve_type_query_name(&mut self, name: &EntityName, scope: ScopeId) -> TypeId {
@@ -20784,6 +20889,13 @@ impl<'src> Binder<'src> {
             return self.types.applied_class(symbol, arguments);
         }
         let base = self.types.named_structural_view(base);
+        if self.types.has_alias(symbol) {
+            let arguments = inferred.iter().map(InferredTypeArgument::type_id).collect();
+            let view = InferredTypeArguments::new(inferred).instantiate(&mut self.types, base);
+            let head = self.types.intern_applied_alias(symbol, arguments);
+            self.types.set_applied_alias_view(head, view);
+            return head;
+        }
         InferredTypeArguments::new(inferred).instantiate(&mut self.types, base)
     }
     /// Whether a type alias declares no type parameters and its raw template
@@ -20870,6 +20982,12 @@ impl<'src> Binder<'src> {
                     .iter()
                     .any(|&argument| self.references_free_type_parameter(argument, visiting, bound))
                     || self.references_free_type_parameter(*structural, visiting, bound)
+            }
+            Type::TypeQuery { arguments, target, .. } => {
+                arguments
+                    .iter()
+                    .any(|&argument| self.references_free_type_parameter(argument, visiting, bound))
+                    || self.references_free_type_parameter(*target, visiting, bound)
             }
             Type::Keyof(operand) => self.references_free_type_parameter(*operand, visiting, bound),
             Type::IndexedAccess { object, index } => {
