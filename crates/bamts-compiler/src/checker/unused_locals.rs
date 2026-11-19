@@ -5,10 +5,11 @@ use crate::diagnostic::Diagnostic;
 use crate::source::TextRange;
 use crate::syntax::SourceFile;
 use crate::syntax::{
-    Accessibility, ArrayBindingElement, BindingPattern, ClassDeclaration, ClassMember,
-    ExportDeclaration, ExportDefaultValue, ExportNamedDeclaration, Expression, ForBinding,
-    ForInitializer, FunctionBody, FunctionLike, IdentifierNode, MemberProperty, NamespaceName,
-    ParameterNode, Pattern, PropertyModifier, PropertyName, Statement, Stmt, VariableDeclaration,
+    Accessibility, ArrayBindingElement, AssignmentArrayElement, AssignmentTarget,
+    AssignmentTargetNode, BindingPattern, ClassDeclaration, ClassMember, ExportDeclaration,
+    ExportDefaultValue, ExportNamedDeclaration, Expression, ForBinding, ForInitializer,
+    FunctionBody, FunctionLike, IdentifierNode, MemberProperty, NamespaceName, ParameterNode,
+    Pattern, PropertyModifier, PropertyName, Statement, Stmt, VariableDeclaration,
 };
 
 use super::binder::{SemanticModel, SymbolId};
@@ -781,7 +782,9 @@ impl Walker<'_> {
                 }
             }
             Expression::Unary(value) => self.walk_expr(&value.argument),
-            Expression::Update(_) => {}
+            Expression::Update(value) => {
+                self.walk_target_reads(&value.argument);
+            }
             Expression::Binary(value) => {
                 self.walk_expr(&value.left);
                 self.walk_expr(&value.right);
@@ -805,6 +808,7 @@ impl Walker<'_> {
             Expression::Satisfies(value) => self.walk_expr(&value.expression),
             Expression::TypeAssertion(value) => self.walk_expr(&value.expression),
             Expression::Assignment(assignment) => {
+                self.walk_target_reads(&assignment.left);
                 self.walk_expr(&assignment.right);
             }
             Expression::Call(value) => {
@@ -894,6 +898,44 @@ impl Walker<'_> {
         }
     }
 
+    fn walk_target_reads(&mut self, target: &AssignmentTargetNode) {
+        match target.data() {
+            AssignmentTarget::Identifier(_) => {}
+            AssignmentTarget::Member(member) => {
+                self.walk_expr(&member.object);
+                if let MemberProperty::Computed(key) = &member.property {
+                    self.walk_expr(key);
+                }
+            }
+            AssignmentTarget::Object(pattern) => {
+                for property in &pattern.properties {
+                    if let PropertyName::Computed(key) = &property.name {
+                        self.walk_expr(key);
+                    }
+                    self.walk_target_reads(&property.target);
+                    if let Some(initializer) = property.initializer.as_deref() {
+                        self.walk_expr(initializer);
+                    }
+                }
+            }
+            AssignmentTarget::Array(pattern) => {
+                for element in &pattern.elements {
+                    match element {
+                        AssignmentArrayElement::Target(inner)
+                        | AssignmentArrayElement::Rest(inner) => {
+                            self.walk_target_reads(inner);
+                        }
+                        AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => {}
+                    }
+                }
+            }
+            AssignmentTarget::Invalid(operand) => {
+                self.walk_expr(operand);
+            }
+            AssignmentTarget::Missing(_) => {}
+        }
+    }
+
     fn walk_call_arguments(&mut self, arguments: &[crate::syntax::CallArgument]) {
         for argument in arguments {
             match argument {
@@ -976,69 +1018,146 @@ mod tests {
             .map(|diagnostic| diagnostic.code().as_str())
             .collect()
     }
+    fn by_name<'a>(diagnostics: &'a [Diagnostic], name: &str) -> Vec<&'a Diagnostic> {
+        let needle = format!("'{name}' is declared");
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message().contains(&needle))
+            .collect()
+    }
+    fn reported_names(diagnostics: &[Diagnostic]) -> Vec<String> {
+        diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                diagnostic
+                    .message()
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.find('\'').map(|end| rest[..end].to_owned()))
+            })
+            .collect()
+    }
+    fn sorted_names(diagnostics: &[Diagnostic]) -> Vec<String> {
+        let mut names = reported_names(diagnostics);
+        names.sort();
+        names
+    }
 
     #[test]
     fn write_only_variable_is_reported() {
-        let outcome = check("function f() { var x = 0; x = 1; return 0; }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
-        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
-        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        let text = "function f() { var x = 0; x = 1; return 0; }";
+        let outcome = check(text);
         assert!(outcome.params.is_empty(), "{outcome:?}");
+        assert_eq!(sorted_names(&outcome.locals), ["f", "x"], "{outcome:?}");
+        let f = by_name(&outcome.locals, "f");
+        let x = by_name(&outcome.locals, "x");
+        assert_eq!(f[0].code().as_str(), "6133", "{outcome:?}");
+        assert_eq!(x[0].code().as_str(), "6133", "{outcome:?}");
+        assert_eq!(f[0].range().start().get(), text.find("f()").expect("f name"), "{outcome:?}");
+        assert_eq!(
+            x[0].range().start().get(),
+            text.find("var x").expect("x declaration") + "var ".len(),
+            "{outcome:?}"
+        );
     }
 
     #[test]
     fn used_before_unused_parameter_pair_reports_only_the_unused_one() {
-        let outcome = check("function g(used, unused) { return used; }");
-        assert_eq!(outcome.params.len(), 1, "{outcome:?}");
+        let text = "function g(used, unused) { return used; }";
+        let outcome = check(text);
+        let unused = by_name(&outcome.params, "unused");
+        assert_eq!(unused.len(), 1, "{outcome:?}");
+        assert_eq!(unused[0].code().as_str(), "6133", "{outcome:?}");
         assert_eq!(
-            outcome.params[0].message(),
-            "'unused' is declared but its value is never read."
+            unused[0].range().start().get(),
+            text.find(", unused").expect("unused parameter") + ", ".len(),
+            "{outcome:?}"
         );
-        assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(sorted_names(&outcome.locals), ["g"], "{outcome:?}");
+        let g = by_name(&outcome.locals, "g");
+        assert_eq!(g[0].code().as_str(), "6133", "{outcome:?}");
     }
 
     #[test]
     fn underscore_prefixed_parameter_is_exempt() {
-        let outcome = check("function h(_a, b) { return b; }");
+        let text = "function h(_a, b) { return b; }";
+        let outcome = check(text);
         assert!(outcome.params.is_empty(), "{outcome:?}");
-        assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(sorted_names(&outcome.locals), ["h"], "{outcome:?}");
+        let h = by_name(&outcome.locals, "h");
+        assert_eq!(h[0].code().as_str(), "6133", "{outcome:?}");
+        assert_eq!(h[0].range().start().get(), text.find("h(").expect("h name"), "{outcome:?}");
     }
 
     #[test]
     fn all_unused_destructured_elements_report_once() {
-        let outcome = check("function k() { const {a, b} = {a: 1, b: 2}; }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"All destructured elements are unused.".to_owned()));
+        let text = "function k() { const {a, b} = {a: 1, b: 2}; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["k"], "{outcome:?}");
+        let elements: Vec<&Diagnostic> = outcome
+            .locals
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str() == "6198")
+            .collect();
+        assert_eq!(elements.len(), 1, "{outcome:?}");
+        assert_eq!(
+            elements[0].message(),
+            "All destructured elements are unused.",
+            "{outcome:?}"
+        );
+        assert_eq!(
+            elements[0].range().start().get(),
+            text.find("{a, b}").expect("binding pattern"),
+            "{outcome:?}"
+        );
     }
 
     #[test]
     fn all_unused_declarators_report_once() {
-        let outcome = check("function m() { var x = 1, y = 2; }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"All variables are unused.".to_owned()));
+        let text = "function m() { var x = 1, y = 2; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["m"], "{outcome:?}");
+        let variables: Vec<&Diagnostic> = outcome
+            .locals
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str() == "6199")
+            .collect();
+        assert_eq!(variables.len(), 1, "{outcome:?}");
+        assert_eq!(variables[0].message(), "All variables are unused.", "{outcome:?}");
+        assert_eq!(
+            variables[0].range().start().get(),
+            text.find("var x = 1").expect("declaration"),
+            "{outcome:?}"
+        );
     }
     #[test]
     fn rest_reports_only_rest_binding() {
-        let outcome = check("function three() { const foo = { a: 1, b: 2 }; const { a, ...bar } = foo; }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"'three' is declared but its value is never read.".to_owned()));
-        assert!(texts.contains(&"'bar' is declared but its value is never read.".to_owned()));
-        assert!(!texts.iter().any(|m| m.contains("destructured")), "{outcome:?}");
+        let text = "function three() { const foo = { a: 1, b: 2 }; const { a, ...bar } = foo; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["bar", "three"], "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
+        let rest = by_name(&outcome.locals, "bar");
+        assert_eq!(
+            rest[0].range().start().get(),
+            text.find("...bar").expect("rest binding") + "...".len(),
+            "{outcome:?}"
+        );
+        assert!(!messages(&outcome.locals).iter().any(|m| m.contains("destructured")), "{outcome:?}");
     }
 
     #[test]
     fn hash_private_unused_reports() {
-        let outcome = check("class C { #x = 1; }");
-        assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        let text = "class C { #x = 1; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["#x"], "{outcome:?}");
         assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
         assert_eq!(
             outcome.locals[0].message(),
             "'#x' is declared but its value is never read."
+        );
+        assert_eq!(
+            outcome.locals[0].range().start().get(),
+            text.find("#x").expect("#x name"),
+            "{outcome:?}"
         );
     }
 
@@ -1073,34 +1192,109 @@ mod tests {
 
     #[test]
     fn partial_object_pattern_reports_only_unused() {
-        let outcome = check("function f() { const o = { a: 1, b: 2 }; const { a, b } = o; return a; }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        let text = "function f() { const o = { a: 1, b: 2 }; const { a, b } = o; return a; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["b", "f"], "{outcome:?}");
         assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
-        assert!(texts.contains(&"'b' is declared but its value is never read.".to_owned()));
-        assert!(!texts.iter().any(|m| m.contains("'a'")), "{outcome:?}");
+        let b = by_name(&outcome.locals, "b");
+        assert_eq!(
+            b[0].range().start().get(),
+            text.find("{ a, b } = o").expect("b binding") + "{ a, ".len(),
+            "{outcome:?}"
+        );
     }
 
     #[test]
     fn partial_array_pattern_reports_only_unused() {
-        let outcome = check("function f() { const [a, b] = [1, 2]; return a; }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        let text = "function f() { const [a, b] = [1, 2]; return a; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["b", "f"], "{outcome:?}");
         assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
-        assert!(texts.contains(&"'b' is declared but its value is never read.".to_owned()));
-        assert!(!texts.iter().any(|m| m.contains("destructured")), "{outcome:?}");
+        let b = by_name(&outcome.locals, "b");
+        assert_eq!(
+            b[0].range().start().get(),
+            text.find("[a, b]").expect("b binding") + "[a, ".len(),
+            "{outcome:?}"
+        );
+        assert!(!messages(&outcome.locals).iter().any(|m| m.contains("destructured")), "{outcome:?}");
     }
 
     #[test]
     fn for_of_unused_binding_reports() {
-        let outcome = check("function f() { const arr = [1]; for (const x of arr) { } }");
-        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        let text = "function f() { const arr = [1]; for (const x of arr) { } }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["f", "x"], "{outcome:?}");
         assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
-        let texts = messages(&outcome.locals);
-        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
-        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        let x = by_name(&outcome.locals, "x");
+        assert_eq!(
+            x[0].range().start().get(),
+            text.find("const x of").expect("x binding") + "const ".len(),
+            "{outcome:?}"
+        );
+    }
+    #[test]
+    fn for_in_unused_binding_reports() {
+        let text = "function f() { const o = {a: 1}; for (const k in o) { } }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["f", "k"], "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
+        let k = by_name(&outcome.locals, "k");
+        assert_eq!(
+            k[0].range().start().get(),
+            text.find("const k in").expect("k binding") + "const ".len(),
+            "{outcome:?}"
+        );
+    }
+    #[test]
+    fn namespace_unused_name_reports() {
+        let text = "namespace N {}\nexport {};\n";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["N"], "{outcome:?}");
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].range().start().get(),
+            text.find("N {}").expect("N name"),
+            "{outcome:?}"
+        );
+    }
+    #[test]
+    fn enum_initializer_nested_body_reports_unused() {
+        let text = "enum E { A = (() => { const z = 1; return 1; })() }";
+        let outcome = check(text);
+        let z = by_name(&outcome.locals, "z");
+        assert_eq!(z.len(), 1, "{outcome:?}");
+        assert_eq!(z[0].code().as_str(), "6133", "{outcome:?}");
+        assert_eq!(
+            z[0].range().start().get(),
+            text.find("const z").expect("z declaration") + "const ".len(),
+            "{outcome:?}"
+        );
+    }
+    #[test]
+    fn computed_member_key_nested_body_reports_unused() {
+        let text = "class C { [(() => { const z = 1; return \"k\"; })()] = 1; }";
+        let outcome = check(text);
+        let z = by_name(&outcome.locals, "z");
+        assert_eq!(z.len(), 1, "{outcome:?}");
+        assert_eq!(z[0].code().as_str(), "6133", "{outcome:?}");
+        assert_eq!(
+            z[0].range().start().get(),
+            text.find("const z").expect("z declaration") + "const ".len(),
+            "{outcome:?}"
+        );
+    }
+    #[test]
+    fn initializer_read_keeps_earlier_declarator_clean() {
+        let text = "function f() { var x = 0, y = x; }";
+        let outcome = check(text);
+        assert_eq!(sorted_names(&outcome.locals), ["f", "y"], "{outcome:?}");
+        let y = by_name(&outcome.locals, "y");
+        assert_eq!(y[0].code().as_str(), "6133", "{outcome:?}");
+        assert_eq!(
+            y[0].range().start().get(),
+            text.find(", y =").expect("y declaration") + ", ".len(),
+            "{outcome:?}"
+        );
     }
 
     #[test]
@@ -1132,6 +1326,46 @@ mod tests {
         let texts = messages(&outcome.locals);
         assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
         assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+    #[test]
+    fn assignment_target_computed_key_nested_body_reports_unused() {
+        let text = "let o: any; o[(() => { const z = 1; return \"k\"; })()] = 1;";
+        let outcome = check(text);
+        let texts = messages(&outcome.locals);
+        assert_eq!(texts.len(), 1, "{outcome:?}");
+        assert_eq!(
+            texts[0],
+            "'z' is declared but its value is never read.",
+            "{outcome:?}"
+        );
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        let expected = text.find("const z").expect("z declaration") + "const ".len();
+        assert_eq!(
+            outcome.locals[0].range().start().get(),
+            expected,
+            "{outcome:?}"
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+    #[test]
+    fn update_target_computed_key_nested_body_reports_unused() {
+        let text = "let o: any; o[(() => { const z = 1; return \"k\"; })()]++;";
+        let outcome = check(text);
+        let texts = messages(&outcome.locals);
+        assert_eq!(texts.len(), 1, "{outcome:?}");
+        assert_eq!(
+            texts[0],
+            "'z' is declared but its value is never read.",
+            "{outcome:?}"
+        );
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        let expected = text.find("const z").expect("z declaration") + "const ".len();
+        assert_eq!(
+            outcome.locals[0].range().start().get(),
+            expected,
+            "{outcome:?}"
+        );
         assert!(outcome.params.is_empty(), "{outcome:?}");
     }
     #[test]
