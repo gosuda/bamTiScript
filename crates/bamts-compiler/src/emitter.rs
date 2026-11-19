@@ -5855,8 +5855,14 @@ impl<'a> Emitter<'a> {
 
     fn emit_variable_decl(&mut self, declaration: &VariableDeclaration) {
         self.emit_declare_prefix();
+        let kind = variable_kind_str(declaration.kind);
         let start = self.anchor.start();
-        self.raw_decl_leading(variable_kind_str(declaration.kind), start);
+        self.flush_indent();
+        if self.generated_column == self.current_indent_spaces() {
+            self.raw_decl_leading(kind, start);
+        } else {
+            self.raw_mapped_token(kind, start, utf16_len(kind));
+        }
         self.raw(" ");
         for (index, declarator) in declaration.declarations.iter().enumerate() {
             if index > 0 {

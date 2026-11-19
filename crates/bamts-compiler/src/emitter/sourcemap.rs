@@ -1829,6 +1829,45 @@ mod tests {
         assert_eq!(member, Some(&(1, 4, 1, 4)));
     }
     #[test]
+    fn declaration_dropped_export_maps_variable_kind_to_export() {
+        let source = "namespace N {\n    export let x: number;\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let member = segments.iter().find(|(line, _, _, _)| *line == 1);
+        assert_eq!(member, Some(&(1, 4, 1, 4)));
+    }
+    #[test]
+    fn declaration_dropped_export_maps_nested_const_kind_to_export() {
+        let source =
+            "namespace outer {\n    namespace inner {\n        export const y: number;\n    }\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let member = segments.iter().find(|(line, _, _, _)| *line == 2);
+        assert_eq!(member, Some(&(2, 8, 2, 8)));
+    }
+    #[test]
     fn declaration_namespace_open_brace_maps_space_and_brace() {
         let source = "namespace m2 {\n}\n";
         let declaration = emit(
