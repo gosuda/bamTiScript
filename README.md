@@ -83,7 +83,7 @@ bamts --project ./tsconfig.json    # pick a configuration explicitly
 bamts --build                      # build a composite project
 ```
 
-Direct compilation writes `<outDir>/<entrypoint-name>`; `--declaration` and `--sourceMap` on that path fail closed with `TS5047`. One source file is limited to 16 MiB and a session to 256 MiB (`BAMTS-R001`, `BAMTS-R002`). The former `check`, `run`, `compile`, `explain`, `--target jit`, and `--target aot` forms are not public commands.
+Direct compilation writes `<outDir>/<entrypoint-name>`; with `--declaration` or `--sourceMap` (and emit enabled) the same path emits JavaScript artifacts instead of a native executable. One source file is limited to 16 MiB and a session to 256 MiB (`BAMTS-R001`, `BAMTS-R002`). The former `check`, `run`, `compile`, `explain`, `--target jit`, and `--target aot` forms are not public commands.
 
 ## Documentation
 
