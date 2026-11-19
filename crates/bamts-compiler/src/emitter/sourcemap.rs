@@ -1616,8 +1616,8 @@ mod tests {
         // Source (0-based): `switch (x) {}\n`
         //   0: switch (x) {}   ← `{` at col 11, `}` at col 12
         //
-        // Generated line 1: `switch (x) {}`
-        //   `{` glyph at gen col 11, `}` glyph at gen col 12, EOL at gen col 13.
+        // Generated lines: `switch (x) {` then `}` on the next line.
+        //   `{` glyph at gen line 1 col 11, `}` glyph at gen line 2 col 0.
         let source = "switch (x) {}\n";
         let javascript = emit(
             source,
@@ -1645,24 +1645,18 @@ mod tests {
             (1, 11, 0, 11),
             "empty switch open brace\n  {mappings}"
         );
-        // Close `}` at gen col 12, src line 0, src col 12.
+        // Close `}` at gen line 2 col 0, src line 0, src col 12.
         let close = segs
             .iter()
-            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 12)
+            .find(|(gl, gc, _sl, _sc)| *gl == 2 && *gc == 0)
             .unwrap_or_else(|| {
-                panic!("empty switch close brace missing at line 1 col 12\n  {mappings}")
+                panic!("empty switch close brace missing at line 2 col 0\n  {mappings}")
             });
         assert_eq!(
             *close,
-            (1, 12, 0, 12),
+            (2, 0, 0, 12),
             "empty switch close brace\n  {mappings}"
         );
-        // EOL at gen col 13, src col 13.
-        let eol = segs
-            .iter()
-            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 13)
-            .unwrap_or_else(|| panic!("empty switch EOL missing at line 1 col 13\n  {mappings}"));
-        assert_eq!(*eol, (1, 13, 0, 13), "empty switch close EOL\n  {mappings}");
     }
     #[test]
     fn inline_sources_requires_a_javascript_source_map() {

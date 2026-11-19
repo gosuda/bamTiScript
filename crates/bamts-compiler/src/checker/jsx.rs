@@ -455,6 +455,7 @@ impl<'src> Binder<'src> {
             .types
             .prepare_applied_alias_view(callee)
             .unwrap_or(callee);
+        let resolved = self.types.type_query_target(resolved).unwrap_or(resolved);
         let resolved = self
             .types
             .prepare_applied_class_view(resolved)

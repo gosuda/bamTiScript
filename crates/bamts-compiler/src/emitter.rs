@@ -2524,7 +2524,10 @@ impl<'a> Emitter<'a> {
         self.emit_expression(&switch.discriminant);
         self.raw_mapped_pos(") ", switch.discriminant.range().end());
         if switch.cases.is_empty() {
+            // Authority: switchStatements.js expands every empty switch to
+            // `{\n}` even when authored single-line (`switch ('') { }`).
             self.raw_mapped_char("{", range, '{', 1);
+            self.newline();
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
@@ -8155,6 +8158,23 @@ export {};
             ),
             "{code}"
         );
+    }
+
+    #[test]
+    fn empty_switch_expands_to_two_lines() {
+        // Authority: switchStatements.js — `switch ('') { }` (and 13 siblings)
+        // prints as `switch ('') {\n}`.
+        let code = emit_authored_js("var x: any;\nswitch (x) { }\n");
+        assert!(code.contains("switch (x) {\n}\n"), "{code}");
+        assert!(!code.contains("switch (x) {}"), "{code}");
+    }
+
+    #[test]
+    fn nested_empty_switch_keeps_its_indent() {
+        // Authority: switchStatements.js empty switches at top level; nesting
+        // checks the close brace aligns with `switch` instead of column 0.
+        let code = emit_authored_js("function f(x) {\n    switch (x) { }\n}\n");
+        assert!(code.contains("    switch (x) {\n    }\n"), "{code}");
     }
 
     #[test]
