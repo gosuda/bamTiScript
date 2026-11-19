@@ -34,7 +34,7 @@ The `hello.ts` input is created in [Quick start](#quick-start).
 
 - One `tsc`-compatible CLI: option names, `tsconfig.json`, `--project`, `--build`, response files, and exit-status classes match TypeScript 7.0.2 (`docs/reference/cli.md`).
 - Direct source-file compilation emits a native host executable through `--outDir` instead of JavaScript (`docs/reference/cli.md`).
-- Unsupported compiler options fail closed with `TS5047` and exit status 5 rather than being silently ignored (`docs/reference/cli.md`).
+- Recognized compiler options without a native mapping fail closed with `TS5047` and exit status 5 rather than being silently ignored; unknown flags are rejected while parsing (`TS5023`, or `TS5025` with a suggestion) with exit status 1 (`docs/reference/cli.md`).
 - The runtime stores ECMAScript strings as exact UTF-16 code units, including lone surrogates (`docs/explanation/architecture.md`).
 - Interpreter, JIT, and AOT consume the same verified bytecode program (`docs/explanation/architecture.md`); the execution tier is selected with `bamts --run` plus `--jit`, `--aot`, or `--target <aot|jit>`.
 - The workspace defaults to `unsafe_code = "forbid"`, with documented exceptions in the codegen, native, FFI, and Node-API crates (`Cargo.toml`). This is a source policy, not an end-to-end memory-safety proof.
