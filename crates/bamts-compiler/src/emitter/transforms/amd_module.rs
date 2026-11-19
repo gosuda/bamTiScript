@@ -5,6 +5,7 @@
 //! `const a_1 = require("./a");` lines of the CommonJS body disappear. UMD keeps
 //! the CommonJS body and only wraps it so a loader can pick the AMD branch.
 
+use super::is_identifier_name;
 use std::collections::BTreeSet;
 
 use crate::emitter::ModuleWrapper;
@@ -248,8 +249,8 @@ impl AmdPlan {
             .collect();
         for ((_, name), path) in directives.dependencies.iter().zip(&quoted) {
             match name {
-                Some(name) => aliased.push((path, name)),
-                None => unaliased.push(path),
+                Some(name) if is_identifier_name(name) => aliased.push((path, name)),
+                _ => unaliased.push(path),
             }
         }
         for dependency in &self.dependencies {
@@ -297,5 +298,72 @@ impl AmdPlan {
             tail: "});".to_owned(),
             body_indent: 0,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::super::{ScriptTarget, emit_transformed};
+    use crate::checker;
+    use crate::diagnostic::Recovered;
+    use crate::emitter::{EmitFileNames, EmitOptions, ModuleKind};
+    use crate::parser;
+    use crate::scanner;
+    use crate::source::{ScriptKind, SourceId, SourceText};
+    use std::sync::Arc;
+
+    fn parse(source: &str) -> crate::syntax::SourceFile {
+        parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(source).expect("test source fits the per-file source budget")),
+        ))
+        .into_product()
+    }
+
+    fn amd_code(source: &str) -> String {
+        let options = EmitOptions {
+            target: ScriptTarget::Es2015,
+            module: Some(ModuleKind::Amd),
+            ..EmitOptions::default()
+        };
+        let file = parse(source);
+        let checked = checker::check(&Recovered::clean(parse(source)));
+        emit_transformed(
+            &file,
+            checked.product(),
+            &options.transform_view(),
+            &EmitFileNames::default(),
+        )
+        .javascript
+        .as_ref()
+        .expect("JavaScript output")
+        .code
+        .to_owned()
+    }
+
+    #[test]
+    fn directive_alias_with_syntax_never_reaches_factory_parameters() {
+        let code = amd_code(
+            "///<amd-dependency path=\"./a\" name=\"x){globalThis.PWNED=1} function q(y\" />\nimport a = require('./a');\nexport var x = a.v;\n",
+        );
+        assert!(
+            !code.contains("PWNED"),
+            "directive alias must not break out of the parameter list: {code}"
+        );
+        assert!(
+            code.contains("\"./a\""),
+            "the dependency path is still listed: {code}"
+        );
+    }
+
+    #[test]
+    fn directive_alias_with_valid_identifier_stays_a_factory_parameter() {
+        let code = amd_code(
+            "///<amd-dependency path=\"./a\" name=\"e\" />\nimport a = require('./a');\nexport var x = a.v;\n",
+        );
+        assert!(
+            code.contains("function (require, exports, e"),
+            "a valid alias keeps its parameter: {code}"
+        );
     }
 }
