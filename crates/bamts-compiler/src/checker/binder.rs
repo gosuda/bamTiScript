@@ -37,7 +37,6 @@ use super::{
     CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, CONSTRUCTOR_TYPE_PARAMETERS,
     DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DERIVED_CONSTRUCTOR_MISSING_SUPER,
     DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION,
-    EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
     EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
     FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
     FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
@@ -5602,9 +5601,7 @@ pub(crate) struct ReferenceIndex {
 /// existing enum scalar solver during the bootstrap interval.
 #[derive(Clone, Copy)]
 pub(crate) struct EnumBindingView<'a> {
-    pub scopes: &'a [Scope],
     pub symbols: &'a [Symbol],
-    pub module_scope: ScopeId,
     pub references: &'a HashMap<NodeId, SymbolId>,
     pub reference_aliases: &'a HashMap<NodeId, SymbolId>,
 }
@@ -7290,9 +7287,7 @@ impl<'src> Binder<'src> {
     )]
     pub(crate) fn enum_binding_view(&self) -> EnumBindingView<'_> {
         EnumBindingView {
-            scopes: &self.scopes,
             symbols: &self.symbols,
-            module_scope: self.module_scope,
             references: &self.reference_index.lexical_symbols,
             reference_aliases: &self.reference_index.reference_aliases,
         }
@@ -28940,7 +28935,6 @@ mod tests {
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
         CANNOT_FIND_TYPE, CONSTRUCTOR_TYPE_PARAMETERS, ConstructEntry,
         DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION,
-        EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
         EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
         FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, FunctionParameter, FunctionSignature,
         GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
@@ -28949,6 +28943,9 @@ mod tests {
         STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
         SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeId, TypeParameterBounds,
         TypeTable, bind_source,
+    };
+    use crate::checker::{
+        EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
