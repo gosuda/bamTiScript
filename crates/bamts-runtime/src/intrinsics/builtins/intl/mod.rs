@@ -653,7 +653,6 @@ fn define_tag(
     super::define_to_string_tag(heap, shapes, object, symbol, tag);
 }
 
-/// StringListFromIterable.
 pub(super) fn string_iterable_to_list<H: Host>(
     machine: &mut Machine<'_, H>,
     iterable: Value,
