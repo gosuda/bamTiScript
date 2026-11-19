@@ -160,6 +160,8 @@ pub const IMPLICIT_ANY_RETURN_FROM_CYCLE: DiagnosticCode = DiagnosticCode::new("
 /// Diagnostic emitted when an inferred anonymous callable return is recursively referenced.
 pub const IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE: DiagnosticCode =
     DiagnosticCode::new("BAMTS-C106");
+/// Diagnostic emitted when an unannotated rest parameter's inferred type is not an array type.
+pub const REST_PARAMETER_ARRAY_TYPE: DiagnosticCode = DiagnosticCode::new("BAMTS-C107");
 pub(crate) const BREAK_TARGET_CROSSES_FUNCTION_MESSAGE: &str =
     "Jump target cannot cross function boundary.";
 pub(crate) const BREAK_TARGET_NOT_ENCLOSING_MESSAGE: &str =
@@ -170,6 +172,8 @@ pub(crate) const SUPER_PROPERTY_NOT_METHOD_MESSAGE: &str =
     "Only public and protected methods of the base class are accessible via the 'super' keyword.";
 pub(crate) const REST_PARAMETER_NOT_LAST_MESSAGE: &str =
     "A rest parameter must be last in a parameter list.";
+pub(crate) const REST_PARAMETER_ARRAY_TYPE_MESSAGE: &str =
+    "A rest parameter must be of an array type.";
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -12801,6 +12805,28 @@ class B extends A {
     fn rest_parameter_empty_array_default_types_as_any_array() {
         let result = check_text("function f2(...x = []) { const s: string = x; }");
         assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn rest_parameter_default_with_non_array_type_reports_array_type() {
+        let result = check_text("function foo(...bar = 0) {}");
+        assert_eq!(checker_codes(&result), ["BAMTS-C107"]);
+    }
+
+    #[test]
+    fn rest_parameter_array_default_and_bare_rest_report_no_array_type_error() {
+        let bare = check_text("function f(...x) {}");
+        assert!(checker_codes(&bare).is_empty());
+        let empty = check_text("function f2(...x = []) {}");
+        assert!(checker_codes(&empty).is_empty());
+        let annotated = check_text("function g(...x: number[]) {}");
+        assert!(checker_codes(&annotated).is_empty());
+    }
+
+    #[test]
+    fn rest_parameter_annotated_non_array_keeps_assignability_error_only() {
+        let invalid = check_text("function f(...x: number) {}");
+        assert_eq!(checker_codes(&invalid), ["BAMTS-C004"]);
     }
 
     #[test]
