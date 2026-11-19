@@ -76,7 +76,6 @@ fn checked_time_duration(time: i128) -> TemporalResult<i128> {
     Ok(time)
 }
 
-/// AddTimeDuration.
 pub fn add_time_duration(one: i128, two: i128) -> TemporalResult<i128> {
     checked_time_duration(one + two)
 }
@@ -87,7 +86,7 @@ fn add_24_hour_days(time: i128, days: i128) -> TemporalResult<i128> {
     checked_time_duration(time.checked_add(shift).ok_or_else(limit_error)?)
 }
 
-/// RoundTimeDuration: `unit` is a time unit or day.
+/// `unit` is a time unit or day.
 pub fn round_time_duration(
     time: i128,
     increment: i128,
@@ -97,7 +96,6 @@ pub fn round_time_duration(
     checked_time_duration(round_nanoseconds(time, unit, increment, mode)?)
 }
 
-/// RoundTimeDurationToIncrement.
 fn round_time_duration_to_increment(
     time: i128,
     step: i128,
@@ -106,7 +104,7 @@ fn round_time_duration_to_increment(
     checked_time_duration(round_to_increment(time, step, mode)?)
 }
 
-/// TotalTimeDuration: the exact quotient, rounded once to a Number.
+/// The exact quotient, rounded once to a Number.
 pub fn total_time_duration(time: i128, unit: Unit) -> TemporalResult<f64> {
     let unit_ns = unit
         .ns_per()
@@ -122,7 +120,7 @@ pub fn date_duration_without_time(duration: &Duration) -> TemporalResult<Duratio
     Duration::new(date.fields())
 }
 
-/// TemporalDurationFromInternal. Time balances up to `largest_unit`, with day
+/// Time balances up to `largest_unit`, with day
 /// the largest bucket it can reach.
 pub fn temporal_duration_from_internal(
     internal: InternalDuration,
@@ -144,7 +142,6 @@ pub fn temporal_duration_from_internal(
     ])
 }
 
-/// CheckISODaysRange.
 pub fn check_iso_days_range(date: PlainDate) -> TemporalResult<()> {
     if epoch_days_from_ymd(date.year, date.month, date.day).abs() > 100_000_000 {
         return Err(TemporalError::range("date is too far from the epoch"));
@@ -160,7 +157,7 @@ fn balance_year_month(year: i64, month: i64) -> (i64, i64) {
     )
 }
 
-/// ISODateSurpasses: whether (year, month, day), compared field by field and
+/// Whether (year, month, day), compared field by field and
 /// before any clamping, lies past `target` in the direction of `sign`.
 fn iso_date_surpasses(sign: i64, year: i64, month: i64, day: i64, target: PlainDate) -> bool {
     let (target_year, target_month, target_day) = (
@@ -279,7 +276,7 @@ struct NudgeWindow {
     end_duration: Duration,
 }
 
-/// ComputeNudgeWindow: the two candidate multiples of `increment` around the
+/// The two candidate multiples of `increment` around the
 /// duration, and the exact times they land on.
 fn compute_nudge_window(
     sign: i128,
@@ -398,7 +395,6 @@ struct Endpoints {
     dest_epoch_ns: i128,
 }
 
-/// NudgeToCalendarUnit.
 fn nudge_to_calendar_unit(
     sign: i128,
     duration: &InternalDuration,
@@ -477,7 +473,7 @@ fn nudge_to_calendar_unit(
     })
 }
 
-/// NudgeToZonedTime: rounds a time unit inside one wall-clock day of a time zone
+/// Rounds a time unit inside one wall-clock day of a time zone
 /// and detects a result that passes the end of that day.
 fn nudge_to_zoned_time(
     sign: i128,
@@ -521,7 +517,7 @@ fn nudge_to_zoned_time(
     })
 }
 
-/// NudgeToDayOrTime: days are exactly 24 hours here.
+/// Days are exactly 24 hours here.
 fn nudge_to_day_or_time(
     duration: &InternalDuration,
     dest_epoch_ns: i128,
@@ -557,7 +553,7 @@ fn nudge_to_day_or_time(
     })
 }
 
-/// BubbleRelativeDuration: after rounding carried into a larger unit, walks
+/// After rounding carried into a larger unit, walks
 /// upward and absorbs each unit the nudged time has reached.
 fn bubble_relative_duration(
     sign: i128,
@@ -592,7 +588,6 @@ fn bubble_relative_duration(
     Ok(duration)
 }
 
-/// RoundRelativeDuration.
 fn round_relative_duration(
     duration: InternalDuration,
     endpoints: Endpoints,
@@ -639,7 +634,6 @@ fn round_relative_duration(
     Ok(nudge.duration)
 }
 
-/// TotalRelativeDuration.
 fn total_relative_duration(
     duration: InternalDuration,
     endpoints: Endpoints,
@@ -674,12 +668,10 @@ fn midnight_record(date: PlainDate) -> PlainDateTime {
     }
 }
 
-/// DifferenceTime.
 pub fn difference_time(one: PlainTime, two: PlainTime) -> i128 {
     two.to_nanoseconds_of_day() - one.to_nanoseconds_of_day()
 }
 
-/// DifferenceISODateTime.
 fn difference_iso_date_time(
     providers: &TemporalProviders<'_>,
     one: PlainDateTime,
@@ -717,7 +709,6 @@ fn difference_iso_date_time(
     Ok(InternalDuration::new(date, time))
 }
 
-/// DifferencePlainDateTimeWithRounding.
 pub fn difference_plain_date_time_with_rounding(
     providers: &TemporalProviders<'_>,
     one: PlainDateTime,
@@ -748,7 +739,6 @@ pub fn difference_plain_date_time_with_rounding(
     round_relative_duration(difference, endpoints, &origin, rounding)
 }
 
-/// DifferencePlainDateTimeWithTotal.
 pub fn difference_plain_date_time_with_total(
     providers: &TemporalProviders<'_>,
     one: PlainDateTime,
@@ -843,7 +833,6 @@ pub fn difference_plain_year_month(
     temporal_duration_from_internal(duration, Unit::Day)
 }
 
-/// DifferenceInstant.
 pub fn difference_instant(
     one: i128,
     two: i128,
@@ -855,7 +844,6 @@ pub fn difference_instant(
     Ok(InternalDuration::new(Duration::default(), time))
 }
 
-/// DifferenceZonedDateTime.
 fn difference_zoned_date_time(
     providers: &TemporalProviders<'_>,
     start_ns: i128,
@@ -907,7 +895,6 @@ fn difference_zoned_date_time(
     ))
 }
 
-/// DifferenceZonedDateTimeWithRounding.
 pub fn difference_zoned_date_time_with_rounding(
     providers: &TemporalProviders<'_>,
     start_ns: i128,
@@ -949,7 +936,6 @@ pub fn difference_zoned_date_time_with_rounding(
     round_relative_duration(difference, endpoints, &origin, rounding)
 }
 
-/// DifferenceZonedDateTimeWithTotal.
 pub fn difference_zoned_date_time_with_total(
     providers: &TemporalProviders<'_>,
     start_ns: i128,
@@ -996,7 +982,7 @@ pub fn plain_relative_endpoints(
     Ok((midnight_record(date), PlainDateTime { date: target, time }))
 }
 
-/// DateDurationDays: a date duration's whole length in days from `date`.
+/// A date duration's whole length in days from `date`.
 pub fn date_duration_days(
     providers: &TemporalProviders<'_>,
     duration: &Duration,
@@ -1023,7 +1009,6 @@ pub fn compare_with_days(
     Ok(add_24_hour_days(one.time, days_one)?.cmp(&add_24_hour_days(two.time, days_two)?))
 }
 
-/// AddInstant.
 pub fn add_instant(epoch_ns: i128, time: i128) -> TemporalResult<Instant> {
     Instant::from_epoch_nanoseconds(epoch_ns + time)
 }

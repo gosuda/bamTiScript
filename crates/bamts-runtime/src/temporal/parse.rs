@@ -191,7 +191,7 @@ fn fraction_nanoseconds(c: &mut Cursor<'_>) -> Option<i128> {
     Some(value)
 }
 
-/// `TimeSpec`, in either the extended or the basic form but never a mixture.
+/// In either the extended or the basic form but never a mixture.
 /// Leap seconds are accepted and clamp to `:59`, as the proposal requires.
 fn time_spec(c: &mut Cursor<'_>) -> Option<i128> {
     let hour = i128::from(two_digits_at_most(c, 23)?);
@@ -213,7 +213,7 @@ fn time_spec(c: &mut Cursor<'_>) -> Option<i128> {
     Some(ns + fraction_nanoseconds(c)?)
 }
 
-/// `UTCOffset`: minute precision, or seconds and a fraction when `sub_minute`.
+/// Minute precision, or seconds and a fraction when `sub_minute`.
 fn utc_offset(c: &mut Cursor<'_>, sub_minute: bool) -> Option<UtcOffsetRecord> {
     let negative = match c.peek()? {
         b'+' => false,
@@ -243,7 +243,7 @@ fn utc_offset(c: &mut Cursor<'_>, sub_minute: bool) -> Option<UtcOffsetRecord> {
     })
 }
 
-/// `DateTimeUTCOffset[Z]`: an absent offset is `Some(None)`.
+/// An absent offset is `Some(None)`.
 fn date_time_offset(c: &mut Cursor<'_>, allow_zulu: bool) -> Option<Option<UtcOffsetRecord>> {
     match c.peek() {
         Some(b'Z' | b'z') if allow_zulu => {
@@ -287,7 +287,7 @@ fn iana_name(c: &mut Cursor<'_>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `TimeZoneAnnotation`. A bracket that is not one leaves the cursor untouched
+/// A bracket that is not one leaves the cursor untouched
 /// so the caller can read it as a key-value annotation.
 fn time_zone_annotation(c: &mut Cursor<'_>) -> Option<String> {
     let start = c.pos;
@@ -352,7 +352,7 @@ fn annotation_value<'a>(c: &mut Cursor<'a>) -> Option<&'a [u8]> {
     }
 }
 
-/// `Annotations`, applying the proposal's calendar rules: the first `u-ca` wins,
+/// Applying the proposal's calendar rules: the first `u-ca` wins,
 /// a repeat is an error once a critical flag is involved, and an unknown key is
 /// ignored unless it is critical.
 fn annotations(c: &mut Cursor<'_>) -> TemporalResult<Option<String>> {
@@ -590,7 +590,7 @@ fn prefer_semantic_error(first: TemporalError, second: TemporalError) -> Tempora
     if first.kind == Syntax { second } else { first }
 }
 
-/// `ParseDateTimeUTCOffset`: the value of an `offset` property.
+/// The value of an `offset` property.
 pub fn parse_date_time_utc_offset(text: &str) -> TemporalResult<i128> {
     let mut c = Cursor::new(text);
     match utc_offset(&mut c, true) {
@@ -599,7 +599,6 @@ pub fn parse_date_time_utc_offset(text: &str) -> TemporalResult<i128> {
     }
 }
 
-/// `ParseTimeZoneIdentifier`.
 pub fn parse_time_zone_identifier(text: &str) -> TemporalResult<ParsedTimeZone> {
     let invalid = || TemporalError::range("invalid time zone identifier");
     let mut c = Cursor::new(text);
