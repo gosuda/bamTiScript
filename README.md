@@ -22,11 +22,13 @@ bamTiScript is for compiler and runtime developers evaluating an alternative Typ
 ```bash
 cargo build --release -p bamts-cli   # writes target/release/bamts
 
-target/release/bamts --noEmit --pretty false hello.ts   # type-check only
-target/release/bamts hello.ts --outDir out              # writes ./out/hello
+target/release/bamts --noEmit --pretty false --ignoreConfig hello.ts   # type-check only
+target/release/bamts --ignoreConfig hello.ts --outDir out              # writes ./out/hello
 ./out/hello
 # hello from bamts
 ```
+
+The `hello.ts` input is created in [Quick start](#quick-start).
 
 ## Why bamTiScript
 
@@ -51,11 +53,13 @@ const message: string = "hello from bamts";
 process.stdout.write(`${message}\n`);
 EOF
 
-target/release/bamts --noEmit --pretty false hello.ts
-target/release/bamts hello.ts --outDir out
+target/release/bamts --noEmit --pretty false --ignoreConfig hello.ts
+target/release/bamts --ignoreConfig hello.ts --outDir out
 ./out/hello
 ```
 
+Direct-file commands need `--ignoreConfig` here because the repository root
+holds a `tsconfig.json`, which they otherwise refuse with `TS5112`.
 The last command prints `hello from bamts`.
 
 ## Installation
