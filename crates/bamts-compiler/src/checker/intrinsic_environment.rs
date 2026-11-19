@@ -60,6 +60,22 @@ pub(crate) enum Lib {
     Scripthost,
     /// `lib.decorators.legacy.d.ts` — decorator types.
     DecoratorsLegacy,
+    /// `lib.es2016.array.include.d.ts` — `Array.prototype.includes`.
+    Es2016Array,
+    /// `lib.es2017.string.d.ts` — `String.prototype.padStart`, `padEnd`.
+    Es2017String,
+    /// `lib.es2019.symbol.d.ts` — `Symbol.prototype.description`.
+    Es2019Symbol,
+    /// `lib.es2019.string.d.ts` — `String.prototype.trimStart`, `trimEnd`.
+    Es2019String,
+    /// `lib.es2020.string.d.ts` — `String.prototype.matchAll`.
+    Es2020String,
+    /// `lib.es2021.string.d.ts` — `String.prototype.replaceAll`.
+    Es2021String,
+    /// `lib.es2022.array.d.ts`, `lib.es2022.string.d.ts` — `.at`.
+    Es2022At,
+    /// `lib.es2023.array.d.ts` — `findLast`, `toReversed`, `toSorted`, `with`.
+    Es2023Array,
 }
 
 impl Lib {
@@ -80,9 +96,8 @@ pub(crate) struct LibSet(u32);
 impl LibSet {
     /// An empty set — no globals resolve.
     pub(crate) const EMPTY: Self = Self(0);
-
     /// The set containing every category — used when lib scoping is disabled.
-    pub(crate) const ALL: Self = Self((1 << 18) - 1);
+    pub(crate) const ALL: Self = Self((1 << 26) - 1);
 
     #[must_use]
     pub(crate) const fn contains(self, lib: Lib) -> bool {
@@ -111,20 +126,35 @@ impl LibSet {
         if (target as u8) >= (ScriptTarget::Es2015 as u8) {
             set = set.with(Lib::Es2015).with(Lib::Es2015Core);
         }
+        if (target as u8) >= (ScriptTarget::Es2016 as u8) {
+            set = set.with(Lib::Es2016Array);
+        }
         if (target as u8) >= (ScriptTarget::Es2017 as u8) {
-            set = set.with(Lib::Es2017SharedMemory);
+            set = set.with(Lib::Es2017SharedMemory).with(Lib::Es2017String);
         }
         if (target as u8) >= (ScriptTarget::Es2018 as u8) {
             set = set.with(Lib::Es2018AsyncIterable);
         }
         if (target as u8) >= (ScriptTarget::Es2019 as u8) {
-            set = set.with(Lib::Es2019Array);
+            set = set
+                .with(Lib::Es2019Array)
+                .with(Lib::Es2019String)
+                .with(Lib::Es2019Symbol);
         }
         if (target as u8) >= (ScriptTarget::Es2020 as u8) {
-            set = set.with(Lib::Es2020BigInt);
+            set = set.with(Lib::Es2020BigInt).with(Lib::Es2020String);
         }
         if (target as u8) >= (ScriptTarget::Es2021 as u8) {
-            set = set.with(Lib::Es2021WeakRef).with(Lib::Es2021Promise);
+            set = set
+                .with(Lib::Es2021WeakRef)
+                .with(Lib::Es2021Promise)
+                .with(Lib::Es2021String);
+        }
+        if (target as u8) >= (ScriptTarget::Es2022 as u8) {
+            set = set.with(Lib::Es2022At);
+        }
+        if (target as u8) >= (ScriptTarget::Es2023 as u8) {
+            set = set.with(Lib::Es2023Array);
         }
         if (target as u8) >= (ScriptTarget::Es2025 as u8) {
             set = set.with(Lib::Es2025Float16).with(Lib::Es2025Iterator);
@@ -151,21 +181,29 @@ impl LibSet {
                     set = set.with(Lib::Es5).with(Lib::Es2015).with(Lib::Es2015Core);
                 }
                 "es7" | "es2016" => {
-                    set = set.with(Lib::Es5).with(Lib::Es2015).with(Lib::Es2015Core);
+                    set = set
+                        .with(Lib::Es5)
+                        .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array);
                 }
                 "es2017" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
-                        .with(Lib::Es2017SharedMemory);
+                        .with(Lib::Es2016Array)
+                        .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String);
                 }
                 "es2018" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable);
                 }
                 "es2019" => {
@@ -173,55 +211,105 @@ impl LibSet {
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable)
-                        .with(Lib::Es2019Array);
+                        .with(Lib::Es2019Array)
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol);
                 }
                 "es2020" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
-                        .with(Lib::Es2020BigInt);
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol)
+                        .with(Lib::Es2020BigInt)
+                        .with(Lib::Es2020String);
                 }
                 "es2021" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol)
                         .with(Lib::Es2020BigInt)
+                        .with(Lib::Es2020String)
                         .with(Lib::Es2021WeakRef)
-                        .with(Lib::Es2021Promise);
+                        .with(Lib::Es2021Promise)
+                        .with(Lib::Es2021String);
                 }
-                "es2022" | "es2023" | "es2024" => {
+                "es2022" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol)
                         .with(Lib::Es2020BigInt)
+                        .with(Lib::Es2020String)
                         .with(Lib::Es2021WeakRef)
-                        .with(Lib::Es2021Promise);
+                        .with(Lib::Es2021Promise)
+                        .with(Lib::Es2021String)
+                        .with(Lib::Es2022At);
+                }
+                "es2023" | "es2024" => {
+                    set = set
+                        .with(Lib::Es5)
+                        .with(Lib::Es2015)
+                        .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
+                        .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
+                        .with(Lib::Es2018AsyncIterable)
+                        .with(Lib::Es2019Array)
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol)
+                        .with(Lib::Es2020BigInt)
+                        .with(Lib::Es2020String)
+                        .with(Lib::Es2021WeakRef)
+                        .with(Lib::Es2021Promise)
+                        .with(Lib::Es2021String)
+                        .with(Lib::Es2022At)
+                        .with(Lib::Es2023Array);
                 }
                 "es2025" => {
                     set = set
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol)
                         .with(Lib::Es2020BigInt)
+                        .with(Lib::Es2020String)
                         .with(Lib::Es2021WeakRef)
                         .with(Lib::Es2021Promise)
+                        .with(Lib::Es2021String)
+                        .with(Lib::Es2022At)
+                        .with(Lib::Es2023Array)
                         .with(Lib::Es2025Float16)
                         .with(Lib::Es2025Iterator);
                 }
@@ -230,12 +318,20 @@ impl LibSet {
                         .with(Lib::Es5)
                         .with(Lib::Es2015)
                         .with(Lib::Es2015Core)
+                        .with(Lib::Es2016Array)
                         .with(Lib::Es2017SharedMemory)
+                        .with(Lib::Es2017String)
                         .with(Lib::Es2018AsyncIterable)
                         .with(Lib::Es2019Array)
+                        .with(Lib::Es2019String)
+                        .with(Lib::Es2019Symbol)
                         .with(Lib::Es2020BigInt)
+                        .with(Lib::Es2020String)
                         .with(Lib::Es2021WeakRef)
                         .with(Lib::Es2021Promise)
+                        .with(Lib::Es2021String)
+                        .with(Lib::Es2022At)
+                        .with(Lib::Es2023Array)
                         .with(Lib::Es2025Float16)
                         .with(Lib::Es2025Iterator)
                         .with(Lib::EsnextDisposable)
@@ -251,8 +347,29 @@ impl LibSet {
                 "es2025.float16" => {
                     set = set.with(Lib::Es2025Float16);
                 }
-                "es2017.sharedmemory" => {
-                    set = set.with(Lib::Es2017SharedMemory);
+                "es2016.array.include" => {
+                    set = set.with(Lib::Es2016Array);
+                }
+                "es2017.string" => {
+                    set = set.with(Lib::Es2017String);
+                }
+                "es2019.string" => {
+                    set = set.with(Lib::Es2019String);
+                }
+                "es2019.symbol" => {
+                    set = set.with(Lib::Es2019Symbol);
+                }
+                "es2020.string" => {
+                    set = set.with(Lib::Es2020String);
+                }
+                "es2021.string" => {
+                    set = set.with(Lib::Es2021String);
+                }
+                "es2022.array" | "es2022.string" => {
+                    set = set.with(Lib::Es2022At);
+                }
+                "es2023.array" => {
+                    set = set.with(Lib::Es2023Array);
                 }
                 // `es2015.core` refines existing interfaces (notably the
                 // `DateConstructor` value overload) without declaring new
