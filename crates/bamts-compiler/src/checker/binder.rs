@@ -5634,9 +5634,10 @@ pub struct SemanticModel {
     /// one per `declare_member_unique` call including every reuse. Consumers
     /// must not re-sort.
     declaration_occurrences: Vec<DeclarationOccurrence>,
-    /// Interface signature parameter name node to its bound `Parameter`
-    /// symbol, recorded for method, call, and construct members and for
-    /// index signature parameters.
+    /// Signature parameter node to its bound symbol: the name node maps to
+    /// the `Parameter` symbol for interface method, call, construct, and
+    /// index members, and the parameter node maps to the `Variable` symbol
+    /// for class index signature parameters.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "read by T4a parameter-symbol publication")
@@ -16572,20 +16573,19 @@ impl<'src> Binder<'src> {
                 }
             }
             ClassMember::IndexSignature(index) => {
-                // Upstream renders index-signature parameters as bare
-                // `>s : Symbol(s, Decl(...))` rows (classIndexer.symbols), so
-                // each parameter binds in a fresh function scope.
                 let parameter_scope = self.new_scope(ScopeKind::Function, Some(scope));
                 for parameter in &index.parameters {
                     if self.is_this_parameter(parameter) {
                         continue;
                     }
-                    self.bind_pattern(
+                    for symbol in self.bind_pattern(
                         &parameter.data().binding,
                         VariableKind::Let,
                         parameter_scope,
                         parameter.id(),
-                    );
+                    ) {
+                        self.signature_parameter_symbols.insert(parameter.id(), symbol);
+                    }
                 }
             }
             ClassMember::Constructor(_)
@@ -16852,6 +16852,21 @@ impl<'src> Binder<'src> {
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
                     self.symbol_types[symbol.get() as usize] = type_id;
+                }
+            }
+            ClassMember::IndexSignature(index) => {
+                for parameter in &index.parameters {
+                    if self.is_this_parameter(parameter) {
+                        continue;
+                    }
+                    let Some(annotation) = parameter.data().type_annotation.as_ref() else {
+                        continue;
+                    };
+                    let type_id = self.resolve_type(&annotation.data().type_node, scope);
+                    if let Some(&symbol) = self.signature_parameter_symbols.get(&parameter.id()) {
+                        self.symbol_types[symbol.get() as usize] = type_id;
+                        self.type_state[symbol.get() as usize] = TypeState::Done(type_id);
+                    }
                 }
             }
             ClassMember::StaticBlock(block) => {
@@ -30436,6 +30451,30 @@ namespace undefined { export var x = 42; }",
                 "parameter `{name}` name node maps to its symbol"
             );
         }
+    }
+
+    #[test]
+    fn class_index_signature_parameter_resolves_string_annotation() {
+        let (model, diagnostics) = bound("class C {\n    [k: string]: number;\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let symbol = symbol_named(&model, "k");
+        assert_eq!(model.symbol_type(symbol), model.types().string());
+    }
+
+    #[test]
+    fn static_class_index_signature_parameter_resolves_number_annotation() {
+        let (model, diagnostics) = bound("class C {\n    static [n: number]: number;\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let symbol = symbol_named(&model, "n");
+        assert_eq!(model.symbol_type(symbol), model.types().number());
+    }
+
+    #[test]
+    fn class_index_signature_parameter_resolves_symbol_annotation() {
+        let (model, diagnostics) = bound("class C {\n    [s: symbol]: number;\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let symbol = symbol_named(&model, "s");
+        assert_eq!(model.symbol_type(symbol), model.types().symbol_type());
     }
 
     /// T1: `declared_return` carries the resolved written annotation and is
