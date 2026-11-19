@@ -10322,7 +10322,7 @@ class B extends A {
     #[test]
     fn rest_parameter_with_default_types_from_initializer() {
         let result = check_text("function foo(...bar = 0) { const s: string = bar; }");
-        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+        assert_eq!(checker_codes(&result), ["BAMTS-C107", "BAMTS-C004"]);
     }
 
     #[test]
