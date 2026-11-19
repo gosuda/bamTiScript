@@ -2480,7 +2480,7 @@ mod tests {
         let mut host = MemoryHost::default();
         host.file(
             abs("/workspace/m2.ts"),
-            "import m1 = require('m2');\nexport const v = m1;\n",
+            "import m1 = require('zzz_missing_sibling');\nexport const v = m1;\n",
         );
         let options = options_with_module("system");
         let kind = ModuleResolutionKind::from_options(&options).unwrap();
@@ -2489,7 +2489,7 @@ mod tests {
             &root(),
             &options,
             abs("/workspace/m2.ts"),
-            "m2",
+            "zzz_missing_sibling",
             (kind, ResolutionMode::Require),
             &host,
             &mut cache,
