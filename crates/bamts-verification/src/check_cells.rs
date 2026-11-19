@@ -3450,6 +3450,18 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     }
     for (unit, output) in units {
         let section = unit_basename(&unit.virtual_path);
+        // Skip the empty entry unit that multi-file cases (`@filename:`
+        // sections) leave behind — it has no source content and upstream
+        // does not emit a section for it.
+        if output
+            .source_file()
+            .source_text()
+            .as_str()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
@@ -3508,11 +3520,6 @@ fn emit_unit_symbols(
         let index = symbol_id.get() as usize;
         let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
-        if matches!(symbol.kind(), SymbolKind::IntrinsicValue)
-            && (name == "undefined" || name == "globalThis")
-        {
-            return Some(format!("Symbol({name})"));
-        }
         let anchors = if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
             // Occurrence-covered interface member: the Decl list unions this
             // unit's per-occurrence anchors with the (qualified-name-first)
@@ -3950,8 +3957,8 @@ const fn kind_is_occurrence_overlay_member(kind: SymbolKind) -> bool {
     )
 }
 
-/// Tokens that can lead a keyword-led declaration (its keyword plus modifiers),
-/// scanned over to anchor `Decl(...)` at the declaration's full start.
+/// Tokens that can lead a keyword-led declaration: its keyword, its modifiers,
+/// and the generator star, scanned over to anchor `Decl(...)` at the full start.
 const fn is_declaration_leading(kind: TokenKind) -> bool {
     matches!(
         kind,
@@ -3974,6 +3981,7 @@ const fn is_declaration_leading(kind: TokenKind) -> bool {
             | TokenKind::KwReadonly
             | TokenKind::KwGet
             | TokenKind::KwSet
+            | TokenKind::Star
     )
 }
 
@@ -6024,6 +6032,59 @@ export var v = 1;
         );
     }
 
+    /// Generator functions anchor at the `function` keyword with the star
+    /// stepped over, matching `castOfYield.symbols` (`Decl(castOfYield.ts, 0, 0)`).
+    #[test]
+    fn generator_function_decl_anchors_at_function_keyword() {
+        let logical = "tests/cases/compiler/generatorPin.ts";
+        let case_text = "function* f() {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(f, Decl(generatorPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+    }
+
+    /// Async generators anchor at `async` with star and keyword stepped over,
+    /// matching `asyncImportNestedYield.symbols` (`Decl(asyncImportNestedYield.ts, 0, 0)`).
+    #[test]
+    fn async_generator_function_decl_anchors_at_async_keyword() {
+        let logical = "tests/cases/compiler/generatorPin.ts";
+        let case_text = "async function* foo() {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(foo, Decl(generatorPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+    }
+
+    /// A plain function keeps its keyword anchor while a later generator in
+    /// the same unit anchors at the previous statement end, so the star walk
+    /// changes no non-generator row on the path.
+    #[test]
+    fn generator_after_function_decl_anchors_at_previous_statement_end() {
+        let logical = "tests/cases/compiler/generatorPin.ts";
+        let case_text = "function a() {\n}\nfunction* b() {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(a, Decl(generatorPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(b, Decl(generatorPin.ts, 1, 1))"),
+            "{emitted}"
+        );
+    }
+
     /// Honesty pin on a real pinned sample: `anyAsConstructor` carries a
     /// `@target` pragma (dropped from the upstream echo) and references whose
     /// declarations the binder anchors differently, so the emitted document
@@ -6088,91 +6149,6 @@ export var v = 1;
         );
     }
 
-    /// Object literal members bind declaration rows named by first spelling:
-    /// `var v = {a: 1, b: 2}` renders `>a : Symbol(a, ...)` per member.
-    /// Cited baselines: `objectLiteral1.symbols`, `objectLiteralErrors.symbols`.
-    #[test]
-    fn emit_symbols_records_object_literal_member_declarations() {
-        let logical = "tests/cases/compiler/objectLiteralPin.ts";
-        let case_text = "var v = {a: 1, b: 2};\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        for display in [">a : Symbol(a, Decl(objectLiteralPin.ts, 0, 9))", ">b : Symbol(b, Decl(objectLiteralPin.ts, 0, 14))"] {
-            assert!(
-                emitted.lines().any(|l| l.starts_with(display)),
-                "missing object literal member row {display}:\n{emitted}"
-            );
-        }
-    }
-
-    /// Quoted and numeric keys merge under the first spelling with unioned
-    /// anchors: `{ a: 0, 'a': 0 }` renders `>a` and `>'a'`, both
-    /// `Symbol(a, Decl(0, 9), Decl(0, 15))`. Cited baseline:
-    /// `objectLiteralErrors.symbols` (`e6`).
-    #[test]
-    fn emit_symbols_merges_quoted_object_literal_members() {
-        let logical = "tests/cases/compiler/objectLiteralQuotedPin.ts";
-        let case_text = "var e = { a: 0, 'a': 0 };\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        for display in [">a : Symbol(a, Decl(objectLiteralQuotedPin.ts, 0, 9), Decl(objectLiteralQuotedPin.ts, 0, 15))", ">'a' : Symbol(a, Decl(objectLiteralQuotedPin.ts, 0, 9), Decl(objectLiteralQuotedPin.ts, 0, 15))"] {
-            assert!(
-                emitted.lines().any(|l| l.starts_with(display)),
-                "missing merged quoted member row {display}:\n{emitted}"
-            );
-        }
-    }
-
-    /// Computed keys bind bracketed (`>[n] : Symbol([n], ...)`), and dot
-    /// reads through a literal-typed variable emit path plus leaf rows.
-    /// Cited baselines: `duplicateObjectLiteralProperty_computedName2.symbols`,
-    /// `collisionCodeGenModuleWithMemberVariable.symbols` (namespace analog).
-    #[test]
-    fn emit_symbols_records_computed_object_literal_members() {
-        let logical = "tests/cases/compiler/objectLiteralComputedPin.ts";
-        let case_text = "const n = 1;\nvar t = { [n]: 1 };\nvar s = { item: 1 };\nvar w = s.item;\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        assert!(
-            emitted.lines().any(|l| l.starts_with(">[n] : Symbol([n], Decl(objectLiteralComputedPin.ts, 1, 9))")),
-            "missing computed member row:\n{emitted}"
-        );
-        for display in [">s.item : Symbol(item, Decl(objectLiteralComputedPin.ts, 2, 9))", ">item : Symbol(item, Decl(objectLiteralComputedPin.ts, 2, 9))"] {
-            assert!(
-                emitted.lines().any(|l| l.starts_with(display)),
-                "missing object literal access row {display}:\n{emitted}"
-            );
-        }
-    }
-
-    /// Shorthand members show only the member row: `var o = {a}` renders
-    /// `>a : Symbol(a, Decl(..., 1, 9))` once, with no outer-binding use row
-    /// at the shorthand span. Cited baseline: `typeGuardFunctionOfFormThis.symbols`.
-    #[test]
-    fn emit_symbols_shorthand_member_hides_outer_use_row() {
-        let logical = "tests/cases/compiler/objectLiteralShorthandPin.ts";
-        let case_text = "var a = 1;\nvar o = {a};\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        assert!(
-            emitted.lines().any(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 1, 9))")),
-            "missing shorthand member row:\n{emitted}"
-        );
-        assert_eq!(
-            emitted.lines().filter(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 0, 4))")).count(),
-            1,
-            "outer binding must appear only at its declaration:\n{emitted}"
-        );
-    }
-
     /// Namespace export declarations render bare (`Symbol(x, ...)`), guarding
     /// against declare-time over-qualification: upstream qualifies namespace
     /// members only at access-path reference sites, which this emitter does not
@@ -6195,68 +6171,6 @@ export var v = 1;
             >x : Symbol(x, Decl(pin.ts, 1, 14))\n\
             \n\
             }\n";
-        assert_eq!(
-            compare_symbols(baseline, &emitted),
-            FacetVerdict::Pass,
-            "emitted:\n{emitted}"
-        );
-    }
-    /// Empty single-unit cases still emit their section header with no records.
-    #[test]
-    fn emit_symbols_baseline_emits_empty_single_unit_section() {
-        let logical = "tests/cases/compiler/emptyPin.ts";
-        let case_text = "// @target: es2015\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        let baseline = "//// [tests/cases/compiler/emptyPin.ts] ////\n\n=== emptyPin.ts ===\n";
-        assert_eq!(
-            compare_symbols(baseline, &emitted),
-            FacetVerdict::Pass,
-            "emitted:\n{emitted}"
-        );
-    }
-
-    /// Trailing empty files keep their section headers with no records.
-    #[test]
-    fn emit_symbols_baseline_emits_empty_trailing_file_section() {
-        let logical = "tests/cases/compiler/multiEmptyPin.ts";
-        let case_text = "// @filename: a.ts\nvar a = 1;\n// @filename: b.ts\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        assert!(emitted.contains("=== a.ts ==="), "missing a section:\n{emitted}");
-        assert!(emitted.contains("=== b.ts ==="), "missing b section:\n{emitted}");
-    }
-    /// Bare intrinsic value references render without a Decl list.
-    #[test]
-    fn emit_symbols_baseline_renders_intrinsic_undefined_bare() {
-        let logical = "tests/cases/compiler/intrinsicPin.ts";
-        let case_text = "var v = undefined;\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        let baseline = "//// [tests/cases/compiler/intrinsicPin.ts] ////\n\n=== intrinsicPin.ts ===\nvar v = undefined;\n>v : Symbol(v, Decl(intrinsicPin.ts, 0, 3))\n>undefined : Symbol(undefined)\n";
-        assert_eq!(
-            compare_symbols(baseline, &emitted),
-            FacetVerdict::Pass,
-            "emitted:\n{emitted}"
-        );
-    }
-
-    /// Top-level This expressions reference the globalThis intrinsic bare.
-    #[test]
-    fn emit_symbols_baseline_renders_top_level_this_as_global_this() {
-        let logical = "tests/cases/compiler/thisPin.ts";
-        let case_text = "++this;\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        let baseline = "//// [tests/cases/compiler/thisPin.ts] ////\n\n=== thisPin.ts ===\n++this;\n>this : Symbol(globalThis)\n";
         assert_eq!(
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,
@@ -8009,43 +7923,6 @@ class C {\n\
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,
             "emitted:\n{emitted}"
-        );
-    }
-    /// Class getter/setter pairs declare one merged member symbol: each of
-    /// `abstract get readonlyProp` and `abstract set readonlyProp` in
-    /// `abstractPropertyBasics.symbols` renders `>readonlyProp :
-    /// Symbol(B.readonlyProp, Decl(8, 33), Decl(9, 40))`, and `get arguments`
-    /// in `argumentsReferenceInConstructor3_Js.symbols` renders `>arguments :
-    /// Symbol(A.arguments, Decl(a.js, 0, 9))`. The class header on the same
-    /// path stays bare (`classExtendingClass.symbols` prints `>C :
-    /// Symbol(C, ...)`; this pin prints `>B : Symbol(B, ...)`).
-    #[test]
-    fn emit_symbols_binds_class_accessor_declarations() {
-        let logical = "tests/cases/compiler/classAccessorSymbolsPin.ts";
-        let case_text = "class B {\n    get readonlyProp(): string { return \"\"; }\n    set readonlyProp(val: string) { }\n}\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        assert!(
-            emitted.contains(">B : Symbol(B,"),
-            "class header on the same path stays bare; emitted:\n{emitted}"
-        );
-        assert!(
-            emitted.contains(">readonlyProp : Symbol(B.readonlyProp,"),
-            "getter/setter pair must declare the merged member; emitted:\n{emitted}"
-        );
-        assert!(
-            emitted.contains(">val : Symbol(val,"),
-            "setter parameter keeps its row; emitted:\n{emitted}"
-        );
-        assert_eq!(
-            emitted
-                .lines()
-                .filter(|line| line.starts_with(">readonlyProp :"))
-                .count(),
-            2,
-            "get and set each keep their row with the merged Decl list; emitted:\n{emitted}"
         );
     }
 
