@@ -9,6 +9,8 @@
 //! `lib` / `target` scoping.
 
 use crate::emitter::ScriptTarget;
+use std::sync::Arc;
+
 
 /// A category of TypeScript lib files that is relevant for global scoping.
 ///
@@ -563,6 +565,45 @@ pub fn global_lib_decl_file(name: &str) -> Option<&'static str> {
         Lib::Dom => Some("lib.dom.d.ts"),
         _ => None,
     }
+}
+
+const GLOBAL_LIB_DECL_FILES: &[(&str, &[(&str, Option<Lib>)])] = &[
+    ("Array", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    ("DataView", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    ("Date", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.scripthost.d.ts", Some(Lib::Scripthost)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    ("Math", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    ("Set", &[("lib.es2015.collection.d.ts", None), ("lib.es2015.collection.d.ts", None), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)), ("lib.es2025.collection.d.ts", Some(Lib::Es2025Iterator))]),
+    ("String", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    ("Symbol", &[("lib.es5.d.ts", None), ("lib.es2015.symbol.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    ("Uint8Array", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+];
+
+#[must_use]
+pub fn lib_decl_files_for_global(
+    name: &str,
+    target: Option<&str>,
+    libs: &[Arc<str>],
+) -> Vec<&'static str> {
+    let parsed = target
+        .and_then(crate::emitter::parse_target)
+        .unwrap_or_default();
+    let set = if libs.is_empty() {
+        LibSet::default_for_target(parsed)
+    } else {
+        LibSet::from_lib_names(libs)
+    };
+    let Some(files) = GLOBAL_LIB_DECL_FILES
+        .iter()
+        .find(|entry| entry.0 == name)
+        .map(|entry| entry.1)
+    else {
+        return global_lib_decl_file(name).map(|file| vec![file]).unwrap_or_default();
+    };
+    files
+        .iter()
+        .filter(|(_, gate)| gate.map_or(true, |lib| set.contains(lib)))
+        .map(|(file, _)| *file)
+        .collect()
 }
 
 const COMMONJS_WRAPPER_VALUES: &[&str] =

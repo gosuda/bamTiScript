@@ -22,7 +22,7 @@ use std::{
 
 use bamts_compiler::checker::{
     DeclarationOccurrence, ScopeKind, SemanticModel, SymbolId, SymbolKind, Type, TypeId,
-    global_lib_decl_file, render_type,
+    lib_decl_files_for_global, render_type,
 };
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
@@ -3541,6 +3541,8 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     for anchors in declaration_anchors.values_mut() {
         anchors.sort();
     }
+    let target = case.options().target();
+    let libs = case.options().lib();
     for (unit, output) in units {
         let section = unit_basename(&unit.virtual_path);
         emit_unit_symbols(
@@ -3549,6 +3551,8 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
             &unit.display_name,
             &section,
             &declaration_anchors,
+            target,
+            libs,
             &mut out,
         );
     }
@@ -3577,6 +3581,8 @@ fn emit_unit_symbols(
     heading: &str,
     section: &str,
     declaration_anchors: &HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>>,
+    target: Option<&str>,
+    libs: &[Arc<str>],
     out: &mut String,
 ) {
     let source = source_file.source_text();
@@ -3608,8 +3614,14 @@ fn emit_unit_symbols(
             if name == "undefined" || name == "globalThis" {
                 return Some(format!("Symbol({name})"));
             }
-            if let Some(file) = global_lib_decl_file(&name) {
-                return Some(format!("Symbol({name}, Decl({file}, --, --))"));
+            let files = lib_decl_files_for_global(&name, target, libs);
+            if !files.is_empty() {
+                let declarations = files
+                    .iter()
+                    .map(|file| format!("Decl({file}, --, --)"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Some(format!("Symbol({name}, {declarations})"));
             }
         }
         let anchors = if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
@@ -6514,6 +6526,48 @@ export var v = 1;
         let case = compile_case(&units, &entry).expect("case compiles");
         let emitted = emit_symbols_baseline(&case, logical);
         let baseline = "//// [tests/cases/compiler/domGlobalPin.ts] ////\n\n=== domGlobalPin.ts ===\nvar w = window;\n>w : Symbol(w, Decl(domGlobalPin.ts, 0, 3))\n>window : Symbol(window, Decl(lib.dom.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Merged lib globals render one Decl per declaring lib file in file order.
+    #[test]
+    fn emit_symbols_baseline_renders_merged_date_with_lib_decl_list() {
+        let logical = "tests/cases/compiler/datePin.ts";
+        let case_text = "var d = new Date();\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/datePin.ts] ////\n\n=== datePin.ts ===\nvar d = new Date();\n>d : Symbol(d, Decl(datePin.ts, 0, 3))\n>Date : Symbol(Date, Decl(lib.es5.d.ts, --, --), Decl(lib.es5.d.ts, --, --), Decl(lib.es5.d.ts, --, --), Decl(lib.scripthost.d.ts, --, --), Decl(lib.es2015.symbol.wellknown.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Merged Array globals render es5, core, iterable, and wellknown Decl rows.
+    #[test]
+    fn emit_symbols_baseline_renders_merged_array_with_lib_decl_list() {
+        let logical = "tests/cases/compiler/arrayPin.ts";
+        let case_text = "var a = Array(1, 2, 3);\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/arrayPin.ts] ////\n\n=== arrayPin.ts ===\nvar a = Array(1, 2, 3);\n>a : Symbol(a, Decl(arrayPin.ts, 0, 3))\n>Array : Symbol(Array, Decl(lib.es5.d.ts, --, --), Decl(lib.es5.d.ts, --, --), Decl(lib.es2015.core.d.ts, --, --), Decl(lib.es2015.iterable.d.ts, --, --), Decl(lib.es2015.symbol.wellknown.d.ts, --, --))\n";
         assert_eq!(
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,

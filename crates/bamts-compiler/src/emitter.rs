@@ -5503,6 +5503,7 @@ impl<'a> Emitter<'a> {
         self.emit_declare_prefix();
         let start = self.anchor.start();
         self.raw_decl_leading(variable_kind_str(declaration.kind), start);
+        self.raw(" ");
         for (index, declarator) in declaration.declarations.iter().enumerate() {
             if index > 0 {
                 self.raw(", ");
