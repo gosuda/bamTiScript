@@ -2546,19 +2546,48 @@ mod tests {
     ///
     /// On Linux the window resets the kernel high-water mark through
     /// `/proc/self/clear_refs`, which a sandbox may deny while leaving
-    /// `VmHWM` readable. The probe runs the real open-and-close path, so it
-    /// stays correct on hosts that sample instead of resetting.
+    /// `VmHWM` readable. The probe checks that capability directly by opening
+    /// the file for write, without running the production open-and-close path,
+    /// so a `PeakWindow::start` regression on a capable host flips the tests to
+    /// the measuring branch and fails instead of silently taking the
+    /// unavailable branch. Hosts that sample instead of resetting are assumed
+    /// capable.
     fn peak_window_available() -> bool {
-        match bamts_platform::PeakWindow::start() {
-            Ok(window) => window.finish().is_ok(),
-            Err(_) => false,
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/proc/self/clear_refs")
+                .is_ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
         }
     }
+
+    /// Tests that open a peak-memory window run one at a time: on Linux a
+    /// window resets a mark shared by the whole process, so overlapping windows
+    /// would lower each other's result.
+    static PEAK_WINDOW_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn the_peak_window_reports_a_touched_allocation() {
         const BYTES: usize = 64 * 1024 * 1024;
+        const BEFORE_BYTES: usize = 256 * 1024 * 1024;
+        let _serial = PEAK_WINDOW_TESTS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if peak_window_available() {
+            // Reset property: a large allocation made and dropped before the
+            // window opens must not raise the window's peak.
+            {
+                let block = vec![1_u8; BEFORE_BYTES];
+                assert_eq!(
+                    block.iter().filter(|byte| **byte == 1).count(),
+                    BEFORE_BYTES
+                );
+            }
             let (marker, peak) = measure_peak(|| {
                 let block = vec![1_u8; BYTES];
                 // Hold it long enough for the 1 ms macOS sampler to see it.
@@ -2569,9 +2598,14 @@ mod tests {
             .unwrap();
             assert_eq!(marker, "done");
             assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
+            assert!(
+                peak < BEFORE_BYTES as u64,
+                "peak {peak} still includes the allocation made before the window"
+            );
         } else {
             let error = measure_peak(|| Ok("done")).unwrap_err();
             assert_eq!(error.code, PerfErrorCode::HarnessError);
+            #[cfg(target_os = "linux")]
             assert!(
                 error.detail.contains("clear_refs"),
                 "the precondition names the missing capability: {error}"
@@ -2581,6 +2615,9 @@ mod tests {
 
     #[test]
     fn a_failed_measurement_returns_the_work_error() {
+        let _serial = PEAK_WINDOW_TESTS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if peak_window_available() {
             let error =
                 measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) })
@@ -2594,6 +2631,7 @@ mod tests {
             })
             .unwrap_err();
             assert_eq!(error.code, PerfErrorCode::HarnessError);
+            #[cfg(target_os = "linux")]
             assert!(
                 error.detail.contains("clear_refs"),
                 "the precondition names the missing capability: {error}"
