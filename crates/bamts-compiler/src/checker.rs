@@ -77,7 +77,8 @@ use crate::enum_plan::{self, EnumDeclarationBinding};
 use crate::lint::{LintProfile, LintTable};
 use crate::source::{ScriptKind, SourceId, TextRange, Utf16Pos};
 use crate::syntax::{
-    IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile, Statement, TokenKind,
+    ExternalModuleReference, IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile,
+    Statement, TokenKind,
 };
 use crate::warning::analyze_warnings;
 use intrinsic_environment::{GlobalEnvironment, LibSet};
@@ -1259,6 +1260,56 @@ fn resolve_export_for_type(
     }
 }
 
+/// Collects the value members of a module namespace for a namespace-style
+/// import (`import * as ns`, `import ns = require(...)`). Each member pairs
+/// its exported name with its source-table type; the binder translates them
+/// into the importing table and wraps them in a `typeof` constructor named
+/// after the alias. Unresolvable members are skipped.
+fn namespace_member_types(
+    target: SourceId,
+    files: &BTreeMap<SourceId, SemanticModel>,
+    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &ExportStars,
+) -> Vec<(EcmaString, TypeId)> {
+    let mut names: Vec<&EcmaString> = exports
+        .keys()
+        .filter(|(source, _)| *source == target)
+        .map(|(_, name)| name)
+        .collect();
+    names.sort_by(|left, right| left.to_utf8_lossy().cmp(&right.to_utf8_lossy()));
+    let mut members = Vec::with_capacity(names.len());
+    for name in names {
+        let mut visited = HashSet::new();
+        let resolution = resolve_export_candidates(
+            target,
+            name,
+            imports,
+            exports,
+            export_stars,
+            files,
+            &mut visited,
+        );
+
+        let Some(linked) = resolution.candidates.iter().find_map(|candidate| match candidate {
+            ExportCandidate::Value(linked) => Some(*linked),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(source_model) = files.get(&linked.source) else {
+            continue;
+        };
+        let value = source_model.value_side_type(linked.symbol);
+        if matches!(source_model.types().get(value), Type::Error) {
+            continue;
+        }
+        members.push((name.clone(), value));
+    }
+    members
+}
+
+
 /// Builds the [`ImportedSymbolType`] facts for one source file by translating
 /// each import binding into the structural type of its resolved source export.
 /// Named, default, and namespace imports all follow existing symbol identities;
@@ -1277,6 +1328,39 @@ fn collect_imported_types_for_source<'a>(
     };
     let mut imported_types = Vec::new();
     for statement in source.statements() {
+        if let Statement::ImportEquals(import) = statement.data() {
+            if import.is_type_only
+                || !matches!(&import.reference, ExternalModuleReference::Require(_))
+            {
+                continue;
+            }
+            let Some(symbol) = lookup_identifier(model, source, &import.local) else {
+                continue;
+            };
+            let Some(ImportTarget::Namespace { source: target_source }) =
+                imports.get(&(source_id, symbol))
+            else {
+                continue;
+            };
+            let target_source = *target_source;
+            let members =
+                namespace_member_types(target_source, files, imports, exports, export_stars);
+            if members.is_empty() {
+                continue;
+            }
+            let Some(target_model) = files.get(&target_source) else {
+                continue;
+            };
+            imported_types.push(ImportedSymbolType {
+                symbol,
+                source_model: target_model,
+                value_type_id: target_model.types().object(),
+                type_parameters: &[],
+                type_plane_id: None,
+                namespace_members: members,
+            });
+            continue;
+        }
         let Statement::Import(import) = statement.data() else {
             continue;
         };
@@ -1317,6 +1401,13 @@ fn collect_imported_types_for_source<'a>(
                     value_type_id: namespace_type,
                     type_parameters: &[],
                     type_plane_id: None,
+                    namespace_members: namespace_member_types(
+                        target_source,
+                        files,
+                        imports,
+                        exports,
+                        export_stars,
+                    ),
                 });
             }
             Some(ImportBinding::Named(specifiers)) => {
@@ -1403,6 +1494,7 @@ fn build_imported_symbol_type<'a>(
         value_type_id,
         type_parameters: source_model.generic_type_parameters(linked.symbol),
         type_plane_id,
+        namespace_members: Vec::new(),
     })
 }
 
@@ -2201,6 +2293,23 @@ fn collect_import_targets(
             continue;
         };
         for statement in source.statements() {
+            if let Statement::ImportEquals(import) = statement.data()
+                && let ExternalModuleReference::Require(_) = &import.reference
+            {
+                let Some(symbol) = lookup_identifier(model, source, &import.local) else {
+                    continue;
+                };
+                let Some(target_source) = edges.get(&(source_id, statement.id())).copied() else {
+                    continue;
+                };
+                targets.insert(
+                    (source_id, symbol),
+                    ImportTarget::Namespace {
+                        source: target_source,
+                    },
+                );
+                continue;
+            }
             let Statement::Import(import) = statement.data() else {
                 continue;
             };
