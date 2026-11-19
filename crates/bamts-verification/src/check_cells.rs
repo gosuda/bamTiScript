@@ -340,12 +340,15 @@ impl CheckedCase {
 
     /// `(unit, output)` pairs in upstream's output-section order: a post-order
     /// descent over imports and `/// <reference>` targets with the case's
-    /// roots visited last-to-first, so a referenced file never precedes the
-    /// file that names it and the earliest-listed member of a reference cycle
-    /// completes first. `ProgramFrontendOutput::modules()` is the same
-    /// descent run forward, so this replays it over the resolved graph with
-    /// the roots reversed. Only the JavaScript, declaration, and source-map
-    /// emitters read this order; every other facet keeps traversal order.
+    /// roots visited in case order, so a referenced file completes before the
+    /// file that names it and every output group follows source order when
+    /// nothing depends on anything else. A cycle member completes before the
+    /// file that reaches it, so the later-listed member of a cycle completes
+    /// first (`asyncFunctionsAcrossFiles.js` carries `//// [b.js]` before
+    /// `//// [a.js]` for an `a`/`b` import cycle; independent inputs keep
+    /// listing order as in `ambientDeclarationsPatterns_merging1.js`).
+    /// Only the JavaScript, declaration, and source-map emitters read this
+    /// order; every other facet keeps traversal order.
     pub fn reached_units_in_module_order(&self) -> Vec<(&CaseUnit, &FrontendOutput)> {
         // `ProgramFrontendOutput::modules()` parallels this order exactly, so the
         // rank computed over the resolved graph indexes the frontend products.
@@ -357,7 +360,7 @@ impl CheckedCase {
         let mut visited = vec![false; modules.len()];
         let mut stack = Vec::new();
         let mut descent = Vec::new();
-        for seed in self.units.iter().rev().filter_map(|(_, index)| *index) {
+        for seed in self.units.iter().filter_map(|(_, index)| *index) {
             if visited[seed] {
                 continue;
             }
@@ -8642,7 +8645,12 @@ let x = b1;
         );
     }
     #[test]
-    fn module_order_reference_cycle_keeps_earliest_listed_unit_first() {
+    fn module_order_reference_cycle_completes_dependency_first() {
+        // A `/// <reference>` cycle lowers to the same graph shape as an
+        // import cycle, so it follows the same authority rule: the member
+        // reached through the edge completes first. The authority import
+        // cycle `asyncFunctionsAcrossFiles.ts` (`a` imports `b`, `b` imports
+        // `a`) carries `//// [b.js]` before `//// [a.js]`.
         let logical = "tests/cases/compiler/referenceCycleOrderPin.ts";
         let case_text = "\
 // @filename: file0.ts
@@ -8661,10 +8669,17 @@ var y = 2;";
             .into_iter()
             .map(|(unit, _)| unit_basename(&unit.virtual_path))
             .collect();
-        assert_eq!(order, vec!["file0.ts".to_owned(), "file1.ts".to_owned()]);
+        assert_eq!(order, vec!["file1.ts".to_owned(), "file0.ts".to_owned()]);
     }
     #[test]
-    fn module_order_shared_reference_target_completes_last() {
+    fn module_order_shared_reference_target_completes_first() {
+        // Post-order descent from the first root reaches `file3` through
+        // `file1`, then `file2` through `file3`, so the shared target's
+        // other dependent completes before the hub and the entry root
+        // completes last. The authority hub
+        // `caseInsensitiveFileSystemWithCapsImportTypeDeclarations.js`
+        // shows the same rule (`types` shared by `type-a` and `type-b`
+        // completes before both, `index` completes last).
         let logical = "tests/cases/compiler/referenceHubOrderPin.ts";
         let case_text = "\
 // @filename: file1.ts
@@ -8691,8 +8706,8 @@ var c = 3;";
             order,
             vec![
                 "file2.ts".to_owned(),
-                "file1.ts".to_owned(),
-                "file3.ts".to_owned()
+                "file3.ts".to_owned(),
+                "file1.ts".to_owned()
             ]
         );
     }
