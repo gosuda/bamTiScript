@@ -11,7 +11,7 @@ use std::{
 use bamts_verification::{
     ErrorCode, Gate, GateReport, Result, VerificationError,
     authority::verify_authority,
-    catalog::{extract_catalog_cells, regenerate_manifest, write_catalog_json},
+    catalog::regenerate_manifest,
     completion::{
         CompletionReport, CompletionScope, RegenerateMode, RegenerateOutcome,
         regenerate_completion_program, verify_completion,
@@ -20,7 +20,7 @@ use bamts_verification::{
     evidence::{ExecutionBinding, PublishMode},
     formal_bridge::{
         LaneStatus, audit_formal_artifacts, qualify_replay_canary, ready_lane_records,
-        regenerate_canonical_fixture, run_replay_canary_child,
+        run_replay_canary_child,
     },
     formal_gates::audit_formal_gates,
     ledger::verify_ledger_g0,
@@ -51,9 +51,6 @@ enum Command {
     AuthorityVerify {
         release: String,
     },
-    CatalogExtract {
-        catalog: String,
-    },
     CatalogRegenerate {
         release: String,
         check: bool,
@@ -72,7 +69,6 @@ enum Command {
         check: bool,
     },
     FormalAudit(Vec<Gate>),
-    RegenerateFixtures,
     SourceFetch {
         name: String,
         destination: PathBuf,
@@ -119,7 +115,6 @@ fn run() -> Result<()> {
 fn dispatch(root: &Path, command: Command) -> Result<()> {
     match command {
         Command::AuthorityVerify { release } => verify_authority_command(root, &release),
-        Command::CatalogExtract { catalog } => extract_catalog(root, &catalog),
         Command::CatalogRegenerate { release, check } => regenerate_catalog(root, &release, check),
         Command::LedgerVerify => verify_g0(root),
         Command::LedgerRebuild { check } => rebuild_ledger_command(root, check),
@@ -127,7 +122,6 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
         Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
         Command::FormalAudit(gates) => audit_formal(root, &gates),
-        Command::RegenerateFixtures => regenerate_fixtures(root),
         Command::SourceFetch { name, destination } => fetch_source(root, &name, &destination),
         Command::UnicodeFetch => fetch_unicode(root),
         Command::UnicodeEmit { destination } => emit_unicode(root, destination.as_deref()),
@@ -434,12 +428,6 @@ fn parse_authority_command(arguments: &mut impl Iterator<Item = OsString>) -> Re
 fn parse_catalog_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
     let subcommand = required_argument(arguments, "catalog subcommand")?;
     match subcommand.as_str() {
-        "extract" => {
-            expect_flag(arguments, "--catalog")?;
-            let catalog = flag_value(arguments, "--catalog")?;
-            reject_extra_arguments(arguments, &["--catalog"])?;
-            Ok(Command::CatalogExtract { catalog })
-        }
         "regenerate" => {
             expect_flag(arguments, "--release")?;
             let release = flag_value(arguments, "--release")?;
@@ -652,10 +640,6 @@ fn parse_formal_command(arguments: &mut impl Iterator<Item = OsString>) -> Resul
             reject_extra_arguments(arguments, &["--gates"])?;
             Ok(Command::FormalAudit(gates))
         }
-        "regenerate-fixtures" => {
-            reject_extra_arguments(arguments, &[])?;
-            Ok(Command::RegenerateFixtures)
-        }
         _ if subcommand.starts_with("--") => Err(usage(format!("unknown flag `{subcommand}`"))),
         _ => Err(usage(format!("unknown formal subcommand `{subcommand}`"))),
     }
@@ -773,11 +757,6 @@ fn verify_authority_command(root: &Path, release: &str) -> Result<()> {
     ))
 }
 
-fn extract_catalog(root: &Path, catalog: &str) -> Result<()> {
-    let cells = extract_catalog_cells(root, catalog)?;
-    write_catalog_json(io::stdout().lock(), catalog, &cells)
-}
-
 fn regenerate_catalog(root: &Path, release: &str, check: bool) -> Result<()> {
     if release != "typescript-7.0.2" {
         return Err(usage(format!(
@@ -871,11 +850,6 @@ fn audit_formal(root: &Path, gates: &[Gate]) -> Result<()> {
     }
 
     emit(&output)
-}
-
-fn regenerate_fixtures(root: &Path) -> Result<()> {
-    let transitions = regenerate_canonical_fixture(root)?;
-    emit(&format!("G6 FIXTURES transitions={transitions}\n"))
 }
 fn verify_completion_command(root: &Path, scope: &CompletionScope) -> Result<()> {
     let report = verified_completion_report(root, scope)?;
@@ -1248,6 +1222,34 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "bamts-verification: E_USAGE: unknown command `toolchain`"
+        );
+    }
+
+    #[test]
+    fn rejects_catalog_extract_subcommand() {
+        let error = parse(&[
+            "bamts-verification",
+            "catalog",
+            "extract",
+            "--catalog",
+            "typescript-7.0.2",
+        ])
+        .expect_err("catalog extract subcommand is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown catalog subcommand `extract`"
+        );
+    }
+
+    #[test]
+    fn rejects_formal_regenerate_fixtures_subcommand() {
+        let error = parse(&["bamts-verification", "formal", "regenerate-fixtures"])
+            .expect_err("formal regenerate-fixtures subcommand is rejected");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert_eq!(
+            error.to_string(),
+            "bamts-verification: E_USAGE: unknown formal subcommand `regenerate-fixtures`"
         );
     }
 
