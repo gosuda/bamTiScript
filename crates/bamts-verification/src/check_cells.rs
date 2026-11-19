@@ -1085,9 +1085,21 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
                     .collect();
                 format!("[{}]", items.join(", "))
             }
+            "typeroots" => {
+                let items: Vec<String> = values
+                    .iter()
+                    .flat_map(|v| v.split(','))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.strip_prefix('/').unwrap_or(s))
+                    .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
             _ => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
         };
         let key = match name.as_str() {
+            "typeroots" => "typeRoots",
             "strictnullchecks" => "strictNullChecks",
             "noimplicitany" => "noImplicitAny",
             "allowjs" => "allowJs",
@@ -6703,6 +6715,21 @@ export var v = 1;
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,
             "emitted:\n{emitted}"
+        );
+    }
+
+    /// `@typeRoots` maps to a camelCase `typeRoots` string array and
+    /// virtual-absolute roots become root-relative paths.
+    #[test]
+    fn build_tsconfig_maps_type_roots_to_camel_case_array() {
+        let pragmas = parse_case_pragmas("// @typeRoots: /types\nvar x = 1;\n");
+        let tsconfig = build_tsconfig(&pragmas);
+        assert!(tsconfig.contains("\"typeRoots\": [\"types\"]"), "{tsconfig}");
+        let pragmas = parse_case_pragmas("// @typeRoots: /a/types, /a/node_modules\nvar x = 1;\n");
+        let tsconfig = build_tsconfig(&pragmas);
+        assert!(
+            tsconfig.contains("\"typeRoots\": [\"a/types\", \"a/node_modules\"]"),
+            "{tsconfig}"
         );
     }
 
