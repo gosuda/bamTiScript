@@ -589,7 +589,9 @@ pub fn global_lib_decl_file(name: &str) -> Option<&'static str> {
     }
 }
 
-const GLOBAL_LIB_DECL_FILES: &[(&str, &[(&str, Option<Lib>)])] = &[
+type GatedDeclFile = (&'static str, Option<Lib>);
+type GlobalLibDecl = (&'static str, &'static [GatedDeclFile]);
+const GLOBAL_LIB_DECL_FILES: &[GlobalLibDecl] = &[
     (
         "Array",
         &[
@@ -671,7 +673,8 @@ const GLOBAL_LIB_DECL_FILES: &[(&str, &[(&str, Option<Lib>)])] = &[
 /// the lib Decl files upstream lists in baseline order. The es2017.date.d.ts
 /// refinement has no dedicated Lib category, so it is gated on
 /// Es2017SharedMemory, which every es2017-or-later set includes.
-const INTRINSIC_STATIC_MEMBERS: &[(&str, &str, &str, &[(&str, Option<Lib>)])] = &[
+type IntrinsicStaticMember = (&'static str, &'static str, &'static str, &'static [GatedDeclFile]);
+const INTRINSIC_STATIC_MEMBERS: &[IntrinsicStaticMember] = &[
     ("Math", "PI", "Math.PI", &[("lib.es5.d.ts", None)]),
     (
         "Date",
@@ -723,7 +726,7 @@ pub fn lib_decl_files_for_global(
     };
     files
         .iter()
-        .filter(|(_, gate)| gate.map_or(true, |lib| set.contains(lib)))
+        .filter(|(_, gate)| gate.is_none_or(|lib| set.contains(lib)))
         .map(|(file, _)| *file)
         .collect()
 }

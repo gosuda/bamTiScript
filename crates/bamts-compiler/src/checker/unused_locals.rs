@@ -204,11 +204,11 @@ impl Walker<'_> {
         let Some(body) = function.body.as_ref() else {
             return;
         };
-        if let Some(name) = function.name.as_ref() {
-            if let Some((span, text)) = self.unused_binding(name, home) {
-                self.locals
-                    .push(unused_diagnostic(self.source, span, &text));
-            }
+        if let Some(name) = function.name.as_ref()
+            && let Some((span, text)) = self.unused_binding(name, home)
+        {
+            self.locals
+                .push(unused_diagnostic(self.source, span, &text));
         }
         self.walk_params(&function.parameters);
         self.walk_function_body(body);
@@ -253,11 +253,11 @@ impl Walker<'_> {
     }
 
     fn walk_namespace(&mut self, namespace: &crate::syntax::NamespaceDeclaration, home: TextRange) {
-        if let NamespaceName::Identifier { name, .. } = &namespace.name {
-            if let Some((span, text)) = self.unused_binding(name, home) {
-                self.locals
-                    .push(unused_diagnostic(self.source, span, &text));
-            }
+        if let NamespaceName::Identifier { name, .. } = &namespace.name
+            && let Some((span, text)) = self.unused_binding(name, home)
+        {
+            self.locals
+                .push(unused_diagnostic(self.source, span, &text));
         }
         self.walk_stmts(&namespace.body.data().statements);
     }
@@ -374,12 +374,11 @@ impl Walker<'_> {
     ) {
         match name {
             PropertyName::Identifier(identifier) => {
-                if matches!(modifier, PropertyModifier::Set) {
-                    if let Some(text) = self.ident_text(identifier) {
-                        if getters.contains(&text) {
-                            return;
-                        }
-                    }
+                if matches!(modifier, PropertyModifier::Set)
+                    && let Some(text) = self.ident_text(identifier)
+                    && getters.contains(&text)
+                {
+                    return;
                 }
                 if let Some((span, text)) = self.unused_binding(identifier, home) {
                     self.locals
@@ -387,12 +386,11 @@ impl Walker<'_> {
                 }
             }
             PropertyName::Private(private) => {
-                if matches!(modifier, PropertyModifier::Set) {
-                    if let Some(text) = self.private_ident_text(private) {
-                        if getters.contains(&text) {
-                            return;
-                        }
-                    }
+                if matches!(modifier, PropertyModifier::Set)
+                    && let Some(text) = self.private_ident_text(private)
+                    && getters.contains(&text)
+                {
+                    return;
                 }
                 if let Some((span, text)) = self.unused_private_binding(private, home) {
                     self.locals
@@ -549,14 +547,13 @@ impl Walker<'_> {
                 rest_present = true;
             }
         }
-        if let [property] = object.properties.as_slice() {
-            if !rest_present {
-                if let BindingPattern::Identifier(identifier) = property.binding.data() {
-                    self.walk_computed_name(&property.name);
-                    self.walk_initializer(property.initializer.as_deref());
-                    return self.check_single_identifier(identifier, pattern.range(), home);
-                }
-            }
+        if let [property] = object.properties.as_slice()
+            && !rest_present
+            && let BindingPattern::Identifier(identifier) = property.binding.data()
+        {
+            self.walk_computed_name(&property.name);
+            self.walk_initializer(property.initializer.as_deref());
+            return self.check_single_identifier(identifier, pattern.range(), home);
         }
         let mut reports = Vec::new();
         let mut all_dead = !object.properties.is_empty();
@@ -605,10 +602,10 @@ impl Walker<'_> {
                 bindings.push(inner);
             }
         }
-        if let [single] = bindings.as_slice() {
-            if let BindingPattern::Identifier(identifier) = single.data() {
-                return self.check_single_identifier(identifier, pattern.range(), home);
-            }
+        if let [single] = bindings.as_slice()
+            && let BindingPattern::Identifier(identifier) = single.data()
+        {
+            return self.check_single_identifier(identifier, pattern.range(), home);
         }
         let mut reports = Vec::new();
         let mut total = 0;
@@ -935,10 +932,9 @@ impl Walker<'_> {
             crate::syntax::JsxAttributeItem::Attribute(inner) => {
                 if let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
                     inner.data().initializer.as_ref()
+                    && let Some(expression) = container.data().expression.as_deref()
                 {
-                    if let Some(expression) = container.data().expression.as_deref() {
-                        self.walk_expr(expression);
-                    }
+                    self.walk_expr(expression);
                 }
             }
             crate::syntax::JsxAttributeItem::Spread(spread) => {

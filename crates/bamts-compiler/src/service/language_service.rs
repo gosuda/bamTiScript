@@ -342,12 +342,11 @@ fn member_access_dot(document: &DocumentSnapshot, position: Utf16Pos) -> Option<
     let (index, dot) = tokens
         .iter()
         .enumerate()
-        .filter(|(_, token)| {
+        .rfind(|(_, token)| {
             !token.is_missing()
                 && matches!(token.kind(), TokenKind::Dot | TokenKind::QuestionDot)
                 && token.range().end() <= position
-        })
-        .last()?;
+        })?;
     let blocked = tokens[index + 1..]
         .iter()
         .any(|token| !token.is_missing() && token.range().start() < position);
