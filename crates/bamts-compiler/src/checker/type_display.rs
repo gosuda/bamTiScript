@@ -181,7 +181,24 @@ fn render_annotated_into(
                 out.push(model.symbol(*symbol).name());
                 return;
             }
-            if !visiting_aliases.contains(symbol)
+            // A reference whose target mentions its type parameters keeps its
+            // written `Name<args>` form (tsc prints `Pair<string>`, never
+            // `[string, string]`); a reference whose target ignores them
+            // (e.g. `type Strange<T> = string`) renders as its view, which
+            // tsc prints as `string`. Baseline proof:
+            // `genericTypeAliases.types` rows `>tree : Tree<number>`,
+            // `>ls : Lazy<string>`, `>x : Foo<string>` against `>s : string`.
+            let aligned = !arguments.is_empty()
+                && arguments.len() == model.types().alias_type_parameters(*symbol).len();
+            if aligned
+                && !visiting_aliases.contains(symbol)
+                && model.types().alias_target_uses_parameters(*symbol)
+            {
+                out.push(model.symbol(*symbol).name());
+                out.push("<");
+                join_annotated(out, model, arguments, false, ", ", visiting_aliases);
+                out.push(">");
+            } else if !visiting_aliases.contains(symbol)
                 && let Some(view) = model.types().applied_alias_view(type_id)
             {
                 visiting_aliases.push(*symbol);
@@ -1192,11 +1209,12 @@ mod tests {
         assert_eq!(render_type(model, v_id), "R");
     }
 
-    /// Parameterized aliases keep their existing expansion: a bare reference
-    /// to a generic alias still renders the substituted structure, so the
-    /// zero-parameter name policy did not widen into generic aliases.
+    /// A parameterized alias whose target mentions its type parameters keeps
+    /// its written `Name<args>` form. Upstream baseline:
+    /// `genericTypeAliases.types` rows `>tree : Tree<number>`,
+    /// `>ls : Lazy<string>`, `>x : Foo<string>`, `>zz : Box<WinCondition>`.
     #[test]
-    fn parameterized_alias_reference_still_expands() {
+    fn parameterized_alias_reference_keeps_written_name() {
         let text = "type Pair<T> = [T, T];\n\
                     declare var p: Pair<string>;\n\
                     let z = p;\n";
@@ -1204,6 +1222,94 @@ mod tests {
         let model = checked.product();
 
         let p_id = typed_expression_of(model, &source, "p", text.find("let z").unwrap());
-        assert_eq!(render_type(model, p_id), "[string, string]");
+        assert_eq!(render_type(model, p_id), "Pair<string>");
+        assert_eq!(render_type_declaration(model, p_id, 0), "Pair<string>");
+    }
+
+    /// A parameterized alias whose target ignores its type parameters renders
+    /// as its view. Upstream baseline: `genericTypeAliases.types` row
+    /// `>s : string` for `var s: Strange<number>` with
+    /// `type Strange<T> = string`.
+    #[test]
+    fn alias_ignoring_its_parameters_renders_its_view() {
+        let text = "type Strange<T> = string;\n\
+                    declare var s: Strange<number>;\n\
+                    let z = s;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let s_id = typed_expression_of(model, &source, "s", text.find("let z").unwrap());
+        assert_eq!(render_type(model, s_id), "string");
+    }
+
+    /// A `typeof` query renders its written spelling for nominal operands and
+    /// resolves plain variables to their target. Upstream baselines:
+    /// `castTest.types` row `>Point : typeof Point`,
+    /// `FunctionAndModuleWithSameNameAndCommonRoot.types` rows
+    /// `>A.Point : typeof A.Point` and `>A : typeof A`.
+    #[test]
+    fn typeof_query_renders_written_name() {
+        let text = "class Point { x: number }\n\
+                    declare var p: typeof Point;\n\
+                    let z = p;\n\
+                    namespace A { export class Q { x: number } }\n\
+                    declare var q: typeof A.Q;\n\
+                    let w = q;\n\
+                    declare var foo: { a: number };\n\
+                    declare var v: typeof foo;\n\
+                    let u = v;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let p_id = typed_expression_of(model, &source, "p", text.find("let z").unwrap());
+        assert_eq!(render_type(model, p_id), "typeof Point");
+        let q_id = typed_expression_of(model, &source, "q", text.find("let w").unwrap());
+        assert_eq!(render_type(model, q_id), "typeof A.Q");
+        let v_id = typed_expression_of(model, &source, "v", text.find("let u").unwrap());
+        assert_eq!(render_type(model, v_id), "{ a: number; }");
+    }
+
+    /// `render_type_annotated` blanks the spans that reproduce written
+    /// annotations: parameter names always, declared parameter and return
+    /// types only when written. `function f(a: string): void` renders
+    /// `(a: string) => void` with blanks over `a`, `string`, and `void`.
+    #[test]
+    fn annotated_signature_blanks_names_and_written_spans() {
+        let text = "function f(a: string): void {}\nlet g = f;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let f_id = typed_expression_of(model, &source, "f", text.find("let g").unwrap());
+        let (rendered, blanks) = render_type_annotated(model, f_id);
+        assert_eq!(rendered, "(a: string) => void");
+        assert_eq!(blanks, vec![(1, 2), (4, 10), (15, 19)]);
+    }
+
+    /// Inferred spans take carets: only the parameter name is blank in
+    /// `(a: any) => void` for `function g(a) {}`.
+    #[test]
+    fn inferred_signature_blanks_only_parameter_name() {
+        let text = "function g(a) {}\nlet h = g;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let g_id = typed_expression_of(model, &source, "g", text.find("let h").unwrap());
+        let (rendered, blanks) = render_type_annotated(model, g_id);
+        assert_eq!(rendered, "(a: any) => void");
+        assert_eq!(blanks, vec![(1, 2)]);
+    }
+
+    /// A declared object member type is blank while its surroundings take
+    /// carets: `{ foo: string; }` blanks only `string`.
+    #[test]
+    fn annotated_object_member_blanks_only_member_type() {
+        let text = "var n: { foo: string } = { foo: \"x\" };\nlet m = n;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+
+        let n_id = typed_expression_of(model, &source, "n", text.find("let m").unwrap());
+        let (rendered, blanks) = render_type_annotated(model, n_id);
+        assert_eq!(rendered, "{ foo: string; }");
+        assert_eq!(blanks, vec![(7, 13)]);
     }
 }
