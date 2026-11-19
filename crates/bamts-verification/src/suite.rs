@@ -1189,7 +1189,6 @@ mod tests {
 === scalarPin.ts ===\n\
 var x: any;\n\
 >x : any\n\
->  : ^^^\n\
 \n\
 var s: string = \"hi\";\n\
 >s : string\n\
