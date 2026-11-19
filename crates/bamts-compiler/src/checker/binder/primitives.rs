@@ -89,8 +89,7 @@ impl Binder<'_> {
     }
 
     fn method_type(&mut self, params: Vec<FunctionParameter>, ret: TypeId) -> TypeId {
-        self.types
-            .function_with_parameters(Vec::new(), params, ret)
+        self.types.function_with_parameters(Vec::new(), params, ret)
     }
 
     fn overloaded(&mut self, signatures: Vec<TypeId>) -> TypeId {
@@ -170,10 +169,9 @@ impl Binder<'_> {
                 let regexp = self.types.union(&[string, regexp_like]);
                 Some(self.method_type(vec![req("regexp", regexp)], number))
             }
-            "slice" => Some(self.method_type(
-                vec![opt("start", number), opt("end", number)],
-                string,
-            )),
+            "slice" => {
+                Some(self.method_type(vec![opt("start", number), opt("end", number)], string))
+            }
             "split" => {
                 let regexp_like = self.regexp_like();
                 let separator = self.types.union(&[string, regexp_like]);
@@ -182,16 +180,14 @@ impl Binder<'_> {
                     strings,
                 ))
             }
-            "substring" => Some(self.method_type(
-                vec![req("start", number), opt("end", number)],
-                string,
-            )),
-            "substr" => Some(self.method_type(
-                vec![req("from", number), opt("length", number)],
-                string,
-            )),
-            "toLowerCase" | "toLocaleLowerCase" | "toUpperCase" | "toLocaleUpperCase"
-            | "trim" | "toString" => Some(self.nullary(string)),
+            "substring" => {
+                Some(self.method_type(vec![req("start", number), opt("end", number)], string))
+            }
+            "substr" => {
+                Some(self.method_type(vec![req("from", number), opt("length", number)], string))
+            }
+            "toLowerCase" | "toLocaleLowerCase" | "toUpperCase" | "toLocaleUpperCase" | "trim"
+            | "toString" => Some(self.nullary(string)),
             "valueOf" => Some(self.nullary(string)),
             "normalize" => Some(self.method_type(vec![opt("form", string)], string)),
             "repeat" => Some(self.method_type(vec![req("count", number)], string)),
@@ -222,8 +218,9 @@ impl Binder<'_> {
                 Some(self.method_type(vec![req("index", number)], found))
             }
             "anchor" => Some(self.method_type(vec![req("name", string)], string)),
-            "big" | "blink" | "bold" | "fixed" | "italics" | "small" | "strike" | "sub"
-            | "sup" => Some(self.nullary(string)),
+            "big" | "blink" | "bold" | "fixed" | "italics" | "small" | "strike" | "sub" | "sup" => {
+                Some(self.nullary(string))
+            }
             "fontcolor" | "link" => {
                 let param = if name == "fontcolor" { "color" } else { "url" };
                 Some(self.method_type(vec![req(param, string)], string))
@@ -250,10 +247,7 @@ impl Binder<'_> {
         );
         let first = self.types.function_with_parameters(
             Vec::new(),
-            vec![
-                req("searchValue", search),
-                req("replaceValue", string),
-            ],
+            vec![req("searchValue", search), req("replaceValue", string)],
             string,
         );
         let second = self.types.function_with_parameters(
@@ -269,9 +263,7 @@ impl Binder<'_> {
         let number = self.types.number();
         match name {
             "toFixed" => Some(self.method_type(vec![opt("fractionDigits", number)], string)),
-            "toExponential" => {
-                Some(self.method_type(vec![opt("fractionDigits", number)], string))
-            }
+            "toExponential" => Some(self.method_type(vec![opt("fractionDigits", number)], string)),
             "toPrecision" => Some(self.method_type(vec![opt("precision", number)], string)),
             "toString" => Some(self.method_type(vec![opt("radix", number)], string)),
             "valueOf" => Some(self.nullary(number)),
@@ -414,14 +406,22 @@ impl Binder<'_> {
             "fill" => {
                 let receiver = self.types.array(element);
                 Some(self.method_type(
-                    vec![req("value", element), opt("start", number), opt("end", number)],
+                    vec![
+                        req("value", element),
+                        opt("start", number),
+                        opt("end", number),
+                    ],
                     receiver,
                 ))
             }
             "copyWithin" => {
                 let receiver = self.types.array(element);
                 Some(self.method_type(
-                    vec![req("target", number), req("start", number), opt("end", number)],
+                    vec![
+                        req("target", number),
+                        req("start", number),
+                        opt("end", number),
+                    ],
                     receiver,
                 ))
             }
@@ -490,10 +490,7 @@ impl Binder<'_> {
             }
             "with" if self.has_lib(Lib::Es2023Array) => {
                 let result = self.types.array(element);
-                Some(self.method_type(
-                    vec![req("index", number), req("value", element)],
-                    result,
-                ))
+                Some(self.method_type(vec![req("index", number), req("value", element)], result))
             }
             "toString" => Some(self.nullary(string)),
             "toLocaleString" => Some(self.nullary(string)),
