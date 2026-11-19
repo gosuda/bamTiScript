@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use crate::diagnostic::Diagnostic;
-use crate::source::{JsxEmit, ScriptKind, TextRange, Utf16Pos};
+use crate::source::{JsxEmit, ScriptKind, TextRange};
 use crate::syntax::{
     ExportDeclaration, ExportNamedDeclaration, IdentifierNode, ImportBinding, ImportDeclaration,
     ImportEqualsDeclaration, ImportSpecifierMode, ModuleExportName, SourceFile, Statement, Stmt,
@@ -193,36 +193,14 @@ fn collect_statements(
     declarations: &mut Vec<ImportDeclarationTargets>,
     exported: &mut HashSet<String>,
 ) {
-    let mut previous_end = None;
     for statement in statements {
-        let report_range = statement_report_range(statement, previous_end);
-        collect_statement(
-            source,
-            statement,
-            report_range,
-            scope,
-            model,
-            declarations,
-            exported,
-        );
-        previous_end = Some(statement.range().end());
+        collect_statement(source, statement, scope, model, declarations, exported);
     }
-}
-
-/// Whole-declaration reports cover the separator that ends the previous
-/// statement, so each unused import claim spans from the prior semicolon.
-fn statement_report_range(statement: &Stmt, previous_end: Option<Utf16Pos>) -> TextRange {
-    let range = statement.range();
-    let start = previous_end.map_or(range.start(), |end| {
-        Utf16Pos::new(end.get().saturating_sub(1))
-    });
-    TextRange::new(start, range.end()).unwrap_or(range)
 }
 
 fn collect_statement(
     source: &SourceFile,
     statement: &Stmt,
-    range: TextRange,
     scope: ScopeId,
     model: &SemanticModel,
     declarations: &mut Vec<ImportDeclarationTargets>,
@@ -230,12 +208,12 @@ fn collect_statement(
 ) {
     match statement.data() {
         Statement::Import(import) => {
-            if let Some(declaration) = collect_import(import, scope, range) {
+            if let Some(declaration) = collect_import(import, scope, statement.range()) {
                 declarations.push(declaration);
             }
         }
         Statement::ImportEquals(import) => {
-            declarations.push(collect_import_equals(import, scope, range))
+            declarations.push(collect_import_equals(import, scope, statement.range()))
         }
         Statement::Export(export) => collect_export_names(source, export, exported),
         Statement::Namespace(namespace) => {
@@ -503,7 +481,7 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.range().start().get())
             .collect();
-        assert_eq!(starts, [0, 23, 44], "{diagnostics:?}");
+        assert_eq!(starts, [0, 25, 46], "{diagnostics:?}");
         let messages: Vec<_> = diagnostics.iter().map(Diagnostic::message).collect();
         assert!(messages.contains(&"'a' is declared but its value is never read."));
         assert!(messages.contains(&"'d' is declared but its value is never read."));
