@@ -380,6 +380,7 @@ impl FrontendOutput {
 pub struct ProgramFrontendOutput {
     entrypoint: SourceId,
     modules: Vec<FrontendOutput>,
+    index: HashMap<SourceId, usize>,
 }
 #[cfg(test)]
 thread_local! {
@@ -412,7 +413,7 @@ impl ProgramFrontendOutput {
     pub fn erased_exports(&self, program: &ResolvedProgram) -> HashMap<SourceId, BTreeSet<String>> {
         let mut erased = HashMap::new();
         let mut exports = HashMap::new();
-        let by_source = self.module_index();
+        let by_source = &self.index;
         for module in &self.modules {
             let source_id = module.source_file().source_id();
             self.resolve_erased_exports(
@@ -421,15 +422,15 @@ impl ProgramFrontendOutput {
                 &mut erased,
                 &mut exports,
                 &mut HashSet::new(),
-                &by_source,
+                by_source,
             );
         }
         erased
     }
 
-    fn module_index(&self) -> HashMap<SourceId, usize> {
-        let mut index = HashMap::with_capacity(self.modules.len());
-        for (position, module) in self.modules.iter().enumerate() {
+    fn module_index(modules: &[FrontendOutput]) -> HashMap<SourceId, usize> {
+        let mut index = HashMap::with_capacity(modules.len());
+        for (position, module) in modules.iter().enumerate() {
             index
                 .entry(module.source_file().source_id())
                 .or_insert(position);
@@ -546,9 +547,7 @@ impl ProgramFrontendOutput {
 
     #[must_use]
     pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
-        self.modules
-            .iter()
-            .find(|output| output.source_file().source_id() == source_id)
+        self.index.get(&source_id).map(|&position| &self.modules[position])
     }
 }
 
@@ -756,6 +755,10 @@ fn tslib_helper_diagnostics_for_files_cached(
 ) -> HashMap<SourceId, Vec<Diagnostic>> {
     let mut diagnostics: HashMap<SourceId, Vec<Diagnostic>> = HashMap::new();
     let mut reported: HashSet<(String, String)> = HashSet::new();
+    let mut by_source = HashMap::with_capacity(files.len());
+    for (position, file) in files.iter().enumerate() {
+        by_source.entry(file.source_id).or_insert(position);
+    }
     for file in files {
         if !file.is_module || file.is_declaration_file {
             continue;
@@ -790,7 +793,7 @@ fn tslib_helper_diagnostics_for_files_cached(
                 ));
             continue;
         };
-        let exports = match tslib_export_names(files, &target, cache) {
+        let exports = match tslib_export_names(files, &target, cache, &by_source) {
             Some(exports) => exports,
             None => {
                 let span = sites[0].1;
@@ -812,7 +815,7 @@ fn tslib_helper_diagnostics_for_files_cached(
                 continue;
             }
         };
-        let identity = tslib_identity(files, &target);
+        let identity = tslib_identity(files, &target, &by_source);
         for (helper, span) in ordered_first_sites(&sites) {
             if exports.contains(helper) {
                 continue;
@@ -2008,13 +2011,12 @@ fn tslib_export_names(
     files: &[TslibHelperFile<'_>],
     target: &TslibTarget,
     cache: &mut TslibDiskCache,
+    by_source: &HashMap<SourceId, usize>,
 ) -> Option<std::collections::BTreeSet<String>> {
     match target {
         TslibTarget::File(id) => {
-            let source = files
-                .iter()
-                .find(|file| file.source_id == *id)
-                .map(|file| file.source)?;
+            let position = by_source.get(id)?;
+            let source = files[*position].source;
             let mut names = std::collections::BTreeSet::new();
             collect_value_exports(source, source.statements(), &mut names);
             Some(names)
@@ -2033,10 +2035,8 @@ fn tslib_export_names(
             names
         }
         TslibTarget::Ambient(id) => {
-            let source = files
-                .iter()
-                .find(|file| file.source_id == *id)
-                .map(|file| file.source)?;
+            let position = by_source.get(id)?;
+            let source = files[*position].source;
             let mut names = std::collections::BTreeSet::new();
             collect_ambient_tslib_exports(source, &mut names);
             Some(names)
@@ -2079,11 +2079,15 @@ fn tslib_on_disk_source(path: &std::path::Path) -> Option<SourceFile> {
 /// Identity key for cross-file TS2343 deduplication: same helper from the same
 /// `tslib` copy reports once. On-disk copies canonicalize so two probes of one
 /// file share an identity.
-fn tslib_identity(files: &[TslibHelperFile<'_>], target: &TslibTarget) -> String {
+fn tslib_identity(
+    files: &[TslibHelperFile<'_>],
+    target: &TslibTarget,
+    by_source: &HashMap<SourceId, usize>,
+) -> String {
     match target {
-        TslibTarget::File(id) => files.iter().find(|file| file.source_id == *id).map_or_else(
+        TslibTarget::File(id) => by_source.get(id).map_or_else(
             || "tslib".to_owned(),
-            |file| file.path.to_string_lossy().into_owned(),
+            |position| files[*position].path.to_string_lossy().into_owned(),
         ),
         TslibTarget::OnDisk(path) => std::fs::canonicalize(path)
             .map(|canonical| canonical.to_string_lossy().into_owned())
@@ -2381,9 +2385,11 @@ pub fn compile_program_frontend_with_cancel(
             cancel.check()?;
         }
         cancel.check()?;
+        let index = ProgramFrontendOutput::module_index(&modules);
         Ok(ProgramFrontendOutput {
             entrypoint: program.entrypoint_id(),
             modules,
+            index,
         })
     })
 }
@@ -2393,14 +2399,19 @@ fn resolved_checker_edges_with_cancel(
     files: &[Recovered<SourceFile>],
     cancel: &CancellationToken,
 ) -> Result<Vec<ResolvedModuleEdge>, Cancelled> {
+    let mut by_source = HashMap::with_capacity(files.len());
+    for (position, file) in files.iter().enumerate() {
+        by_source
+            .entry(file.product().source_id())
+            .or_insert(position);
+    }
     let mut edges = Vec::new();
     for module in program.modules() {
         cancel.check()?;
-        let source = files
-            .iter()
-            .find(|file| file.product().source_id() == module.source_id())
-            .expect("resolved module has one parsed source")
-            .product();
+        let position = by_source
+            .get(&module.source_id())
+            .expect("resolved module has one parsed source");
+        let source = files[*position].product();
         let nodes = SourceEdgeNodeIndex::new(source);
         for edge in module.dependencies() {
             cancel.check()?;
@@ -2511,8 +2522,8 @@ fn canonicalize(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontendMode, FrontendRequest, ProgramFrontendOutput, canonicalize, compile_frontend,
-        compile_program_frontend, compile_program_frontend_with_cancel,
+        FrontendMode, FrontendOutput, FrontendRequest, ProgramFrontendOutput, canonicalize,
+        compile_frontend, compile_program_frontend, compile_program_frontend_with_cancel,
         resolved_checker_edges_with_cancel,
     };
     use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticSeverity};
@@ -4132,35 +4143,166 @@ mod tests {
     }
 
     #[test]
-    fn module_lookup_returns_first_linear_match() {
+    fn module_lookup_matches_linear_scan_for_every_module() {
         let (root_path, program) = barrel_case();
         let output = compile_program_frontend(&program, FrontendMode::Check);
-        for module in output.modules() {
-            let id = module.source_file().source_id();
+        for position in 0..output.modules().len() {
+            let id = output.modules()[position].source_file().source_id();
             let linear = output
                 .modules()
                 .iter()
-                .find(|output| output.source_file().source_id() == id)
+                .find(|module| module.source_file().source_id() == id)
                 .expect("module resolves linearly");
             let indexed = output.module(id).expect("module resolves by index");
             assert!(
                 std::ptr::eq(linear, indexed),
-                "index lookup must return the first linear match for {id:?}"
+                "off-by-one index position returns the wrong module for {id:?}"
             );
         }
-        for module in program.modules() {
-            let id = module.source_id();
-            let linear = program
+        assert!(
+            output.module(SourceId::new(u32::MAX)).is_none(),
+            "absent source id must resolve to no module"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn module_index_keeps_first_position_for_duplicate_source_ids() {
+        let build = |source: &str| {
+            compile_frontend(FrontendRequest {
+                source_id: SourceId::new(7),
+                script_kind: ScriptKind::TypeScript,
+                source: Arc::new(
+                    SourceText::new(source).expect("test source fits the per-file budget"),
+                ),
+                mode: FrontendMode::Check,
+                no_emit: false,
+                no_emit_on_error: false,
+            })
+        };
+        let modules = vec![
+            build("export const first: number = 1;"),
+            build("export const second: number = 2;"),
+        ];
+        let index = ProgramFrontendOutput::module_index(&modules);
+        let output = ProgramFrontendOutput {
+            entrypoint: SourceId::new(7),
+            modules,
+            index,
+        };
+        let found = output
+            .module(SourceId::new(7))
+            .expect("duplicate source id resolves");
+        assert!(
+            std::ptr::eq(found, &output.modules[0]),
+            "insert instead of or_insert keeps the last duplicate instead of the first"
+        );
+    }
+
+    fn linear_erased_exports(
+        output: &ProgramFrontendOutput,
+        program: &ResolvedProgram,
+    ) -> std::collections::HashMap<SourceId, std::collections::BTreeSet<String>> {
+        fn linear_module<'output>(
+            output: &'output ProgramFrontendOutput,
+            source_id: SourceId,
+        ) -> Option<&'output FrontendOutput> {
+            output
                 .modules()
                 .iter()
-                .find(|candidate| candidate.source_id() == id)
-                .expect("module resolves linearly");
-            let indexed = program.module(id).expect("module resolves by index");
-            assert!(
-                std::ptr::eq(linear, indexed),
-                "program index must return the first linear match for {id:?}"
+                .find(|module| module.source_file().source_id() == source_id)
+        }
+        fn resolve(
+            output: &ProgramFrontendOutput,
+            program: &ResolvedProgram,
+            source_id: SourceId,
+            erased: &mut std::collections::HashMap<SourceId, std::collections::BTreeSet<String>>,
+            visiting: &mut std::collections::HashSet<SourceId>,
+        ) {
+            if erased.contains_key(&source_id) {
+                return;
+            }
+            let Some(module) = linear_module(output, source_id) else {
+                return;
+            };
+            if !visiting.insert(source_id) {
+                return;
+            }
+            let exports = crate::emitter::transforms::module_exports(
+                module.source_file(),
+                module.semantic_model(),
+            );
+            let mut names = exports.types;
+            let forwarded: std::collections::BTreeSet<String> = exports
+                .forwards
+                .iter()
+                .map(|(exported, ..)| exported.clone())
+                .collect();
+            for (exported, specifier, imported) in &exports.forwards {
+                let target = super::local_dependency(program, source_id, specifier);
+                if let Some(target) = target {
+                    resolve(output, program, target, erased, visiting);
+                }
+                if target
+                    .and_then(|target| erased.get(&target))
+                    .is_some_and(|target_names| target_names.contains(imported))
+                {
+                    names.insert(exported.clone());
+                } else {
+                    names.remove(exported);
+                }
+            }
+            let mut star_values = std::collections::BTreeSet::new();
+            for specifier in &exports.stars {
+                if let Some(target) = super::local_dependency(program, source_id, specifier) {
+                    resolve(output, program, target, erased, visiting);
+                    if let Some(target_module) = linear_module(output, target) {
+                        star_values.extend(
+                            crate::emitter::transforms::module_exports(
+                                target_module.source_file(),
+                                target_module.semantic_model(),
+                            )
+                            .values,
+                        );
+                    }
+                    if let Some(starred) = erased.get(&target) {
+                        names.extend(
+                            starred
+                                .iter()
+                                .filter(|name| {
+                                    name.as_str() != "default"
+                                        && !forwarded.contains(name.as_str())
+                                })
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+            names.retain(|name| !exports.values.contains(name) && !star_values.contains(name));
+            erased.insert(source_id, names);
+        }
+        let mut erased = std::collections::HashMap::new();
+        for module in output.modules() {
+            resolve(
+                output,
+                program,
+                module.source_file().source_id(),
+                &mut erased,
+                &mut std::collections::HashSet::new(),
             );
         }
+        erased
+    }
+
+    #[test]
+    fn erased_exports_matches_linear_scan_oracle() {
+        let (root_path, program) = barrel_case();
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert_eq!(
+            output.erased_exports(&program),
+            linear_erased_exports(&output, &program),
+            "index position drift resolves a module to the wrong exports"
+        );
         let _ = std::fs::remove_dir_all(root_path);
     }
 }
