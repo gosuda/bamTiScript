@@ -6138,8 +6138,15 @@ pub(crate) struct Binder<'src> {
     imported_enum_member_uses: HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
     local_enum_member_targets: HashMap<NodeId, SymbolId>,
     imported_enum_member_targets: HashSet<NodeId>,
-    /// Bound named interface member declaration occurrences in source
-    /// order, moved into the model by [`Binder::finish`].
+    /// Per-object-literal member scopes and cooked-name member symbols,
+    /// keyed by the literal node. Scopes stay detached (no parent) so member
+    /// names never leak into lexical lookup; detached scopes carry no owner,
+    /// so member symbols render bare like namespace exports.
+    object_literal_scopes: HashMap<NodeId, ScopeId>,
+    object_literal_members: HashMap<NodeId, HashMap<String, SymbolId>>,
+    /// Bound named member declaration occurrences in source order, moved
+    /// into the model by [`Binder::finish`]. Interface members and object
+    /// literal members share this vec; the emitter sorts by position.
     interface_member_occurrences: Vec<DeclarationOccurrence>,
     /// Interface signature parameter name node to its bound `Parameter`
     /// symbol, moved into the model by [`Binder::finish`].
@@ -6417,6 +6424,8 @@ impl<'src> Binder<'src> {
             enum_declarations: Vec::new(),
             enum_declaration_symbols: HashMap::new(),
             enum_member_scopes: HashMap::new(),
+            object_literal_scopes: HashMap::new(),
+            object_literal_members: HashMap::new(),
             enum_member_symbols: HashMap::new(),
             enum_member_names: HashMap::new(),
             enum_member_symbols_by_name: HashMap::new(),
@@ -17132,6 +17141,16 @@ impl<'src> Binder<'src> {
                     );
                     self.member_reference_recorded.insert(expression.id());
                 }
+                if !self.member_reference_recorded.contains(&expression.id())
+                    && let Some(literal) = self.member_object_literal(&member.object)
+                {
+                    self.record_object_literal_member_rows(
+                        literal,
+                        &member.property,
+                        expression.range(),
+                        expression.id(),
+                    );
+                }
                 let base = object_symbol
                     .filter(|symbol| self.symbols[symbol.get() as usize].kind == SymbolKind::Import)
                     .map(enum_plan::ImportedEnumMemberBase::Import)
@@ -22546,6 +22565,184 @@ impl<'src> Binder<'src> {
         target
     }
 
+    /// Source slice of an exact source range for member-name spellings.
+    fn object_member_source_slice(&self, range: TextRange) -> Option<String> {
+        let text = self.source.source_text();
+        let start = text.utf16_to_byte(range.start()).ok()?;
+        let end = text.utf16_to_byte(range.end()).ok()?;
+        text.as_str().get(start..end).map(str::to_owned)
+    }
+
+    /// Cooked key plus first-occurrence spelling of an object literal
+    /// member name. Plain, quoted, and numeric keys cook to the unquoted
+    /// value so `a`, `'a'`, and `"a"` merge; the spelling keeps the written
+    /// form (quotes, digits) for display. Computed keys spell bracketed
+    /// source (`[n]`, `[name + ".a"]`) and cook the same when no literal
+    /// fills the brackets.
+    fn object_member_spelling(&self, name: &PropertyName) -> Option<(String, String)> {
+        let key = match self.property_key(name) {
+            Some(key) => key,
+            None => match name {
+                PropertyName::Computed(expression) => match self.object_member_source_slice(expression.range()) {
+                    Some(inner) => format!("[{inner}]"),
+                    None => return None,
+                },
+                _ => return None,
+            },
+        };
+        let spelling = match name {
+            PropertyName::Identifier(identifier) => self.identifier_text(identifier).into_owned(),
+            PropertyName::String(literal) => self.text(literal.data().token()).to_owned(),
+            PropertyName::Number(literal) => self.text(literal.data().token()).to_owned(),
+            PropertyName::Computed(expression) => match self.object_member_source_slice(expression.range()) {
+                Some(inner) => format!("[{inner}]"),
+                None => return None,
+            },
+            PropertyName::Private(_) | PropertyName::Missing(_) => return None,
+        };
+        Some((key, spelling))
+    }
+
+    /// Declares each named member of one object literal under its cooked
+    /// key, recording one declaration occurrence per written member. The
+    /// first spelling wins the symbol name; duplicates union anchors
+    /// through the occurrence rows. Symbols render bare: the member scope
+    /// stays detached with no owner. Runs from typing and from member
+    /// access linking, so declaration is idempotent and occurrences may
+    /// repeat; the emitter dedups identical rows.
+    fn declare_object_literal_members(&mut self, object: &ObjectLiteral, literal: NodeId) {
+        let scope = match self.object_literal_scopes.get(&literal).copied() {
+            Some(scope) => scope,
+            None => {
+                let scope = self.new_scope(ScopeKind::Block, None);
+                self.object_literal_scopes.insert(literal, scope);
+                scope
+            }
+        };
+        for member in &object.members {
+            let (name, kind) = match member.data() {
+                ObjectMember::Property(property) => {
+                    (&property.name, SymbolKind::Variable(VariableKind::Let))
+                }
+                ObjectMember::Method(method) => (&method.name, SymbolKind::Function),
+                ObjectMember::Spread(_) | ObjectMember::Missing(_) => continue,
+            };
+            let Some((key, spelling)) = self.object_member_spelling(name) else {
+                continue;
+            };
+            let symbol =
+                match self.object_literal_members.get(&literal).and_then(|members| members.get(&key)).copied() {
+                    Some(existing) => existing,
+                    None => {
+                        let id = self.reserve_symbol(&spelling, kind, scope, member.id(), member.range());
+                        self.object_literal_members.entry(literal).or_default().insert(key, id);
+                        id
+                    }
+                };
+            self.interface_member_occurrences.push(DeclarationOccurrence {
+                declaration: member.id(),
+                declaration_range: member.range(),
+                symbol,
+                name_range: self.occurrence_name_range(name),
+            });
+        }
+    }
+
+    /// Unwraps parenthesized expressions to the inner operand.
+    fn unwrap_parenthesized(object: &Expr) -> &Expr {
+        match object.data() {
+            Expression::Parenthesized(inner) => Self::unwrap_parenthesized(inner),
+            _ => object,
+        }
+    }
+
+    /// Resolves a member-access base to its object literal node: the object
+    /// itself, a parenthesized literal, or a variable seeded with a literal
+    /// site anchor. Ensures inline literals are declared so row recording
+    /// never depends on typing order.
+    fn member_object_literal(&mut self, object: &Expr) -> Option<NodeId> {
+        let base = Self::unwrap_parenthesized(object);
+        if let Expression::Object(literal) = base.data() {
+            let node = base.id();
+            if !self.object_literal_members.contains_key(&node) {
+                self.declare_object_literal_members(literal, node);
+            }
+            return Some(node);
+        }
+        let Expression::Identifier(_) = base.data() else {
+            return None;
+        };
+        let symbol = self.resolved_expression_reference(base)?;
+        match self.symbol_anchor.get(&symbol).copied() {
+            Some(PropertyOwner::Site(literal)) => Some(literal),
+            _ => None,
+        }
+    }
+
+    fn object_literal_member_symbol(&self, literal: NodeId, key: &str) -> Option<SymbolId> {
+        self.object_literal_members
+            .get(&literal)
+            .and_then(|members| members.get(key))
+            .copied()
+    }
+
+    /// Records the reference rows for a member access on an object
+    /// literal: the property leaf plus the whole path for plain names, the
+    /// quoted or numeric leaf alone for computed literals, nothing for
+    /// dynamic keys. Displays slice from source; qualified names stay bare.
+    fn record_object_literal_member_rows(
+        &mut self,
+        literal: NodeId,
+        property: &MemberProperty,
+        path_range: TextRange,
+        expression_id: NodeId,
+    ) {
+        if self.member_reference_recorded.contains(&expression_id) {
+            return;
+        }
+        let key = match enum_plan::cook_member_property_name(self.source, property) {
+            Some(name) => name.to_utf8_lossy().as_str().to_owned(),
+            None => match property {
+                MemberProperty::Computed(expression) => match self.object_member_source_slice(expression.range()) {
+                    Some(inner) => format!("[{inner}]"),
+                    None => return,
+                },
+                _ => return,
+            },
+        };
+        let Some(member) = self.object_literal_member_symbol(literal, &key) else {
+            return;
+        };
+        match property {
+            MemberProperty::Named(identifier) => {
+                self.symbol_references.push((identifier.range(), member));
+            }
+            MemberProperty::Computed(expression) => match expression.data() {
+                Expression::Literal(Literal::String(_) | Literal::Number(_)) => {
+                    self.symbol_references.push((expression.range(), member));
+                }
+                _ => return,
+            },
+            MemberProperty::Private(_) => return,
+        }
+        if !matches!(property, MemberProperty::Private(_) | MemberProperty::Computed(_)) {
+            self.symbol_references.push((path_range, member));
+        }
+        self.member_reference_recorded.insert(expression_id);
+    }
+
+    fn suppress_shorthand_value_row(
+        &mut self,
+        literal: NodeId,
+        key: &str,
+        value_range: TextRange,
+    ) {
+        let Some(member) = self.object_literal_member_symbol(literal, key) else {
+            return;
+        };
+        self.symbol_references.retain(|(range, symbol)| *range != value_range || *symbol == member);
+    }
+
     fn type_of_object_literal(
         &mut self,
         object: &'src ObjectLiteral,
@@ -22553,6 +22750,7 @@ impl<'src> Binder<'src> {
         contextual_target: Option<TypeId>,
         scope: ScopeId,
     ) -> TypeId {
+        self.declare_object_literal_members(object, literal_node);
         let owner = self
             .literal_anchor
             .get(&literal_node)
@@ -22609,6 +22807,9 @@ impl<'src> Binder<'src> {
                                 self.types.widen_fresh_literal(inferred)
                             }
                         };
+                        if property.shorthand {
+                            self.suppress_shorthand_value_row(literal_node, &name, property.value.range());
+                        }
                         upsert_property(
                             &mut properties,
                             PropertyType::new(name, false, value_type),
