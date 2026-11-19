@@ -632,6 +632,7 @@ struct TslibHelperFile<'a> {
 
 enum TslibTarget {
     File(SourceId),
+    OnDisk(std::path::PathBuf),
     Ambient(SourceId),
 }
 
@@ -1836,11 +1837,17 @@ fn resolve_tslib(files: &[TslibHelperFile<'_>], from: &TslibHelperFile<'_>) -> O
             if let Some(id) = candidates.get(&probe.to_string_lossy().into_owned()) {
                 return Some(TslibTarget::File(*id));
             }
+            if probe.is_file() {
+                return Some(TslibTarget::OnDisk(probe));
+            }
         }
         for name in ["index.d.ts", "index.ts", "index.tsx", "index.js"] {
             let probe = dir.join("node_modules").join("tslib").join(name);
             if let Some(id) = candidates.get(&probe.to_string_lossy().into_owned()) {
                 return Some(TslibTarget::File(*id));
+            }
+            if probe.is_file() {
+                return Some(TslibTarget::OnDisk(probe));
             }
         }
         directory = dir.parent();
@@ -1874,11 +1881,16 @@ fn tslib_export_names(
     target: &TslibTarget,
 ) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
+    let disk_source;
     let source = match target {
         TslibTarget::File(id) => files
             .iter()
             .find(|file| file.source_id == *id)
             .map(|file| file.source),
+        TslibTarget::OnDisk(path) => {
+            disk_source = tslib_on_disk_source(path);
+            disk_source.as_ref()
+        }
         TslibTarget::Ambient(id) => files
             .iter()
             .find(|file| file.source_id == *id)
@@ -1888,10 +1900,30 @@ fn tslib_export_names(
         return names;
     };
     match target {
-        TslibTarget::File(_) => collect_value_exports(source, source.statements(), &mut names),
+        TslibTarget::File(_) | TslibTarget::OnDisk(_) => {
+            collect_value_exports(source, source.statements(), &mut names)
+        }
         TslibTarget::Ambient(_) => collect_ambient_tslib_exports(source, &mut names),
     }
     names
+}
+
+/// Read and parse a `tslib` copy the loader never pulled into the program.
+/// Import-free `tslib` packages still satisfy `importHelpers`, so exports are
+/// collected from the file on disk.
+fn tslib_on_disk_source(path: &std::path::Path) -> Option<SourceFile> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let source_id = SourceId::new(u32::MAX);
+    let script_kind = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("ts" | "mts" | "cts") => ScriptKind::TypeScript,
+        Some("tsx") => ScriptKind::TypeScriptReact,
+        Some("js" | "mjs" | "cjs") => ScriptKind::JavaScript,
+        Some("jsx") => ScriptKind::JavaScriptReact,
+        _ => return None,
+    };
+    let text = SourceText::new(text).ok()?;
+    let (source, _) = parser::parse(scanner::scan(source_id, script_kind, Arc::new(text))).into_parts();
+    Some(source)
 }
 
 /// Identity key for cross-file TS2343 deduplication: same helper from the same
@@ -1902,6 +1934,7 @@ fn tslib_identity(files: &[TslibHelperFile<'_>], target: &TslibTarget) -> String
             || "tslib".to_owned(),
             |file| file.path.to_string_lossy().into_owned(),
         ),
+        TslibTarget::OnDisk(path) => path.to_string_lossy().into_owned(),
         TslibTarget::Ambient(id) => format!("ambient:{id:?}"),
     }
 }
