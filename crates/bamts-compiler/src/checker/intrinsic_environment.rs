@@ -577,6 +577,22 @@ const GLOBAL_LIB_DECL_FILES: &[(&str, &[(&str, Option<Lib>)])] = &[
     ("Symbol", &[("lib.es5.d.ts", None), ("lib.es2015.symbol.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
     ("Uint8Array", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
 ];
+/// Static members of lib globals recorded as dotted reference symbols, with
+/// the lib Decl files upstream lists in baseline order. The es2017.date.d.ts
+/// refinement has no dedicated Lib category, so it is gated on
+/// Es2017SharedMemory, which every es2017-or-later set includes.
+const INTRINSIC_STATIC_MEMBERS: &[(&str, &str, &str, &[(&str, Option<Lib>)])] = &[
+    ("Math", "PI", "Math.PI", &[("lib.es5.d.ts", None)]),
+    ("Date", "UTC", "DateConstructor.UTC", &[("lib.es5.d.ts", None), ("lib.es2017.date.d.ts", Some(Lib::Es2017SharedMemory))]),
+];
+
+#[must_use]
+pub(crate) fn intrinsic_static_member(owner: &str, member: &str) -> Option<&'static str> {
+    INTRINSIC_STATIC_MEMBERS
+        .iter()
+        .find(|entry| entry.0 == owner && entry.1 == member)
+        .map(|entry| entry.2)
+}
 
 #[must_use]
 pub fn lib_decl_files_for_global(
@@ -592,11 +608,17 @@ pub fn lib_decl_files_for_global(
     } else {
         LibSet::from_lib_names(libs)
     };
-    let Some(files) = GLOBAL_LIB_DECL_FILES
+    let files = INTRINSIC_STATIC_MEMBERS
         .iter()
-        .find(|entry| entry.0 == name)
-        .map(|entry| entry.1)
-    else {
+        .find(|entry| entry.2 == name)
+        .map(|entry| entry.3)
+        .or_else(|| {
+            GLOBAL_LIB_DECL_FILES
+                .iter()
+                .find(|entry| entry.0 == name)
+                .map(|entry| entry.1)
+        });
+    let Some(files) = files else {
         return global_lib_decl_file(name).map(|file| vec![file]).unwrap_or_default();
     };
     files
