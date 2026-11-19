@@ -120,6 +120,8 @@ const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL_MESSAGE: &str =
 
 #[path = "binder/date.rs"]
 mod date;
+#[path = "binder/primitives.rs"]
+mod primitives;
 
 /// Maximum depth of recursive type resolution before the checker emits
 /// `TYPE_NESTING_TOO_DEEP` and returns the error type. Set higher than the
@@ -1483,6 +1485,10 @@ pub struct TypeTable {
     /// The `ConcatArray<T>` interface head backing the synthesized `concat`
     /// member on array types.
     concat_array_symbol: Option<SymbolId>,
+    /// The method-level `U` shared by synthesized generic array members
+    /// (`map`, `flatMap`, `reduce`). Declared once per bind; every synthesized
+    /// generic signature lists it, so all instantiations render `<U>`.
+    method_type_parameter: Option<SymbolId>,
     /// Declared constraint per type-parameter symbol. Class and interface names
     /// never enter this map, so nominal named types remain nominal.
     type_parameter_constraints: HashMap<SymbolId, TypeId>,
@@ -1540,10 +1546,11 @@ impl TypeTable {
             symbol: TypeId(0),
             object: TypeId(0),
             object_symbol: None,
-            collection_symbols: [None; 4],
             record_symbol: None,
             property_key_symbol: None,
             concat_array_symbol: None,
+            method_type_parameter: None,
+            collection_symbols: [None; 4],
             type_parameter_constraints: HashMap::new(),
             type_parameter_defaults: HashMap::new(),
             classes: HashMap::new(),
@@ -8940,6 +8947,9 @@ impl<'src> Binder<'src> {
         let mut map_value = None;
         let mut date_value = None;
         let mut console_value = None;
+        let method_scope = self.new_scope(ScopeKind::Block, None);
+        let method_u = self.declare_intrinsic_type_parameter(method_scope, "U");
+        self.types.method_type_parameter = Some(method_u);
         for name in self
             .intrinsics
             .values()
@@ -19494,11 +19504,12 @@ impl<'src> Binder<'src> {
                 } else {
                     self.types.property_type(object_type, name)
                 };
-                Some(
-                    property
-                        .map(|property| self.project_this_type(property, owner_hint, receiver))
-                        .unwrap_or_else(|| self.types.any()),
-                )
+                match property {
+                    Some(found) => {
+                        Some(self.project_this_type(found, owner_hint, receiver))
+                    }
+                    None => self.array_prototype_member(object_type, name, range),
+                }
             }
             Type::AppliedClass { symbol, .. } => {
                 if let Some(view) = self.types.prepare_applied_class_view(object_type) {
@@ -19529,6 +19540,17 @@ impl<'src> Binder<'src> {
                 let property = self.function_call_member_type(&signature);
                 Some(self.project_this_type(property, owner_hint, receiver))
             }
+            Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_) => {
+                self.primitive_wrapper_member(object_type, name, range)
+            }
             Type::Error
             | Type::Any
             | Type::Unknown
@@ -19536,16 +19558,7 @@ impl<'src> Binder<'src> {
             | Type::Void
             | Type::Null
             | Type::Undefined
-            | Type::Boolean
-            | Type::Number
-            | Type::BigInt
-            | Type::String
-            | Type::Symbol
             | Type::Object
-            | Type::BooleanLiteral(_)
-            | Type::NumberLiteral(_)
-            | Type::StringLiteral(_)
-            | Type::BigIntLiteral(_)
             | Type::Function(_)
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)

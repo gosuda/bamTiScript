@@ -12437,6 +12437,131 @@ class B extends A {
     }
 
     #[test]
+    fn string_wrapper_char_at_resolves_with_exact_signature() {
+        let text = "declare const s: string; s.charAt;";
+        let result = check_text(text);
+        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        let model = result.product();
+        let member = member_expression_id(0, text, 1);
+        let type_id = model.node_type(member).expect("member is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "(pos: number) => string"
+        );
+    }
+
+    #[test]
+    fn number_wrapper_to_exponential_resolves_with_exact_signature() {
+        let text = "declare const n: number; n.toExponential;";
+        let result = check_text(text);
+        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        let model = result.product();
+        let member = member_expression_id(0, text, 1);
+        let type_id = model.node_type(member).expect("member is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "(fractionDigits?: number) => string"
+        );
+    }
+
+    #[test]
+    fn primitive_wrapper_missing_members_report() {
+        let missing_on_number = check_text("declare const n: number; n.charAt(0);");
+        assert_eq!(checker_codes(&missing_on_number), ["BAMTS-C057"]);
+        let missing_on_string =
+            check_text("declare const s: string; s.toExponential(0);");
+        assert_eq!(checker_codes(&missing_on_string), ["BAMTS-C057"]);
+    }
+
+    #[test]
+    fn array_wrapper_push_and_length_resolve() {
+        let text = "declare const a: string[]; a.push;";
+        let result = check_text(text);
+        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        let model = result.product();
+        let member = member_expression_id(0, text, 1);
+        let type_id = model.node_type(member).expect("member is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "(...items: string[]) => number"
+        );
+        let length = check_text("declare const a: string[]; a.length;");
+        assert!(checker_codes(&length).is_empty());
+        let length_model = length.product();
+        let length_member = member_expression_id(0, "declare const a: string[]; a.length;", 1);
+        let length_id = length_model
+            .node_type(length_member)
+            .expect("length is typed");
+        assert_eq!(super::render_type(length_model, length_id), "number");
+    }
+
+    #[test]
+    fn array_wrapper_missing_member_reports() {
+        let result = check_text("declare const a: string[]; a.charAt(0);");
+        assert_eq!(checker_codes(&result), ["BAMTS-C057"]);
+    }
+
+    #[test]
+    fn array_includes_is_gated_by_lib() {
+        let old = check_text_with(
+            "declare const a: string[]; a.includes(\"x\");",
+            ProgramCheckOptions::standard().with_target(Some("es2015")),
+        );
+        assert_eq!(program_codes(&old), ["BAMTS-C057"]);
+        let text = "declare const a: string[]; a.includes;";
+        let current = check_text(text);
+        assert!(checker_codes(&current).is_empty(), "{:?}", checker_codes(&current));
+        let model = current.product();
+        let member = member_expression_id(0, text, 1);
+        let type_id = model.node_type(member).expect("member is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "(searchElement: string, fromIndex?: number) => boolean"
+        );
+    }
+
+    #[test]
+    fn string_literal_receiver_resolves_lib_member() {
+        let result = check_text("\"\".padStart(2);");
+        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+        let model = result.product();
+        let parsed = parsed(0, "\"\".padStart(2);");
+        let Statement::Expression(statement) = parsed.product().statements()[0].data() else {
+            panic!("selected statement is a call");
+        };
+        let type_id = model
+            .node_type(statement.expression.id())
+            .expect("call is typed");
+        assert_eq!(super::render_type(model, type_id), "string");
+    }
+
+    #[test]
+    fn string_literal_receiver_missing_member_reports() {
+        let result = check_text("\"\".nosuchmember;");
+        assert_eq!(checker_codes(&result), ["BAMTS-C057"]);
+    }
+
+    #[test]
+    fn const_enum_scalar_chains_stay_silent() {
+        let result = check_text("const enum E { A = 7, B = 9 } E.A.B;");
+        assert!(checker_codes(&result).is_empty(), "{:?}", checker_codes(&result));
+    }
+
+    #[test]
+    fn boolean_symbol_and_bigint_wrappers_resolve() {
+        let boolean = check_text("declare const b: boolean; b.toString();");
+        assert!(checker_codes(&boolean).is_empty(), "{:?}", checker_codes(&boolean));
+        let symbol = check_text("declare const sy: symbol; sy.description;");
+        assert!(checker_codes(&symbol).is_empty(), "{:?}", checker_codes(&symbol));
+        let model = symbol.product();
+        let member = member_expression_id(0, "declare const sy: symbol; sy.description;", 1);
+        let type_id = model.node_type(member).expect("member is typed");
+        assert_eq!(super::render_type(model, type_id), "symbol | undefined");
+        let bigint = check_text("declare const bi: bigint; bi.toString(16);");
+        assert!(checker_codes(&bigint).is_empty(), "{:?}", checker_codes(&bigint));
+    }
+
+    #[test]
     fn index_signatures_supply_member_types_and_readonly_rules() {
         let lookup = check_text(
             "interface Dictionary { [key: string]: number }\
