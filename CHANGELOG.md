@@ -93,6 +93,10 @@ version has shipped, and no tag or stable package exists while any gate in
   8,192 live slots or 1 MiB of growth before the next one runs, which removed
   a case where a program with few live objects collected every few
   allocations.
+- Removed the empty Cargo feature `bamts-runtime/aot-main`. The runtime native
+  engine and `run_linked_program` are unconditional with no replacement
+  feature; the concrete AOT `main` stays in `bamts-node` behind its own
+  `aot-main` feature.
 
 ### Known incomplete
 

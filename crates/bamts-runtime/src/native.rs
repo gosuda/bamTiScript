@@ -4905,7 +4905,7 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
 /// a compiled [`NativeEntryTable`] (an AOT `LinkedProgram` or a JIT program),
 /// and the returned [`ExecutionOutcome`] carries buffered stdout and the exit
 /// code. It is always available and never feature-gated, so a downstream host
-/// crate can link against it without enabling the runtime's `aot-main` feature.
+/// crate can link against it directly.
 ///
 /// Returns [`NativeError::ProgramMismatch`] before constructing the engine when
 /// `entries` was not compiled from this program's exact canonical encoding.
