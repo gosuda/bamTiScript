@@ -1,6 +1,15 @@
     use super::*;
     use bamts_compiler::checker::render_type;
     use crate::facets::load_diagnostic_code_map;
+    use super::build_info_facet::build_info_implied;
+    use super::case_units::{
+        directive_parts, is_option_directive_line, rewrite_shared_lib_refs, shared_lib_refs,
+        strip_directive_lines,
+    };
+    use super::compile::{inject_mount_paths, mount_specifiers_in, reference_testdata_root};
+    use super::source_map_facet::{inline_source_map_producer_gap, is_inline_source_map};
+    use super::types_facet::{TypeAnnotation, dedup_type_records, writes_caret};
+    use super::trace_facet::collect_case_resolution_trace;
 
     fn repo_code_map() -> DiagnosticCodeMap {
         // `cargo test` runs with the package root as the working directory;
@@ -4211,7 +4220,7 @@ let x = b1;
         if candidate.is_dir() {
             return candidate;
         }
-        if let Some(testdata) = super::reference_testdata_root() {
+        if let Some(testdata) = reference_testdata_root() {
             return testdata;
         }
         manifest.join("../../target/authority/typescript-7.0.2-tests")
