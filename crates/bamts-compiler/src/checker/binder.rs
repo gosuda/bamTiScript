@@ -5902,6 +5902,19 @@ impl SemanticModel {
         &self.property_anchors
     }
 
+    /// Returns the bare spans of object-literal shorthand properties, in
+    /// first-seen order, feeding the S2 `.symbols` shorthand anchor override.
+    /// Assignment targets and binding patterns never record shorthand
+    /// anchors, so every span here is a value-position literal shorthand.
+    #[must_use]
+    pub fn shorthand_property_ranges(&self) -> Vec<TextRange> {
+        self.property_anchors
+            .iter()
+            .filter(|anchor| anchor.kind == PropertyAnchorKind::Shorthand)
+            .map(|anchor| anchor.range)
+            .collect()
+    }
+
     /// Returns the interned property site for a rename identity.
     #[must_use]
     pub(crate) fn property_site(&self, id: PropertyId) -> Option<&PropertySite> {
