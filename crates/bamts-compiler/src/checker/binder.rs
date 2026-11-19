@@ -6496,6 +6496,10 @@ pub(crate) struct Binder<'src> {
     pub(crate) namespace_qualified_type_paths: HashMap<NodeId, Box<[SymbolId]>>,
     /// Class member scopes keyed by their owning class symbol.
     class_member_scopes: HashMap<SymbolId, ScopeId>,
+    /// `#`-prefixed member names declared anywhere in the program, so
+    /// private-name checks on `any`/`unknown` receivers stay O(1) instead
+    /// of scanning every class member scope per access.
+    declared_private_names: HashSet<String>,
     /// Interface member scopes keyed by their owning interface symbol.
     interface_member_scopes: HashMap<SymbolId, ScopeId>,
     /// Member scopes for type alias object literals, keyed by the literal
@@ -6790,6 +6794,7 @@ impl<'src> Binder<'src> {
             namespace_reference_blocks: HashMap::new(),
             namespace_qualified_type_paths: HashMap::new(),
             class_member_scopes: HashMap::new(),
+            declared_private_names: HashSet::new(),
             interface_member_scopes: HashMap::new(),
             literal_member_scopes: HashMap::new(),
             member_reference_recorded: HashSet::new(),
@@ -11139,6 +11144,9 @@ impl<'src> Binder<'src> {
         declaration: NodeId,
         range: TextRange,
     ) -> SymbolId {
+        if name.starts_with('#') {
+            self.declared_private_names.insert(name.to_owned());
+        }
         // `var` and function declarations are hoisted to the nearest Function or
         // Module scope, so a binding textually nested in a block, `for`, or
         // `catch` scope is owned by its enclosing function. `let`/`const` and all
@@ -19952,9 +19960,7 @@ impl<'src> Binder<'src> {
     /// Undeclared names cannot resolve on `any` receivers either.
     fn private_name_declared(&self, name: &EcmaString) -> bool {
         let key = name.to_utf8_lossy();
-        self.class_member_scopes
-            .values()
-            .any(|scope| self.scopes[scope.0 as usize].value(&key).is_some())
+        self.declared_private_names.contains(&*key)
     }
 
     /// The class that owns `#name` lookup for this receiver, when the
