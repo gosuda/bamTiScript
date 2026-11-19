@@ -15,22 +15,18 @@ use std::cmp::Ordering;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use super::array_es2023::{
-    array_create, create_data_property, index_key, integer_or_infinity, length_of_array_like,
-    to_object,
-};
+use super::array_es2023::{array_create, create_data_property, index_key, to_object};
 use super::property_descriptor::descriptor_from_property;
-use super::{allocate_string, keep_root, range_error, type_error, value_number, with_roots};
+use super::{
+    allocate_string, argument, keep_root, length_of_array_like, range_error, to_integer_or_infinity,
+    type_error, value_number, with_roots,
+};
 use crate::intrinsics::BuiltinOutcome;
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property};
 
 const MAX_SAFE_INTEGER: usize = 9_007_199_254_740_991;
 /// How deeply `flat` follows nested arrays before treating the input as cyclic.
 const MAX_FLATTEN_DEPTH: usize = 4096;
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
-}
 
 /// Charges one step, so a claimed length of 2^53 - 1 ends in fuel exhaustion
 /// rather than a loop nothing can interrupt.
@@ -199,7 +195,7 @@ pub(super) fn relative_position<H: Host>(
     value: Value,
     length: usize,
 ) -> Result<usize, EvalFailure> {
-    let relative = integer_or_infinity(machine, value)?;
+    let relative = to_integer_or_infinity(machine, value)?;
     let length = length as f64;
     Ok(if relative < 0.0 {
         (length + relative).max(0.0) as usize
@@ -371,7 +367,7 @@ pub(super) fn splice<H: Host>(
             0 => 0,
             1 => length - start,
             _ => {
-                let requested = integer_or_infinity(machine, args[1])?;
+                let requested = to_integer_or_infinity(machine, args[1])?;
                 requested.clamp(0.0, (length - start) as f64) as usize
             }
         };
@@ -530,7 +526,7 @@ fn start_index<H: Host>(
     from_index: Value,
     length: usize,
 ) -> Result<Option<usize>, EvalFailure> {
-    let relative = integer_or_infinity(machine, from_index)?;
+    let relative = to_integer_or_infinity(machine, from_index)?;
     if relative == f64::INFINITY {
         return Ok(None);
     }
@@ -585,7 +581,7 @@ pub(super) fn last_index_of<H: Host>(
             return Ok(-1.0);
         }
         let relative = if args.len() > 1 {
-            integer_or_infinity(machine, args[1])?
+            to_integer_or_infinity(machine, args[1])?
         } else {
             (length - 1) as f64
         };
@@ -1095,7 +1091,7 @@ pub(super) fn flat<H: Host>(
         let length = length_of_array_like(machine, object)?;
         let requested = match argument(args, 0) {
             Value::UNDEFINED => 1.0,
-            requested => integer_or_infinity(machine, requested)?.max(0.0),
+            requested => to_integer_or_infinity(machine, requested)?.max(0.0),
         };
         let remaining = requested.is_finite().then_some(requested as usize);
         let target = array_species_create(machine, object, 0)?;

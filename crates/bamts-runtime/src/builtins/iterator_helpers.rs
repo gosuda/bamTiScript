@@ -14,9 +14,9 @@ use bamts_native::{Decoded, Value};
 
 use super::property_descriptor::descriptor_from_property;
 use super::{
-    allocate_array, allocate_string, define_data, define_frozen_data, define_symbol_property,
-    heap_index, install_constructor_function, install_function, keep_root, range_error,
-    release_roots, root_count, type_error, value_number, with_roots,
+    allocate_array, allocate_string, argument, define_data, define_frozen_data,
+    define_symbol_property, heap_index, install_constructor_function, install_function, keep_root,
+    range_error, release_roots, root_count, type_error, value_number, with_roots,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
@@ -64,10 +64,6 @@ const SUSPENDED_START: u32 = 0;
 const SUSPENDED_YIELD: u32 = 1;
 const RUNNING: u32 = 2;
 const COMPLETED: u32 = 3;
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
-}
 
 fn is_nullish(value: Value) -> bool {
     matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null))

@@ -28,7 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use super::{allocate_array, allocate_string, define_data, install_function, type_error};
+use super::{
+    allocate_array, allocate_string, define_data, install_function, length_of_array_like, type_error,
+};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -40,9 +42,6 @@ const UNMEASURED_JSON_DEPTH: usize = 256;
 /// `space` never contributes more than ten indentation units (ECMA-262
 /// clamp), and string gaps truncate to their first ten code units.
 const MAX_GAP_UNITS: usize = 10;
-
-/// Largest ToLength result; array-like JSON traversal snapshots this bound.
-const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 /// Whether one more level of a recursive JSON walk, `JSON.stringify` or a reviver,
 /// passes the stack. A machine that measures its native stack stops only where that
@@ -221,26 +220,6 @@ fn create_data_property<H: Host>(
     value: Value,
 ) -> Result<(), EvalFailure> {
     machine.create_data_property_key(object, key, value)
-}
-
-fn length_of_array_like<H: Host>(
-    machine: &mut Machine<'_, H>,
-    value: Value,
-) -> Result<usize, EvalFailure> {
-    let length = machine.get_named_property(value, "length")?;
-    let number = machine.coerce_number_observable(length)?;
-    let number = match number.decode() {
-        Some(Decoded::Int32(value)) => f64::from(value as i32),
-        Some(Decoded::Number(value)) => value,
-        _ => 0.0,
-    };
-    if number.is_nan() || number <= 0.0 {
-        return Ok(0);
-    }
-    if !number.is_finite() {
-        return Ok(MAX_SAFE_INTEGER as usize);
-    }
-    Ok((number.trunc()).min(MAX_SAFE_INTEGER) as usize)
 }
 
 // ---- JSON.rawJSON / JSON.isRawJSON ----------------------------------------

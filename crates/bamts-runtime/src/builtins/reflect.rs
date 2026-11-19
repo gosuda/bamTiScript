@@ -7,7 +7,7 @@ use bamts_native::{SlotId, Value};
 use super::object::create_list_from_array_like;
 use super::property_descriptor::{from_property_descriptor, to_property_descriptor};
 use super::{
-    allocate_array, allocate_string, define_data, define_to_string_tag, install_function,
+    allocate_array, allocate_string, argument, define_data, define_to_string_tag, install_function,
     type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
@@ -71,10 +71,6 @@ pub(super) fn install<H: Host>(
         "Reflect",
     );
     globals.insert(EcmaString::encode("Reflect"), reflect);
-}
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
 fn require_object<H: Host>(
