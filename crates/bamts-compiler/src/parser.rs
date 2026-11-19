@@ -127,6 +127,8 @@ const AWAIT_OUTSIDE_ASYNC: DiagnosticCode = DiagnosticCode::new("BAMTS-P018");
 /// A module name that is not a string literal. TypeScript reports it as a grammar
 /// error, which a file with a parse error does not get.
 const MODULE_NAME_NOT_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-P020");
+/// A rest parameter carries an initializer, which the grammar forbids.
+const REST_PARAMETER_INITIALIZER: DiagnosticCode = DiagnosticCode::new("BAMTS-P021");
 
 /// A parser operation was interrupted before completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5442,6 +5444,20 @@ impl Parser {
             let inner = self.parse_binding_pattern();
             let optional = self.eat(TokenKind::Question).is_some();
             let type_annotation = self.parse_optional_type_annotation();
+            let initializer = if self.at(TokenKind::Eq) {
+                let eq_start = self.cur_start();
+                self.bump();
+                let init = self.parse_assignment_expression(false);
+                let end = init.range().end();
+                self.error_at(
+                    REST_PARAMETER_INITIALIZER,
+                    TextRange::new(eq_start, end).expect("rest initializer spans forward"),
+                    "A rest parameter cannot have an initializer.",
+                );
+                Some(Box::new(init))
+            } else {
+                None
+            };
             let binding = self.node(
                 rest_start,
                 BindingPattern::Rest(RestBindingPattern {
@@ -5456,7 +5472,7 @@ impl Parser {
                     binding,
                     optional,
                     type_annotation,
-                    initializer: None,
+                    initializer,
                 },
             );
         }
