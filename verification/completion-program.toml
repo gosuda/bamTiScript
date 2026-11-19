@@ -323,7 +323,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C4.1"
 cluster = "C4"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/string_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/string.rs"]
 catalogs = ["test262"]
 
 [[leaf]]

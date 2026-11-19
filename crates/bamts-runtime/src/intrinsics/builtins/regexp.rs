@@ -9,7 +9,7 @@ use bamts_native::Value;
 use super::annex_b::record_legacy_match;
 use super::regexp_protocol::{flags_getter, test, to_length};
 use super::regexp_v::{CompiledV, create_result_property, execution_failure};
-use super::string_edge::is_regexp;
+use super::string::is_regexp;
 use super::{
     allocate_array, allocate_string, define_data, install_constructor_function, install_function,
     type_error, with_roots,
