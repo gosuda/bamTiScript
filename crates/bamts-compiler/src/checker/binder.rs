@@ -25533,7 +25533,8 @@ impl<'src> Binder<'src> {
         }
         match &function.body {
             Some(FunctionBody::Expression(expression)) => {
-                let return_type = self.legacy_type_of_expr(expression, parent);
+                let inferred = self.legacy_type_of_expr(expression, parent);
+                let return_type = self.types.widen_fresh_literal(inferred);
                 if function.is_async {
                     self.awaited_type(return_type)
                 } else {
@@ -25560,7 +25561,8 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         match &arrow.body {
             FunctionBody::Expression(expression) => {
-                let return_type = self.legacy_type_of_expr(expression, parent);
+                let inferred = self.legacy_type_of_expr(expression, parent);
+                let return_type = self.types.widen_fresh_literal(inferred);
                 if arrow.is_async {
                     self.awaited_type(return_type)
                 } else {
