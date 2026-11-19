@@ -40,6 +40,8 @@ const TS1206: DiagnosticCode = DiagnosticCode::new("TS1206");
 const TS17000: DiagnosticCode = DiagnosticCode::new("TS17000");
 /// Unary expressions require parentheses before exponentiation.
 const TS17006: DiagnosticCode = DiagnosticCode::new("TS17006");
+/// The left-hand side of a `for...of` statement may not be `async`.
+const TS1106: DiagnosticCode = DiagnosticCode::new("TS1106");
 /// Expression expected.
 const TS1109: DiagnosticCode = DiagnosticCode::new("TS1109");
 /// Type expected.
@@ -138,6 +140,7 @@ pub fn typescript_parse_message(code: DiagnosticCode) -> Option<&'static str> {
         "TS17006" => {
             "An unary expression with the '{0}' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses."
         }
+        "TS1106" => "The left-hand side of a 'for...of' statement may not be 'async'.",
         "TS1109" => "Expression expected.",
         "TS1110" => "Type expected.",
         "TS1124" => "Digit expected.",
@@ -257,6 +260,10 @@ fn map_expected_token(message: &str) -> DiagnosticCode {
         TS1472
     } else if lower == "expected a string literal" {
         TS1141
+    } else if lower.contains("for-of target") && lower.contains("async") {
+        TS1106
+    } else if lower.contains("string import name requires") {
+        TS1003
     } else if lower.contains("declaration or statement") {
         TS1128
     } else {
@@ -448,6 +455,20 @@ mod tests {
                 "TS17000",
             ),
             (
+                "BAMTS-P001",
+                5,
+                10,
+                "a for-of target cannot be `async`",
+                "TS1106",
+            ),
+            (
+                "BAMTS-P001",
+                9,
+                20,
+                "a string import name requires `as` and a local binding",
+                "TS1003",
+            ),
+            (
                 "BAMTS-P005",
                 1,
                 3,
@@ -501,6 +522,16 @@ mod tests {
                 "BAMTS-P001",
                 "expected a string literal",
                 "String literal expected.",
+            ),
+            (
+                "BAMTS-P001",
+                "a for-of target cannot be `async`",
+                "The left-hand side of a 'for...of' statement may not be 'async'.",
+            ),
+            (
+                "BAMTS-P001",
+                "a string import name requires `as` and a local binding",
+                "Identifier expected.",
             ),
             ("BAMTS-P001", "expected `with`", "'with' expected."),
             (

@@ -218,6 +218,7 @@ pub fn parse_with_cancel(
     let source = Arc::clone(scanned.source());
     let eof = *scanned.eof();
     let tokens = scanned.tokens().to_vec();
+    let json_is_data = script_kind == ScriptKind::Json && json_tokens_form_data(&tokens, &source);
 
     let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
     let statements = parser.parse_statements_until(&[]);
@@ -315,7 +316,7 @@ pub fn parse_with_cancel(
             parser
                 .diagnostics
                 .iter()
-                .filter(|d| !tagged_escape(d))
+                .filter(|diagnostic| !json_is_data && !tagged_escape(diagnostic))
                 .map(|diagnostic| {
                     // A literal that the parser scans again, such as a JSX attribute
                     // string, is not closed at the same place as a scanned one.
@@ -451,7 +452,230 @@ fn is_trivia(kind: TokenKind) -> bool {
             | TokenKind::Unknown
     )
 }
+/// Whether every significant token forms one JSON document value.
+///
+/// TypeScript reads `.json` units with its JSON parser, which accepts comments
+/// and trailing commas and reports no grammar diagnostics for a well-formed
+/// document. The scanner token stream here is that document exactly when this
+/// returns true; anything else keeps the TypeScript-grammar diagnostics.
+fn json_tokens_form_data(tokens: &[Token], source: &SourceText) -> bool {
+    let mut reader = JsonDataReader { tokens, source, index: 0 };
+    reader.value(0) && reader.at_end()
+}
 
+/// Cursor over significant tokens for one JSON document value.
+struct JsonDataReader<'a> {
+    tokens: &'a [Token],
+    source: &'a SourceText,
+    index: usize,
+}
+
+impl<'a> JsonDataReader<'a> {
+    fn peek(&mut self) -> Option<TokenKind> {
+        while self.index < self.tokens.len() && is_json_gap(self.tokens[self.index].kind()) {
+            self.index += 1;
+        }
+        self.tokens.get(self.index).map(Token::kind)
+    }
+
+    fn eat(&mut self, kind: TokenKind) -> bool {
+        if self.peek() == Some(kind) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_json_string(&mut self) -> bool {
+        if self.peek() != Some(TokenKind::StringLiteral) {
+            return false;
+        }
+        if !json_token_is_double_quoted(self.source, self.tokens[self.index]) {
+            return false;
+        }
+        self.index += 1;
+        true
+    }
+
+    fn eat_json_number(&mut self) -> bool {
+        if self.peek() != Some(TokenKind::NumericLiteral) {
+            return false;
+        }
+        if !json_token_is_number(self.source, self.tokens[self.index]) {
+            return false;
+        }
+        self.index += 1;
+        true
+    }
+
+    fn at_end(&mut self) -> bool {
+        self.peek().is_none_or(|kind| kind == TokenKind::EndOfFile)
+    }
+
+    fn value(&mut self, depth: u32) -> bool {
+        if depth > 256 {
+            return false;
+        }
+        match self.peek() {
+            Some(TokenKind::LBrace) => {
+                self.index += 1;
+                self.object(depth + 1)
+            }
+            Some(TokenKind::LBracket) => {
+                self.index += 1;
+                self.array(depth + 1)
+            }
+            Some(TokenKind::StringLiteral) => self.eat_json_string(),
+            Some(TokenKind::NumericLiteral) => self.eat_json_number(),
+            Some(TokenKind::KwTrue) | Some(TokenKind::KwFalse) | Some(TokenKind::KwNull) => {
+                self.index += 1;
+                true
+            }
+            Some(TokenKind::Minus) => {
+                self.index += 1;
+                self.eat_json_number()
+            }
+            _ => false,
+        }
+    }
+
+    fn member(&mut self, depth: u32) -> bool {
+        if !self.eat_json_string() {
+            return false;
+        }
+        if !self.eat(TokenKind::Colon) {
+            return false;
+        }
+        self.value(depth)
+    }
+
+    fn object(&mut self, depth: u32) -> bool {
+        if self.eat(TokenKind::RBrace) {
+            return true;
+        }
+        loop {
+            if !self.member(depth) {
+                return false;
+            }
+            if self.eat(TokenKind::RBrace) {
+                return true;
+            }
+            if !self.eat(TokenKind::Comma) {
+                return false;
+            }
+            if self.eat(TokenKind::RBrace) {
+                return true;
+            }
+        }
+    }
+
+    fn array(&mut self, depth: u32) -> bool {
+        if self.eat(TokenKind::RBracket) {
+            return true;
+        }
+        loop {
+            if !self.value(depth) {
+                return false;
+            }
+            if self.eat(TokenKind::RBracket) {
+                return true;
+            }
+            if !self.eat(TokenKind::Comma) {
+                return false;
+            }
+            if self.eat(TokenKind::RBracket) {
+                return true;
+            }
+        }
+    }
+}
+
+/// JSON gap content: whitespace and comments, but never an unknown character.
+fn is_json_gap(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Whitespace
+            | TokenKind::LineComment
+            | TokenKind::BlockComment
+            | TokenKind::Shebang
+    )
+}
+
+/// Whether `token` spells a double-quoted string in `source`.
+fn json_token_is_double_quoted(source: &SourceText, token: Token) -> bool {
+    json_token_text(source, token).is_some_and(|text| text.as_bytes().first() == Some(&b'"'))
+}
+
+/// Whether `token` spells a JSON number in `source`.
+fn json_token_is_number(source: &SourceText, token: Token) -> bool {
+    json_token_text(source, token).is_some_and(json_number_text_is_valid)
+}
+
+/// The source slice of `token`, or `None` for a missing or unmappable token.
+fn json_token_text(source: &SourceText, token: Token) -> Option<&str> {
+    if token.is_missing() {
+        return None;
+    }
+    let range = token.range();
+    let (Ok(start), Ok(end)) = (
+        source.utf16_to_byte(range.start()),
+        source.utf16_to_byte(range.end()),
+    ) else {
+        return None;
+    };
+    source.as_str().get(start..end)
+}
+
+/// Whether `text` matches the JSON number grammar.
+fn json_number_text_is_valid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = usize::from(bytes.first() == Some(&b'-'));
+    if !consume_json_int_part(bytes, &mut index) {
+        return false;
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        if !consume_json_digits(bytes, &mut index) {
+            return false;
+        }
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        if !consume_json_digits(bytes, &mut index) {
+            return false;
+        }
+    }
+    index == bytes.len()
+}
+
+/// Consumes `0` or a nonzero digit run, returning whether one was present.
+fn consume_json_int_part(bytes: &[u8], index: &mut usize) -> bool {
+    match bytes.get(*index) {
+        Some(b'0') => {
+            *index += 1;
+            true
+        }
+        Some(b'1'..=b'9') => {
+            *index += 1;
+            consume_json_digits(bytes, index);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Consumes a nonempty ASCII digit run, returning whether one was present.
+fn consume_json_digits(bytes: &[u8], index: &mut usize) -> bool {
+    let start = *index;
+    while matches!(bytes.get(*index), Some(b'0'..=b'9')) {
+        *index += 1;
+    }
+    *index > start
+}
 /// Whether TypeScript reports `diagnostic` while it parses. Every lexical error
 /// is one. A grammar error, such as `yield` outside a generator, is reported by
 /// its checker instead.
@@ -1658,7 +1882,6 @@ impl Parser {
         self.expect(TokenKind::RParen, "expected `)`");
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut cases = Vec::new();
-        let mut seen_default = false;
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
             if self.is_cancelled() {
                 break;
@@ -1667,13 +1890,6 @@ impl Parser {
             let test = if self.eat(TokenKind::KwCase).is_some() {
                 Some(Box::new(self.parse_expression(false)))
             } else if self.eat(TokenKind::KwDefault).is_some() {
-                if seen_default {
-                    self.error_here(
-                        EXPECTED_TOKEN,
-                        "a switch can only have one `default` clause",
-                    );
-                }
-                seen_default = true;
                 None
             } else {
                 let skipped = self.bump();
@@ -1855,7 +2071,7 @@ impl Parser {
                     && !is_await
                     && self.lexeme(*identifier.data().token()) == "async"
                 {
-                    self.error_here(EXPECTED_TOKEN, "a for-of target cannot be `async`");
+                    self.error_at(EXPECTED_TOKEN, expression.range(), "a for-of target cannot be `async`");
                 }
                 self.bump();
                 let target = self.expression_to_target(expression);
@@ -2200,6 +2416,23 @@ impl Parser {
                     expression: Box::new(expression),
                     type_arguments,
                 });
+                loop {
+                    if !self.at(TokenKind::Comma) {
+                        break;
+                    }
+                    let comma = self.cur();
+                    self.bump();
+                    if self.heritage_comma_is_trailing() {
+                        self.error_at(
+                            EXPECTED_TOKEN,
+                            comma.range(),
+                            "trailing comma is not allowed",
+                        );
+                        break;
+                    }
+                    let _expression = self.parse_lhs_expression(LhsContext::Expression);
+                    let _type_arguments = self.try_parse_type_arguments_in_heritage();
+                }
             } else if self.at(TokenKind::KwImplements) {
                 let range = self.cur().range();
                 self.note_typescript_syntax(range);
@@ -2209,7 +2442,17 @@ impl Parser {
                         break;
                     }
                     implements.push(self.parse_type());
-                    if self.eat(TokenKind::Comma).is_none() {
+                    if !self.at(TokenKind::Comma) {
+                        break;
+                    }
+                    let comma = self.cur();
+                    self.bump();
+                    if self.heritage_comma_is_trailing() {
+                        self.error_at(
+                            EXPECTED_TOKEN,
+                            comma.range(),
+                            "trailing comma is not allowed",
+                        );
                         break;
                     }
                 }
@@ -2563,6 +2806,18 @@ impl Parser {
             }
             _ => false,
         }
+    }
+
+    /// Whether a heritage comma is trailing: the follower cannot extend the
+    /// list. A class body opens after a trailing comma, and heritage keywords
+    /// never start an element. At the end of the text the input is truncated,
+    /// not trailed: the single diagnostic is the missing continuation.
+    fn heritage_comma_is_trailing(&self) -> bool {
+        !self.at_eof()
+            && (self.at(TokenKind::LBrace)
+                || self.at(TokenKind::KwExtends)
+                || self.at(TokenKind::KwImplements)
+                || !self.can_start_expression())
     }
 
     /// Distinguishes `[key: string]: T` from a computed member name.
@@ -6895,6 +7150,20 @@ impl Parser {
             return None;
         }
         let function = self.parse_function_type_signature(false);
+        // A body after an accessor signature parses without a syntax
+        // diagnostic; tsc accepts `get foo() { ... }` in a type literal at
+        // parse time (`tsc --noCheck` is clean) and reports TS1183 at check
+        // time. Consuming the block here also keeps the body from cascading
+        // into spurious errors on the members that follow it.
+        if self.at(TokenKind::LBrace) {
+            let context = KeywordContext {
+                in_function: true,
+                await_reserved: false,
+                yield_reserved: false,
+            };
+            let _body = self.with_keyword_context(context, Self::parse_block);
+        }
+
         Some(self.node(
             start,
             TypeMember::Method(TypeMethodSignature {
@@ -8132,9 +8401,36 @@ mod tests {
     }
 
     #[test]
-    fn type_member_accessor_with_body_still_reports() {
-        let recovered = parse_ts("type T = { get foo() { return 0 } };");
-        assert!(!errors(&recovered).is_empty());
+    fn type_member_accessor_with_body_parses_as_method() {
+        // tsc accepts a type-member accessor body at parse time (`tsc
+        // --noCheck` reports nothing) and rejects it at check time with
+        // TS1183, while a plain `foo() {}` stays a parse error. The parser
+        // therefore consumes the body without a syntax diagnostic; the
+        // ambient-implementation error belongs to the checker.
+        for source in [
+            "type T = { get foo() { return 0 } };",
+            "type T = { set foo(v: number) { } };",
+        ] {
+            let recovered = parse_ts(source);
+            assert!(
+                errors(&recovered).is_empty(),
+                "expected no errors for {source:?}, got: {:?}",
+                errors(&recovered)
+                    .iter()
+                    .map(|d| (d.code().as_str(), d.message()))
+                    .collect::<Vec<_>>()
+            );
+            let Statement::TypeAlias(alias) = recovered.product().statements()[0].data() else {
+                panic!("expected a type alias for {source:?}");
+            };
+            let TypeNode::Object(object) = alias.type_node.data() else {
+                panic!("expected an object type for {source:?}");
+            };
+            assert!(
+                matches!(object.members.as_slice(), [member] if matches!(member.data(), TypeMember::Method(_))),
+                "expected one method member for {source:?}"
+            );
+        }
     }
 
     #[test]
@@ -9108,9 +9404,119 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_switch_default_is_rejected() {
-        assert!(!errors(&parse_ts("switch (v) { default: break; default: break; }")).is_empty());
+    fn duplicate_switch_default_is_accepted() {
+        assert_clean("switch (v) { default: break; default: break; }");
         assert_clean("switch (v) { case 0: break; default: break; }");
+    }
+    #[test]
+    fn heritage_trailing_comma_reports_ts1009() {
+        for text in [
+            "class C extends A, {\n}",
+            "class C extends A, implements B, {\n}",
+            "class C implements B, {\n}",
+        ] {
+            let found = errors(&parse_ts(text))
+                .iter()
+                .filter(|d| d.message() == "trailing comma is not allowed")
+                .map(|d| {
+                    (
+                        d.code(),
+                        d.range(),
+                        crate::diagnostics_parser::typescript_parse_code(d.code(), d.message()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !found.is_empty(),
+                "expected a trailing comma diagnostic for {text:?}"
+            );
+            assert!(
+                found.iter().all(|(code, _, _)| code.as_str() == "BAMTS-P001"),
+                "trailing comma stays BAMTS-P001 for {text:?}"
+            );
+            assert!(
+                found.iter().all(|(_, _, ts)| ts.as_ref().is_some_and(|code| code.as_str() == "TS1009")),
+                "trailing comma projects to TS1009 for {text:?}"
+            );
+        }
+        assert_eq!(
+            errors(&parse_ts("class C extends A, implements B, {\n}"))
+                .iter()
+                .filter(|d| d.message() == "trailing comma is not allowed")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn heritage_list_continues_past_comma() {
+        assert_clean("class C extends A, B {\n}");
+        assert_clean("class C implements I, J {\n}");
+        assert_clean("interface I extends A, B {\n}");
+    }
+
+    #[test]
+    fn type_literal_accessors_parse_without_syntax_errors() {
+        for text in [
+            "type A = {\n    get foo() { return 0 }\n};\n",
+            "type B = {\n    set foo(v: any) { }\n};\n",
+            "interface X {\n    get foo() { return 0 }\n}\n",
+            "interface Y {\n    set foo(v: any) { }\n}\n",
+            "interface Z {\n    get foo(): number;\n}\n",
+        ] {
+            assert!(
+                errors(&parse_ts(text)).is_empty(),
+                "expected no errors for {text:?}, got: {:?}",
+                errors(&parse_ts(text))
+                    .iter()
+                    .map(|d| (d.code().as_str(), d.message()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+
+    #[test]
+    fn json_data_unit_reports_no_syntax_diagnostics() {
+        for text in [
+            "{ \"name\": \"foo\", \"version\": \"1.2.3\" }\n",
+            "{}\n",
+            "[]\n",
+            "[\"a\", null, \"string\"]\n",
+            "-10\n",
+            "{\n    \"a\": true,\n    \"b\": \"hello\",\n}\n",
+            "\"just a string\"\n",
+            "/* leading */ { \"a\": 1, } // trailing\n",
+            "// only a comment\n{ \"a\": [1, 2, { \"b\": null }] }\n",
+        ] {
+            let recovered = parse_text(text, ScriptKind::Json);
+            assert!(
+                errors(&recovered).is_empty(),
+                "expected no errors for {text:?}, got: {:?}",
+                errors(&recovered)
+                    .iter()
+                    .map(|d| (d.code().as_str(), d.message()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn json_malformed_unit_keeps_typescript_diagnostics() {
+        for text in [
+            "{ \"a\": }\n",
+            "{ \"a\" \"b\" }\n",
+            "[1 2]\n",
+            "{ 'a': 1 }\n",
+            "{ \"a\": 1\n",
+            "[1, 2\n",
+            "{ \"a\": 1 } trailing\n",
+        ] {
+            assert!(
+                !errors(&parse_text(text, ScriptKind::Json)).is_empty(),
+                "expected errors for {text:?}"
+            );
+        }
     }
 
     #[test]
