@@ -879,6 +879,20 @@ fn classic_stem(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(stem))
 }
 
+/// Origin of a relative specifier handed to [`resolve_relative_inner`].
+///
+/// The ESM extensionless-relative rejection applies only to specifiers the
+/// user wrote. Probes the resolver synthesizes from package directory
+/// contents (`./index` for a bare package root, `./{subpath}` inside it)
+/// always probe with extension substitution: the NodeNext CJS-mode trace
+/// resolves a bare package without `package.json` to
+/// `node_modules/dep/index.ts`, so the guard must not reject them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelativeOrigin {
+    UserWritten,
+    Synthesized,
+}
+
 fn resolve_relative(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
@@ -887,9 +901,49 @@ fn resolve_relative(
     host: &dyn ResolutionHost,
     trace: &mut ResolutionTrace,
 ) -> Result<ResolvedModule, ResolutionError> {
+    resolve_relative_inner(
+        context,
+        importer,
+        specifier,
+        strategy,
+        host,
+        trace,
+        RelativeOrigin::UserWritten,
+    )
+}
+
+fn resolve_synthesized_relative(
+    context: (&ProjectRoot, &CompilerOptions),
+    importer: &Path,
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+) -> Result<ResolvedModule, ResolutionError> {
+    resolve_relative_inner(
+        context,
+        importer,
+        specifier,
+        strategy,
+        host,
+        trace,
+        RelativeOrigin::Synthesized,
+    )
+}
+
+fn resolve_relative_inner(
+    context: (&ProjectRoot, &CompilerOptions),
+    importer: &Path,
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    host: &dyn ResolutionHost,
+    trace: &mut ResolutionTrace,
+    origin: RelativeOrigin,
+) -> Result<ResolvedModule, ResolutionError> {
     let (root, options) = context;
     let (kind, mode, flavor) = strategy;
-    if mode == ResolutionMode::Import
+    if origin == RelativeOrigin::UserWritten
+        && mode == ResolutionMode::Import
         && !kind.allows_extensionless_relative()
         && Path::new(specifier).extension().is_none()
     {
@@ -1480,7 +1534,7 @@ fn resolve_installed_package(
         format!("./{subpath}")
     };
     let fake_importer = package_root.join("package.json");
-    match resolve_relative(
+    match resolve_synthesized_relative(
         (root, options),
         &fake_importer,
         &relative,
