@@ -281,7 +281,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C3.1"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/array_es2023.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/array.rs"]
 catalogs = ["test262"]
 
 [[leaf]]

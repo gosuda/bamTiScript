@@ -7,9 +7,9 @@ use bamts_native::{Decoded, Value};
 use super::{is_object, locale_record, range_error, type_error};
 use crate::intl::locale_data::DATA;
 use crate::intl::locale_negotiation::{LocaleMatcher, canonicalize_unicode_locale_id};
-use crate::intrinsics::builtins::array_es2023::index_key;
+use crate::intrinsics::builtins::array::index_key;
 use crate::intrinsics::builtins::length_of_array_like;
-use crate::intrinsics::builtins::array_generic::tick;
+use crate::intrinsics::builtins::array::tick;
 use crate::{EvalFailure, Host, Machine};
 
 /// A resolved options argument. `None` stands for the empty null-prototype
