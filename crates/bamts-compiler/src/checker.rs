@@ -1271,39 +1271,6 @@ impl ExportResolutionSet {
         }
     }
 }
-/// Resolves one exported value name to its source [`LinkedExport`], following
-/// re-exports and export-star fallbacks through the shared export tables. A
-/// missing or ambiguous export yields `None`, preserving existing diagnostics.
-fn resolve_export_for_type(
-    source: SourceId,
-    name: &EcmaString,
-    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
-    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
-    export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, SemanticModel>,
-) -> Option<LinkedExport> {
-    let resolution = resolve_export_candidates(
-        source,
-        name,
-        imports,
-        exports,
-        export_stars,
-        files,
-        &mut HashSet::new(),
-    );
-    let linked = resolution
-        .candidates
-        .iter()
-        .find_map(|candidate| match candidate {
-            ExportCandidate::Value(linked) => Some(*linked),
-            _ => None,
-        });
-    if matches!(resolution.into_resolution(), ExportResolution::NotConst) {
-        linked
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 std::thread_local! {
@@ -1519,7 +1486,7 @@ fn collect_imported_types_for_source<'a>(
                 continue;
             };
             if let Some(imported) =
-                build_imported_symbol_type(source_id, symbol, tables.imports, tables.exports, tables.export_stars, tables.files)
+                build_imported_symbol_type(source_id, symbol, tables, member_cache)
             {
                 imported_types.push(imported);
             }
@@ -1566,14 +1533,9 @@ fn collect_imported_types_for_source<'a>(
                     else {
                         continue;
                     };
-                    if let Some(imported) = build_imported_symbol_type(
-                        source_id,
-                        symbol,
-                        tables.imports,
-                        tables.exports,
-                        tables.export_stars,
-                        tables.files,
-                    ) {
+                    if let Some(imported) =
+                        build_imported_symbol_type(source_id, symbol, tables, member_cache)
+                    {
                         imported_types.push(imported);
                     }
                 }
@@ -1585,66 +1547,101 @@ fn collect_imported_types_for_source<'a>(
 }
 
 /// Resolves one imported binding to its source export's structural type fact.
+/// A named import of a namespace re-export (`export * as ns from './m'`)
+/// answers the namespace's member list, so member access keeps each type.
 fn build_imported_symbol_type<'a>(
     source_id: SourceId,
     symbol: SymbolId,
-    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
-    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
-    export_stars: &ExportStars,
-    files: &'a BTreeMap<SourceId, SemanticModel>,
+    tables: &CrossFileImportTables<'a>,
+    member_cache: &mut HashMap<SourceId, Vec<(EcmaString, TypeId)>>,
 ) -> Option<ImportedSymbolType<'a>> {
-    let target = imports.get(&(source_id, symbol))?;
+    let target = tables.imports.get(&(source_id, symbol))?;
     let (target_source, target_name) = match target {
         ImportTarget::Named { source, name, .. } => (*source, name.clone()),
         ImportTarget::Namespace { .. } => return None,
     };
-    let linked = resolve_export_for_type(
+    let mut visited = HashSet::new();
+    let resolution = resolve_export_candidates(
         target_source,
         &target_name,
-        imports,
-        exports,
-        export_stars,
-        files,
-    )?;
-    let source_model = files.get(&linked.source)?;
-    let symbol_kind = source_model.symbol(linked.symbol).kind();
-    // Classes and enums answer their constructor on the value plane;
-    // the helper owns that rule for every reader.
-    let value_type_id = source_model.value_side_type(linked.symbol);
-    let value_type = source_model.types().get(value_type_id);
-    if matches!(value_type, Type::Error | Type::Any | Type::Unknown) {
+        tables.imports,
+        tables.exports,
+        tables.export_stars,
+        tables.files,
+        &mut visited,
+    );
+    if resolution.candidates.len() != 1 {
         return None;
     }
-    let type_plane_id = match (symbol_kind, value_type) {
-        (SymbolKind::Class, Type::ConstructorType { structural, .. }) => {
-            let Type::ObjectType(object) = source_model.types().get(*structural) else {
+    match resolution.candidates.iter().next().expect("checked single candidate") {
+        ExportCandidate::Value(linked) => {
+            let linked = *linked;
+            let source_model = tables.files.get(&linked.source)?;
+            let symbol_kind = source_model.symbol(linked.symbol).kind();
+            // Classes and enums answer their constructor on the value plane;
+            // the helper owns that rule for every reader.
+            let value_type_id = source_model.value_side_type(linked.symbol);
+            let value_type = source_model.types().get(value_type_id);
+            if matches!(value_type, Type::Error | Type::Any | Type::Unknown) {
                 return None;
+            }
+            let type_plane_id = match (symbol_kind, value_type) {
+                (SymbolKind::Class, Type::ConstructorType { structural, .. }) => {
+                    let Type::ObjectType(object) = source_model.types().get(*structural) else {
+                        return None;
+                    };
+                    let mut signatures = object.construct_signatures.iter();
+                    signatures.next().and_then(|first| {
+                        let return_type = first.signature.return_type();
+                        matches!(
+                            source_model.types().get(return_type),
+                            Type::AppliedClass { symbol, .. } if *symbol == linked.symbol
+                        )
+                        .then_some(return_type)
+                        .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
+                    })
+                }
+                (SymbolKind::Interface | SymbolKind::TypeAlias, _) => Some(value_type_id),
+                // Enums split planes like classes: the value plane is the
+                // constructor, the type plane stays the scalar enum type.
+                (SymbolKind::Enum, _) => Some(source_model.symbol_type(linked.symbol)),
+                _ => None,
             };
-            let mut signatures = object.construct_signatures.iter();
-            signatures.next().and_then(|first| {
-                let return_type = first.signature.return_type();
-                matches!(
-                    source_model.types().get(return_type),
-                    Type::AppliedClass { symbol, .. } if *symbol == linked.symbol
-                )
-                .then_some(return_type)
-                .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
+            Some(ImportedSymbolType {
+                symbol,
+                source_model,
+                value_type_id,
+                type_parameters: source_model.generic_type_parameters(linked.symbol),
+                type_plane_id,
+                namespace_members: Vec::new(),
             })
         }
-        (SymbolKind::Interface | SymbolKind::TypeAlias, _) => Some(value_type_id),
-        // Enums split planes like classes: the value plane is the
-        // constructor, the type plane stays the scalar enum type.
-        (SymbolKind::Enum, _) => Some(source_model.symbol_type(linked.symbol)),
-        _ => None,
-    };
-    Some(ImportedSymbolType {
-        symbol,
-        source_model,
-        value_type_id,
-        type_parameters: source_model.generic_type_parameters(linked.symbol),
-        type_plane_id,
-        namespace_members: Vec::new(),
-    })
+        ExportCandidate::Namespace(namespace_source) => {
+            let namespace_source = *namespace_source;
+            let members = namespace_member_types(
+                namespace_source,
+                tables.files,
+                tables.imports,
+                tables.exports,
+                tables.export_stars,
+                tables.direct_index,
+                member_cache,
+            );
+            if members.is_empty() {
+                return None;
+            }
+            let namespace_model = tables.files.get(&namespace_source)?;
+            Some(ImportedSymbolType {
+                symbol,
+                source_model: namespace_model,
+                value_type_id: namespace_model.types().object(),
+                type_parameters: &[],
+                type_plane_id: None,
+                namespace_members: members,
+            })
+        }
+        ExportCandidate::Const(_) => None,
+    }
 }
 
 fn collect_imported_const_enum_facts(

@@ -3629,6 +3629,71 @@ function check(options: Options = {}) {
     }
 
     #[test]
+    fn named_import_of_star_as_namespace_resolves_members() {
+        // Oracle (tsc 7.0.2, noEmit): `const v` is clean and only `const w`
+        // fails with TS2322, because `ns.sub` keeps its string type.
+        let importer =
+            "import { ns } from \"./re\"; const v: string = ns.sub; const w: number = ns.sub;";
+        let checked = linked(
+            &[
+                "export const sub: string = \"hi\";",
+                "export * as ns from \"./a\";",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
+        assert_eq!(
+            program_codes(&checked),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "ns.sub must keep its string type, so only the number annotation fails"
+        );
+    }
+
+    #[test]
+    fn named_import_of_namespace_through_named_reexport_chain() {
+        // Oracle (tsc 7.0.2, noEmit): `export { ns }` forwards the namespace
+        // binding, so `const v` is clean and only `const w` fails with TS2322.
+        let importer =
+            "import { ns } from \"./mid\"; const v: string = ns.sub; const w: number = ns.sub;";
+        let checked = linked(
+            &[
+                "export const sub: string = \"hi\";",
+                "export * as ns from \"./m\";",
+                "export { ns } from \"./re\";",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 1), (3, 0, 2)],
+        );
+        assert_eq!(
+            program_codes(&checked),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "a chained ns.sub must keep its string type, so only the number annotation fails"
+        );
+    }
+
+    #[test]
+    fn named_import_of_namespace_through_star_barrel() {
+        // Oracle (tsc 7.0.2, noEmit): `export * from` forwards the `ns`
+        // namespace binding, so `const v` is clean and only `const w` fails.
+        let importer =
+            "import { ns } from \"./barrel\"; const v: string = ns.sub; const w: number = ns.sub;";
+        let checked = linked(
+            &[
+                "export const sub: string = \"hi\";",
+                "export * as ns from \"./m\";",
+                "export * from \"./re\";",
+                importer,
+            ],
+            &[(1, 0, 0), (2, 0, 1), (3, 0, 2)],
+        );
+        assert_eq!(
+            program_codes(&checked),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "a star-forwarded ns.sub must keep its string type, so only the number annotation fails"
+        );
+    }
+
+    #[test]
     fn import_name_index_builds_once_per_program_with_shared_member_cache() {
         let probe = super::ImportProbe::arm();
         let lib = "export const a: number = 1; export const b: number = 2;";
