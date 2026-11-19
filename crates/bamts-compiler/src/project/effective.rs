@@ -745,6 +745,174 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
     (emit_options, diagnostics)
 }
 
+/// One `outFile` bundle: the single JavaScript file every input concatenates into.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutFileBundle {
+    /// The output path the `outFile` option resolved to.
+    pub path: PathBuf,
+    /// The concatenated bundle text. When `sourceMap` is on it ends with one
+    /// `sourceMappingURL` comment and no trailing newline.
+    pub code: String,
+}
+
+/// Emits the `outFile` bundle JavaScript for an already resolved program.
+///
+/// Every module prints through the ordinary per-file emit in program order,
+/// so the concatenation is exactly the single-file AMD wrapper with one
+/// addition: under AMD or UMD a module's factory carries the module name its
+/// source path takes relative to the common source directory, without the
+/// extension. A file without module syntax prints unwrapped, the way it
+/// prints alone. Under any other module kind only the script files join the
+/// bundle, because those formats cannot name a `define` and the manifest
+/// carries no output for them. With `sourceMap` on, one `sourceMappingURL`
+/// comment computed from the bundle path closes the file.
+pub fn emit_out_file_javascript(
+    program: &crate::program::ResolvedProgram,
+    frontend: &crate::pipeline::ProgramFrontendOutput,
+    options: &CompilerOptions,
+) -> Result<OutFileBundle, Arc<str>> {
+    let Some(out_file) = options.out_file() else {
+        return Err(Arc::from("outFile bundle emit requires the outFile option"));
+    };
+    let wraps = |options: &EmitOptions| {
+        matches!(
+            options.module,
+            Some(ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System)
+        )
+    };
+    let kept: Vec<&crate::program::ResolvedModule> = program
+        .modules()
+        .iter()
+        .filter(|module| {
+            let relative = module.path().to_string_lossy();
+            if relative.ends_with(".d.ts") || relative.ends_with(".json") {
+                return false;
+            }
+            options.allow_js() || !relative.ends_with(".js")
+        })
+        .collect();
+    let common_source_dir = bundle_common_source_dir(kept.iter().map(|module| module.path()));
+    let mut code = String::new();
+    for module in &kept {
+        let Some(output) = frontend.module(module.source_id()) else {
+            return Err(Arc::from(format!(
+                "outFile bundle emit has no frontend output for {}",
+                module.path().display()
+            )));
+        };
+        let is_module = crate::checker::source_is_module(output.source_file());
+        let (mut emit_options, _) = emit_options(options, module.source_id());
+        emit_options.declaration = false;
+        emit_options.declaration_map = false;
+        emit_options.source_map = false;
+        emit_options.inline_source_map = false;
+        emit_options.inline_sources = false;
+        // The bundle carries one strict prologue before the first script's
+        // body; the single-file prologue would repeat it per script file.
+        let is_script = !is_module;
+        if is_script && options.always_strict() && !code.starts_with("\"use strict\";\n") {
+            code.push_str("\"use strict\";\n");
+        }
+        emit_options.always_strict = false;
+        if is_module && wraps(&emit_options) {
+            emit_options.bundle_module_name = Some(Arc::from(bundle_module_name(
+                module.path(),
+                &common_source_dir,
+            )));
+        } else if is_module {
+            continue;
+        }
+        let source_name = Arc::from(module.path().to_string_lossy().as_ref());
+        let mut js_path = module.path().to_path_buf();
+        js_path.set_extension("js");
+        let names = EmitFileNames {
+            source_name,
+            js_file_name: Some(Arc::from(js_path.to_string_lossy().as_ref())),
+            ..EmitFileNames::default()
+        };
+        let emitted = emitter::emit_checked(
+            output.source_file(),
+            output.semantic_model(),
+            &emit_options,
+            &names,
+        );
+        let Some(javascript) = emitted.javascript else {
+            return Err(Arc::from(format!(
+                "outFile bundle emit produced no JavaScript for {}",
+                module.path().display()
+            )));
+        };
+        code.push_str(&javascript.code);
+    }
+    if options.source_map() && !options.inline_source_map() {
+        let url = bundle_map_url(out_file, options, &common_source_dir);
+        code.push_str("//# sourceMappingURL=");
+        code.push_str(&url);
+    }
+    Ok(OutFileBundle {
+        path: out_file.to_path_buf(),
+        code,
+    })
+}
+
+/// The common source directory of the bundle inputs: the longest path prefix
+/// they share, which may sit above the project root when one input lives in
+/// a sibling directory.
+fn bundle_common_source_dir<'a>(paths: impl Iterator<Item = &'a Path>) -> PathBuf {
+    let mut common: Option<PathBuf> = None;
+    for path in paths {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        common = Some(match common {
+            None => parent.to_path_buf(),
+            Some(previous) => previous
+                .components()
+                .zip(parent.components())
+                .take_while(|(left, right)| left == right)
+                .map(|(component, _)| component)
+                .collect::<PathBuf>(),
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// The AMD module name for one bundle input: its path relative to the common
+/// source directory without the extension, with forward slashes.
+fn bundle_module_name(source: &Path, common_source_dir: &Path) -> String {
+    let relative = source
+        .strip_prefix(common_source_dir)
+        .unwrap_or(source)
+        .to_string_lossy();
+    let stem = relative.rsplit_once('.').map_or(relative.as_ref(), |(stem, _)| stem);
+    stem.replace('\\', "/")
+}
+
+/// The `sourceMappingURL` the bundle's trailing comment carries: the map
+/// basename, or the `mapRoot`-resolved address when a root is configured.
+fn bundle_map_url(out_file: &Path, options: &CompilerOptions, common_source_dir: &Path) -> String {
+    let identity = format!(
+        "{}.map",
+        out_file
+            .file_name()
+            .map_or_else(|| String::from("out.js"), |name| name.to_string_lossy().into_owned())
+    );
+    match options.map_root().filter(|root| !root.is_empty()) {
+        Some(root) if is_url_like(root) || root.starts_with('/') => {
+            join_url_segments(root, &identity)
+        }
+        Some(root) => {
+            let base = common_source_dir.join(root);
+            let url = relative_path_between(
+                out_file.parent().unwrap_or_else(|| Path::new("")),
+                &base.join(&identity),
+            );
+            slash_text(&url)
+        }
+        None => identity,
+    }
+}
+
 /// What a Node module mode emits for one file: the extension decides, then the
 /// `type` of the nearest `package.json`, and a file with neither is CommonJS.
 fn node_module_format(

@@ -175,6 +175,9 @@ pub struct TransformOptions {
     pub helpers: HelperOptions,
     /// Module kind used to decide strict prologue and JSX import style.
     pub module_kind: Option<ModuleKind>,
+    /// The `define("name", ...)` name an `outFile` bundle gives this AMD or
+    /// UMD module; single-file emit leaves it unset.
+    pub bundle_module_name: Option<Arc<str>>,
     /// Default and namespace imports under CommonJS go through the interop
     /// helpers.
     pub es_module_interop: bool,
@@ -1129,9 +1132,19 @@ impl<'a> Rewriter<'a> {
         let mut plan = CjsPlan {
             es_module_interop: options.es_module_interop,
             amd: match options.module_kind {
-                Some(ModuleKind::Amd) => Some(AmdPlan::default()),
+                Some(ModuleKind::Amd) => Some(AmdPlan {
+                    module_name: options
+                        .bundle_module_name
+                        .as_ref()
+                        .map(|name| name.to_string()),
+                    ..AmdPlan::default()
+                }),
                 Some(ModuleKind::Umd) => Some(AmdPlan {
                     umd: true,
+                    module_name: options
+                        .bundle_module_name
+                        .as_ref()
+                        .map(|name| name.to_string()),
                     ..AmdPlan::default()
                 }),
                 _ => None,
@@ -17133,6 +17146,42 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
             code.contains("define([\"require\", \"exports\", \"m2\"]"),
             "{code}"
         );
+    }
+
+    #[test]
+    fn amd_bundle_names_the_module_in_the_wrapper() {
+        let output = emit_with_options(
+            "import a = require('./a');\nexport var x = a.v;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                bundle_module_name: Some(Arc::from("ref/m1")),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains(
+                "define(\"ref/m1\", [\"require\", \"exports\", \"./a\"], function (require, exports, a) {",
+            ),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn amd_bundle_leaves_a_script_unwrapped() {
+        let output = emit_with_options(
+            "var a1 = 10;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Amd),
+                bundle_module_name: Some(Arc::from("m1")),
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert_eq!(code, "\"use strict\";\nvar a1 = 10;\n");
     }
 
     #[test]
