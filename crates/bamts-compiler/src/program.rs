@@ -266,6 +266,9 @@ pub struct ResolvedProgram {
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
+    no_unused_locals: bool,
+    jsx_custom_factory: bool,
+    no_unused_parameters: bool,
     jsx: Option<JsxEmit>,
     jsx_factory: Option<Arc<str>>,
     jsx_fragment_factory: Option<Arc<str>>,
@@ -444,6 +447,10 @@ impl ResolvedProgram {
         .with_script_target(self.target)
         .with_libs(self.libs)
         .with_check_js(self.check_js)
+        .with_no_unused_locals(self.no_unused_locals)
+        .with_no_unused_parameters(self.no_unused_parameters)
+        .with_jsx(self.jsx)
+        .with_jsx_custom_factory(self.jsx_custom_factory)
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -851,7 +858,10 @@ impl ProgramLoader {
             verbatim_module_syntax: self.options.verbatim_module_syntax(),
             target,
             libs,
+            no_unused_parameters: self.options.no_unused_parameters(),
             check_js: self.options.check_js(),
+            no_unused_locals: self.options.no_unused_locals(),
+            jsx_custom_factory: self.options.jsx_custom_factory(),
             jsx: self.options.jsx(),
             jsx_factory: self.options.jsx_factory().map(Arc::from),
             jsx_fragment_factory: self.options.jsx_fragment_factory().map(Arc::from),
