@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+latchkey:
+  schema: 1
+
+jobs:
+  ci:
+    runs-on: small
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+      QUINT_HOME: /tmp/quint
+    steps:
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+          rustc --version
+      - name: Install dependencies (cargo, npm, Quint)
+        run: |
+          cargo fetch --locked
+          npm ci
+          npm ci --prefix formal/quint
+          version=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
+          test "$version" = v0.6.0
+          archive=/tmp/quint-evaluator.tar.gz
+          evaluator_dir="$QUINT_HOME/rust-evaluator-$version"
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+            "https://github.com/quint-co/quint/releases/download/evaluator/$version/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz" \
+            --output "$archive"
+          printf '61755a09d5052d93a4e75e840059edfd0d3674aeda164b9d2464be3d6e21b1c2  %s\n' "$archive" | sha256sum --check --strict
+          mkdir -p "$evaluator_dir"
+          tar -xzf "$archive" -C "$evaluator_dir" quint_evaluator
+          chmod +x "$evaluator_dir/quint_evaluator"
+      - name: Fetch pinned TypeScript test fixtures
+        run: cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
+      - name: Lint (rustfmt)
+        run: cargo fmt --all --check
+      - name: Lint (cargo check)
+        run: cargo check --workspace --locked
+      - name: Lint (clippy)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
