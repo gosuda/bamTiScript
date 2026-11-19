@@ -6,8 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Component, Path, PathBuf},
     process::Command,
 };
@@ -216,27 +215,6 @@ pub fn run_replay_canary_child(root: &Path, faulty: bool) -> Result<()> {
     }
 }
 
-pub fn regenerate_canonical_fixture(root: &Path) -> Result<usize> {
-    let (_, mut normalized) = load_normalized_transitions(root)?;
-    normalized.sort_by(|left, right| left.id.cmp(&right.id));
-
-    let fixture_path = root.join("verification/formal/trace-fixtures.jsonl");
-    let mut content = String::new();
-    for transition in &normalized {
-        validate_transition(transition, &fixture_path)?;
-        let line = serde_json::to_string(transition).map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Json,
-                format!("{} cannot be serialized: {error}", fixture_path.display()),
-            )
-        })?;
-        content.push_str(&line);
-        content.push('\n');
-    }
-    replace_file_atomically(&fixture_path, content.as_bytes())?;
-    Ok(normalized.len())
-}
-
 fn audit_g6_ready(root: &Path) -> Result<usize> {
     let (manifest, normalized) = load_normalized_transitions(root)?;
     let fixture_path = root.join("verification/formal/trace-fixtures.jsonl");
@@ -331,69 +309,6 @@ fn validate_unique_transition_ids(
         }
     }
     Ok(())
-}
-
-fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("{} has no parent directory", path.display()),
-        )
-    })?;
-    let name = path.file_name().ok_or_else(|| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("{} has no file name", path.display()),
-        )
-    })?;
-    let name = name.to_string_lossy();
-
-    for sequence in 0..128_u16 {
-        let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
-        let file = match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(VerificationError::new(
-                    ErrorCode::Io,
-                    format!("cannot create {}: {error}", temporary.display()),
-                ));
-            }
-        };
-        let mut file = file;
-        if let Err(error) = file.write_all(content).and_then(|()| file.sync_all()) {
-            let _ = fs::remove_file(&temporary);
-            return Err(VerificationError::new(
-                ErrorCode::Io,
-                format!("cannot write {}: {error}", temporary.display()),
-            ));
-        }
-        drop(file);
-        if let Err(error) = fs::rename(&temporary, path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(VerificationError::new(
-                ErrorCode::Io,
-                format!(
-                    "cannot atomically replace {} with {}: {error}",
-                    path.display(),
-                    temporary.display()
-                ),
-            ));
-        }
-        return Ok(());
-    }
-
-    Err(VerificationError::new(
-        ErrorCode::Io,
-        format!(
-            "cannot reserve a same-directory temporary file for {}",
-            path.display()
-        ),
-    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1755,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn regenerate_canonical_fixture_then_audit_g6() {
+    fn audit_g6_with_canonical_fixture() {
         let root = env::temp_dir().join(format!("bamts-formal-bridge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -1820,10 +1735,18 @@ mod tests {
             "verification/formal/trace-fixtures.jsonl",
             "stale fixture\n",
         );
-        assert_eq!(regenerate_canonical_fixture(&root).unwrap(), 6);
-        let regenerated =
-            parse_canonical_fixture(&root.join("verification/formal/trace-fixtures.jsonl"))
-                .unwrap();
+        let fixture_path = root.join("verification/formal/trace-fixtures.jsonl");
+        let (_, mut normalized) = load_normalized_transitions(&root).unwrap();
+        normalized.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(normalized.len(), 6);
+        let mut content = String::new();
+        for transition in &normalized {
+            validate_transition(transition, &fixture_path).unwrap();
+            content.push_str(&serde_json::to_string(transition).unwrap());
+            content.push('\n');
+        }
+        fs::write(&fixture_path, content.as_bytes()).unwrap();
+        let regenerated = parse_canonical_fixture(&fixture_path).unwrap();
         assert_eq!(regenerated.len(), 6);
         assert!(regenerated.windows(2).all(|pair| pair[0].id < pair[1].id));
 
