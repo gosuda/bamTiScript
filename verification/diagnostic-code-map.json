@@ -804,6 +804,12 @@
       "evidence": "REST_PARAMETER_INITIALIZER (parser.rs) -> TS1048 in the TypeScript 7.0.2 authority baselines: parserParameterList10.ts(2,11), restParamAsOptional.ts(2,16), destructuringParameterDeclaration4.ts(15,16), fatarrowfunctionsOptionalArgsErrors1.ts(4,5).",
       "status": "mapped",
       "tsCode": 1048
+    },
+    {
+      "bamtsCode": "BAMTS-C107",
+      "evidence": "REST_PARAMETER_ARRAY_TYPE (checker/binder.rs resolve_parameter) -> TS2370 in the TypeScript 7.0.2 authority baseline parserParameterList10.ts(2,8) for unannotated ...bar = 0. Annotated non-array rest (destructuringParameterDeclaration6.ts, nonArrayRestArgs.ts) keeps the existing C004 and is a separate mechanism.",
+      "status": "mapped",
+      "tsCode": 2370
     }
   ]
 }
