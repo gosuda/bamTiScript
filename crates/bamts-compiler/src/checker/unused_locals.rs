@@ -275,10 +275,18 @@ impl Walker<'_> {
                 if !matches!(method.modifier, PropertyModifier::Get) {
                     continue;
                 }
-                if let PropertyName::Identifier(name) = &method.name {
-                    if let Some(text) = self.ident_text(name) {
-                        getters.insert(text);
+                match &method.name {
+                    PropertyName::Identifier(name) => {
+                        if let Some(text) = self.ident_text(name) {
+                            getters.insert(text);
+                        }
                     }
+                    PropertyName::Private(name) => {
+                        if let Some(text) = self.private_ident_text(name) {
+                            getters.insert(text);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -310,7 +318,9 @@ impl Walker<'_> {
                 let Some(body) = method.function.body.as_ref() else {
                     return;
                 };
-                if matches!(method.modifiers.accessibility, Some(Accessibility::Private)) {
+                if matches!(method.modifiers.accessibility, Some(Accessibility::Private))
+                    || matches!(method.name, PropertyName::Private(_))
+                {
                     self.check_member_name(&method.name, &method.modifier, getters, home);
                 }
                 self.walk_params(&method.function.parameters);
@@ -328,7 +338,8 @@ impl Walker<'_> {
                 if matches!(
                     property.modifiers.accessibility,
                     Some(Accessibility::Private)
-                ) {
+                ) || matches!(property.name, PropertyName::Private(_))
+                {
                     self.check_private_name(&property.name, home);
                 }
             }
@@ -340,11 +351,11 @@ impl Walker<'_> {
                     self.walk_expr(&decorator.data().expression);
                 }
                 self.walk_computed_name(&accessor.name);
-                self.walk_initializer(accessor.initializer.as_deref());
                 if matches!(
                     accessor.modifiers.accessibility,
                     Some(Accessibility::Private)
-                ) {
+                ) || matches!(accessor.name, PropertyName::Private(_))
+                {
                     self.check_private_name(&accessor.name, home);
                 }
             }
@@ -360,29 +371,52 @@ impl Walker<'_> {
         getters: &HashSet<String>,
         home: TextRange,
     ) {
-        let PropertyName::Identifier(identifier) = name else {
-            return;
-        };
-        if matches!(modifier, PropertyModifier::Set) {
-            if let Some(text) = self.ident_text(identifier) {
-                if getters.contains(&text) {
-                    return;
+        match name {
+            PropertyName::Identifier(identifier) => {
+                if matches!(modifier, PropertyModifier::Set) {
+                    if let Some(text) = self.ident_text(identifier) {
+                        if getters.contains(&text) {
+                            return;
+                        }
+                    }
+                }
+                if let Some((span, text)) = self.unused_binding(identifier, home) {
+                    self.locals
+                        .push(unused_diagnostic(self.source, span, &text));
                 }
             }
-        }
-        if let Some((span, text)) = self.unused_binding(identifier, home) {
-            self.locals
-                .push(unused_diagnostic(self.source, span, &text));
+            PropertyName::Private(private) => {
+                if matches!(modifier, PropertyModifier::Set) {
+                    if let Some(text) = self.private_ident_text(private) {
+                        if getters.contains(&text) {
+                            return;
+                        }
+                    }
+                }
+                if let Some((span, text)) = self.unused_private_binding(private, home) {
+                    self.locals
+                        .push(unused_diagnostic(self.source, span, &text));
+                }
+            }
+            _ => {}
         }
     }
 
     fn check_private_name(&mut self, name: &PropertyName, home: TextRange) {
-        let PropertyName::Identifier(identifier) = name else {
-            return;
-        };
-        if let Some((span, text)) = self.unused_binding(identifier, home) {
-            self.locals
-                .push(unused_diagnostic(self.source, span, &text));
+        match name {
+            PropertyName::Identifier(identifier) => {
+                if let Some((span, text)) = self.unused_binding(identifier, home) {
+                    self.locals
+                        .push(unused_diagnostic(self.source, span, &text));
+                }
+            }
+            PropertyName::Private(private) => {
+                if let Some((span, text)) = self.unused_private_binding(private, home) {
+                    self.locals
+                        .push(unused_diagnostic(self.source, span, &text));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -530,6 +564,7 @@ impl Walker<'_> {
             self.walk_initializer(property.initializer.as_deref());
             let is_rest = matches!(property.binding.data(), BindingPattern::Rest(_));
             if rest_present && !is_rest {
+                all_dead = false;
                 continue;
             }
             if self.is_renamed_underscore(&property.name, &property.binding) {
@@ -683,6 +718,41 @@ impl Walker<'_> {
         self.source
             .identifier_text(identifier.data().token())
             .map(|name| name.into_owned())
+    }
+
+    fn private_ident_text(
+        &self,
+        identifier: &crate::syntax::PrivateIdentifierNode,
+    ) -> Option<String> {
+        self.source
+            .token_text(identifier.data().token())
+            .map(|name| name.to_owned())
+    }
+
+    fn unused_private_binding(
+        &self,
+        identifier: &crate::syntax::PrivateIdentifierNode,
+        home: TextRange,
+    ) -> Option<(TextRange, String)> {
+        let key = (
+            identifier.range().start().get(),
+            identifier.range().end().get(),
+        );
+        let symbol = self.bindings.get(&key).copied()?;
+        if self.marked.contains(&symbol) {
+            return None;
+        }
+        let name = self
+            .source
+            .token_text(identifier.data().token())?
+            .to_owned();
+        if is_exported_name(self.model, &self.exported, &name, symbol) {
+            return None;
+        }
+        if is_symbol_read(&self.reads, symbol, home) {
+            return None;
+        }
+        Some((identifier.range(), name))
     }
 
     fn walk_computed_name(&mut self, name: &PropertyName) {
@@ -946,5 +1016,96 @@ mod tests {
         assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
         let texts = messages(&outcome.locals);
         assert!(texts.contains(&"All variables are unused.".to_owned()));
+    }
+    #[test]
+    fn rest_reports_only_rest_binding() {
+        let outcome = check("function three() { const foo = { a: 1, b: 2 }; const { a, ...bar } = foo; }");
+        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'three' is declared but its value is never read.".to_owned()));
+        assert!(texts.contains(&"'bar' is declared but its value is never read.".to_owned()));
+        assert!(!texts.iter().any(|m| m.contains("destructured")), "{outcome:?}");
+    }
+
+    #[test]
+    fn hash_private_unused_reports() {
+        let outcome = check("class C { #x = 1; }");
+        assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'#x' is declared but its value is never read."
+        );
+    }
+
+    #[test]
+    fn hash_private_used_is_clean() {
+        let outcome = check("class C { #x = 1; m() { return this.#x; } } export const c = new C();");
+        assert!(outcome.locals.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn declaration_file_locals_are_clean() {
+        let source_text = Arc::new(SourceText::new("const x = 1;\n").expect("test source fits the budget").with_declaration_file(true));
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            crate::source::ScriptKind::TypeScript,
+            source_text,
+        ));
+        let file = parsed.product();
+        let (model, _) = bind_source(file);
+        let outcome = unused_diagnostics(file, &model);
+        assert!(outcome.locals.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn exported_local_is_clean() {
+        let outcome = check("export const x = 1;");
+        assert!(outcome.locals.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn partial_object_pattern_reports_only_unused() {
+        let outcome = check("function f() { const o = { a: 1, b: 2 }; const { a, b } = o; return a; }");
+        assert_eq!(outcome.locals.len(), 2, "{outcome:?}");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'f' is declared but its value is never read.".to_owned()));
+        assert!(texts.contains(&"'b' is declared but its value is never read.".to_owned()));
+        assert!(!texts.iter().any(|m| m.contains("'a'")), "{outcome:?}");
+    }
+
+    #[test]
+    fn partial_array_pattern_reports_only_unused() {
+        let outcome = check("function f() { const [a, b] = [1, 2]; return a; }");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'b' is declared but its value is never read.".to_owned()));
+        assert!(!texts.iter().any(|m| m.contains("destructured")), "{outcome:?}");
+    }
+
+    #[test]
+    fn for_of_unused_binding_reports() {
+        let outcome = check("function f() { const arr = [1]; for (const x of arr) { } }");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+    }
+
+    #[test]
+    fn compound_assignment_counts_as_read() {
+        let outcome = check("function f() { var x = 0; x += 1; return 1; }");
+        let texts = messages(&outcome.locals);
+        assert!(!texts.iter().any(|m| m.contains("'x'")), "{outcome:?}");
+    }
+
+    #[test]
+    fn update_counts_as_read() {
+        let outcome = check("function f() { var x = 0; x++; return 1; }");
+        let texts = messages(&outcome.locals);
+        assert!(!texts.iter().any(|m| m.contains("'x'")), "{outcome:?}");
+    }
+
+    #[test]
+    fn destructuring_assignment_target_is_write_only() {
+        let outcome = check("function f() { var x = 0; [x] = [1]; return 0; }");
+        let texts = messages(&outcome.locals);
+        assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
     }
 }
