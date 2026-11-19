@@ -2258,6 +2258,117 @@ impl TypeTable {
         }
         self.applied_alias_views.get(&type_id).copied()
     }
+    /// Whether the alias template mentions one of the alias's own type
+    /// parameters. A reference whose target ignores its arguments (e.g.
+    /// `type Strange<T> = string`, whose uses tsc prints as `string`) renders
+    /// as its view; a reference whose target uses them (e.g.
+    /// `type Pair<T> = [T, T]`, printed as `Pair<string>`) keeps its written
+    /// name. Baseline proof: `genericTypeAliases.types` rows
+    /// `>tree : Tree<number>`, `>ls : Lazy<string>`, `>x : Foo<string>` keep
+    /// the name, while `>s : string` (for `Strange<number>`) expands it.
+    #[must_use]
+    pub fn alias_target_uses_parameters(&self, symbol: SymbolId) -> bool {
+        let Some(template) = self.alias_template_raw(symbol) else {
+            return false;
+        };
+        let parameters = self.alias_type_parameters(symbol).to_vec();
+        if parameters.is_empty() {
+            return false;
+        }
+        let mut visiting = HashSet::new();
+        self.template_mentions_parameter(template, &parameters, &mut visiting)
+    }
+
+    fn template_mentions_parameter(
+        &self,
+        type_id: TypeId,
+        parameters: &[SymbolId],
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        match self.get(type_id) {
+            Type::Named(symbol) => parameters.contains(symbol),
+            Type::Array(element) => {
+                self.template_mentions_parameter(*element, parameters, visiting)
+            }
+            Type::Tuple(shape) => {
+                let shape = shape.clone();
+                shape.prefix.iter().copied().chain(shape.rest).chain(shape.suffix.iter().copied())
+                    .any(|element| self.template_mentions_parameter(element, parameters, visiting))
+            }
+            Type::Union(members) | Type::Intersection(members) => {
+                let members = members.clone();
+                members.iter().copied()
+                    .any(|member| self.template_mentions_parameter(member, parameters, visiting))
+            }
+            Type::ObjectType(object) => {
+                let object = object.clone();
+                object.properties.iter().map(|property| property.type_id())
+                    .chain(object.call_signatures.iter().flat_map(|signature| {
+                        Self::signature_member_types(signature)
+                    }))
+                    .chain(object.construct_signatures.iter().flat_map(|entry| {
+                        Self::signature_member_types(&entry.signature)
+                    }))
+                    .chain(object.index_signatures.iter().flat_map(|index| {
+                        index.parameters.iter().map(|parameter| parameter.type_id())
+                            .chain(std::iter::once(index.value_type))
+                    }))
+                    .any(|member| self.template_mentions_parameter(member, parameters, visiting))
+            }
+            Type::Function(signature) => {
+                let members = Self::signature_member_types(signature);
+                members.into_iter()
+                    .any(|member| self.template_mentions_parameter(member, parameters, visiting))
+            }
+            Type::AppliedClass { arguments, .. } => {
+                let arguments = arguments.clone();
+                arguments.iter().copied()
+                    .any(|argument| self.template_mentions_parameter(argument, parameters, visiting))
+            }
+            Type::AppliedAlias { arguments, .. } => {
+                let arguments = arguments.clone();
+                arguments.iter().copied()
+                    .any(|argument| self.template_mentions_parameter(argument, parameters, visiting))
+            }
+            Type::Keyof(operand) => {
+                self.template_mentions_parameter(*operand, parameters, visiting)
+            }
+            Type::IndexedAccess { object, index } => {
+                self.template_mentions_parameter(*object, parameters, visiting)
+                    || self.template_mentions_parameter(*index, parameters, visiting)
+            }
+            Type::Record { key, value } => {
+                self.template_mentions_parameter(*key, parameters, visiting)
+                    || self.template_mentions_parameter(*value, parameters, visiting)
+            }
+            Type::This { constraint, .. } => {
+                self.template_mentions_parameter(*constraint, parameters, visiting)
+            }
+            Type::ConstructorType { arguments, structural, .. } => {
+                let arguments = arguments.clone();
+                arguments.iter().copied().chain(std::iter::once(*structural))
+                    .any(|member| self.template_mentions_parameter(member, parameters, visiting))
+            }
+            Type::TypeQuery { arguments, target, .. } => {
+                let arguments = arguments.clone();
+                arguments.iter().copied().chain(std::iter::once(*target))
+                    .any(|member| self.template_mentions_parameter(member, parameters, visiting))
+            }
+            _ => false,
+        }
+    }
+    fn signature_member_types(signature: &FunctionSignature) -> Vec<TypeId> {
+        signature.parameters().iter().map(|parameter| parameter.type_id())
+            .chain(std::iter::once(signature.return_type()))
+            .chain(signature.declared_return())
+            .chain(signature.type_parameter_bounds().iter().flat_map(|bounds| {
+                bounds.constraint().into_iter().chain(bounds.default())
+            }))
+            .collect()
+    }
     #[must_use]
     pub fn type_query(&mut self, name: Box<str>, arguments: Vec<TypeId>, target: TypeId) -> TypeId {
         self.intern(Type::TypeQuery {
