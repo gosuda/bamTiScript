@@ -193,7 +193,7 @@ impl SystemPlan {
             let last = self.export_names.len() - 1;
             for (index, name) in self.export_names.iter().enumerate() {
                 let comma = if index == last { "" } else { "," };
-                lines.push(format!("    \"{name}\": true{comma}"));
+                lines.push(format!("    {}: true{comma}", quote_string(name)));
             }
             lines.push(String::from("};"));
             " && !exportedNames_1.hasOwnProperty(n)"
@@ -255,13 +255,18 @@ impl SystemPlan {
                     for (index, (exported, imported)) in pairs.iter().enumerate() {
                         let comma = if index + 1 == pairs.len() { "" } else { "," };
                         lines.push(format!(
-                            "                \"{exported}\": {param}[\"{imported}\"]{comma}"
+                            "                {}: {param}[{}]{comma}",
+                            quote_string(exported),
+                            quote_string(imported)
                         ));
                     }
                     lines.push(String::from("            });"));
                 }
                 SetterAction::NamespaceObject(name) => {
-                    lines.push(format!("            exports_1(\"{name}\", {param});"));
+                    lines.push(format!(
+                        "            exports_1({}, {param});",
+                        quote_string(name)
+                    ));
                 }
             }
         }
@@ -392,7 +397,8 @@ pub(super) fn publish_import_reexport(
         Some(system) => {
             system.export_name(exported);
             format!(
-                "exports_1(\"{exported}\", {});",
+                "exports_1({}, {});",
+                quote_string(exported),
                 import_read(root, property)
             )
         }
@@ -469,7 +475,8 @@ impl Rewriter<'_> {
         range: TextRange,
     ) -> Expr {
         let callee = self.ident_expr("exports_1");
-        let literal = self.string_literal(name);
+        let quoted = quote_string(name);
+        let literal = self.string_literal(&quoted[1..quoted.len() - 1]);
         let name_expr = self.syn_node(range, Expression::Literal(Literal::String(literal)));
         self.call_expression(range, callee, vec![name_expr, value])
     }
@@ -1132,5 +1139,116 @@ impl Rewriter<'_> {
             out.push(self.system_export_call(&name, &local, range));
         }
         out
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::super::{ScriptTarget, emit_transformed};
+    use crate::checker;
+    use crate::diagnostic::Recovered;
+    use crate::emitter::{EmitFileNames, EmitOptions, ModuleKind};
+    use crate::parser;
+    use crate::scanner;
+    use crate::source::{ScriptKind, SourceId, SourceText};
+    use std::sync::Arc;
+
+    fn parse(source: &str) -> crate::syntax::SourceFile {
+        parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(source).expect("test source fits the per-file source budget")),
+        ))
+        .into_product()
+    }
+
+    fn system_code(source: &str) -> String {
+        let options = EmitOptions {
+            target: ScriptTarget::Es2015,
+            module: Some(ModuleKind::System),
+            ..EmitOptions::default()
+        };
+        let file = parse(source);
+        let checked = checker::check(&Recovered::clean(parse(source)));
+        emit_transformed(
+            &file,
+            checked.product(),
+            &options.transform_view(),
+            &EmitFileNames::default(),
+        )
+        .javascript
+        .as_ref()
+        .expect("JavaScript output")
+        .code
+        .to_owned()
+    }
+
+    #[test]
+    fn star_table_escapes_a_hostile_export_name() {
+        let code =
+            system_code("export * from \"./b\";\nexport { a as \"x\\\"y\" } from \"./c\";\n");
+        assert!(
+            code.contains("\"x\\\"y\": true"),
+            "export name is escaped in the star table: {code}"
+        );
+        assert!(
+            !code.contains("\"x\"y\""),
+            "raw quote must not break out of the key: {code}"
+        );
+    }
+
+    #[test]
+    fn setter_object_pairs_escape_both_export_names() {
+        let code = system_code("export { \"p\\\"q\" as \"x\\\"y\" } from \"./b\";\n");
+        assert!(
+            code.contains("\"x\\\"y\": "),
+            "exported name is escaped in the setter object: {code}"
+        );
+        assert!(
+            code.contains("[\"p\\\"q\"]"),
+            "imported name is escaped in the setter object: {code}"
+        );
+        assert!(
+            !code.contains("\"x\"y\"") && !code.contains("\"p\"q\""),
+            "raw quotes must not break out of the setter lines: {code}"
+        );
+    }
+
+    #[test]
+    fn namespace_object_escapes_the_export_name() {
+        let code = system_code("export * as \"x\\\"y\" from \"./b\";\n");
+        assert!(
+            code.contains("exports_1(\"x\\\"y\", "),
+            "namespace export name is escaped: {code}"
+        );
+        assert!(
+            !code.contains("exports_1(\"x\"y\", "),
+            "raw quote must not break out of the call: {code}"
+        );
+    }
+
+    #[test]
+    fn import_reexport_call_escapes_the_export_name() {
+        let code = system_code("import { q } from \"./b\";\nexport { q as \"x\\\"y\" };\n");
+        assert!(
+            code.contains("exports_1(\"x\\\"y\", "),
+            "re-exported name is escaped: {code}"
+        );
+        assert!(
+            !code.contains("exports_1(\"x\"y\", "),
+            "raw quote must not break out of the call: {code}"
+        );
+    }
+
+    #[test]
+    fn local_specifier_export_call_escapes_the_export_name() {
+        let code = system_code("var a = 1;\nexport { a as \"x\\\"y\" };\n");
+        assert!(
+            code.contains("exports_1(\"x\\\"y\", a)"),
+            "local export name is escaped: {code}"
+        );
+        assert!(
+            !code.contains("exports_1(\"x\"y\", a)"),
+            "raw quote must not break out of the call: {code}"
+        );
     }
 }
