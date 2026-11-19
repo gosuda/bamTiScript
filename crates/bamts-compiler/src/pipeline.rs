@@ -265,6 +265,9 @@ fn program_emit_options(
     options.no_emit_helpers = check.no_emit_helpers();
     options.remove_comments = check.remove_comments();
     options.verbatim_module_syntax = program.verbatim_module_syntax();
+    options.source_map = program.source_map();
+    options.inline_source_map = program.inline_source_map();
+    options.inline_sources = program.inline_sources();
 
     // JSX routing is JavaScript-specific and already shared with the CLI path,
     // which applies the same overrides from `program.jsx()` after its base
@@ -2184,11 +2187,14 @@ pub fn compile_program_frontend_with_cancel(
             js_path.set_extension(if keeps_jsx { "jsx" } else { "js" });
             let names = EmitFileNames {
                 source_name,
-                js_file_name: Some(Arc::from(
-                    js_path.to_string_lossy().into_owned().into_boxed_str(),
-                )),
+                js_file_name: js_path.file_name().map(|name| {
+                    Arc::from(name.to_string_lossy().into_owned().into_boxed_str())
+                }),
                 declaration_file_name: None,
                 source_root: None,
+                js_source_name: module.path().file_name().map(|name| {
+                    Arc::from(name.to_string_lossy().into_owned().into_boxed_str())
+                }),
                 ..EmitFileNames::default()
             };
             let emit = if let Some(options) = program_emit_options(program, mode, index) {
@@ -3112,6 +3118,32 @@ mod tests {
         assert!(
             !js.starts_with("\"use strict\";\n"),
             "ES module output should not have strict prologue, got: {js:?}"
+        );
+        std::fs::remove_dir_all(root_path).unwrap();
+    }
+    #[test]
+    fn source_map_program_closes_emit_with_external_map_url() {
+        let source = "export const value: number = 1;";
+        let config = r#"{"compilerOptions":{"sourceMap":true}}"#;
+        let (root_path, program) = program_fixture_with_config(source, config);
+        assert!(program.source_map());
+        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
+        let js = entrypoint_javascript(&output);
+        assert!(
+            js.ends_with("//# sourceMappingURL=main.js.map"),
+            "external map url closes the emit: {js:?}"
+        );
+        std::fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn program_without_source_map_emits_no_map_url() {
+        let (root_path, program) = program_fixture("export const value: number = 1;");
+        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
+        let js = entrypoint_javascript(&output);
+        assert!(
+            !js.contains("sourceMappingURL"),
+            "no map url without sourceMap: {js:?}"
         );
         std::fs::remove_dir_all(root_path).unwrap();
     }
