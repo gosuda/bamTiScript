@@ -19,8 +19,8 @@ use super::typedarray_all::{
     typed_array_snapshot, value_from_storage,
 };
 use super::{
-    allocate_string, define_data, define_to_string_tag, heap_index, install_constructor_function,
-    install_function, range_error, type_error, value_number,
+    allocate_string, argument, define_data, define_to_string_tag, heap_index,
+    install_constructor_function, install_function, range_error, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -201,10 +201,6 @@ fn install_atomics<H: Host>(
         "Atomics",
     );
     globals.insert(EcmaString::encode("Atomics"), atomics);
-}
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
 /// GetArrayBufferMaxByteLengthOption: anything but an object means "fixed".

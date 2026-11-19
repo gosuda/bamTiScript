@@ -191,7 +191,7 @@ fn append(out: &mut EcmaStringBuilder, text: &EcmaString) {
     }
 }
 fn integer<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<isize, EvalFailure> {
-    Ok(super::array_es2023::integer_or_infinity(machine, value)? as isize)
+    Ok(super::to_integer_or_infinity(machine, value)? as isize)
 }
 /// Rejects a search string that is a RegExp, for the methods that take text only.
 fn require_not_regexp<H: Host>(
@@ -834,7 +834,7 @@ fn pad<H: Host>(
     start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let target = super::array_es2023::integer_or_infinity(
+    let target = super::to_integer_or_infinity(
         machine,
         args.first().copied().unwrap_or(Value::UNDEFINED),
     )?
@@ -915,7 +915,7 @@ fn repeat<H: Host>(
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let string = text(machine, this)?;
-    let count = super::array_es2023::integer_or_infinity(
+    let count = super::to_integer_or_infinity(
         machine,
         args.first().copied().unwrap_or(Value::UNDEFINED),
     )?;

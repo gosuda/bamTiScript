@@ -6,7 +6,7 @@ use bamts_native::{Decoded, Value};
 
 use super::array_generic as generic;
 use super::{allocate_string, array_es2023};
-use super::{define_data, install_constructor_function, install_function, type_error};
+use super::{define_data, install_constructor_function, install_function, length_of_array_like, type_error};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
@@ -259,7 +259,7 @@ pub(super) fn elements<H: Host>(
         return Ok(values);
     }
     let object = array_es2023::to_object(machine, this)?;
-    let length = array_es2023::length_of_array_like(machine, object)?;
+    let length = length_of_array_like(machine, object)?;
     // An array's length is what it already holds, however many of those are holes.
     if !is_array && length > MAX_ARRAY_LIKE_ELEMENTS {
         return Err(type_error("Array method received too long an array-like"));
@@ -335,7 +335,7 @@ fn locale_join<H: Host>(
     object: Value,
     forwarded: &[Value],
 ) -> Result<EcmaString, EvalFailure> {
-    let length = array_es2023::length_of_array_like(machine, object)?;
+    let length = length_of_array_like(machine, object)?;
     let mut output = bamts_bytecode::EcmaStringBuilder::new();
     for index in 0..length {
         generic::tick(machine)?;
@@ -377,7 +377,7 @@ fn copy_within_steps<H: Host>(
     object: Value,
     args: &[Value],
 ) -> Result<(), EvalFailure> {
-    let length = array_es2023::length_of_array_like(machine, object)?;
+    let length = length_of_array_like(machine, object)?;
     let target = args.first().copied().unwrap_or(Value::UNDEFINED);
     let mut to = super::array_generic::relative_position(machine, target, length)?;
     let start = args.get(1).copied().unwrap_or(Value::UNDEFINED);

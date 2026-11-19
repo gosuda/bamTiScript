@@ -10,7 +10,8 @@ use std::sync::Arc;
 use super::arraybuffer::{ArrayBufferHandle, SharedBlock};
 use super::{
     allocate_string, builtin_property, define_data, define_frozen_data, heap_index,
-    install_constructor_function, install_function, range_error, type_error,
+    install_constructor_function, install_function, length_of_array_like, number, range_error,
+    type_error,
 };
 use crate::intrinsics::builtins::bigint::{self, BigIntValue};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
@@ -542,42 +543,18 @@ pub(crate) fn write_element<H: Host>(
     Ok(true)
 }
 
-fn numeric_value<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, EvalFailure> {
-    match machine.coerce_number_observable(value)?.decode() {
-        Some(Decoded::Int32(value)) => Ok(f64::from(value as i32)),
-        Some(Decoded::Number(value)) => Ok(value),
-        _ => unreachable!("ToNumber produces a numeric value"),
-    }
-}
-
 /// ToIntegerOrInfinity. Adding `+0` turns the `-0` that truncating a small
 /// negative fraction yields into the `+0` the operation is defined to return.
 pub(crate) fn integer_or_infinity<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<f64, EvalFailure> {
-    let number = numeric_value(machine, value)?;
+    let number = number(machine, value)?;
     Ok(if number.is_nan() {
         0.0
     } else {
         number.trunc() + 0.0
     })
-}
-
-fn length_of_array_like<H: Host>(
-    machine: &mut Machine<'_, H>,
-    source: Value,
-) -> Result<usize, EvalFailure> {
-    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-    let length = machine.get_named_property(source, "length")?;
-    let number = numeric_value(machine, length)?;
-    if number.is_nan() || number <= 0.0 {
-        return Ok(0);
-    }
-    if number == f64::INFINITY {
-        return Ok(MAX_SAFE_INTEGER as usize);
-    }
-    Ok(number.trunc().min(MAX_SAFE_INTEGER) as usize)
 }
 
 pub(crate) fn storage_from_value<H: Host>(
@@ -596,7 +573,7 @@ pub(crate) fn storage_from_value<H: Host>(
         storage.copy_from_slice(&bigint.to_le_bytes());
         return Ok(storage);
     }
-    let number = numeric_value(machine, value)?;
+    let number = number(machine, value)?;
     match kind {
         ElementKind::Int8 => storage[0] = to_int_mod(number, 8) as i8 as u8,
         ElementKind::Uint8 => storage[0] = to_uint_mod(number, 8) as u8,
@@ -2382,7 +2359,7 @@ fn compare_typed_array_elements<H: Host>(
         return default_typed_array_order(machine, kind, left, right);
     };
     let result = machine.call_value(compare, Value::UNDEFINED, &[left, right])?;
-    let result = numeric_value(machine, result)?;
+    let result = number(machine, result)?;
     Ok(if result.is_nan() || result == 0.0 {
         Ordering::Equal
     } else if result < 0.0 {
@@ -3064,8 +3041,8 @@ mod tests {
         args: &[Value],
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
-        let left = numeric_value(machine, args[0])?;
-        let right = numeric_value(machine, args[1])?;
+        let left = number(machine, args[0])?;
+        let right = number(machine, args[1])?;
         Ok(BuiltinOutcome::Value(crate::number_value(
             (left / 10.0).trunc() - (right / 10.0).trunc(),
         )))

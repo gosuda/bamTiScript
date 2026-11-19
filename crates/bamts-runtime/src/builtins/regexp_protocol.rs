@@ -10,18 +10,17 @@ use crate::heap::Heap;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use super::array_es2023::{index_key, integer_or_infinity, length_of_array_like};
+use super::array_es2023::index_key;
 use super::array_generic::tick;
 use super::regexp::{builtin_exec, regexp_parts};
-use super::{allocate_array, allocate_string, keep_root, type_error, with_roots};
+use super::{
+    allocate_array, allocate_string, argument, keep_root, length_of_array_like,
+    to_integer_or_infinity, type_error, with_roots,
+};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, Property};
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
-}
 
 fn require_object<H: Host>(
     machine: &Machine<'_, H>,
@@ -61,7 +60,7 @@ pub(super) fn to_length<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<usize, EvalFailure> {
-    let length = integer_or_infinity(machine, value)?;
+    let length = to_integer_or_infinity(machine, value)?;
     Ok(length.clamp(0.0, MAX_SAFE_INTEGER) as usize)
 }
 
@@ -395,7 +394,7 @@ fn read_replace_step<H: Host>(
     let matched = machine.get_named_property(result, "0")?;
     let matched = machine.coerce_string_observable(matched)?;
     let position = machine.get_named_property(result, "index")?;
-    let position = integer_or_infinity(machine, position)?.clamp(0.0, length as f64) as usize;
+    let position = to_integer_or_infinity(machine, position)?.clamp(0.0, length as f64) as usize;
     budget_claimed_captures(
         machine,
         capture_count,

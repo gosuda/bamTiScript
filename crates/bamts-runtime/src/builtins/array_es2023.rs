@@ -11,7 +11,10 @@ use std::mem::size_of;
 use bamts_native::Value;
 
 use super::array_generic::tick;
-use super::{allocate_array, define_data, install_function, range_error, type_error, value_number};
+use super::{
+    allocate_array, argument, define_data, install_function, length_of_array_like, number,
+    range_error, to_integer_or_infinity, type_error, value_number,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     ArrayElementKind, EvalFailure, HeapEntry, Host, Machine, PropertyKey, RuntimeErrorKind,
@@ -118,46 +121,11 @@ pub(super) fn install<H: Host>(
     );
 }
 
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
-}
-
 pub(super) fn to_object<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<Value, EvalFailure> {
     machine.value_to_object(value)
-}
-
-fn number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, EvalFailure> {
-    machine.coerce_number_observable(value).map(value_number)
-}
-
-pub(super) fn integer_or_infinity<H: Host>(
-    machine: &mut Machine<'_, H>,
-    value: Value,
-) -> Result<f64, EvalFailure> {
-    let number = number(machine, value)?;
-    Ok(if number.is_nan() || number == 0.0 {
-        0.0
-    } else {
-        number.trunc()
-    })
-}
-
-pub(super) fn length_of_array_like<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-) -> Result<usize, EvalFailure> {
-    let length = machine.get_named_property(object, "length")?;
-    let length = number(machine, length)?;
-    if length.is_nan() || length <= 0.0 {
-        return Ok(0);
-    }
-    if length == f64::INFINITY {
-        return Ok(MAX_SAFE_INTEGER as usize);
-    }
-    Ok(length.trunc().min(MAX_SAFE_INTEGER) as usize)
 }
 
 pub(super) fn index_key(atoms: &mut crate::AtomTable, index: usize) -> PropertyKey {
@@ -270,7 +238,7 @@ fn at<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let object = to_object(machine, this)?;
     let length = length_of_array_like(machine, object)?;
-    let relative = integer_or_infinity(machine, argument(args, 0))?;
+    let relative = to_integer_or_infinity(machine, argument(args, 0))?;
     let index = relative_position(relative, length);
     if index < 0.0 || index >= length as f64 {
         return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
@@ -465,7 +433,7 @@ fn to_spliced<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let object = to_object(machine, this)?;
     let length = length_of_array_like(machine, object)?;
-    let relative_start = integer_or_infinity(machine, argument(args, 0))?;
+    let relative_start = to_integer_or_infinity(machine, argument(args, 0))?;
     let actual_start = clamped_start(relative_start, length);
     let insert_count = args.len().saturating_sub(2);
     let skip_count = if args.is_empty() {
@@ -473,7 +441,7 @@ fn to_spliced<H: Host>(
     } else if args.len() == 1 {
         length - actual_start
     } else {
-        let relative = integer_or_infinity(machine, args[1])?;
+        let relative = to_integer_or_infinity(machine, args[1])?;
         if relative <= 0.0 {
             0
         } else {
@@ -520,7 +488,7 @@ fn with<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let object = to_object(machine, this)?;
     let length = length_of_array_like(machine, object)?;
-    let relative = integer_or_infinity(machine, argument(args, 0))?;
+    let relative = to_integer_or_infinity(machine, argument(args, 0))?;
     let actual = relative_position(relative, length);
     if actual < 0.0 || actual >= length as f64 {
         return Err(range_error("Array index is out of range"));

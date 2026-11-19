@@ -6,8 +6,8 @@ use bamts_native::{Decoded, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use super::{
-    allocate_string, builtin_property, heap_index, install_function, range_error, type_error,
-    value_number,
+    allocate_string, builtin_property, heap_index, install_function, range_error,
+    to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey, RuntimeErrorKind};
@@ -107,25 +107,13 @@ fn number<H: Host>(machine: &mut Machine<'_, H>, value: Value) -> Result<f64, Ev
     machine.coerce_number_observable(value).map(value_number)
 }
 
-fn integer_or_infinity<H: Host>(
-    machine: &mut Machine<'_, H>,
-    value: Value,
-) -> Result<f64, EvalFailure> {
-    let value = number(machine, value)?;
-    Ok(if value.is_nan() || value == 0.0 {
-        0.0
-    } else {
-        value.trunc()
-    })
-}
-
 fn length_of_array_like<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<usize, EvalFailure> {
     require_coercible(value)?;
     let length = machine.get_named_property(value, "length")?;
-    let length = integer_or_infinity(machine, length)?.clamp(0.0, MAX_SAFE_INTEGER);
+    let length = to_integer_or_infinity(machine, length)?.clamp(0.0, MAX_SAFE_INTEGER);
     Ok(length as usize)
 }
 
@@ -292,7 +280,7 @@ fn at<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = string_receiver(machine, this)?;
-    let relative = integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let relative = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let index = if relative >= 0.0 {
         relative
     } else {
@@ -602,7 +590,7 @@ fn pad<H: Host>(
     at_start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = string_receiver(machine, this)?;
-    let target = integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
+    let target = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
         .clamp(0.0, MAX_SAFE_INTEGER);
     if target <= source.len_units() as f64 {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, source)?));
@@ -743,7 +731,7 @@ fn repeat<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = string_receiver(machine, this)?;
-    let count = integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let count = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     if count < 0.0 || count == f64::INFINITY {
         return Err(range_error("Invalid count value"));
     }

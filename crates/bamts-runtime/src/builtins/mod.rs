@@ -319,6 +319,34 @@ fn value_number(value: Value) -> f64 {
     }
 }
 
+pub(super) fn argument(args: &[Value], index: usize) -> Value {
+    args.get(index).copied().unwrap_or(Value::UNDEFINED)
+}
+
+pub(super) fn number<H: Host>(
+    machine: &mut Machine<'_, H>,
+    value: Value,
+) -> Result<f64, EvalFailure> {
+    machine.coerce_number_observable(value).map(value_number)
+}
+
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+pub(super) fn length_of_array_like<H: Host>(
+    machine: &mut Machine<'_, H>,
+    object: Value,
+) -> Result<usize, EvalFailure> {
+    let length = machine.get_named_property(object, "length")?;
+    let length = value_number(machine.coerce_number_observable(length)?);
+    if length.is_nan() || length <= 0.0 {
+        return Ok(0);
+    }
+    if length == f64::INFINITY {
+        return Ok(MAX_SAFE_INTEGER as usize);
+    }
+    Ok(length.trunc().min(MAX_SAFE_INTEGER) as usize)
+}
+
 #[allow(dead_code)]
 pub(crate) fn to_uint8<H: Host>(
     machine: &mut Machine<'_, H>,

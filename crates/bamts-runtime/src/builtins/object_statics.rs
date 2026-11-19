@@ -5,7 +5,9 @@ use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::property_descriptor::{PropertyDescriptor, from_property_descriptor, same_value};
-use super::{allocate_array, allocate_string, install_function, keep_root, type_error, with_roots};
+use super::{
+    allocate_array, allocate_string, argument, install_function, keep_root, type_error, with_roots,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -85,10 +87,6 @@ fn define_static(
         PropertyKey::Named(atoms.intern_str(name)),
         super::builtin_property(value),
     );
-}
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
 fn require_object_coercible(value: Value, operation: &'static str) -> Result<(), EvalFailure> {

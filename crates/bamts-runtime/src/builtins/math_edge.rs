@@ -4,7 +4,9 @@ use bamts_bytecode::EcmaString;
 use bamts_bytecode::IteratorKind;
 use bamts_native::{Decoded, Value};
 
-use super::{define_data, define_frozen_data, install_function, type_error, value_number};
+use super::{
+    argument, define_data, define_frozen_data, install_function, type_error, value_number,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, Host, Machine};
 
@@ -88,10 +90,6 @@ fn functions<H: Host>() -> [(&'static str, u32, BuiltinHandler<H>); 30] {
         ("tanh", 1, tanh::<H>),
         ("trunc", 1, trunc::<H>),
     ]
-}
-
-fn argument(args: &[Value], index: usize) -> Value {
-    args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
 /// Enough limbs for any sum the iterator protocol can produce: a finite Number
