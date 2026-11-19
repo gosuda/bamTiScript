@@ -11,14 +11,14 @@ use std::collections::HashSet;
 use crate::diagnostic::Diagnostic;
 use crate::source::{JsxEmit, ScriptKind, TextRange};
 use crate::syntax::{
-    ExportDeclaration, ExportNamedDeclaration, IdentifierNode, ImportBinding, ImportDeclaration,
-    ImportEqualsDeclaration, ImportSpecifierMode, ModuleExportName, SourceFile, Statement, Stmt,
+    IdentifierNode, ImportBinding, ImportDeclaration, ImportEqualsDeclaration,
+    ImportSpecifierMode, SourceFile, Statement, Stmt,
 };
 
 use super::binder::{ScopeId, SemanticModel};
 use super::unused_reads::{
-    FileReads, all_unused_diagnostic, file_reads, is_exported_name, is_symbol_read,
-    unused_diagnostic,
+    FileReads, all_unused_diagnostic, exported_local_names, file_reads, is_exported_name,
+    is_symbol_read, unused_diagnostic,
 };
 
 /// Options the unused-import check reads.
@@ -38,15 +38,13 @@ pub(crate) fn unused_import_diagnostics(
         return Vec::new();
     }
     let pragma = pragma_factories(source);
-    let mut exported = HashSet::new();
+    let mut exported = exported_local_names(source);
     let mut declarations = Vec::new();
     collect_statements(
-        source,
         source.statements(),
         model.module_scope(),
         model,
         &mut declarations,
-        &mut exported,
     );
     if is_classic_jsx(options.jsx) {
         match &pragma.factory {
@@ -174,25 +172,21 @@ struct ImportDeclarationTargets {
 }
 
 fn collect_statements(
-    source: &SourceFile,
     statements: &[Stmt],
     scope: ScopeId,
     model: &SemanticModel,
     declarations: &mut Vec<ImportDeclarationTargets>,
-    exported: &mut HashSet<String>,
 ) {
     for statement in statements {
-        collect_statement(source, statement, scope, model, declarations, exported);
+        collect_statement(statement, scope, model, declarations);
     }
 }
 
 fn collect_statement(
-    source: &SourceFile,
     statement: &Stmt,
     scope: ScopeId,
     model: &SemanticModel,
     declarations: &mut Vec<ImportDeclarationTargets>,
-    exported: &mut HashSet<String>,
 ) {
     match statement.data() {
         Statement::Import(import) => {
@@ -203,16 +197,13 @@ fn collect_statement(
         Statement::ImportEquals(import) => {
             declarations.push(collect_import_equals(import, scope, statement.range()))
         }
-        Statement::Export(export) => collect_export_names(source, export, exported),
         Statement::Namespace(namespace) => {
             let child = model.namespace_local_scope(statement.id()).unwrap_or(scope);
             collect_statements(
-                source,
                 &namespace.body.data().statements,
                 child,
                 model,
                 declarations,
-                exported,
             );
         }
         Statement::Declare(_) => {}
@@ -283,63 +274,6 @@ fn collect_import_equals(
     }
 }
 
-fn collect_export_names(
-    source: &SourceFile,
-    export: &ExportDeclaration,
-    exported: &mut HashSet<String>,
-) {
-    match export {
-        ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
-            source: from,
-            specifiers,
-            ..
-        }) => {
-            if from.is_some() {
-                return;
-            }
-            for specifier in specifiers {
-                note_export_specifier(source, specifier, exported);
-            }
-        }
-        ExportDeclaration::Default(default) => {
-            let crate::syntax::ExportDefaultValue::Expression(expression) = &default.value else {
-                return;
-            };
-            let crate::syntax::Expression::Identifier(identifier) = expression.data() else {
-                return;
-            };
-            note_identifier_export(source, identifier, exported);
-        }
-        ExportDeclaration::Assignment(expression) => {
-            let crate::syntax::Expression::Identifier(identifier) = expression.data() else {
-                return;
-            };
-            note_identifier_export(source, identifier, exported);
-        }
-        _ => {}
-    }
-}
-
-fn note_identifier_export(
-    source: &SourceFile,
-    identifier: &crate::syntax::IdentifierNode,
-    exported: &mut HashSet<String>,
-) {
-    if let Some(name) = source.identifier_text(identifier.data().token()) {
-        exported.insert(name.into_owned());
-    }
-}
-
-fn note_export_specifier(
-    source: &SourceFile,
-    specifier: &crate::syntax::ExportSpecifierNode,
-    exported: &mut HashSet<String>,
-) {
-    if let ModuleExportName::Identifier(local) = &specifier.data().local {
-        note_identifier_export(source, local, exported);
-    }
-}
-
 /// The local name of a reportable import binding, if it is neither
 /// type-only nor underscore-prefixed. Exported names are resolved
 /// separately so shadowed locals are still checked.
@@ -379,38 +313,13 @@ fn report_declaration(
         }
         unused.push((target.local.range(), name));
     }
-    let value_count = declaration
-        .bindings
-        .iter()
-        .filter(|target| !target.type_only)
-        .count();
-    if !unused.is_empty() && (value_count <= 1 || unused.len() == value_count) {
-        report_whole_declaration(source, declaration, unused, diagnostics);
+    if unused.len() > 1 {
+        diagnostics.push(all_unused_diagnostic(source, declaration.range));
         return;
     }
     for (range, name) in unused {
         diagnostics.push(unused_diagnostic(source, range, &name));
     }
-}
-
-/// A fully unused declaration reports once at the declaration: TS6192 for
-/// several bindings, TS6133 naming the single binding.
-fn report_whole_declaration(
-    source: &SourceFile,
-    declaration: &ImportDeclarationTargets,
-    mut unused: Vec<(TextRange, String)>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if unused.len() > 1 {
-        diagnostics.push(all_unused_diagnostic(source, declaration.range));
-        return;
-    }
-    let (range, name) = unused.pop().expect("one unused binding reports");
-    if declaration.bindings.len() > 1 {
-        diagnostics.push(unused_diagnostic(source, range, &name));
-        return;
-    }
-    diagnostics.push(unused_diagnostic(source, declaration.range, &name));
 }
 
 // Diagnostics use the shared constructors so imports and locals agree on
@@ -460,16 +369,18 @@ mod tests {
 
     #[test]
     fn unused_named_default_and_namespace_bindings_share_one_statement_error() {
-        let diagnostics = check(
-            "import { a } from \"./m\";\nimport d from \"./m\";\nimport * as ns from \"./m\";\nexport {};\n",
-        );
+        let text = "import { a } from \"./m\";\nimport d from \"./m\";\nimport * as ns from \"./m\";\nexport {};\n";
+        let diagnostics = check(text);
         assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         assert_eq!(codes(&diagnostics), ["6133", "6133", "6133"]);
         let starts: Vec<usize> = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.range().start().get())
             .collect();
-        assert_eq!(starts, [0, 25, 46], "{diagnostics:?}");
+        let expected_a = text.find("{ a }").expect("a binding") + "{ ".len();
+        let expected_d = text.find("import d ").expect("d binding") + "import ".len();
+        let expected_ns = text.find("* as ns").expect("ns binding") + "* as ".len();
+        assert_eq!(starts, [expected_a, expected_d, expected_ns], "{diagnostics:?}");
         let messages: Vec<_> = diagnostics.iter().map(Diagnostic::message).collect();
         assert!(messages.contains(&"'a' is declared but its value is never read."));
         assert!(messages.contains(&"'d' is declared but its value is never read."));
@@ -477,11 +388,31 @@ mod tests {
     }
 
     #[test]
-    fn used_type_reexport_underscore_and_factory_bindings_are_clean() {
-        let diagnostics = check(
-            "import { T } from \"./m\";\nimport { u } from \"./m\";\nimport { _q } from \"./m\";\nimport \"./m\";\nlet x: T;\nexport { u };\n",
-        );
+    fn imported_type_used_in_annotation_is_clean() {
+        let diagnostics = check("import { T } from \"./m\";\nlet x: T;\nexport {};\n");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn reexported_binding_is_clean() {
+        let diagnostics = check("import { u } from \"./m\";\nexport { u };\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn underscore_prefixed_import_is_clean() {
+        let diagnostics = check("import { _q } from \"./m\";\nexport {};\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn side_effect_import_is_clean() {
+        let diagnostics = check("import \"./m\";\nexport {};\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn classic_jsx_factory_import_is_clean() {
         let classic = UnusedImportOptions {
             jsx: Some(JsxEmit::React),
             jsx_custom_factory: false,
@@ -582,32 +513,64 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(codes(&diagnostics), ["6192"]);
         assert_eq!(diagnostics[0].range().start().get(), 0, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message(),
+            "All imports in import declaration are unused."
+        );
     }
 
     #[test]
     fn single_unused_in_multi_binding_reports_name() {
-        let diagnostics = check("import { a, b } from \"./m\";\nexport const x = a;\n");
+        let text = "import { a, b } from \"./m\";\nexport const x = a;\n";
+        let diagnostics = check(text);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(codes(&diagnostics), ["6133"]);
         assert_eq!(
             diagnostics[0].message(),
             "'b' is declared but its value is never read."
         );
+        let expected = text.find(", b }").expect("b binding") + ", ".len();
+        assert_eq!(
+            diagnostics[0].range().start().get(),
+            expected,
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
-    fn import_type_and_inline_type_are_clean() {
-        let diagnostics = check("import type { T } from \"./m\";\nexport {};\n");
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let inline = check("import { type T } from \"./m\";\nexport {};\n");
-        assert!(inline.is_empty(), "{inline:?}");
+    fn namespace_internal_export_does_not_mark_import_used() {
+        let text = "import { a } from \"./m\";\nnamespace N { export { a }; }\n";
+        let diagnostics = check(text);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+        assert_eq!(
+            diagnostics[0].message(),
+            "'a' is declared but its value is never read."
+        );
+        let expected = text.find("{ a }").expect("a binding") + "{ ".len();
+        assert_eq!(
+            diagnostics[0].range().start().get(),
+            expected,
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
     fn import_equals_unused_reports() {
-        let diagnostics = check("import r = require(\"./m\");\nexport {};\n");
+        let text = "import r = require(\"./m\");\nexport {};\n";
+        let diagnostics = check(text);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(codes(&diagnostics), ["6133"]);
+        assert_eq!(
+            diagnostics[0].message(),
+            "'r' is declared but its value is never read."
+        );
+        let expected = text.find("import r").expect("r binding") + "import ".len();
+        assert_eq!(
+            diagnostics[0].range().start().get(),
+            expected,
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
