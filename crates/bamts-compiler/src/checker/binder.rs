@@ -20502,7 +20502,8 @@ impl<'src> Binder<'src> {
                     None => self.array_prototype_member(object_type, name, range),
                 }
             }
-            Type::Number
+            Type::Boolean
+            | Type::Number
             | Type::BigInt
             | Type::String
             | Type::Symbol
@@ -20589,7 +20590,6 @@ impl<'src> Binder<'src> {
             | Type::Void
             | Type::Null
             | Type::Undefined
-            | Type::Boolean
             | Type::Object
             | Type::Function(_)
             | Type::AppliedAlias { .. }
