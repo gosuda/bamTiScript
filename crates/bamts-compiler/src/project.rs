@@ -7,6 +7,8 @@ pub mod resolution;
 pub mod resolution_trace;
 pub mod tsconfig;
 
+pub use effective::{OutFileBundle, emit_out_file_javascript};
+
 #[cfg(test)]
 pub(crate) mod test_paths;
 

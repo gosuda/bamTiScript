@@ -166,6 +166,11 @@ pub struct EmitOptions {
     pub jsx_import_source: Option<Arc<str>>,
     pub newline: Newline,
     pub indent_width: u8,
+    /// The explicit `define("name", ...)` name an `outFile` bundle gives one
+    /// AMD or UMD module: the source path relative to the common source
+    /// directory without its extension. Single-file emit leaves it unset, so
+    /// the wrapper stays nameless.
+    pub bundle_module_name: Option<Arc<str>>,
 }
 
 impl Default for EmitOptions {
@@ -200,6 +205,7 @@ impl Default for EmitOptions {
             jsx_import_source: None,
             newline: Newline::Lf,
             indent_width: 4,
+            bundle_module_name: None,
         }
     }
 }
@@ -430,6 +436,7 @@ impl EmitOptions {
             es_module_interop: self.es_module_interop,
             newline: self.newline,
             indent_width: self.indent_width,
+            bundle_module_name: self.bundle_module_name.clone(),
             jsx: self.jsx,
             jsx_factory: self.jsx_factory.clone(),
             jsx_fragment_factory: self.jsx_fragment_factory.clone(),
