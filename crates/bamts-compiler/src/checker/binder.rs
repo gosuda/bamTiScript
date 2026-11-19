@@ -15000,6 +15000,31 @@ impl<'src> Binder<'src> {
             view = constraint;
         }
         view = self.types.prepare_applied_class_view(view).unwrap_or(view);
+        if let Type::Union(members) = self.types.get(view).clone() {
+            let mut rests = Vec::with_capacity(members.len());
+            for member in members {
+                if matches!(self.types.get(member), Type::Null | Type::Undefined) {
+                    continue;
+                }
+                rests.push(self.rest_spread_source(member, excluded));
+            }
+            if rests.is_empty() {
+                return self.types.object_type_with_members(ObjectType {
+                    properties: Vec::new(),
+                    call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures: Vec::new(),
+                    generator_return: None,
+                    iterator_property: None,
+                    async_iterator_property: None,
+                });
+            }
+            if rests.len() == 1 {
+                return rests[0];
+            }
+            return self.types.union(&rests);
+        }
         let (structural, statics) = match self.types.get(view).clone() {
             Type::ConstructorType { structural, .. } => (structural, true),
             _ => (view, false),
@@ -29209,10 +29234,11 @@ mod tests {
         EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
         FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, FunctionParameter, FunctionSignature,
         GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
-        NAMESPACE_NO_EXPORTED_MEMBER, ObjectType, PROPERTY_NOT_INITIALIZED, PropertyType,
-        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
-        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
-        TupleShape, Type, TypeId, TypeParameterBounds, TypeTable, bind_source,
+        NAMESPACE_NO_EXPORTED_MEMBER, ObjectType, PROPERTY_DOES_NOT_EXIST,
+        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
+        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
+        SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeId, TypeParameterBounds,
+        TypeTable, bind_source,
     };
     use crate::diagnostic::{Diagnostic, DiagnosticCode};
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -29239,6 +29265,17 @@ mod tests {
         assert_eq!(codes, [CANNOT_FIND_NAME]);
         let (_, diagnostics) = bound("var known: number[] = [];\n[...known] = known;\n");
         assert_eq!(diagnostics.len(), 0, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn union_object_rest_drops_excluded_names_per_member() {
+        let (_, diagnostics) = bound(
+            "declare const u: { a: number, b: number } | { a: number, c: number };\n\
+             const { a, ...rest } = u;\n\
+             const n: number = rest.a;\n",
+        );
+        let codes: Vec<_> = diagnostics.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [PROPERTY_DOES_NOT_EXIST]);
     }
 
     #[test]
