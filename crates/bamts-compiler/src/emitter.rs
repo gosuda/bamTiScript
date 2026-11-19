@@ -7414,6 +7414,27 @@ mod tests {
         let file = b.finish(vec![expr_stmt(tree)]);
         assert_eq!(emit_js(&file).code, "(a + b) * c;\n");
     }
+    #[test]
+    fn tagged_template_spacing_follows_the_unwrapped_tag() {
+        fn emit_tagged(input: &str) -> String {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+            ));
+            assert!(parsed.diagnostics().is_empty(), "{input}");
+            emit_output(parsed.product(), &EmitOptions::default())
+                .javascript
+                .expect("JavaScript output")
+                .code
+                .clone()
+        }
+        assert_eq!(emit_tagged("tag`x`;\n"), "tag`x`;\n");
+        assert_eq!(emit_tagged("getTag()`x`;\n"), "getTag() `x`;\n");
+        assert_eq!(emit_tagged("new Tag()`x`;\n"), "new Tag() `x`;\n");
+        assert_eq!(emit_tagged("(getTag())`x`;\n"), "(getTag()) `x`;\n");
+        assert_eq!(emit_tagged("(tag as any)`x`;\n"), "tag`x`;\n");
+    }
 
     #[test]
     fn exponent_is_right_associative_and_forces_left_grouping() {
