@@ -385,7 +385,11 @@ impl Rewriter<'_> {
         (prelude, wrapped)
     }
 
-    fn plain_parameter(&mut self, name: &IdentifierNode, range: TextRange) -> ParameterNode {
+    pub(super) fn plain_parameter(
+        &mut self,
+        name: &IdentifierNode,
+        range: TextRange,
+    ) -> ParameterNode {
         let binding = self.node(name.range(), BindingPattern::Identifier(name.clone()));
         self.node(
             range,

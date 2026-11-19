@@ -562,15 +562,27 @@ impl Rewriter<'_> {
         expression: &Expr,
         assignment: &AssignmentExpression,
     ) -> Option<Expr> {
-        let AssignmentTarget::Member(member) = assignment.left.data() else {
-            return None;
+        let (object, property, object_range) = match assignment.left.data() {
+            AssignmentTarget::Member(member) => (
+                member.object.as_ref(),
+                &member.property,
+                member.object.range(),
+            ),
+            AssignmentTarget::Invalid(operand) => {
+                let member = asserted_member(operand)?;
+                (
+                    member.object.as_ref(),
+                    &member.property,
+                    member.object.range(),
+                )
+            }
+            _ => return None,
         };
-        let name = self.private_member_name(&member.property)?;
+        let name = self.private_member_name(property)?;
         let range = expression.range();
-        let object_range = member.object.range();
         let Some(resolved) = self.resolve_private(&name, PrivateAccess::Write) else {
             let right = self.rewrite_expr(&assignment.right);
-            let object = self.rewrite_expr(&member.object);
+            let object = self.rewrite_expr(object);
             let target = self.empty_property_target(object, object_range);
             return Some(self.node(
                 range,
@@ -583,14 +595,14 @@ impl Rewriter<'_> {
         };
         if assignment.operator == AssignmentOperator::Assign {
             let right = self.rewrite_expr(&assignment.right);
-            let receiver = self.rewrite_expr(&member.object);
+            let receiver = self.rewrite_expr(object);
             return Some(self.private_set_call(receiver, right, &resolved, range));
         }
-        let receivers = if matches!(member.object.data(), Expression::This) {
-            let rewritten = self.rewrite_expr(&member.object);
+        let receivers = if matches!(object.data(), Expression::This) {
+            let rewritten = self.rewrite_expr(object);
             (rewritten.clone(), rewritten)
         } else {
-            self.private_captured_receiver(&member.object, PrivateAccess::Write)
+            self.private_captured_receiver(object, PrivateAccess::Write)
         };
         let right = self.rewrite_expr(&assignment.right);
         let read = self.private_get_call(receivers.1, &resolved, object_range);
@@ -889,6 +901,261 @@ impl Rewriter<'_> {
             self.node(range, Expression::Literal(Literal::String(literal))),
         ))
     }
+
+    /// Whether a destructuring pattern writes a private member: a `this.#x`
+    /// style member target or an invalid target wrapping one, at any depth.
+    pub(super) fn pattern_has_private_target(&self, target: &AssignmentTargetNode) -> bool {
+        match target.data() {
+            AssignmentTarget::Object(pattern) => pattern
+                .properties
+                .iter()
+                .any(|property| self.pattern_has_private_target(&property.target)),
+            AssignmentTarget::Array(pattern) => pattern.elements.iter().any(|element| {
+                match element {
+                    AssignmentArrayElement::Target(target)
+                    | AssignmentArrayElement::Rest(target) => {
+                        self.pattern_has_private_target(target)
+                    }
+                    AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => false,
+                }
+            }),
+            AssignmentTarget::Member(member) => {
+                matches!(member.property, MemberProperty::Private(_))
+            }
+            AssignmentTarget::Invalid(operand) => asserted_member(operand).is_some_and(|member| {
+                matches!(member.property, MemberProperty::Private(_))
+            }),
+            _ => false,
+        }
+    }
+
+    /// Rewrites a destructuring assignment whose pattern writes private
+    /// members: each private target becomes a setter that routes the write
+    /// through `__classPrivateFieldSet`, receivers that are not plain
+    /// identifiers are captured once ahead of the assignment, and the
+    /// captures lead it inside one sequence.
+    pub(super) fn lower_private_destructured_assignment(
+        &mut self,
+        expression: &Expr,
+        assignment: &AssignmentExpression,
+    ) -> Option<Expr> {
+        if !matches!(
+            assignment.left.data(),
+            AssignmentTarget::Object(_) | AssignmentTarget::Array(_)
+        ) || !self.private_lowering_active()
+            || !self.pattern_has_private_target(&assignment.left)
+        {
+            return None;
+        }
+        let mut captures = Vec::new();
+        let left = self.rewrite_private_destructured_target(&assignment.left, &mut captures);
+        let right = self.rewrite_expr(&assignment.right);
+        let rewritten = self.node(
+            expression.range(),
+            Expression::Assignment(AssignmentExpression {
+                operator: assignment.operator,
+                left,
+                right: Box::new(right),
+            }),
+        );
+        if captures.is_empty() {
+            return Some(rewritten);
+        }
+        let mut parts = captures;
+        parts.push(rewritten);
+        Some(self.sequence(parts, expression.range()))
+    }
+
+    /// Rewrites one destructuring target, routing private member targets
+    /// through the setter form and delegating every other target to the
+    /// ordinary assignment-target rewrite so exports and member objects
+    /// still lower.
+    fn rewrite_private_destructured_target(
+        &mut self,
+        target: &AssignmentTargetNode,
+        captures: &mut Vec<Expr>,
+    ) -> AssignmentTargetNode {
+        match target.data() {
+            AssignmentTarget::Object(pattern) => {
+                let properties = pattern
+                    .properties
+                    .iter()
+                    .map(|property| AssignmentObjectProperty {
+                        name: self.rewrite_property_name(&property.name),
+                        target: self.rewrite_private_destructured_target(
+                            &property.target,
+                            captures,
+                        ),
+                        initializer: property
+                            .initializer
+                            .as_deref()
+                            .map(|value| Box::new(self.rewrite_expr(value))),
+                        rest: property.rest,
+                    })
+                    .collect();
+                self.node(
+                    target.range(),
+                    AssignmentTarget::Object(AssignmentObjectPattern { properties }),
+                )
+            }
+            AssignmentTarget::Array(pattern) => {
+                let elements = pattern
+                    .elements
+                    .iter()
+                    .map(|element| match element {
+                        AssignmentArrayElement::Target(inner) => {
+                            AssignmentArrayElement::Target(
+                                self.rewrite_private_destructured_target(inner, captures),
+                            )
+                        }
+                        AssignmentArrayElement::Rest(inner) => AssignmentArrayElement::Rest(
+                            self.rewrite_private_destructured_target(inner, captures),
+                        ),
+                        other => other.clone(),
+                    })
+                    .collect();
+                self.node(
+                    target.range(),
+                    AssignmentTarget::Array(AssignmentArrayPattern { elements }),
+                )
+            }
+            AssignmentTarget::Member(member) => {
+                if let Some(name) = self.private_member_name(&member.property) {
+                    return self.rewrite_private_destructured_member(
+                        member.object.as_ref(),
+                        &name,
+                        captures,
+                        target.range(),
+                    );
+                }
+                self.rewrite_member_target(member, target.range())
+            }
+            AssignmentTarget::Invalid(operand) => {
+                if let Some(member) = asserted_member(operand)
+                    && let Some(name) = self.private_member_name(&member.property)
+                {
+                    return self.rewrite_private_destructured_member(
+                        member.object.as_ref(),
+                        &name,
+                        captures,
+                        target.range(),
+                    );
+                }
+                target.clone()
+            }
+            _ => self.rewrite_assignment_target(target),
+        }
+    }
+
+    /// Rewrites one private member target inside a destructuring pattern
+    /// into `({ set value(v) { __classPrivateFieldSet(receiver, state, v,
+    /// kind, f); } }).value`. A `this` or composite receiver is captured
+    /// into a hoisted temporary first; a plain identifier is used as is.
+    fn rewrite_private_destructured_member(
+        &mut self,
+        object: &Expr,
+        name: &str,
+        captures: &mut Vec<Expr>,
+        range: TextRange,
+    ) -> AssignmentTargetNode {
+        let Some(resolved) = self.resolve_private(name, PrivateAccess::Write) else {
+            let rewritten_object = self.rewrite_expr(object);
+            let property = MemberProperty::Named(self.ident(""));
+            return self.node(
+                range,
+                AssignmentTarget::Member(AssignmentMemberTarget {
+                    object: Box::new(rewritten_object),
+                    property,
+                }),
+            );
+        };
+        let rewritten_object = self.rewrite_expr(object);
+        let receiver = match rewritten_object.data() {
+            Expression::Identifier(_) => rewritten_object,
+            _ => {
+                let temp = self.expression_temp();
+                let capture = self.temp_assignment(&temp, rewritten_object, range);
+                captures.push(capture);
+                self.node(temp.range(), Expression::Identifier(temp))
+            }
+        };
+        let setter = self.private_destructured_setter(receiver, &resolved, range);
+        self.node(range, AssignmentTarget::Invalid(Box::new(setter)))
+    }
+
+    /// `({ set value(v) { __classPrivateFieldSet(receiver, state, v, kind,
+    /// f); } }).value` — the assignment-target form of a private write
+    /// that a destructuring pattern can carry.
+    fn private_destructured_setter(
+        &mut self,
+        receiver: Expr,
+        resolved: &ResolvedPrivate,
+        range: TextRange,
+    ) -> Expr {
+        let value_name = self.temp_ident();
+        let value_ident = self.node(
+            value_name.range(),
+            Expression::Identifier(value_name.clone()),
+        );
+        let call = self.private_set_call(receiver, value_ident, resolved, range);
+        let statement = self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(call),
+            }),
+        );
+        let block = self.node(range, Block { statements: vec![statement] });
+        let binding = self.node(
+            value_name.range(),
+            BindingPattern::Identifier(value_name.clone()),
+        );
+        let parameter = self.node(
+            range,
+            Parameter {
+                decorators: Vec::new(),
+                modifiers: ParameterModifiers::default(),
+                binding,
+                optional: false,
+                type_annotation: None,
+                initializer: None,
+            },
+        );
+        let function = FunctionLike {
+            decorators: Vec::new(),
+            name: None,
+            is_async: false,
+            is_generator: false,
+            type_parameters: None,
+            parameters: vec![parameter],
+            return_type: None,
+            body: Some(FunctionBody::Block(block)),
+        };
+        let property_name = self.ident("value");
+        let method = self.syn_node(
+            range,
+            ObjectMember::Method(ObjectMethod {
+                name: PropertyName::Identifier(property_name.clone()),
+                modifier: PropertyModifier::Set,
+                function,
+            }),
+        );
+        let object = self.syn_node(
+            range,
+            Expression::Object(ObjectLiteral {
+                members: vec![method],
+            }),
+        );
+        self.alternate_layout.insert(object.id());
+        let parenthesized = self.syn_node(range, Expression::Parenthesized(Box::new(object)));
+        self.node(
+            range,
+            Expression::Member(MemberExpression {
+                object: Box::new(parenthesized),
+                property: MemberProperty::Named(property_name),
+                optional: false,
+            }),
+        )
+    }
 }
 
 fn preferred_slot<'s>(matches: &[&'s PrivateSlot], preferred: PrivateKind) -> &'s PrivateSlot {
@@ -918,5 +1185,19 @@ fn compound_operator(operator: AssignmentOperator) -> BinaryOperator {
         | AssignmentOperator::LogicalAndAssign
         | AssignmentOperator::LogicalOrAssign
         | AssignmentOperator::NullishAssign => BinaryOperator::Add,
+    }
+}
+
+/// The member expression left once parentheses, assertions, and non-null
+/// marks around an invalid assignment target's operand are erased.
+fn asserted_member(expression: &Expr) -> Option<&MemberExpression> {
+    match expression.data() {
+        Expression::Parenthesized(inner) => asserted_member(inner),
+        Expression::As(cast) => asserted_member(&cast.expression),
+        Expression::Satisfies(cast) => asserted_member(&cast.expression),
+        Expression::TypeAssertion(cast) => asserted_member(&cast.expression),
+        Expression::NonNull(non_null) => asserted_member(&non_null.expression),
+        Expression::Member(member) => Some(member),
+        _ => None,
     }
 }
