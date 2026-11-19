@@ -3514,7 +3514,15 @@ impl<'a> Emitter<'a> {
                 ')',
             )
             .unwrap_or(last_end);
-        self.emit_list_break_before(last_end, close, ')');
+        let break_from = if self.options.remove_comments {
+            last_end
+        } else {
+            self.trailing_element_comments(last_end)
+                .last()
+                .map_or(last_end, |comment| comment.end())
+        };
+        let past_close = Utf16Pos::new(close.get().saturating_add(1));
+        self.emit_list_break_before(break_from, past_close, ')');
         self.raw_mapped_token(")", close, 1);
     }
     fn is_this_parameter(&self, parameter: &Parameter) -> bool {
