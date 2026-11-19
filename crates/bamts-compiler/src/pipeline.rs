@@ -783,19 +783,26 @@ struct TslibHelperWalk<'a> {
     sites: Vec<(&'static str, crate::source::TextRange)>,
     ambient: bool,
     in_async_generator: bool,
+    extends_keywords: Vec<crate::source::TextRange>,
 }
-
 /// First-spanning sites in source order for one file.
 fn tslib_helper_sites(
     source: &SourceFile,
     context: &TslibHelperContext,
 ) -> Vec<(&'static str, crate::source::TextRange)> {
+    let extends_keywords = source
+        .tokens()
+        .iter()
+        .filter(|token| token.kind() == crate::syntax::TokenKind::KwExtends)
+        .map(|token| token.range())
+        .collect::<Vec<_>>();
     let mut walk = TslibHelperWalk {
         context,
         source,
         sites: Vec::new(),
         ambient: false,
         in_async_generator: false,
+        extends_keywords,
     };
     walk.stmts(source.statements());
     walk.sites
@@ -1721,14 +1728,10 @@ impl TslibHelperWalk<'_> {
 
     fn extends_span(&self, heritage: &crate::syntax::ClassHeritage) -> crate::source::TextRange {
         let expression = heritage.expression.range();
-        let mut keyword = None;
-        for token in self.source.tokens() {
-            if token.kind() == crate::syntax::TokenKind::KwExtends
-                && token.range().end() <= expression.start()
-            {
-                keyword = Some(token.range());
-            }
-        }
+        let index = self
+            .extends_keywords
+            .partition_point(|keyword| keyword.end() <= expression.start());
+        let keyword = index.checked_sub(1).and_then(|at| self.extends_keywords.get(at)).copied();
         keyword.map_or(expression, |keyword| {
             crate::source::TextRange::new(keyword.start(), expression.end()).unwrap_or(expression)
         })
