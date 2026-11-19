@@ -11,7 +11,6 @@
 use crate::emitter::ScriptTarget;
 use std::sync::Arc;
 
-
 /// A category of TypeScript lib files that is relevant for global scoping.
 ///
 /// Each variant aggregates the `lib.*.d.ts` files from the TypeScript 7.0.2
@@ -568,14 +567,82 @@ pub fn global_lib_decl_file(name: &str) -> Option<&'static str> {
 }
 
 const GLOBAL_LIB_DECL_FILES: &[(&str, &[(&str, Option<Lib>)])] = &[
-    ("Array", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
-    ("DataView", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
-    ("Date", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.scripthost.d.ts", Some(Lib::Scripthost)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
-    ("Math", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
-    ("Set", &[("lib.es2015.collection.d.ts", None), ("lib.es2015.collection.d.ts", None), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)), ("lib.es2025.collection.d.ts", Some(Lib::Es2025Iterator))]),
-    ("String", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
-    ("Symbol", &[("lib.es5.d.ts", None), ("lib.es2015.symbol.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
-    ("Uint8Array", &[("lib.es5.d.ts", None), ("lib.es5.d.ts", None), ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)), ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)), ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015))]),
+    (
+        "Array",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)),
+            ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
+    (
+        "DataView",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
+    (
+        "Date",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.scripthost.d.ts", Some(Lib::Scripthost)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
+    (
+        "Math",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
+    (
+        "Set",
+        &[
+            ("lib.es2015.collection.d.ts", None),
+            ("lib.es2015.collection.d.ts", None),
+            ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+            ("lib.es2025.collection.d.ts", Some(Lib::Es2025Iterator)),
+        ],
+    ),
+    (
+        "String",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)),
+            ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
+    (
+        "Symbol",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es2015.symbol.d.ts", Some(Lib::Es2015)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
+    (
+        "Uint8Array",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es5.d.ts", None),
+            ("lib.es2015.core.d.ts", Some(Lib::Es2015Core)),
+            ("lib.es2015.iterable.d.ts", Some(Lib::Es2015)),
+            ("lib.es2015.symbol.wellknown.d.ts", Some(Lib::Es2015)),
+        ],
+    ),
 ];
 /// Static members of lib globals recorded as dotted reference symbols, with
 /// the lib Decl files upstream lists in baseline order. The es2017.date.d.ts
@@ -583,7 +650,15 @@ const GLOBAL_LIB_DECL_FILES: &[(&str, &[(&str, Option<Lib>)])] = &[
 /// Es2017SharedMemory, which every es2017-or-later set includes.
 const INTRINSIC_STATIC_MEMBERS: &[(&str, &str, &str, &[(&str, Option<Lib>)])] = &[
     ("Math", "PI", "Math.PI", &[("lib.es5.d.ts", None)]),
-    ("Date", "UTC", "DateConstructor.UTC", &[("lib.es5.d.ts", None), ("lib.es2017.date.d.ts", Some(Lib::Es2017SharedMemory))]),
+    (
+        "Date",
+        "UTC",
+        "DateConstructor.UTC",
+        &[
+            ("lib.es5.d.ts", None),
+            ("lib.es2017.date.d.ts", Some(Lib::Es2017SharedMemory)),
+        ],
+    ),
 ];
 
 #[must_use]
@@ -619,7 +694,9 @@ pub fn lib_decl_files_for_global(
                 .map(|entry| entry.1)
         });
     let Some(files) = files else {
-        return global_lib_decl_file(name).map(|file| vec![file]).unwrap_or_default();
+        return global_lib_decl_file(name)
+            .map(|file| vec![file])
+            .unwrap_or_default();
     };
     files
         .iter()
