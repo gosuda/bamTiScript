@@ -1259,14 +1259,12 @@ impl TslibHelperWalk<'_> {
     }
 
     fn jsx_attribute(&mut self, attribute: &crate::syntax::JsxAttributeItem) {
-        if let crate::syntax::JsxAttributeItem::Attribute(attribute) = attribute {
-            if let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
+        if let crate::syntax::JsxAttributeItem::Attribute(attribute) = attribute
+            && let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
                 &attribute.data().initializer
-            {
-                if let Some(expression) = &container.data().expression {
-                    self.expr(expression);
-                }
-            }
+            && let Some(expression) = &container.data().expression
+        {
+            self.expr(expression);
         }
     }
 
@@ -1317,26 +1315,25 @@ impl TslibHelperWalk<'_> {
                 .context
                 .target
                 .supports(LanguageFeature::AsyncFunctions)
+            && let Some(span) = span
         {
-            if let Some(span) = span {
-                self.record(crate::emitter::helpers::HelperKind::Awaiter.ident(), span);
-            }
+            self.record(crate::emitter::helpers::HelperKind::Awaiter.ident(), span);
         }
         if is_async_generator
             && !self
                 .context
                 .target
                 .supports(LanguageFeature::AsyncIteration)
+            && let Some(span) = span
         {
-            if let Some(span) = span {
-                self.record(ASYNC_GENERATOR, span);
-                self.record(AWAIT_HELPER, span);
-            }
+            self.record(ASYNC_GENERATOR, span);
+            self.record(AWAIT_HELPER, span);
         }
-        if function.is_generator && !self.context.target.supports(LanguageFeature::Generators) {
-            if let Some(span) = span {
-                self.record(crate::emitter::helpers::HelperKind::Generator.ident(), span);
-            }
+        if function.is_generator
+            && !self.context.target.supports(LanguageFeature::Generators)
+            && let Some(span) = span
+        {
+            self.record(crate::emitter::helpers::HelperKind::Generator.ident(), span);
         }
         for parameter in &function.parameters {
             self.parameter(parameter);
@@ -1518,13 +1515,12 @@ impl TslibHelperWalk<'_> {
             .context
             .target
             .supports(LanguageFeature::ObjectRestSpread)
+            && let crate::syntax::BindingPattern::Identifier(name) = argument.data()
         {
-            if let crate::syntax::BindingPattern::Identifier(name) = argument.data() {
-                self.record(
-                    crate::emitter::helpers::HelperKind::Rest.ident(),
-                    name.range(),
-                );
-            }
+            self.record(
+                crate::emitter::helpers::HelperKind::Rest.ident(),
+                name.range(),
+            );
         }
     }
 
@@ -1542,17 +1538,16 @@ impl TslibHelperWalk<'_> {
             AssignmentTarget::Object(object) => {
                 for property in &object.properties {
                     self.property_name(&property.name);
-                    if property.rest {
-                        if let AssignmentTarget::Identifier(name) = property.target.data() {
-                            if !self.context.target.supports(
-                                crate::emitter::transforms::LanguageFeature::ObjectRestSpread,
-                            ) {
-                                self.record(
-                                    crate::emitter::helpers::HelperKind::Rest.ident(),
-                                    name.range(),
-                                );
-                            }
-                        }
+                    if property.rest
+                        && let AssignmentTarget::Identifier(name) = property.target.data()
+                        && !self.context.target.supports(
+                            crate::emitter::transforms::LanguageFeature::ObjectRestSpread,
+                        )
+                    {
+                        self.record(
+                            crate::emitter::helpers::HelperKind::Rest.ident(),
+                            name.range(),
+                        );
                     }
                     self.assignment_target(&property.target);
                     if let Some(initializer) = &property.initializer {
@@ -1577,20 +1572,21 @@ impl TslibHelperWalk<'_> {
     }
 
     fn assignment_expression(&mut self, assignment: &crate::syntax::AssignmentExpression) {
-        if let crate::syntax::AssignmentTarget::Member(member) = assignment.left.data() {
-            if self.is_private_member(&member.property) && self.private_fields_active() {
-                let span = assignment.left.range();
-                if assignment.operator != crate::syntax::AssignmentOperator::Assign {
-                    self.record(
-                        crate::emitter::helpers::HelperKind::ClassPrivateFieldGet.ident(),
-                        span,
-                    );
-                }
+        if let crate::syntax::AssignmentTarget::Member(member) = assignment.left.data()
+            && self.is_private_member(&member.property)
+            && self.private_fields_active()
+        {
+            let span = assignment.left.range();
+            if assignment.operator != crate::syntax::AssignmentOperator::Assign {
                 self.record(
-                    crate::emitter::helpers::HelperKind::ClassPrivateFieldSet.ident(),
+                    crate::emitter::helpers::HelperKind::ClassPrivateFieldGet.ident(),
                     span,
                 );
             }
+            self.record(
+                crate::emitter::helpers::HelperKind::ClassPrivateFieldSet.ident(),
+                span,
+            );
         }
         if !matches!(
             assignment.left.data(),
@@ -1635,15 +1631,14 @@ impl TslibHelperWalk<'_> {
     }
 
     fn private_name_in(&mut self, operand: &crate::syntax::Expr) {
-        if let crate::syntax::Expression::Identifier(name) = operand.data() {
-            if name.data().token().kind() == crate::syntax::TokenKind::PrivateIdentifier
-                && self.private_fields_active()
-            {
-                self.record(
-                    crate::emitter::helpers::HelperKind::ClassPrivateFieldIn.ident(),
-                    name.range(),
-                );
-            }
+        if let crate::syntax::Expression::Identifier(name) = operand.data()
+            && name.data().token().kind() == crate::syntax::TokenKind::PrivateIdentifier
+            && self.private_fields_active()
+        {
+            self.record(
+                crate::emitter::helpers::HelperKind::ClassPrivateFieldIn.ident(),
+                name.range(),
+            );
         }
     }
 
@@ -1883,19 +1878,17 @@ impl TslibHelperWalk<'_> {
         initializer: &crate::syntax::Expr,
     ) {
         use crate::emitter::transforms::LanguageFeature;
-        if let crate::syntax::BindingPattern::Identifier(name) = binding.data() {
-            if let crate::syntax::Expression::Function(function) = initializer.data() {
-                if function.function.name.is_none()
-                    && function.function.is_async
-                    && !function.function.is_generator
-                    && !self.context.target.supports(LanguageFeature::AsyncFunctions)
-                {
-                    self.record(
-                        crate::emitter::helpers::HelperKind::Awaiter.ident(),
-                        name.range(),
-                    );
-                }
-            }
+        if let crate::syntax::BindingPattern::Identifier(name) = binding.data()
+            && let crate::syntax::Expression::Function(function) = initializer.data()
+            && function.function.name.is_none()
+            && function.function.is_async
+            && !function.function.is_generator
+            && !self.context.target.supports(LanguageFeature::AsyncFunctions)
+        {
+            self.record(
+                crate::emitter::helpers::HelperKind::Awaiter.ident(),
+                name.range(),
+            );
         }
     }
 
@@ -2172,17 +2165,17 @@ fn collect_exported_declaration(
             }
         }
         Statement::Function(function) => {
-            if let Some(name) = &function.function.name {
-                if let Some(text) = source.token_text(name.data().token()) {
-                    names.insert(text.to_owned());
-                }
+            if let Some(name) = &function.function.name
+                && let Some(text) = source.token_text(name.data().token())
+            {
+                names.insert(text.to_owned());
             }
         }
         Statement::Class(class) => {
-            if let Some(name) = &class.name {
-                if let Some(text) = source.token_text(name.data().token()) {
-                    names.insert(text.to_owned());
-                }
+            if let Some(name) = &class.name
+                && let Some(text) = source.token_text(name.data().token())
+            {
+                names.insert(text.to_owned());
             }
         }
         Statement::Enum(declaration) => {
@@ -2191,10 +2184,10 @@ fn collect_exported_declaration(
             }
         }
         Statement::Namespace(namespace) => {
-            if let crate::syntax::NamespaceName::Identifier { name, .. } = &namespace.name {
-                if let Some(text) = source.token_text(name.data().token()) {
-                    names.insert(text.to_owned());
-                }
+            if let crate::syntax::NamespaceName::Identifier { name, .. } = &namespace.name
+                && let Some(text) = source.token_text(name.data().token())
+            {
+                names.insert(text.to_owned());
             }
         }
         Statement::Declare(inner) => collect_declared_exports(source, inner, names),
@@ -4252,10 +4245,10 @@ mod tests {
         output: &ProgramFrontendOutput,
         program: &ResolvedProgram,
     ) -> std::collections::HashMap<SourceId, std::collections::BTreeSet<String>> {
-        fn linear_module<'output>(
-            output: &'output ProgramFrontendOutput,
+        fn linear_module(
+            output: &ProgramFrontendOutput,
             source_id: SourceId,
-        ) -> Option<&'output FrontendOutput> {
+        ) -> Option<&FrontendOutput> {
             output
                 .modules()
                 .iter()

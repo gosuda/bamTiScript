@@ -1031,16 +1031,15 @@ pub fn check_program_with_options_and_cancel(
             else {
                 continue;
             };
-            let imported = collect_imported_types_for_source(
-                source_id,
-                source,
-                &imports,
-                &exports,
-                &export_stars,
-                &files,
-                &direct_index,
-                &mut member_cache,
-            );
+            let tables = CrossFileImportTables {
+                imports: &imports,
+                exports: &exports,
+                export_stars: &export_stars,
+                files: &files,
+                direct_index: &direct_index,
+            };
+            let imported =
+                collect_imported_types_for_source(source_id, source, &tables, &mut member_cache);
             if imported.is_empty() {
                 continue;
             }
@@ -1071,16 +1070,15 @@ pub fn check_program_with_options_and_cancel(
         cancel.check()?;
         let source = recovered.product();
         let source_id = source.source_id();
-        let imported = collect_imported_types_for_source(
-            source_id,
-            source,
-            &imports,
-            &exports,
-            &export_stars,
-            &files,
-            &direct_index,
-            &mut member_cache,
-        );
+        let tables = CrossFileImportTables {
+            imports: &imports,
+            exports: &exports,
+            export_stars: &export_stars,
+            files: &files,
+            direct_index: &direct_index,
+        };
+        let imported =
+            collect_imported_types_for_source(source_id, source, &tables, &mut member_cache);
         let sibling_scripts = sibling_script_models(&files, &script_ids, source_id);
         let (mut model, core_diagnostics) = bind_source_with_environment_and_imports_with_cancel(
             source,
@@ -1350,7 +1348,7 @@ fn build_export_name_index(
         IMPORT_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
     }
     let mut direct_index: HashMap<SourceId, Vec<EcmaString>> = HashMap::new();
-    for ((source, name), _) in exports.iter() {
+    for (source, name) in exports.keys() {
         direct_index.entry(*source).or_default().push(name.clone());
     }
     direct_index
@@ -1445,6 +1443,13 @@ fn namespace_member_types(
     members
 }
 
+struct CrossFileImportTables<'a> {
+    imports: &'a HashMap<(SourceId, SymbolId), ImportTarget>,
+    exports: &'a HashMap<(SourceId, EcmaString), ExportTarget>,
+    export_stars: &'a ExportStars,
+    files: &'a BTreeMap<SourceId, SemanticModel>,
+    direct_index: &'a HashMap<SourceId, Vec<EcmaString>>,
+}
 
 /// Builds the [`ImportedSymbolType`] facts for one source file by translating
 /// each import binding into the structural type of its resolved source export.
@@ -1454,13 +1459,10 @@ fn namespace_member_types(
 fn collect_imported_types_for_source<'a>(
     source_id: SourceId,
     source: &SourceFile,
-    imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
-    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
-    export_stars: &ExportStars,
-    files: &'a BTreeMap<SourceId, SemanticModel>,
-    direct_index: &HashMap<SourceId, Vec<EcmaString>>,
+    tables: &CrossFileImportTables<'a>,
     member_cache: &mut HashMap<SourceId, Vec<(EcmaString, TypeId)>>,
 ) -> Vec<ImportedSymbolType<'a>> {
+    let files = tables.files;
     let Some(model) = files.get(&source_id) else {
         return Vec::new();
     };
@@ -1476,18 +1478,18 @@ fn collect_imported_types_for_source<'a>(
                 continue;
             };
             let Some(ImportTarget::Namespace { source: target_source }) =
-                imports.get(&(source_id, symbol))
+                tables.imports.get(&(source_id, symbol))
             else {
                 continue;
             };
             let target_source = *target_source;
             let members = namespace_member_types(
                 target_source,
-                files,
-                imports,
-                exports,
-                export_stars,
-                direct_index,
+                tables.files,
+                tables.imports,
+                tables.exports,
+                tables.export_stars,
+                tables.direct_index,
                 member_cache,
             );
             if members.is_empty() {
@@ -1517,7 +1519,7 @@ fn collect_imported_types_for_source<'a>(
                 continue;
             };
             if let Some(imported) =
-                build_imported_symbol_type(source_id, symbol, imports, exports, export_stars, files)
+                build_imported_symbol_type(source_id, symbol, tables.imports, tables.exports, tables.export_stars, tables.files)
             {
                 imported_types.push(imported);
             }
@@ -1527,7 +1529,7 @@ fn collect_imported_types_for_source<'a>(
                 let Some(symbol) = lookup_identifier(model, source, local) else {
                     continue;
                 };
-                let Some(target) = imports.get(&(source_id, symbol)) else {
+                let Some(target) = tables.imports.get(&(source_id, symbol)) else {
                     continue;
                 };
                 let ImportTarget::Namespace {
@@ -1548,11 +1550,11 @@ fn collect_imported_types_for_source<'a>(
                     type_plane_id: None,
                     namespace_members: namespace_member_types(
                         target_source,
-                        files,
-                        imports,
-                        exports,
-                        export_stars,
-                        direct_index,
+                        tables.files,
+                        tables.imports,
+                        tables.exports,
+                        tables.export_stars,
+                        tables.direct_index,
                         member_cache,
                     ),
                 });
@@ -1567,10 +1569,10 @@ fn collect_imported_types_for_source<'a>(
                     if let Some(imported) = build_imported_symbol_type(
                         source_id,
                         symbol,
-                        imports,
-                        exports,
-                        export_stars,
-                        files,
+                        tables.imports,
+                        tables.exports,
+                        tables.export_stars,
+                        tables.files,
                     ) {
                         imported_types.push(imported);
                     }
