@@ -1693,6 +1693,7 @@ impl TslibHelperWalk<'_> {
     fn parameter_decorator(&mut self, decorator: &crate::syntax::DecoratorNode) {
         use crate::emitter::helpers::HelperKind;
         let span = decorator.range();
+        self.record(HelperKind::Decorate.ident(), span);
         self.record(HelperKind::Param.ident(), span);
         if self.context.emit_decorator_metadata {
             self.record(HelperKind::Metadata.ident(), span);
@@ -2697,7 +2698,8 @@ mod tests {
             .collect()
     }
 
-    fn entry_positions(output: &ProgramFrontendOutput, code: &str) -> Vec<(usize, usize, String)> {
+
+    fn entry_ranges(output: &ProgramFrontendOutput, code: &str) -> Vec<(usize, usize, usize, usize, String)> {
         let entry = output
             .modules()
             .iter()
@@ -2709,13 +2711,23 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code().as_str() == code)
             .map(|diagnostic| {
-                let (line, column) = source
+                let (start_line, start_column) = source
                     .line_column(diagnostic.range().start())
                     .expect("diagnostic range is in bounds");
-                (line, column, diagnostic.message().to_owned())
+                let (end_line, end_column) = source
+                    .line_column(diagnostic.range().end())
+                    .expect("diagnostic range is in bounds");
+                (
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                    diagnostic.message().to_owned(),
+                )
             })
             .collect()
     }
+
 
     const TSLIB_HELPERS_CONFIG: &str =
         r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015"}}"#;
@@ -3050,12 +3062,14 @@ mod tests {
         const ES2020: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2020"}}"#;
         const ES2022: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2022"}}"#;
         const EXP_ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015","experimentalDecorators":true,"emitDecoratorMetadata":true}}"#;
+        const EXP_NO_METADATA_ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015","experimentalDecorators":true}}"#;
+        const MODULE_ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"es2015","target":"es2015"}}"#;
         struct Row {
             name: &'static str,
             source: &'static str,
             extra: &'static [(&'static str, &'static str)],
             config: &'static str,
-            expected: &'static [(&'static str, usize, usize)],
+            expected: &'static [(&'static str, usize, usize, usize, usize)],
         }
         let rows: &[Row] = &[
             Row {
@@ -3063,7 +3077,7 @@ mod tests {
                 source: "export {};\nexport async function foo(): Promise<void> {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 1, 22)],
+                expected: &[("__awaiter", 1, 22, 1, 25)],
             },
             Row {
                 name: "awaiter_gated_es2018",
@@ -3077,7 +3091,7 @@ mod tests {
                 source: "export {};\nfunction* g() {}\n",
                 extra: &[],
                 config: ES5,
-                expected: &[("__generator", 1, 10)],
+                expected: &[("__generator", 1, 10, 1, 11)],
             },
             Row {
                 name: "generator_gated_es2015",
@@ -3091,7 +3105,7 @@ mod tests {
                 source: "export async function* g() {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__asyncGenerator", 0, 23), ("__await", 0, 23)],
+                expected: &[("__asyncGenerator", 0, 23, 0, 24), ("__await", 0, 23, 0, 24)],
             },
             Row {
                 name: "async_delegator_quad",
@@ -3099,10 +3113,10 @@ mod tests {
                 extra: &[],
                 config: ES2015,
                 expected: &[
-                    ("__asyncGenerator", 0, 23),
-                    ("__await", 0, 23),
-                    ("__asyncDelegator", 1, 2),
-                    ("__asyncValues", 1, 2),
+                    ("__asyncGenerator", 0, 23, 0, 24),
+                    ("__await", 0, 23, 0, 24),
+                    ("__asyncDelegator", 1, 2, 1, 7),
+                    ("__asyncValues", 1, 2, 1, 7),
                 ],
             },
             Row {
@@ -3117,7 +3131,7 @@ mod tests {
                 source: "export {};\nclass A {}\nclass B extends A {}\n",
                 extra: &[],
                 config: ES5,
-                expected: &[("__extends", 2, 8)],
+                expected: &[("__extends", 2, 8, 2, 17)],
             },
             Row {
                 name: "extends_gated_es2015",
@@ -3131,7 +3145,7 @@ mod tests {
                 source: "export {};\nconst o = { a: 1 };\nconst y = { ...o };\n",
                 extra: &[],
                 config: ES5,
-                expected: &[("__assign", 2, 15)],
+                expected: &[("__assign", 2, 15, 2, 16)],
             },
             Row {
                 name: "assign_gated_es2015",
@@ -3145,7 +3159,7 @@ mod tests {
                 source: "export {};\nconst y = { a: 1 };\nconst { ...x } = y;\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__rest", 2, 11)],
+                expected: &[("__rest", 2, 11, 2, 12)],
             },
             Row {
                 name: "rest_gated_es2018",
@@ -3159,39 +3173,54 @@ mod tests {
                 source: "export {};\ndeclare var dec: any;\n@dec\nclass C {\n  method(@dec x: number) {}\n}\n",
                 extra: &[],
                 config: EXP_ES2015,
-                expected: &[("__decorate", 2, 0), ("__metadata", 2, 0), ("__param", 4, 9)],
+                expected: &[
+                    ("__decorate", 2, 0, 2, 4),
+                    ("__metadata", 2, 0, 2, 4),
+                    ("__param", 4, 9, 4, 13),
+                ],
             },
             Row {
                 name: "es_decorate_pair",
                 source: "export {};\ndeclare var dec: any;\n@dec\nclass C {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__esDecorate", 2, 0), ("__runInitializers", 2, 0)],
+                expected: &[("__esDecorate", 2, 0, 2, 4), ("__runInitializers", 2, 0, 2, 4)],
             },
             Row {
-                name: "set_function_name",
-                source: "export {};\ndeclare var dec: any;\nexport default @dec class {}\n",
+                name: "member_method_decorator_set_function_name",
+                source: "export {};\ndeclare var dec: any;\nclass C {\n  @dec\n  m() {}\n}\n",
                 extra: &[],
                 config: ES2015,
                 expected: &[
-                    ("__esDecorate", 2, 15),
-                    ("__runInitializers", 2, 15),
-                    ("__setFunctionName", 2, 15),
+                    ("__esDecorate", 3, 2, 3, 6),
+                    ("__runInitializers", 3, 2, 3, 6),
+                    ("__setFunctionName", 3, 2, 3, 6),
                 ],
+            },
+            Row {
+                name: "param_decorator_without_metadata",
+                source: "export {};\ndeclare var dec: any;\nclass C {\n  method(@dec x: number) {}\n}\n",
+                extra: &[],
+                config: EXP_NO_METADATA_ES2015,
+                expected: &[("__decorate", 3, 9, 3, 13), ("__param", 3, 9, 3, 13)],
             },
             Row {
                 name: "prop_key",
                 source: "export {};\ndeclare var dec: any;\ndeclare var x: any;\nclass C {\n  @dec static accessor [x]: any;\n}\n",
                 extra: &[],
                 config: ES2022,
-                expected: &[("__esDecorate", 4, 2), ("__propKey", 4, 2), ("__runInitializers", 4, 2)],
+                expected: &[
+                    ("__esDecorate", 4, 2, 4, 6),
+                    ("__propKey", 4, 2, 4, 6),
+                    ("__runInitializers", 4, 2, 4, 6),
+                ],
             },
             Row {
                 name: "make_template_object",
                 source: "export {};\nfunction tag(s: any): any { return s; }\nconst v = tag`x`;\n",
                 extra: &[],
                 config: ES5,
-                expected: &[("__makeTemplateObject", 2, 12)],
+                expected: &[("__makeTemplateObject", 2, 12, 2, 17)],
             },
             Row {
                 name: "make_template_object_gated_es2015",
@@ -3205,70 +3234,84 @@ mod tests {
                 source: "import * as ns from \"dep\";\ndeclare module \"dep\";\nexport {};\nns;\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__importStar", 0, 0)],
+                expected: &[("__importStar", 0, 0, 0, 26)],
             },
             Row {
                 name: "import_default_named",
                 source: "import { default as foo } from \"dep\";\ndeclare module \"dep\";\nexport {};\nfoo;\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 9)],
+                expected: &[("__importDefault", 0, 9, 0, 23)],
             },
             Row {
                 name: "import_default_clause",
                 source: "import foo from \"dep\";\ndeclare module \"dep\";\nexport {};\nfoo;\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 0)],
+                expected: &[("__importDefault", 0, 0, 0, 22)],
             },
             Row {
                 name: "combined_default_namespace_reports_only_import_star",
                 source: "import greet, * as dependency from \"dep\";\ndeclare module \"dep\";\nexport {};\ngreet;\ndependency;\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__importStar", 0, 0)],
+                expected: &[("__importStar", 0, 0, 0, 41)],
+            },
+            Row {
+                name: "import_default_gated_es2015_module",
+                source: "import foo from \"dep\";\ndeclare module \"dep\";\nexport {};\nfoo;\n",
+                extra: &[],
+                config: MODULE_ES2015,
+                expected: &[],
+            },
+            Row {
+                name: "import_star_gated_es2015_module",
+                source: "import * as ns from \"dep\";\ndeclare module \"dep\";\nexport {};\nns;\n",
+                extra: &[],
+                config: MODULE_ES2015,
+                expected: &[],
             },
             Row {
                 name: "oracle_arrow_argument_reports_awaiter_at_arrow",
                 source: "declare function foo(f: any): void;\nfoo(async () => {});\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 1, 4)],
+                expected: &[("__awaiter", 1, 4, 1, 18)],
             },
             Row {
                 name: "oracle_arrow_initializer_reports_awaiter_at_arrow",
                 source: "const f = async () => {};\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 10)],
+                expected: &[("__awaiter", 0, 10, 0, 24)],
             },
             Row {
                 name: "oracle_function_initializer_reports_awaiter_at_binding",
                 source: "const g = async function () {};\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 6)],
+                expected: &[("__awaiter", 0, 6, 0, 7)],
             },
             Row {
                 name: "oracle_function_argument_reports_awaiter_at_function",
                 source: "declare function foo(f: any): void;\nfoo(async function () {});\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 1, 4)],
+                expected: &[("__awaiter", 1, 4, 1, 24)],
             },
             Row {
                 name: "oracle_async_method_reports_awaiter_at_name",
                 source: "class C { async m() {} }\nexport { C };\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 16)],
+                expected: &[("__awaiter", 0, 16, 0, 17)],
             },
             Row {
                 name: "oracle_async_object_method_reports_awaiter_at_name",
                 source: "const o = { async m() {} };\nexport { o };\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 18)],
+                expected: &[("__awaiter", 0, 18, 0, 19)],
             },
             Row {
                 name: "oracle_nested_arrow_reports_awaiter_at_arrow",
@@ -3276,9 +3319,9 @@ mod tests {
                 extra: &[],
                 config: ES2015,
                 expected: &[
-                    ("__asyncGenerator", 0, 23),
-                    ("__await", 0, 23),
-                    ("__awaiter", 0, 38),
+                    ("__asyncGenerator", 0, 23, 0, 26),
+                    ("__await", 0, 23, 0, 26),
+                    ("__awaiter", 0, 38, 0, 52),
                 ],
             },
             Row {
@@ -3286,105 +3329,128 @@ mod tests {
                 source: "import d, { a } from \"./dep\";\nexport const x = [d, a];\n",
                 extra: &[("dep.ts", "export default 1;\nexport const a = 2;\n")],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 0)],
+                expected: &[("__importDefault", 0, 0, 0, 29)],
             },
             Row {
                 name: "oracle_default_with_default_specifier_reports_import_default_at_specifier",
                 source: "import d, { default as x } from \"./dep\";\nexport const y = [d, x];\n",
                 extra: &[("dep.ts", "export default 1;\nexport const a = 2;\n")],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 12)],
+                expected: &[("__importDefault", 0, 12, 0, 24)],
             },
             Row {
                 name: "oracle_unused_default_reports_import_default",
                 source: "import foo from \"./dep\";\nexport type T = typeof foo;\n",
                 extra: &[("dep.ts", "export default 1;\nexport const a = 2;\n")],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 0)],
+                expected: &[("__importDefault", 0, 0, 0, 24)],
             },
             Row {
                 name: "oracle_unused_namespace_reports_import_star",
                 source: "import * as ns from \"./dep\";\nexport type U = typeof ns;\n",
                 extra: &[("dep.ts", "export default 1;\nexport const a = 2;\n")],
                 config: ES2015,
-                expected: &[("__importStar", 0, 0)],
+                expected: &[("__importStar", 0, 0, 0, 28)],
             },
             Row {
                 name: "oracle_fully_unused_default_reports_import_default",
                 source: "import dropped from \"./dep\";\nexport const z = 1;\n",
                 extra: &[("dep.ts", "export default 1;\nexport const a = 2;\n")],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 0)],
+                expected: &[("__importDefault", 0, 0, 0, 28)],
             },
             Row {
                 name: "oracle_export_default_async_fn_reports_at_statement",
                 source: "export default async function () {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 0)],
+                expected: &[("__awaiter", 0, 0, 0, 35)],
             },
             Row {
                 name: "oracle_export_default_async_gen_reports_at_statement",
                 source: "export default async function* () {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__asyncGenerator", 0, 0), ("__await", 0, 0)],
+                expected: &[
+                    ("__asyncGenerator", 0, 0, 0, 36),
+                    ("__await", 0, 0, 0, 36),
+                ],
             },
             Row {
                 name: "oracle_paren_function_init_reports_at_function",
                 source: "const p = (async function () {});\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 11)],
+                expected: &[("__awaiter", 0, 11, 0, 31)],
             },
             Row {
                 name: "oracle_double_paren_function_init_reports_at_function",
                 source: "const r = ((async function () {}));\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 12)],
+                expected: &[("__awaiter", 0, 12, 0, 32)],
             },
             Row {
                 name: "oracle_named_export_default_async_fn_reports_at_name",
                 source: "export default async function f() {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 30)],
+                expected: &[("__awaiter", 0, 30, 0, 31)],
             },
             Row {
                 name: "oracle_export_default_async_arrow_reports_at_arrow",
                 source: "export default async () => {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 15)],
+                expected: &[("__awaiter", 0, 15, 0, 29)],
             },
             Row {
                 name: "oracle_paren_arrow_init_reports_at_arrow",
                 source: "const q = (async () => {});\nexport {};\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__awaiter", 0, 11)],
+                expected: &[("__awaiter", 0, 11, 0, 25)],
             },
             Row {
                 name: "export_star",
                 source: "export * from \"./other\";\n",
                 extra: &[("other.ts", "export const x = 1;\n")],
                 config: ES2015,
-                expected: &[("__exportStar", 0, 0)],
+                expected: &[("__exportStar", 0, 0, 0, 24)],
+            },
+            Row {
+                name: "export_star_gated_es2015_module",
+                source: "export * from \"./other\";\n",
+                extra: &[("other.ts", "export const x = 1;\n")],
+                config: MODULE_ES2015,
+                expected: &[],
             },
             Row {
                 name: "export_default_reexport",
                 source: "export { default } from \"./other\";\n",
                 extra: &[("other.ts", "export default 1;\n")],
                 config: ES2015,
-                expected: &[("__importDefault", 0, 9)],
+                expected: &[("__importDefault", 0, 9, 0, 16)],
             },
             Row {
                 name: "using_pair",
                 source: "export {};\nusing x = null;\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__addDisposableResource", 1, 0), ("__disposeResources", 1, 0)],
+                expected: &[
+                    ("__addDisposableResource", 1, 0, 1, 15),
+                    ("__disposeResources", 1, 0, 1, 15),
+                ],
+            },
+            Row {
+                name: "for_using_pair",
+                source: "export {};\nfor (using x = null;;) { break; }\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[
+                    ("__addDisposableResource", 1, 5, 1, 19),
+                    ("__disposeResources", 1, 5, 1, 19),
+                ],
             },
             Row {
                 name: "private_fields",
@@ -3392,9 +3458,9 @@ mod tests {
                 extra: &[],
                 config: ES2020,
                 expected: &[
-                    ("__classPrivateFieldSet", 3, 4),
-                    ("__classPrivateFieldGet", 3, 18),
-                    ("__classPrivateFieldIn", 4, 4),
+                    ("__classPrivateFieldSet", 3, 4, 3, 15),
+                    ("__classPrivateFieldGet", 3, 18, 3, 29),
+                    ("__classPrivateFieldIn", 4, 4, 4, 10),
                 ],
             },
             Row {
@@ -3427,43 +3493,303 @@ mod tests {
             files.extend_from_slice(row.extra);
             let (root_path, program) = tslib_case(&files, row.config);
             let output = compile_program_frontend(&program, FrontendMode::Check);
-            let reported = entry_positions(&output, "TS2343");
+            let reported = entry_ranges(&output, "TS2343");
             assert!(
                 entry_diagnostics(&output, "TS2354").is_empty(),
                 "row {}: tslib is present so TS2354 must not fire: {:?}",
                 row.name,
                 entry_diagnostics(&output, "TS2354")
             );
-            let mut actual: Vec<&str> = Vec::new();
-            for (_, _, message) in &reported {
-                let found = row
-                    .expected
-                    .iter()
-                    .find(|(helper, _, _)| message.contains(&format!("'{helper}'")))
-                    .map(|(helper, _, _)| *helper);
-                actual.push(found.unwrap_or_else(|| {
-                    panic!("row {}: unexpected TS2343 message {message:?} in {reported:?}", row.name)
-                }));
-            }
-            let expected_names: Vec<&str> =
-                row.expected.iter().map(|(helper, _, _)| *helper).collect();
             assert_eq!(
-                actual, expected_names,
-                "row {}: helper set or order differs: {reported:?}",
+                reported.len(),
+                row.expected.len(),
+                "row {}: report count differs: {reported:?}",
                 row.name
             );
-            for ((helper, line, column), (actual_line, actual_column, _)) in
-                row.expected.iter().zip(reported.iter())
+            for (
+                (helper, start_line, start_column, end_line, end_column),
+                (actual_start_line, actual_start_column, actual_end_line, actual_end_column, message),
+            ) in row.expected.iter().zip(reported.iter())
             {
+                let expected_message = format!(
+                    "This syntax requires an imported helper named '{helper}' which does not exist in 'tslib'. Consider upgrading your version of 'tslib'."
+                );
                 assert_eq!(
-                    (*actual_line, *actual_column),
-                    (*line, *column),
-                    "row {}: helper {helper} position differs: {reported:?}",
+                    *message, expected_message,
+                    "row {}: helper {helper} text differs",
+                    row.name
+                );
+                assert_eq!(
+                    (
+                        *actual_start_line,
+                        *actual_start_column,
+                        *actual_end_line,
+                        *actual_end_column
+                    ),
+                    (*start_line, *start_column, *end_line, *end_column),
+                    "row {}: helper {helper} range differs: {reported:?}",
                     row.name
                 );
             }
             let _ = std::fs::remove_dir_all(root_path);
         }
+    }
+
+    #[test]
+    fn allow_synthetic_default_imports_reports_import_default() {
+        let (root_path, program) = tslib_case(
+            &[
+                (
+                    "main.ts",
+                    "import foo from \"dep\";\ndeclare module \"dep\";\nexport {};\nfoo;\n",
+                ),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015","allowSyntheticDefaultImports":true}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_ranges(&output, "TS2343");
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(
+            (reported[0].0, reported[0].1, reported[0].2, reported[0].3),
+            (0, 0, 0, 22),
+            "{reported:?}"
+        );
+        assert!(
+            reported[0].4.contains("'__importDefault'"),
+            "allowSyntheticDefaultImports alone still needs __importDefault: {reported:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn iteration_constructs_need_no_tslib_helper_at_es2015() {
+        let (root_path, program) = tslib_case(
+            &[
+                (
+                    "main.ts",
+                    "export {};\nfor (const x of [1, 2, 3]) { console.log(x); }\nexport const y = [...[1, 2]];\nexport const [a, b] = [1, 2];\n",
+                ),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(
+            entry_diagnostics(&output, "TS2343").is_empty(),
+            "for-of, spread, and destructuring need no helper at the minimum target: {:?}",
+            entry_diagnostics(&output, "TS2343")
+        );
+        assert!(
+            entry_diagnostics(&output, "TS2354").is_empty(),
+            "{:?}",
+            entry_diagnostics(&output, "TS2354")
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn reexport_needs_only_export_star_from_tslib() {
+        let (root_path, program) = tslib_case(
+            &[
+                ("main.ts", "export * from \"./other\";\n"),
+                ("other.ts", "export const x = 1;\n"),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export declare function __exportStar(m: any, exports: any): any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(
+            entry_diagnostics(&output, "TS2343").is_empty(),
+            "__createBinding is never reported on its own: {:?}",
+            entry_diagnostics(&output, "TS2343")
+        );
+        assert!(
+            entry_diagnostics(&output, "TS2354").is_empty(),
+            "{:?}",
+            entry_diagnostics(&output, "TS2354")
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    fn decode_base64(payload: &str) -> Vec<u8> {
+        fn sextet(unit: u8) -> u8 {
+            match unit {
+                b'A'..=b'Z' => unit - b'A',
+                b'a'..=b'z' => unit - b'a' + 26,
+                b'0'..=b'9' => unit - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("inline map payload is base64"),
+            }
+        }
+        let bytes = payload.as_bytes();
+        assert!(bytes.len() % 4 == 0, "inline map payload pads to a quartet");
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for quartet in bytes.chunks_exact(4) {
+            let pad = quartet.iter().rev().take_while(|unit| **unit == b'=').count();
+            let mut word: u32 = 0;
+            for (position, unit) in quartet.iter().enumerate() {
+                if *unit != b'=' {
+                    word |= u32::from(sextet(*unit)) << (18 - 6 * position);
+                }
+            }
+            out.push((word >> 16) as u8);
+            if pad < 2 {
+                out.push((word >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(word as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn shared_on_disk_tslib_reports_once_per_helper_across_files() {
+        let (root_path, program) = tslib_case(
+            &[
+                (
+                    "main.ts",
+                    "import \"./other\";\nexport async function foo(): Promise<void> {}\n",
+                ),
+                (
+                    "other.ts",
+                    "export function* g() {}\n",
+                ),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es5"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let mut reports: Vec<(String, String)> = Vec::new();
+        for module in output.modules() {
+            let file = program
+                .module(module.source_file().source_id())
+                .map(|resolved| resolved.path().to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            for diagnostic in module.diagnostics() {
+                if diagnostic.code().as_str() == "TS2343" {
+                    reports.push((file.clone(), diagnostic.message().to_owned()));
+                }
+            }
+        }
+        reports.sort();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(
+            reports[0].0.ends_with("main.ts") && reports[0].1.contains("'__awaiter'"),
+            "main.ts reports only __awaiter: {reports:?}"
+        );
+        assert!(
+            reports[1].0.ends_with("other.ts") && reports[1].1.contains("'__generator'"),
+            "other.ts reports only __generator: {reports:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn inline_source_map_embeds_decodable_map_with_expected_sources() {
+        let source = "export const value: number = 1;";
+        let config = r#"{"compilerOptions":{"inlineSourceMap":true}}"#;
+        let (root_path, program) = program_fixture_with_config(source, config);
+        assert!(program.inline_source_map());
+        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
+        let js = entrypoint_javascript(&output);
+        let prefix = "//# sourceMappingURL=data:application/json;base64,";
+        let payload = js
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("inline map comment closes the emit");
+        let decoded: Vec<u8> = decode_base64(payload);
+        let map = String::from_utf8(decoded).expect("inline map is UTF-8 JSON");
+        assert!(
+            map.contains("\"version\":3"),
+            "inline payload is a source map: {map:?}"
+        );
+        assert!(
+            map.contains("main.ts"),
+            "inline map names the compiled source: {map:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn inline_sources_embeds_compiled_source_text() {
+        let source = "export const value: number = 1;";
+        let config = r#"{"compilerOptions":{"inlineSourceMap":true,"inlineSources":true}}"#;
+        let (root_path, program) = program_fixture_with_config(source, config);
+        assert!(program.inline_sources());
+        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
+        let js = entrypoint_javascript(&output);
+        let prefix = "//# sourceMappingURL=data:application/json;base64,";
+        let payload = js
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("inline map comment closes the emit");
+        let decoded: Vec<u8> = decode_base64(payload);
+        let map = String::from_utf8(decoded).expect("inline map is UTF-8 JSON");
+        assert!(
+            map.contains(source),
+            "inline map carries the compiled source text: {map:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn shared_import_module_exports_computed_once() {
+        let (root_path, program) = tslib_case(
+            &[
+                ("main.ts", "import \"./other\";\nimport \"./shared\";\nexport {};\n"),
+                ("other.ts", "import \"./shared\";\nexport const a = 1;\n"),
+                ("shared.ts", "export type T = number;\nexport const v = 1;\n"),
+            ],
+            r#"{"compilerOptions":{"module":"commonjs"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        reset_module_exports_computations();
+        let erased = output.erased_exports(&program);
+        let counts = module_exports_computations();
+        assert_eq!(counts.len(), output.modules().len(), "{counts:?}");
+        for module in output.modules() {
+            let id = module.source_file().source_id();
+            assert_eq!(
+                counts.get(&id),
+                Some(&1),
+                "shared module exports computed once: {counts:?}"
+            );
+        }
+        let shared = output
+            .modules()
+            .iter()
+            .find(|module| {
+                program
+                    .module(module.source_file().source_id())
+                    .is_some_and(|resolved| {
+                        resolved.path().file_name().is_some_and(|name| {
+                            name.to_string_lossy() == "shared.ts"
+                        })
+                    })
+            })
+            .expect("shared module present");
+        assert_eq!(
+            erased.get(&shared.source_file().source_id()),
+            Some(&std::collections::BTreeSet::from(["T".to_owned()])),
+            "shared type export is erased"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
     }
 
     #[test]
