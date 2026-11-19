@@ -1029,11 +1029,13 @@ pub fn check_program_with_options_and_cancel(
     let imports = collect_import_targets(input.files, &files, &edge_targets);
     let exports = collect_export_targets(input.files, &files, &edge_targets);
     let export_stars = collect_export_stars(input.files, &edge_targets);
+    let direct_index = build_export_name_index(&exports);
 
     let worklist: Vec<SourceId> = source_ids.clone();
     for _ in 0..source_ids.len() {
         cancel.check()?;
-        let mut changed = false;
+        let mut member_cache: HashMap<SourceId, Vec<(EcmaString, TypeId)>> = HashMap::new();
+        let mut rebound = Vec::new();
         for &source_id in &worklist {
             let Some(source) = input
                 .files
@@ -1050,6 +1052,8 @@ pub fn check_program_with_options_and_cancel(
                 &exports,
                 &export_stars,
                 &files,
+                &direct_index,
+                &mut member_cache,
             );
             if imported.is_empty() {
                 continue;
@@ -1064,16 +1068,19 @@ pub fn check_program_with_options_and_cancel(
                 &sibling_scripts,
                 cancel.clone(),
             )?;
-            files.insert(source_id, model);
-            changed = true;
+            rebound.push((source_id, model));
         }
-        if !changed {
+        if rebound.is_empty() {
             break;
+        }
+        for (source_id, model) in rebound {
+            files.insert(source_id, model);
         }
     }
 
     let mut diagnostics = Vec::new();
     let mut final_files = BTreeMap::new();
+    let mut member_cache: HashMap<SourceId, Vec<(EcmaString, TypeId)>> = HashMap::new();
     for recovered in input.files {
         cancel.check()?;
         let source = recovered.product();
@@ -1085,6 +1092,8 @@ pub fn check_program_with_options_and_cancel(
             &exports,
             &export_stars,
             &files,
+            &direct_index,
+            &mut member_cache,
         );
         let sibling_scripts = sibling_script_models(&files, &script_ids, source_id);
         let (mut model, core_diagnostics) = bind_source_with_environment_and_imports_with_cancel(
@@ -1347,10 +1356,58 @@ fn resolve_export_for_type(
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static IMPORT_PROBE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IMPORT_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IMPORT_MEMBER_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct ImportProbe {
+    _private: (),
+}
+
+#[cfg(test)]
+impl ImportProbe {
+    fn arm() -> Self {
+        IMPORT_PROBE_ARMED.with(|armed| armed.set(true));
+        IMPORT_INDEX_BUILDS.with(|count| count.set(0));
+        IMPORT_MEMBER_COMPUTES.with(|count| count.set(0));
+        ImportProbe { _private: () }
+    }
+    fn index_builds(&self) -> usize {
+        IMPORT_INDEX_BUILDS.with(|count| count.get())
+    }
+    fn member_computes(&self) -> usize {
+        IMPORT_MEMBER_COMPUTES.with(|count| count.get())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ImportProbe {
+    fn drop(&mut self) {
+        IMPORT_PROBE_ARMED.with(|armed| armed.set(false));
+    }
+}
+
+fn build_export_name_index(
+    exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
+) -> HashMap<SourceId, Vec<EcmaString>> {
+    #[cfg(test)]
+    if IMPORT_PROBE_ARMED.with(|armed| armed.get()) {
+        IMPORT_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
+    }
+    let mut direct_index: HashMap<SourceId, Vec<EcmaString>> = HashMap::new();
+    for ((source, name), _) in exports.iter() {
+        direct_index.entry(*source).or_default().push(name.clone());
+    }
+    direct_index
+}
+
 fn namespace_export_names(
     target: SourceId,
     direct_index: &HashMap<SourceId, Vec<EcmaString>>,
-    ns_index: &HashMap<SourceId, Vec<EcmaString>>,
     export_stars: &ExportStars,
 ) -> Vec<EcmaString> {
     let default_name = EcmaString::encode("default");
@@ -1365,16 +1422,6 @@ fn namespace_export_names(
         let is_target = source == target;
         if let Some(direct) = direct_index.get(&source) {
             for name in direct {
-                if !is_target && *name == default_name {
-                    continue;
-                }
-                if seen_names.insert(name.clone()) {
-                    names.push(name.clone());
-                }
-            }
-        }
-        if let Some(aliased) = ns_index.get(&source) {
-            for name in aliased {
                 if !is_target && *name == default_name {
                     continue;
                 }
@@ -1402,13 +1449,16 @@ fn namespace_member_types(
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
     direct_index: &HashMap<SourceId, Vec<EcmaString>>,
-    ns_index: &HashMap<SourceId, Vec<EcmaString>>,
     cache: &mut HashMap<SourceId, Vec<(EcmaString, TypeId)>>,
 ) -> Vec<(EcmaString, TypeId)> {
     if let Some(cached) = cache.get(&target) {
         return cached.clone();
     }
-    let names = namespace_export_names(target, direct_index, ns_index, export_stars);
+    #[cfg(test)]
+    if IMPORT_PROBE_ARMED.with(|armed| armed.get()) {
+        IMPORT_MEMBER_COMPUTES.with(|count| count.set(count.get() + 1));
+    }
+    let names = namespace_export_names(target, direct_index, export_stars);
     let mut members = Vec::with_capacity(names.len());
     for name in names {
         let mut visited = HashSet::new();
@@ -1457,19 +1507,12 @@ fn collect_imported_types_for_source<'a>(
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
     files: &'a BTreeMap<SourceId, SemanticModel>,
+    direct_index: &HashMap<SourceId, Vec<EcmaString>>,
+    member_cache: &mut HashMap<SourceId, Vec<(EcmaString, TypeId)>>,
 ) -> Vec<ImportedSymbolType<'a>> {
     let Some(model) = files.get(&source_id) else {
         return Vec::new();
     };
-    let mut direct_index: HashMap<SourceId, Vec<EcmaString>> = HashMap::new();
-    for ((source, name), _) in exports.iter() {
-        direct_index.entry(*source).or_default().push(name.clone());
-    }
-    let mut ns_index: HashMap<SourceId, Vec<EcmaString>> = HashMap::new();
-    for ((source, name), _) in export_stars.namespace_exports.iter() {
-        ns_index.entry(*source).or_default().push(name.clone());
-    }
-    let mut member_cache: HashMap<SourceId, Vec<(EcmaString, TypeId)>> = HashMap::new();
     let mut imported_types = Vec::new();
     for statement in source.statements() {
         if let Statement::ImportEquals(import) = statement.data() {
@@ -1493,9 +1536,8 @@ fn collect_imported_types_for_source<'a>(
                 imports,
                 exports,
                 export_stars,
-                &direct_index,
-                &ns_index,
-                &mut member_cache,
+                direct_index,
+                member_cache,
             );
             if members.is_empty() {
                 continue;
@@ -1559,9 +1601,8 @@ fn collect_imported_types_for_source<'a>(
                         imports,
                         exports,
                         export_stars,
-                        &direct_index,
-                        &ns_index,
-                        &mut member_cache,
+                        direct_index,
+                        member_cache,
                     ),
                 });
             }
@@ -6562,10 +6603,23 @@ function check(options: Options = {}) {
             ],
             &[(1, 0, 0), (2, 0, 1)],
         );
+        assert_eq!(
+            program_codes(&checked),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "star-transitive ns.x must keep its number type, so assigning to string fails"
+        );
+        let clean = linked(
+            &[
+                "export const x: number = 1;",
+                "export * from \"./b\";",
+                "import * as ns from \"./a\"; const y: number = ns.x;",
+            ],
+            &[(1, 0, 0), (2, 0, 1)],
+        );
         assert!(
-            !program_codes(&checked).is_empty(),
-            "star-transitive ns.x must keep its number type, so assigning to string must fail: {:?}",
-            program_codes(&checked)
+            program_codes(&clean).is_empty(),
+            "matching annotation must be diagnostic-free: {:?}",
+            program_codes(&clean)
         );
     }
 
@@ -6580,9 +6634,50 @@ function check(options: Options = {}) {
             ],
             &[(2, 0, 0), (2, 1, 1), (3, 0, 2)],
         );
+        assert_eq!(
+            program_codes(&checked),
+            [PROPERTY_DOES_NOT_EXIST.as_str()],
+            "ambiguous ns.x must error while unambiguous ns.ok stays clean"
+        );
+        let clean = linked(
+            &[
+                "export const x: number = 1; export const ok: number = 1;",
+                "export const x: number = 2;",
+                "export * from \"./b\"; export * from \"./c\";",
+                "import * as ns from \"./a\"; const z: number = ns.ok;",
+            ],
+            &[(2, 0, 0), (2, 1, 1), (3, 0, 2)],
+        );
         assert!(
-            !program_codes(&checked).is_empty(),
-            "ambiguous ns.x must not resolve silently"
+            program_codes(&clean).is_empty(),
+            "unambiguous ns.ok must resolve with type number: {:?}",
+            program_codes(&clean)
+        );
+    }
+
+    #[test]
+    fn import_name_index_builds_once_per_program_with_shared_member_cache() {
+        let probe = super::ImportProbe::arm();
+        let lib = "export const a: number = 1; export const b: number = 2;";
+        let importer = "import * as ns from \"./lib\"; const v: number = ns.a;";
+        let checked = linked(
+            &[lib, importer, importer, importer],
+            &[(1, 0, 0), (2, 0, 0), (3, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            program_codes(&checked)
+        );
+        assert_eq!(
+            probe.index_builds(),
+            1,
+            "the export name index must be built once per program, not once per file per pass"
+        );
+        assert!(
+            probe.member_computes() <= 5,
+            "namespace members must be shared across importers and passes, not recomputed per call: {}",
+            probe.member_computes()
         );
     }
 
