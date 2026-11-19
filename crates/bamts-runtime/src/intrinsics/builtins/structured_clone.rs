@@ -1137,14 +1137,14 @@ mod tests {
                     .unwrap();
                 machine
                     .allocate(HeapEntry::TypedArray {
-                        kind: super::super::typedarray_all::ElementKind::Uint8,
+                        kind: super::super::typedarray::ElementKind::Uint8,
                         buffer: handle.value(),
                         byte_offset: 0,
-                        byte_length: super::super::typedarray_all::LengthSlot::Fixed(3),
-                        array_length: super::super::typedarray_all::LengthSlot::Fixed(3),
+                        byte_length: super::super::typedarray::LengthSlot::Fixed(3),
+                        array_length: super::super::typedarray::LengthSlot::Fixed(3),
                         properties: PropertyMap::default(),
                         prototype: Some(machine.intrinsics.builtins.typed_array_prototype(
-                            super::super::typedarray_all::ElementKind::Uint8,
+                            super::super::typedarray::ElementKind::Uint8,
                         )),
                         extensible: true,
                     })
@@ -1168,7 +1168,7 @@ mod tests {
             .allocate(HeapEntry::DataView {
                 buffer: buffer.value(),
                 byte_offset: 0,
-                byte_length: super::super::typedarray_all::LengthSlot::Fixed(4),
+                byte_length: super::super::typedarray::LengthSlot::Fixed(4),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.builtins.dataview_prototype()),
                 extensible: true,

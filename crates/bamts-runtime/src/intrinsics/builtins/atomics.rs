@@ -14,7 +14,7 @@ use super::arraybuffer::{
     to_clamped_index, to_index,
 };
 use super::bigint;
-use super::typedarray_all::{
+use super::typedarray::{
     ElementKind, TypedArraySnapshot, ViewBuffer, integer_or_infinity, storage_from_value,
     typed_array_snapshot, value_from_storage,
 };

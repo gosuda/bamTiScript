@@ -13,11 +13,11 @@ mod array_generic;
 pub(crate) use array_generic::is_array;
 pub(crate) mod bigint;
 mod collections;
-mod date_full;
+mod date;
 mod function_constructor;
 mod intl;
 pub(crate) mod iterator_helpers;
-mod json_edge;
+mod json;
 mod number;
 mod object;
 mod object_statics;
@@ -33,10 +33,10 @@ pub(crate) mod arraybuffer;
 pub(crate) mod atomics;
 pub(crate) mod dataview;
 mod disposable_stack;
-mod error_edge;
-pub(crate) use error_edge::initialize_error;
+mod error;
+pub(crate) use error::initialize_error;
 mod map_set_edge;
-mod math_edge;
+mod math;
 mod number_format;
 pub(crate) use number_format::string_to_number;
 mod regexp_protocol;
@@ -50,7 +50,7 @@ mod temporal;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod timers;
-pub(crate) mod typedarray_all;
+pub(crate) mod typedarray;
 mod uri;
 pub(crate) mod weakref_finalization;
 pub(crate) use collections::ordinary_runtime;
@@ -89,7 +89,7 @@ pub(crate) fn install<H: Host>(
         options.script_compiler,
     );
     map_set_edge::install(heap, atoms, shapes, globals, builtins);
-    date_full::install(heap, atoms, shapes, globals, builtins);
+    date::install(heap, atoms, shapes, globals, builtins);
     object::install(heap, atoms, shapes, globals, builtins);
     array::install(heap, atoms, shapes, globals, builtins);
     string::install(heap, atoms, shapes, globals, builtins);
@@ -102,12 +102,12 @@ pub(crate) fn install<H: Host>(
     weakref_finalization::install(heap, atoms, shapes, globals, builtins);
     arraybuffer::install(heap, atoms, shapes, globals, builtins);
     atomics::install(heap, atoms, shapes, globals, builtins);
-    typedarray_all::install(heap, atoms, shapes, globals, builtins);
+    typedarray::install(heap, atoms, shapes, globals, builtins);
     dataview::install(heap, atoms, shapes, globals, builtins);
     install_globals(heap, atoms, shapes, globals, builtins);
-    json_edge::install(heap, atoms, shapes, globals, builtins);
+    json::install(heap, atoms, shapes, globals, builtins);
     install_errors(heap, atoms, shapes, globals, builtins);
-    error_edge::install(heap, atoms, shapes, globals, builtins);
+    error::install(heap, atoms, shapes, globals, builtins);
     proxy::install(heap, atoms, shapes, globals, builtins);
     if let Some(id) = builtins.id_named("Proxy") {
         builtins.set_constructable(id, true);
@@ -582,7 +582,7 @@ fn install_math<H: Host>(
     }
     define_to_string_tag(heap, shapes, math, builtins.symbol_to_string_tag(), "Math");
     globals.insert(EcmaString::encode("Math"), math);
-    math_edge::install(heap, atoms, shapes, builtins, math);
+    math::install(heap, atoms, shapes, builtins, math);
 }
 fn numeric_args<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -1527,14 +1527,14 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::TypedArray { properties, .. } => {
                 if let PropertyKey::Named(name) = key
                     && let Some(typed_index) =
-                        typedarray_all::typed_array_index(self.atoms.resolve(*name))
+                        typedarray::typed_array_index(self.atoms.resolve(*name))
                 {
                     let view = self.value_for_runtime_index(index)?;
-                    let bounds = typedarray_all::typed_array_bounds(self, view)?;
+                    let bounds = typedarray::typed_array_bounds(self, view)?;
                     return Ok(match typed_index {
                         Some(offset) if !bounds.out_of_bounds && offset < bounds.element_length => {
                             Some(Property::Data {
-                                value: typedarray_all::read_element(self, view, offset)?,
+                                value: typedarray::read_element(self, view, offset)?,
                                 writable: true,
                                 enumerable: true,
                                 configurable: true,
@@ -1708,14 +1708,14 @@ impl<'a, H: Host> Machine<'a, H> {
             };
         }
         if let PropertyKey::Named(name) = &key
-            && let Some(typed_index) = typedarray_all::typed_array_index(self.atoms.resolve(*name))
+            && let Some(typed_index) = typedarray::typed_array_index(self.atoms.resolve(*name))
             && matches!(self.heap[index], HeapEntry::TypedArray { .. })
         {
             let Some(offset) = typed_index else {
                 return Err(type_error("Invalid typed array index descriptor"));
             };
             let view = self.value_for_runtime_index(index)?;
-            let bounds = typedarray_all::typed_array_bounds(self, view)?;
+            let bounds = typedarray::typed_array_bounds(self, view)?;
             if bounds.out_of_bounds || offset >= bounds.element_length {
                 return Err(type_error("Invalid typed array index descriptor"));
             }
@@ -2100,7 +2100,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 ));
             }
             if matches!(&self.heap[index], HeapEntry::TypedArray { .. })
-                && matches!(key, PropertyKey::Named(name) if typedarray_all::typed_array_index(self.atoms.resolve(*name)).is_some())
+                && matches!(key, PropertyKey::Named(name) if typedarray::typed_array_index(self.atoms.resolve(*name)).is_some())
             {
                 return Err(type_error(
                     "atomic descriptor batch cannot contain typed array index properties",

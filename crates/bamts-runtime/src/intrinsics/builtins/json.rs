@@ -259,7 +259,7 @@ fn raw_json<H: Host>(
         }
     }
     let (brand_slot, brand) =
-        raw_json_brand(machine).expect("json_edge::install runs before any handler");
+        raw_json_brand(machine).expect("json::install runs before any handler");
     let text_value = allocate_string(machine, text)?;
     let raw_json_key = PropertyKey::Named(machine.intern_str("rawJSON"));
     let mut properties = PropertyMap::default();

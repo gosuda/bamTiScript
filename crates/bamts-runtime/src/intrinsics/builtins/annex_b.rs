@@ -21,12 +21,12 @@
 //! it:
 //! - global `escape`/`unescape` (§B.2.2) -> `builtins/uri.rs`
 //! - `Date.prototype.getYear`/`setYear`/`toGMTString` (§B.2.4) ->
-//!   `builtins/date_full.rs` (`toGMTString` is the same function object as
+//!   `builtins/date.rs` (`toGMTString` is the same function object as
 //!   `toUTCString` there)
 //!
 //! Integration: declare `mod annex_b;` and call
 //! `annex_b::install(heap, globals, builtins);` immediately after
-//! `regexp::install`; `date_full::install`, `object::install`, and
+//! `regexp::install`; `date::install`, `object::install`, and
 //! `string::install` must already have installed the delegated targets.
 
 use crate::heap::Heap;

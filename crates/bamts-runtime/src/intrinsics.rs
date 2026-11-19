@@ -104,8 +104,8 @@ pub(crate) struct BuiltinTable<H: Host> {
     promise_prototype: Option<Value>,
     typedarray_constructor: Option<Value>,
     typedarray_prototype: Option<Value>,
-    typedarray_constructors: [Option<Value>; builtins::typedarray_all::KIND_COUNT],
-    typedarray_prototypes: [Option<Value>; builtins::typedarray_all::KIND_COUNT],
+    typedarray_constructors: [Option<Value>; builtins::typedarray::KIND_COUNT],
+    typedarray_prototypes: [Option<Value>; builtins::typedarray::KIND_COUNT],
     arraybuffer_constructor: Option<Value>,
     arraybuffer_prototype: Option<Value>,
     dataview_prototype: Option<Value>,
@@ -192,8 +192,8 @@ impl<H: Host> BuiltinTable<H> {
             promise_prototype: None,
             typedarray_constructor: None,
             typedarray_prototype: None,
-            typedarray_constructors: [None; builtins::typedarray_all::KIND_COUNT],
-            typedarray_prototypes: [None; builtins::typedarray_all::KIND_COUNT],
+            typedarray_constructors: [None; builtins::typedarray::KIND_COUNT],
+            typedarray_prototypes: [None; builtins::typedarray::KIND_COUNT],
             arraybuffer_constructor: None,
             arraybuffer_prototype: None,
             dataview_prototype: None,
@@ -502,28 +502,28 @@ impl<H: Host> BuiltinTable<H> {
     }
     pub(crate) fn set_typed_array_constructor(
         &mut self,
-        kind: builtins::typedarray_all::ElementKind,
+        kind: builtins::typedarray::ElementKind,
         constructor: Value,
     ) {
         self.typedarray_constructors[kind as usize] = Some(constructor);
     }
     pub(crate) fn typed_array_constructor(
         &self,
-        kind: builtins::typedarray_all::ElementKind,
+        kind: builtins::typedarray::ElementKind,
     ) -> Value {
         self.typedarray_constructors[kind as usize]
             .unwrap_or_else(|| panic!("TypedArray builtins install {}", kind.name()))
     }
     pub(crate) fn set_typed_array_prototype(
         &mut self,
-        kind: builtins::typedarray_all::ElementKind,
+        kind: builtins::typedarray::ElementKind,
         prototype: Value,
     ) {
         self.typedarray_prototypes[kind as usize] = Some(prototype);
     }
     pub(crate) fn typed_array_prototype(
         &self,
-        kind: builtins::typedarray_all::ElementKind,
+        kind: builtins::typedarray::ElementKind,
     ) -> Value {
         self.typedarray_prototypes[kind as usize]
             .unwrap_or_else(|| panic!("TypedArray builtins install {}", kind.name()))
@@ -531,9 +531,9 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn typed_array_kind_for_builtin(
         &self,
         id: BuiltinId,
-    ) -> Option<builtins::typedarray_all::ElementKind> {
+    ) -> Option<builtins::typedarray::ElementKind> {
         let name = self.get(id).name;
-        builtins::typedarray_all::ElementKind::ALL
+        builtins::typedarray::ElementKind::ALL
             .into_iter()
             .find(|kind| kind.name() == name)
     }
@@ -1632,7 +1632,7 @@ mod tests {
         table.arraybuffer_prototype = Some(roots[18]);
         table.sharedarraybuffer_prototype = Some(roots[19]);
         table.typedarray_prototype = Some(roots[20]);
-        for offset in 0..builtins::typedarray_all::KIND_COUNT {
+        for offset in 0..builtins::typedarray::KIND_COUNT {
             table.typedarray_constructors[offset] = Some(roots[21 + offset]);
             table.typedarray_prototypes[offset] = Some(roots[33 + offset]);
         }
@@ -2140,7 +2140,7 @@ mod tests {
             "TextEncoderStream",
             "TextDecoderStream",
         ];
-        for kind in builtins::typedarray_all::ElementKind::ALL {
+        for kind in builtins::typedarray::ElementKind::ALL {
             assert!(
                 machine.intrinsics.global(kind.name()).is_some(),
                 "{} is installed by the typed-array surface",

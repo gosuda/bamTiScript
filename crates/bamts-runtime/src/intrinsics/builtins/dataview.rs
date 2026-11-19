@@ -7,7 +7,7 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::arraybuffer::to_index;
-use super::typedarray_all::{
+use super::typedarray::{
     ElementKind, LengthSlot, ViewBuffer, storage_from_value, value_from_storage,
 };
 use super::{
