@@ -41,7 +41,6 @@ mod regexp_protocol;
 pub(crate) mod regexp_v;
 mod set_methods;
 mod string;
-mod string_edge;
 mod structured_clone;
 mod symbol;
 mod temporal;
@@ -95,7 +94,6 @@ pub(crate) fn install<H: Host>(
     install_boolean(heap, atoms, shapes, globals, builtins);
     install_math(heap, atoms, shapes, globals, builtins);
     regexp::install(heap, atoms, shapes, globals, builtins);
-    string_edge::install(heap, atoms, shapes, globals, builtins);
     annex_b::install(heap, atoms, shapes, globals, builtins);
     weakref_finalization::install(heap, atoms, shapes, globals, builtins);
     arraybuffer::install(heap, atoms, shapes, globals, builtins);
