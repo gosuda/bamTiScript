@@ -12453,7 +12453,7 @@ impl<'src> Binder<'src> {
         declaration: NodeId,
         declaration_range: TextRange,
         name_node: &PropertyName,
-    ) {
+    ) -> SymbolId {
         let symbol = self.declare_member_unique(
             name,
             kind,
@@ -12469,6 +12469,7 @@ impl<'src> Binder<'src> {
                 symbol,
                 name_range,
             });
+        symbol
     }
 
     /// Binds the named parameters of one type-side signature fragment into a
@@ -17422,6 +17423,35 @@ impl<'src> Binder<'src> {
             _ => false,
         }
     }
+    /// Declares one class member under its binding key and records the
+    /// display spelling for quoted, numeric, and computed names, so
+    /// `.symbols` rows render `C["foo"]`, `C[0]`, and `Test[x]`.
+    /// Computed keys no static lookup queries bind under their bracketed
+    /// source spelling through the merging path, which reports no
+    /// duplicate diagnostic.
+    fn declare_class_member(
+        &mut self,
+        name: &str,
+        kind: SymbolKind,
+        scope: ScopeId,
+        member: &'src crate::syntax::ClassMemberNode,
+        name_node: &PropertyName,
+    ) {
+        let dynamic = matches!(name_node, PropertyName::Computed(_))
+            && self.property_key(name_node).is_none();
+        let range = if dynamic {
+            self.occurrence_name_range(name_node)
+        } else {
+            Self::property_name_range(name_node)
+        };
+        let symbol = if dynamic {
+            self.declare_member_unique(name, kind, scope, member.id(), range)
+        } else {
+            self.declare(name, kind, scope, member.id(), range)
+        };
+        self.note_member_spelling(symbol, name_node);
+    }
+
     fn bind_class_member(&mut self, member: &'src crate::syntax::ClassMemberNode, scope: ScopeId) {
         let owner = self
             .scopes
@@ -17435,37 +17465,46 @@ impl<'src> Binder<'src> {
         };
         match member.data() {
             ClassMember::Property(property) => {
-                if let Some(name) = self.member_symbol_key(&property.name) {
-                    self.declare(
+                if let Some(name) = self
+                    .member_binding_name(&property.name)
+                    .or_else(|| self.member_symbol_key(&property.name))
+                {
+                    self.declare_class_member(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
                         scope,
-                        member.id(),
-                        Self::property_name_range(&property.name),
+                        member,
+                        &property.name,
                     );
                     anchor(self, &name, &property.name);
                 }
             }
             ClassMember::AutoAccessor(accessor) => {
-                if let Some(name) = self.member_symbol_key(&accessor.name) {
-                    self.declare(
+                if let Some(name) = self
+                    .member_binding_name(&accessor.name)
+                    .or_else(|| self.member_symbol_key(&accessor.name))
+                {
+                    self.declare_class_member(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
                         scope,
-                        member.id(),
-                        Self::property_name_range(&accessor.name),
+                        member,
+                        &accessor.name,
                     );
                     anchor(self, &name, &accessor.name);
                 }
             }
             ClassMember::Method(method) if method.modifier == PropertyModifier::None => {
-                if let Some(name) = self.member_symbol_key(&method.name) {
-                    self.declare(
+                if let Some(name) = self
+                    .member_binding_name(&method.name)
+                    .or_else(|| self.member_symbol_key(&method.name))
+                {
+                    self.declare_class_member(
                         &name,
                         SymbolKind::Function,
                         scope,
-                        member.id(),
-                        Self::property_name_range(&method.name),
+                        member,
+                        &method.name,
                     );
                     anchor(self, &name, &method.name);
                 }
@@ -17476,8 +17515,11 @@ impl<'src> Binder<'src> {
                     PropertyModifier::Get | PropertyModifier::Set
                 ) =>
             {
-                if let Some(name) = self.member_symbol_key(&method.name) {
-                    self.declare_member_occurrence(
+                if let Some(name) = self
+                    .member_binding_name(&method.name)
+                    .or_else(|| self.member_symbol_key(&method.name))
+                {
+                    let symbol = self.declare_member_occurrence(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
                         scope,
@@ -17485,6 +17527,7 @@ impl<'src> Binder<'src> {
                         member.range(),
                         &method.name,
                     );
+                    self.note_member_spelling(symbol, &method.name);
                 }
             }
             ClassMember::IndexSignature(index) => {
