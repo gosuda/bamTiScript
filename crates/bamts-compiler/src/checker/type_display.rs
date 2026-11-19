@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use super::binder::{FunctionSignature, ObjectType, PropertyType};
 use super::{SemanticModel, SymbolId, Type, TypeId};
 use crate::literal::number_value;
-use bamts_bytecode::EcmaString;
+use bamts_bytecode::{EcmaString, format_number};
 /// Renders an interned type as its canonical TypeScript display string.
 #[must_use]
 pub fn render_type(model: &SemanticModel, type_id: TypeId) -> String {
@@ -733,9 +733,7 @@ fn render_number_literal(text: &str) -> String {
             } else if value == value.trunc() && value.abs() < 1e21 {
                 format!("{value:.0}")
             } else {
-                // Fall back to Rust's f64 Display, which matches tsc for
-                // non-integer values in the common cases.
-                value.to_string()
+                format_number(value)
             }
         }
         _ => text.to_owned(),
@@ -1009,6 +1007,29 @@ mod tests {
         assert_eq!(render_type(model, b), "1");
         let c = typed_expression_of(model, &source, "c", text.find("let w").unwrap());
         assert_eq!(render_type(model, c), "1");
+    }
+
+    #[test]
+    fn number_literals_use_exponent_form_like_tsc() {
+        let text = "const aa = 0.0000001;\nconst bb = 1e21;\nconst cc = 1e-9;\nconst dd = 1e25;\nconst ee = 0.000001;\nconst ff = 1e20;\nconst gg = 1e-3;\nconst hh = 1.5;\nlet z1 = aa;\nlet z2 = bb;\nlet z3 = cc;\nlet z4 = dd;\nlet z5 = ee;\nlet z6 = ff;\nlet z7 = gg;\nlet z8 = hh;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+        let aa = typed_expression_of(model, &source, "aa", text.find("let z1").unwrap());
+        assert_eq!(render_type(model, aa), "1e-7");
+        let bb = typed_expression_of(model, &source, "bb", text.find("let z2").unwrap());
+        assert_eq!(render_type(model, bb), "1e+21");
+        let cc = typed_expression_of(model, &source, "cc", text.find("let z3").unwrap());
+        assert_eq!(render_type(model, cc), "1e-9");
+        let dd = typed_expression_of(model, &source, "dd", text.find("let z4").unwrap());
+        assert_eq!(render_type(model, dd), "1e+25");
+        let ee = typed_expression_of(model, &source, "ee", text.find("let z5").unwrap());
+        assert_eq!(render_type(model, ee), "0.000001");
+        let ff = typed_expression_of(model, &source, "ff", text.find("let z6").unwrap());
+        assert_eq!(render_type(model, ff), "100000000000000000000");
+        let gg = typed_expression_of(model, &source, "gg", text.find("let z7").unwrap());
+        assert_eq!(render_type(model, gg), "0.001");
+        let hh = typed_expression_of(model, &source, "hh", text.find("let z8").unwrap());
+        assert_eq!(render_type(model, hh), "1.5");
     }
 
     /// The renderer reads `declared_return` before the semantic `return_type`,
