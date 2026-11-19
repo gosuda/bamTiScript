@@ -1701,4 +1701,80 @@ mod tests {
         assert!(javascript.code.contains("data:application/json;base64,"));
         assert!(!javascript.code.contains("output.js.map"));
     }
+    #[test]
+    fn single_line_comment_carries_start_and_end_mappings() {
+        let source = "// Comment\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        assert_eq!(map.encode_mappings(), ";AAAA,UAAU");
+    }
+
+    #[test]
+    fn authored_empty_statement_carries_semicolon_mapping() {
+        let source = ";\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        assert_eq!(map.encode_mappings(), ";AAAA,CAAC");
+    }
+    #[test]
+    fn single_line_block_comment_carries_start_and_end_mappings() {
+        let source = "/* note */\nvar x = 0;\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        assert_eq!(
+            map.encode_mappings(),
+            ";AAAA,UAAU;AACV,IAAI,CAAC,GAAG,CAAC,CAAC"
+        );
+    }
+
+    #[test]
+    fn multiline_block_comment_maps_start_and_end_only() {
+        let source = "/*\n * note\n */\nvar x = 0;\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        assert_eq!(
+            map.encode_mappings(),
+            ";AAAA;;GAEG;AACH,IAAI,CAAC,GAAG,CAAC,CAAC"
+        );
+    }
 }

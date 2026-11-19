@@ -1350,14 +1350,36 @@ impl Emitter<'_> {
         let Some(text) = self.source_slice(comment).map(str::to_owned) else {
             return;
         };
+        if text.starts_with("//") && !text.contains('\n') {
+            self.raw_mapped(&text, comment);
+            return;
+        }
         let column = self
             .source
             .line_column(comment.start())
             .map_or(0, |(_, column)| column);
-        let is_block = text.starts_with("/*");
+        if !text.contains('\n') {
+            self.raw_mapped(&text, comment);
+            return;
+        }
+        if text.starts_with("/*") {
+            self.flush_indent();
+            self.record_mapping(comment);
+            self.last_mapped_end = None;
+            for (index, line) in text.split('\n').enumerate() {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let line = line.trim_end();
+                if index > 0 {
+                    self.newline();
+                }
+                let indent = line.len() - line.trim_start().len();
+                self.raw(&line[if index == 0 { 0 } else { indent.min(column) }..]);
+            }
+            self.last_mapped_end = Some(comment);
+            return;
+        }
         for (index, line) in text.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
-            let line = if is_block { line.trim_end() } else { line };
             if index > 0 {
                 self.newline();
             }
@@ -1390,7 +1412,7 @@ impl Emitter<'_> {
                     self.raw(" ");
                     if let Some(text) = self.source_slice(comment) {
                         let text = text.to_owned();
-                        self.raw(&text);
+                        self.raw_mapped(&text, comment);
                     }
                 }
                 self.newline();
@@ -2182,7 +2204,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Empty if statement.id().get() < self.synthesized_floor => {
-                self.raw(";");
+                self.raw_mapped(";", stmt_range);
                 true
             }
             Statement::Empty => false,
