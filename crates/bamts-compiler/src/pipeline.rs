@@ -1804,8 +1804,12 @@ impl TslibHelperWalk<'_> {
             }
             ExportDeclaration::Default(default) => match &default.value {
                 ExportDefaultValue::Function(function) => {
-                    let span = function.name.as_ref().map(|name| name.range());
-                    self.function_like(function, span);
+                    let span = function
+                        .name
+                        .as_ref()
+                        .map(|name| name.range())
+                        .unwrap_or(span);
+                    self.function_like(function, Some(span));
                 }
                 ExportDefaultValue::Class(class) => self.class_decl(class),
                 ExportDefaultValue::Expression(expression) => self.expr(expression),
@@ -1880,11 +1884,7 @@ impl TslibHelperWalk<'_> {
     ) {
         use crate::emitter::transforms::LanguageFeature;
         if let crate::syntax::BindingPattern::Identifier(name) = binding.data() {
-            let mut candidate = initializer;
-            while let crate::syntax::Expression::Parenthesized(inner) = candidate.data() {
-                candidate = inner;
-            }
-            if let crate::syntax::Expression::Function(function) = candidate.data() {
+            if let crate::syntax::Expression::Function(function) = initializer.data() {
                 if function.function.name.is_none()
                     && function.function.is_async
                     && !function.function.is_generator
@@ -3322,6 +3322,55 @@ mod tests {
                 extra: &[("dep.ts", "export default 1;\nexport const a = 2;\n")],
                 config: ES2015,
                 expected: &[("__importDefault", 0, 0)],
+            },
+            Row {
+                name: "oracle_export_default_async_fn_reports_at_statement",
+                source: "export default async function () {}\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__awaiter", 0, 0)],
+            },
+            Row {
+                name: "oracle_export_default_async_gen_reports_at_statement",
+                source: "export default async function* () {}\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__asyncGenerator", 0, 0), ("__await", 0, 0)],
+            },
+            Row {
+                name: "oracle_paren_function_init_reports_at_function",
+                source: "const p = (async function () {});\nexport {};\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__awaiter", 0, 11)],
+            },
+            Row {
+                name: "oracle_double_paren_function_init_reports_at_function",
+                source: "const r = ((async function () {}));\nexport {};\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__awaiter", 0, 12)],
+            },
+            Row {
+                name: "oracle_named_export_default_async_fn_reports_at_name",
+                source: "export default async function f() {}\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__awaiter", 0, 30)],
+            },
+            Row {
+                name: "oracle_export_default_async_arrow_reports_at_arrow",
+                source: "export default async () => {};\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__awaiter", 0, 15)],
+            },
+            Row {
+                name: "oracle_paren_arrow_init_reports_at_arrow",
+                source: "const q = (async () => {});\nexport {};\n",
+                extra: &[],
+                config: ES2015,
+                expected: &[("__awaiter", 0, 11)],
             },
             Row {
                 name: "export_star",
