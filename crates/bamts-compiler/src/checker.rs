@@ -57,6 +57,7 @@ pub use binder::{
     DeclarationOccurrence, PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol,
     SymbolId, SymbolKind, Type, TypeId, TypeTable,
 };
+pub use intrinsic_environment::global_lib_decl_file;
 pub(crate) use binder::{
     EnumBindingView, EnumSourceInventory, ImportedSymbolType, bind_source_with_cancel,
     bind_source_with_environment_and_cancel, bind_source_with_environment_and_imports_with_cancel,
