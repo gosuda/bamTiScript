@@ -44,6 +44,18 @@ impl AnnotatedType {
     }
 }
 
+fn push_blank_rendered(
+    out: &mut AnnotatedType,
+    model: &SemanticModel,
+    type_id: TypeId,
+    group: bool,
+    visiting_aliases: &mut Vec<SymbolId>,
+) {
+    let start = out.text.len();
+    render_annotated_into(out, model, type_id, group, visiting_aliases);
+    out.blanks.push((start, out.text.len()));
+}
+
 /// Renders an interned type as its canonical TypeScript display string and
 /// yields the caret-blank spans for `.types` baselines.
 #[must_use]
@@ -580,21 +592,11 @@ fn render_signature_into(
             out.push_blank(model.symbol(*symbol).name());
             if let Some(constraint) = bounds.constraint() {
                 out.push(" extends ");
-                out.push_blank(&render_type_grouped(
-                    model,
-                    constraint,
-                    false,
-                    visiting_aliases,
-                ));
+                push_blank_rendered(out, model, constraint, false, visiting_aliases);
             }
             if let Some(default) = bounds.default() {
                 out.push(" = ");
-                out.push_blank(&render_type_grouped(
-                    model,
-                    default,
-                    false,
-                    visiting_aliases,
-                ));
+                push_blank_rendered(out, model, default, false, visiting_aliases);
             }
         }
         out.push(">");
@@ -613,12 +615,7 @@ fn render_signature_into(
         }
         out.push(": ");
         if parameter.declared() {
-            out.push_blank(&render_type_grouped(
-                model,
-                parameter.type_id(),
-                false,
-                visiting_aliases,
-            ));
+            push_blank_rendered(out, model, parameter.type_id(), false, visiting_aliases);
         } else {
             render_annotated_into(out, model, parameter.type_id(), false, visiting_aliases);
         }
@@ -629,12 +626,7 @@ fn render_signature_into(
         .declared_return()
         .unwrap_or(signature.return_type());
     if signature.declared_return().is_some() {
-        out.push_blank(&render_type_grouped(
-            model,
-            displayed,
-            false,
-            visiting_aliases,
-        ));
+        push_blank_rendered(out, model, displayed, false, visiting_aliases);
     } else {
         render_annotated_into(out, model, displayed, false, visiting_aliases);
     }
@@ -665,6 +657,7 @@ fn render_object_into(
     }
 
     let start = out.text.len();
+    out.push("{ ");
     let mut first = true;
     for signature in &object.call_signatures {
         if !first {
@@ -712,15 +705,9 @@ fn render_object_into(
         render_property_into(out, model, property, visiting_aliases);
     }
     if first {
+        out.text.truncate(start);
         out.push("{}");
     } else {
-        out.text.insert_str(start, "{ ");
-        for blank in out.blanks.iter_mut() {
-            if blank.0 >= start {
-                blank.0 += 2;
-                blank.1 += 2;
-            }
-        }
         out.push("; }");
     }
 }
@@ -787,12 +774,7 @@ fn render_property_into(
     } else {
         out.push(": ");
         if property.declared() {
-            out.push_blank(&render_type_grouped(
-                model,
-                property.type_id(),
-                false,
-                visiting_aliases,
-            ));
+            push_blank_rendered(out, model, property.type_id(), false, visiting_aliases);
         } else {
             render_annotated_into(out, model, property.type_id(), false, visiting_aliases);
         }
@@ -882,7 +864,7 @@ fn render_string_literal(value: &EcmaString) -> String {
 mod tests {
     use super::{
         render_signature, render_signature_declaration, render_string_literal, render_type,
-        render_type_declaration, render_type_grouped,
+        render_type_annotated, render_type_declaration, render_type_grouped,
     };
     use bamts_bytecode::EcmaString;
     use std::sync::Arc;
