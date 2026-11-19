@@ -317,6 +317,9 @@ fn symbol_at(
         return Ok(Some(SymbolId::new(index)));
     }
 
+    if property_anchor_at(document, token.range().start()).is_some() {
+        return Ok(None);
+    }
     Ok(model
         .symbol_references()
         .iter()

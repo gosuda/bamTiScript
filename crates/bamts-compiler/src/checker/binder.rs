@@ -30016,7 +30016,7 @@ mod tests {
     #[test]
     fn member_access_records_qualified_reference_rows() {
         let (model, diagnostics) =
-            bound("class C { m() { return this.n; } n: number = 0; }\nvar c = new C();\nc.m().n;");
+            bound("class C { m() { return this.n; } n: number = 0; }\nvar c = new C();\nc.n;");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let n = symbol_named(&model, "n");
         let rows: Vec<_> = model

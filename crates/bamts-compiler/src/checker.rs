@@ -57,7 +57,7 @@ pub use binder::{
     DeclarationOccurrence, PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol,
     SymbolId, SymbolKind, Type, TypeId, TypeTable,
 };
-pub use intrinsic_environment::global_lib_decl_file;
+pub use intrinsic_environment::{global_lib_decl_file, lib_decl_files_for_global};
 pub(crate) use binder::{
     EnumBindingView, EnumSourceInventory, ImportedSymbolType, bind_source_with_cancel,
     bind_source_with_environment_and_cancel, bind_source_with_environment_and_imports_with_cancel,
@@ -12792,10 +12792,10 @@ class B extends A {
     }
 
     #[test]
-    fn array_named_properties_remain_permissive() {
+    fn array_named_properties_report_missing_members() {
         let result =
             check_text("declare const values: number[]; const label: string = values.tag;");
-        assert!(checker_codes(&result).is_empty());
+        assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
     }
 
     #[test]
