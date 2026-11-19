@@ -458,7 +458,7 @@ fn append_suffix(path: &Path, suffix: &str) -> Result<PathBuf, OutputMapError> {
     Ok(path.with_file_name(suffixed))
 }
 
-fn is_declaration_source(path: &Path) -> bool {
+pub(crate) fn is_declaration_source(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(OsStr::to_str)
