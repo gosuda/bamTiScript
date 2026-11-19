@@ -3450,18 +3450,6 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     }
     for (unit, output) in units {
         let section = unit_basename(&unit.virtual_path);
-        // Skip the empty entry unit that multi-file cases (`@filename:`
-        // sections) leave behind — it has no source content and upstream
-        // does not emit a section for it.
-        if output
-            .source_file()
-            .source_text()
-            .as_str()
-            .trim()
-            .is_empty()
-        {
-            continue;
-        }
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
@@ -3520,6 +3508,11 @@ fn emit_unit_symbols(
         let index = symbol_id.get() as usize;
         let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
+        if matches!(symbol.kind(), SymbolKind::IntrinsicValue)
+            && (name == "undefined" || name == "globalThis")
+        {
+            return Some(format!("Symbol({name})"));
+        }
         let anchors = if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
             // Occurrence-covered interface member: the Decl list unions this
             // unit's per-occurrence anchors with the (qualified-name-first)
@@ -6117,6 +6110,68 @@ export var v = 1;
             >x : Symbol(x, Decl(pin.ts, 1, 14))\n\
             \n\
             }\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+    /// Empty single-unit cases still emit their section header with no records.
+    #[test]
+    fn emit_symbols_baseline_emits_empty_single_unit_section() {
+        let logical = "tests/cases/compiler/emptyPin.ts";
+        let case_text = "// @target: es2015\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/emptyPin.ts] ////\n\n=== emptyPin.ts ===\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Trailing empty files keep their section headers with no records.
+    #[test]
+    fn emit_symbols_baseline_emits_empty_trailing_file_section() {
+        let logical = "tests/cases/compiler/multiEmptyPin.ts";
+        let case_text = "// @filename: a.ts\nvar a = 1;\n// @filename: b.ts\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(emitted.contains("=== a.ts ==="), "missing a section:\n{emitted}");
+        assert!(emitted.contains("=== b.ts ==="), "missing b section:\n{emitted}");
+    }
+    /// Bare intrinsic value references render without a Decl list.
+    #[test]
+    fn emit_symbols_baseline_renders_intrinsic_undefined_bare() {
+        let logical = "tests/cases/compiler/intrinsicPin.ts";
+        let case_text = "var v = undefined;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/intrinsicPin.ts] ////\n\n=== intrinsicPin.ts ===\nvar v = undefined;\n>v : Symbol(v, Decl(intrinsicPin.ts, 0, 3))\n>undefined : Symbol(undefined)\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Top-level This expressions reference the globalThis intrinsic bare.
+    #[test]
+    fn emit_symbols_baseline_renders_top_level_this_as_global_this() {
+        let logical = "tests/cases/compiler/thisPin.ts";
+        let case_text = "++this;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/thisPin.ts] ////\n\n=== thisPin.ts ===\n++this;\n>this : Symbol(globalThis)\n";
         assert_eq!(
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,

@@ -16904,6 +16904,9 @@ impl<'src> Binder<'src> {
                 if let Some(owner) = owner {
                     self.references.insert(expression.id(), owner);
                     self.symbol_references.push((expression.range(), owner));
+                } else if let Some(global) = self.lookup_value(scope, "globalThis") {
+                    self.references.insert(expression.id(), global);
+                    self.symbol_references.push((expression.range(), global));
                 }
             }
             Expression::Array(array) => {
