@@ -8,9 +8,7 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-#[path = "builtins/mod.rs"]
 pub(crate) mod builtins;
-#[path = "regexp.rs"]
 mod regexp;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct BuiltinId(usize);

@@ -17,7 +17,7 @@ use crate::{
 };
 
 const SOURCES_LEDGER: &str = "vendor/sources.toml";
-const GENERATED_TABLE: &str = "crates/bamts-runtime/src/builtins/regexp_v/emoji_tables.rs";
+const GENERATED_TABLE: &str = "crates/bamts-runtime/src/intrinsics/builtins/regexp_v/emoji_tables.rs";
 const IDENTITY_FILE: &str = ".bamti-source.json";
 const GENERATOR_VERSION: &str = "bamts-verification unicode/v1";
 const EMOJI_SEQUENCES: &str = "unicode-emoji-sequences";

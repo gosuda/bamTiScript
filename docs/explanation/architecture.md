@@ -17,7 +17,7 @@ For technical contributors seeking to locate specific functionality, the followi
 | **Source & Declaration Emitter** | `bamts-compiler` | [`../../crates/bamts-compiler`](../../crates/bamts-compiler) | [`src/emitter.rs`](../../crates/bamts-compiler/src/emitter.rs) |
 | **Bytecode IR & Verifier** | `bamts-bytecode` | [`../../crates/bamts-bytecode`](../../crates/bamts-bytecode) | [`src/lib.rs`](../../crates/bamts-bytecode/src/lib.rs), [`src/program.rs`](../../crates/bamts-bytecode/src/program.rs), [`src/string.rs`](../../crates/bamts-bytecode/src/string.rs) |
 | **Interpreter & Garbage Collector** | `bamts-runtime` | [`../../crates/bamts-runtime`](../../crates/bamts-runtime) | [`src/vm.rs`](../../crates/bamts-runtime/src/vm.rs), [`src/gc.rs`](../../crates/bamts-runtime/src/gc.rs), [`src/intrinsics.rs`](../../crates/bamts-runtime/src/intrinsics.rs) |
-| **Standard Builtins** | `bamts-runtime` | [`../../crates/bamts-runtime`](../../crates/bamts-runtime) | [`src/builtins/`](../../crates/bamts-runtime/src/builtins/) (`object.rs`, `array.rs`, `string.rs`, `promise.rs`, etc.) |
+| **Standard Builtins** | `bamts-runtime` | [`../../crates/bamts-runtime`](../../crates/bamts-runtime) | [`src/intrinsics/builtins/`](../../crates/bamts-runtime/src/intrinsics/builtins/) (`object.rs`, `array.rs`, `string.rs`, `promise.rs`, etc.) |
 | **JIT & AOT Codegen** | `bamts-codegen` | [`../../crates/bamts-codegen`](../../crates/bamts-codegen) | [`src/jit.rs`](../../crates/bamts-codegen/src/jit.rs), [`src/aot.rs`](../../crates/bamts-codegen/src/aot.rs), [`src/jit_memory.rs`](../../crates/bamts-codegen/src/jit_memory.rs) |
 | **Native ABI & Value Layout** | `bamts-native` | [`../../crates/bamts-native`](../../crates/bamts-native) | [`src/lib.rs`](../../crates/bamts-native/src/lib.rs), [`src/native_bridge.rs`](../../crates/bamts-native/src/native_bridge.rs) |
 | **Node Host & Capabilities** | `bamts-node` | [`../../crates/bamts-node`](../../crates/bamts-node) | [`src/lib.rs`](../../crates/bamts-node/src/lib.rs), [`src/timers.rs`](../../crates/bamts-node/src/timers.rs) |
@@ -61,7 +61,7 @@ flowchart TD
 - Static verification: [`src/program.rs`](../../crates/bamts-bytecode/src/program.rs) verifies module and linkage invariants before it produces `Program<Verified>`. Runtime and code-generation entry points consume that verified type.
 
 ### 4. Execution targets
-- Interpreter (`bamts-runtime`): [`src/vm.rs`](../../crates/bamts-runtime/src/vm.rs) runs verified bytecode. [`src/gc.rs`](../../crates/bamts-runtime/src/gc.rs) owns garbage collection, and [`src/builtins/`](../../crates/bamts-runtime/src/builtins/) owns language globals and intrinsic objects.
+- Interpreter (`bamts-runtime`): [`src/vm.rs`](../../crates/bamts-runtime/src/vm.rs) runs verified bytecode. [`src/gc.rs`](../../crates/bamts-runtime/src/gc.rs) owns garbage collection, and [`src/intrinsics/builtins/`](../../crates/bamts-runtime/src/intrinsics/builtins/) owns language globals and intrinsic objects.
 - Native code generation (`bamts-codegen` and `bamts-native`):
   - JIT: [`src/jit.rs`](../../crates/bamts-codegen/src/jit.rs) translates verified bytecode for in-process execution. [`src/jit_memory.rs`](../../crates/bamts-codegen/src/jit_memory.rs) owns executable-memory lifecycle.
   - AOT: [`src/aot.rs`](../../crates/bamts-codegen/src/aot.rs) compiles verified bytecode into the native object consumed by the CLI's host linker.
