@@ -3795,8 +3795,6 @@ fn symbol_record_for(
 /// token stream; for keyword-led declarations (class/function/interface/type/
 /// enum/namespace) the scan steps left over the leading keyword and modifiers
 /// so the marker anchors at the declaration keyword, not the name.
-/// For import aliases the scan steps left over `as` and the imported name,
-/// so the marker anchors at the specifier's full start, not the local name.
 fn symbol_decl_position(
     tokens: &[Token],
     source: &SourceText,
@@ -3832,9 +3830,6 @@ fn symbol_decl_position(
             }
             node_index = prev;
         }
-    }
-    if symbol.kind() == SymbolKind::Import {
-        node_index = import_specifier_start(tokens, node_index);
     }
     // Decorator walk: scan left over accessor keywords and decorator
     // expression tokens so a decorated member anchors at the decorator's
@@ -3904,16 +3899,6 @@ fn symbol_decl_position(
         None => Utf16Pos::ZERO,
     };
     source.line_column(full_start).ok()
-}
-
-fn import_specifier_start(tokens: &[Token], name_index: usize) -> usize {
-    let Some(as_index) = prev_significant_token(tokens, name_index) else {
-        return name_index;
-    };
-    if tokens[as_index].kind() != TokenKind::KwAs {
-        return name_index;
-    }
-    prev_significant_token(tokens, as_index).unwrap_or(name_index)
 }
 
 /// Per-unit `Decl` anchors for interface member declaration occurrences,
@@ -8318,6 +8303,61 @@ class C {\n\
                 .count(),
             2,
             "get and set each keep their row with the merged Decl list; emitted:\n{emitted}"
+        );
+    }
+    /// Alias object literal members declare bare member symbols: `type State`
+    /// in `computedPropertyBindingElementDeclarationNoCrash1.symbols` renders
+    /// `>State : Symbol(State, ...)`, `>a : Symbol(a, ...)` and
+    /// `>b : Symbol(b, ...)`, and `type T` in
+    /// `DeclarationErrorsNoEmitOnError.symbols` renders `>T : Symbol(T, ...)`
+    /// and `>x : Symbol(x, ...)`. The alias header on the same path stays
+    /// bare and keeps its single row.
+    #[test]
+    fn emit_symbols_binds_alias_object_literal_members() {
+        let logical = "tests/cases/compiler/aliasObjectMemberSymbolsPin.ts";
+        let case_text = "export type State = {\n    a: number;\n    b: string;\n};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains(">State : Symbol(State,"),
+            "alias header on the same path stays; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">a : Symbol(a,"),
+            "literal member a must declare a bare symbol; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">b : Symbol(b,"),
+            "literal member b must declare a bare symbol; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|line| line.starts_with(">a :")).count(),
+            1,
+            "one row per written literal member; emitted:\n{emitted}"
+        );
+    }
+    /// Union branches keep distinct member symbols: `type X` in
+    /// `arrayDestructuringInSwitch2.symbols` renders two `>kind` rows with
+    /// their own Decl anchors (Decl(0, 10) and Decl(0, 34)) rather than one
+    /// merged symbol.
+    #[test]
+    fn emit_symbols_binds_alias_union_literal_members() {
+        let logical = "tests/cases/compiler/aliasUnionMemberSymbolsPin.ts";
+        let case_text = "export type U = {\n    p: number;\n} | {\n    p: string;\n};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains(">U : Symbol(U,"),
+            "alias header on the same path stays; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|line| line.starts_with(">p :")).count(),
+            2,
+            "each union branch keeps its own member row; emitted:\n{emitted}"
         );
     }
 
