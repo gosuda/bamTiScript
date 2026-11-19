@@ -97,6 +97,9 @@ version has shipped, and no tag or stable package exists while any gate in
   engine and `run_linked_program` are unconditional with no replacement
   feature; the concrete AOT `main` stays in `bamts-node` behind its own
   `aot-main` feature.
+- Removed `bamts_runtime::run_with_telemetry` and `RunTelemetry`; call
+  `bamts_runtime::run` for the same outcome. Peak RSS stays available where
+  it is consumed, via `bamts_platform::peak_memory_bytes`.
 
 ### Known incomplete
 
