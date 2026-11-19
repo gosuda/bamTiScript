@@ -1155,21 +1155,6 @@ struct LinkedEnum {
     symbol: SymbolId,
 }
 
-trait EnumSourceRead {
-    fn enum_facts(&self) -> &enum_plan::EnumFacts;
-    fn symbol_kind(&self, symbol: SymbolId) -> Option<SymbolKind>;
-}
-
-impl EnumSourceRead for SemanticModel {
-    fn enum_facts(&self) -> &enum_plan::EnumFacts {
-        SemanticModel::enum_facts(self)
-    }
-
-    fn symbol_kind(&self, symbol: SymbolId) -> Option<SymbolKind> {
-        Some(self.symbol(symbol).kind())
-    }
-}
-
 #[derive(Clone, Debug)]
 enum ImportTarget {
     Named {
@@ -1901,13 +1886,13 @@ fn collect_enum_rebuild_bindings<'src>(
         _ => {}
     }
 }
-fn resolve_imported_const_enum_value<S: EnumSourceRead>(
+fn resolve_imported_const_enum_value(
     source: SourceId,
     site: &enum_plan::ImportedEnumMemberUse,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
 ) -> enum_plan::ImportedConstEnumValue {
     let candidates: HashMap<_, _> = files
         .get(&source)
@@ -2233,14 +2218,14 @@ fn collect_export_stars(
     clippy::too_many_arguments,
     reason = "imported member base resolution threads the shared import/export lookup tables"
 )]
-fn resolve_imported_member_base<S: EnumSourceRead>(
+fn resolve_imported_member_base(
     source: SourceId,
     site: &enum_plan::ImportedEnumMemberUse,
     candidates: &HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ImportedMemberBaseResolution {
     match site.base() {
@@ -2282,14 +2267,14 @@ fn resolve_imported_member_base<S: EnumSourceRead>(
     clippy::too_many_arguments,
     reason = "imported member result resolution threads the shared import/export lookup tables"
 )]
-fn resolve_imported_member_result<S: EnumSourceRead>(
+fn resolve_imported_member_result(
     source: SourceId,
     site: &enum_plan::ImportedEnumMemberUse,
     candidates: &HashMap<NodeId, enum_plan::ImportedEnumMemberUse>,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ImportedMemberBaseResolution {
     match resolve_imported_member_base(
@@ -2323,25 +2308,25 @@ fn resolve_imported_member_result<S: EnumSourceRead>(
     }
 }
 
-fn resolve_import_target<S: EnumSourceRead>(
+fn resolve_import_target(
     _source: SourceId,
     target: &ImportTarget,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolution {
     resolve_import_target_candidates(target, imports, exports, export_stars, files, visited)
         .into_resolution()
 }
 
-fn resolve_import_target_candidates<S: EnumSourceRead>(
+fn resolve_import_target_candidates(
     target: &ImportTarget,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolutionSet {
     match target {
@@ -2360,26 +2345,26 @@ fn resolve_import_target_candidates<S: EnumSourceRead>(
     }
 }
 
-fn resolve_export<S: EnumSourceRead>(
+fn resolve_export(
     source: SourceId,
     name: &EcmaString,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolution {
     resolve_export_candidates(source, name, imports, exports, export_stars, files, visited)
         .into_resolution()
 }
 
-fn resolve_export_candidates<S: EnumSourceRead>(
+fn resolve_export_candidates(
     source: SourceId,
     name: &EcmaString,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolutionSet {
     let key = (source, name.clone());
@@ -2428,13 +2413,13 @@ fn resolve_export_candidates<S: EnumSourceRead>(
     result
 }
 
-fn resolve_exported_symbol_candidates<S: EnumSourceRead>(
+fn resolve_exported_symbol_candidates(
     source: SourceId,
     symbol: SymbolId,
     imports: &HashMap<(SourceId, SymbolId), ImportTarget>,
     exports: &HashMap<(SourceId, EcmaString), ExportTarget>,
     export_stars: &ExportStars,
-    files: &BTreeMap<SourceId, S>,
+    files: &BTreeMap<SourceId, SemanticModel>,
     visited: &mut HashSet<(SourceId, EcmaString)>,
 ) -> ExportResolutionSet {
     let Some(model) = files.get(&source) else {
@@ -2447,8 +2432,8 @@ fn resolve_exported_symbol_candidates<S: EnumSourceRead>(
         }));
     }
     let value = ExportCandidate::Value(LinkedExport { source, symbol });
-    match model.symbol_kind(symbol) {
-        Some(SymbolKind::Import) => {
+    match model.symbol(symbol).kind() {
+        SymbolKind::Import => {
             imports
                 .get(&(source, symbol))
                 .map_or_else(ExportResolutionSet::default, |target| {
@@ -2462,8 +2447,7 @@ fn resolve_exported_symbol_candidates<S: EnumSourceRead>(
                     )
                 })
         }
-        Some(_) => ExportResolutionSet::candidate(value),
-        None => ExportResolutionSet::default(),
+        _ => ExportResolutionSet::candidate(value),
     }
 }
 fn lookup_identifier(
