@@ -47,7 +47,8 @@ impl ModuleResolutionKind {
     /// Resolves the kind from compiler options, defaulting per the module
     /// format when `moduleResolution` is unset: `amd`, `system`, and `umd`
     /// default to `Classic` (upstream probes the importing file's directory
-    /// for bare names under those formats), everything else to `NodeNext`.
+    /// for bare names under those formats), an unset `module` to `Bundler`,
+    /// and everything else to `NodeNext`.
     pub fn from_options(options: &CompilerOptions) -> Result<Self, ResolutionError> {
         match options.module_resolution() {
             Some(value) => Self::parse(value),
@@ -57,13 +58,17 @@ impl ModuleResolutionKind {
 
     /// Default kind for an unset `moduleResolution`, keyed off the module
     /// format alone. Matching is case-insensitive and ignores padding.
+    /// Oracle (tsc 7.0.2, `--traceResolution` on a scratch project with
+    /// neither `module` nor `moduleResolution`): `Module resolution kind is
+    /// not specified, using 'Bundler'`.
     fn default_for_module(module: Option<&str>) -> Self {
-        let classic = module.is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "amd" | "system" | "umd"
-            )
-        });
+        let Some(module) = module else {
+            return Self::Bundler;
+        };
+        let classic = matches!(
+            module.trim().to_ascii_lowercase().as_str(),
+            "amd" | "system" | "umd"
+        );
         if classic {
             Self::Classic
         } else {
@@ -134,6 +139,59 @@ impl ResolutionMode {
             Self::Require => PackageMode::Require,
         }
     }
+}
+
+/// Derives the per-importing-file resolution mode for `node16`/`nodenext`-style
+/// lookup: the importer extension decides (`.mts`/`.mjs` import, `.cts`/`.cjs`
+/// require), then the `type` field of the nearest `package.json`, defaulting
+/// to CJS. The tsconfig `module` option plays no part: a plain `.ts` file with
+/// no package scope resolves in CJS mode even under `module: nodenext`.
+/// Callers consult this only under those two kinds; under `bundler`/`classic`
+/// the edge syntax decides through the ambient mode instead.
+pub fn mode_for_importer(
+    host: &dyn ResolutionHost,
+    root: &ProjectRoot,
+    importer: &Path,
+) -> ResolutionMode {
+    match importer.extension().and_then(|extension| extension.to_str()) {
+        Some(extension)
+            if extension.eq_ignore_ascii_case("mts")
+                || extension.eq_ignore_ascii_case("mjs") =>
+        {
+            return ResolutionMode::Import;
+        }
+        Some(extension)
+            if extension.eq_ignore_ascii_case("cts")
+                || extension.eq_ignore_ascii_case("cjs") =>
+        {
+            return ResolutionMode::Require;
+        }
+        _ => {}
+    }
+    let mut directory = importer.parent();
+    while let Some(current) = directory {
+        if !current.starts_with(root.path()) {
+            break;
+        }
+        let candidate = current.join("package.json");
+        if host.file_exists(&candidate) {
+            let is_module = host
+                .read_file(&candidate)
+                .and_then(|source| PackageJson::parse(root, &candidate, &source).ok())
+                .and_then(|package| package.package_type().map(str::to_string))
+                .is_some_and(|package_type| package_type.eq_ignore_ascii_case("module"));
+            return if is_module {
+                ResolutionMode::Import
+            } else {
+                ResolutionMode::Require
+            };
+        }
+        if current == root.path() {
+            break;
+        }
+        directory = current.parent();
+    }
+    ResolutionMode::Require
 }
 
 /// File-system probe used by the resolver. Implementations must be deterministic:
@@ -881,12 +939,13 @@ fn classic_stem(path: &Path) -> Option<PathBuf> {
 
 /// Origin of a relative specifier handed to [`resolve_relative_inner`].
 ///
-/// The ESM extensionless-relative rejection applies only to specifiers the
-/// user wrote. Probes the resolver synthesizes from package directory
-/// contents (`./index` for a bare package root, `./{subpath}` inside it)
-/// always probe with extension substitution: the NodeNext CJS-mode trace
-/// resolves a bare package without `package.json` to
-/// `node_modules/dep/index.ts`, so the guard must not reject them.
+/// The extensionless-relative rejection for ESM (`import` under
+/// `node16`/`nodenext`) applies only to specifiers the user wrote. Probes the
+/// resolver synthesizes from package contents keep probing with extension
+/// substitution: a bare root with a manifest keeps the legacy `index` default
+/// for ESM importers, and extensionless subpaths keep probing for CJS ones.
+/// Manifest-less ESM roots and extensionless ESM subpaths never reach this
+/// function; the installed-package fallback rejects them first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RelativeOrigin {
     UserWritten,
@@ -940,7 +999,7 @@ fn resolve_relative_inner(
     trace: &mut ResolutionTrace,
     origin: RelativeOrigin,
 ) -> Result<ResolvedModule, ResolutionError> {
-    let (root, options) = context;
+    let (root, _) = context;
     let (kind, mode, flavor) = strategy;
     if origin == RelativeOrigin::UserWritten
         && mode == ResolutionMode::Import
@@ -953,13 +1012,7 @@ fn resolve_relative_inner(
             trace: trace.clone(),
         });
     }
-    let plan = plan_relative_module(
-        root,
-        importer,
-        specifier,
-        flavor,
-        options.resolve_json_module(),
-    )?;
+    let plan = plan_relative_module(root, importer, specifier, flavor)?;
     for candidate in plan.candidates() {
         let exists = host.file_exists(candidate);
         trace.push(ResolutionTraceStep::Candidate {
@@ -1323,8 +1376,16 @@ fn try_node_modules(
             fallback: false,
         });
         let package_root = directory.join("node_modules").join(&package_name);
+        // The package directory itself may be absent while a stem file beside
+        // it exists (`node_modules/dep.ts` with no `node_modules/dep/`): tsc
+        // probes stems regardless under node16/nodenext (its trace prints the
+        // `package.json` miss), so enter whenever the `node_modules`
+        // container exists. Bundler keeps the old gate: its loose-file path
+        // below already probes stems, and its trace prints no miss line.
         if (host.directory_exists(&package_root)
-            || host.file_exists(&package_root.join("package.json")))
+            || host.file_exists(&package_root.join("package.json"))
+            || (kind != ModuleResolutionKind::Bundler
+                && host.directory_exists(&node_modules)))
             && let Some(resolved) = resolve_installed_package(
                 (root, options),
                 importer,
@@ -1526,8 +1587,41 @@ fn resolve_installed_package(
     {
         return confined_hit(root, trace, kind, mode, &found);
     }
-
     // No usable exports/legacy entry: try subpath as a relative file inside the package.
+    // In ESM mode (`import` under node16/nodenext) a manifest-less package performs
+    // no file probing, and neither does an extensionless subpath: both fail the way
+    // an extensionless relative import fails. A bare root with a manifest keeps the
+    // legacy `index` default, resolved with extension substitution below.
+    let has_manifest = chain.iter().any(|(_, content)| content.is_some());
+    if mode == ResolutionMode::Import
+        && !kind.allows_extensionless_relative()
+        && (!has_manifest || !subpath.is_empty())
+    {
+        return Ok(None);
+    }
+    if subpath.is_empty() && mode == ResolutionMode::Require {
+        // Oracle (tsc 7.0.2, CJS mode, manifest or not): a bare package probes
+        // the package stem before its directory index, in a preferred
+        // TypeScript pass first and a JavaScript fallback pass after:
+        // `dep.ts, dep.tsx, dep.d.ts, dep/index.ts, dep/index.tsx,
+        // dep/index.d.ts`, then `dep.js, dep.jsx, dep/index.js, dep/index.jsx`.
+        // `Types` flavor hoists the declaration candidate inside each pass.
+        let (preferred, fallback): (&[&str], &[&str]) = match flavor {
+            ResolutionFlavor::Types => (&["d.ts", "ts", "tsx"], &["js", "jsx"]),
+            ResolutionFlavor::Runtime => (&["ts", "tsx", "d.ts"], &["js", "jsx"]),
+        };
+        for extensions in [preferred, fallback] {
+            for stem in [package_root.to_path_buf(), package_root.join("index")] {
+                if let Some(found) = probe_loose_stems(host, trace, &[stem], extensions)
+                    && let Some(mut resolved) = confined_hit(root, trace, kind, mode, &found)?
+                {
+                    resolved.package_json = Some(package_json_path.clone());
+                    return Ok(Some(resolved));
+                }
+            }
+        }
+        return Ok(None);
+    }
     let relative = if subpath.is_empty() {
         "./index".to_string()
     } else {

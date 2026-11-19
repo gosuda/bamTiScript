@@ -291,7 +291,9 @@
     }
 
     #[test]
-    fn nodenext_import_resolves_bare_package_index_without_manifest() {
+    fn nodenext_require_resolves_bare_package_index_without_manifest() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, CJS importer resolving
+        // in CJS mode): a manifest-less package resolves to its directory index.
         let mut host = MemoryHost::default();
         host.file(
             abs("/workspace/node_modules/dep/index.ts"),
@@ -301,13 +303,13 @@
         let resolved = resolve_module_name(
             &root(),
             &options,
-            abs("/workspace/src/main.ts"),
+            abs("/workspace/src/main.cts"),
             "dep",
-            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
             &host,
             &mut ResolutionCache::new(),
         )
-        .expect("bare package without a manifest resolves to its directory index");
+        .expect("CJS importer resolves a manifest-less package to its directory index");
         assert_eq!(
             resolved.path(),
             abs("/workspace/node_modules/dep/index.ts").as_path()
@@ -315,7 +317,8 @@
     }
 
     #[test]
-    fn node16_import_resolves_bare_package_index_without_manifest() {
+    fn node16_require_resolves_bare_package_index_without_manifest() {
+        // Oracle (tsc 7.0.2, moduleResolution node16, CJS importer): same rule.
         let mut host = MemoryHost::default();
         host.file(
             abs("/workspace/node_modules/dep/index.ts"),
@@ -325,17 +328,507 @@
         let resolved = resolve_module_name(
             &root(),
             &options,
-            abs("/workspace/src/main.ts"),
+            abs("/workspace/src/main.cts"),
             "dep",
-            (ModuleResolutionKind::Node16, ResolutionMode::Import),
+            (ModuleResolutionKind::Node16, ResolutionMode::Require),
             &host,
             &mut ResolutionCache::new(),
         )
-        .expect("bare package without a manifest resolves to its directory index");
+        .expect("CJS importer resolves a manifest-less package to its directory index");
         assert_eq!(
             resolved.path(),
             abs("/workspace/node_modules/dep/index.ts").as_path()
         );
+    }
+
+    #[test]
+    fn nodenext_import_rejects_bare_package_index_without_manifest() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, ESM importer resolving
+        // in ESM mode): a package with no package.json gets no file probing,
+        // so `dep` is not resolved.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let missing = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.mts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        );
+        assert!(matches!(missing, Err(ResolutionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn node16_import_rejects_bare_package_index_without_manifest() {
+        // Oracle (tsc 7.0.2, moduleResolution node16, ESM importer): same rule.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("node16");
+        let missing = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.mts"),
+            "dep",
+            (ModuleResolutionKind::Node16, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        );
+        assert!(matches!(missing, Err(ResolutionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn nodenext_import_resolves_bare_package_index_with_manifest() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, ESM importer): a package
+        // whose manifest has neither `main` nor `exports` keeps the legacy
+        // `index` default, resolved with extension substitution.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/package.json"),
+            r#"{"name":"dep","version":"1.0.0"}"#,
+        );
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.mts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("ESM importer resolves the legacy index default when a manifest exists");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/index.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn nodenext_import_rejects_extensionless_subpath_even_with_manifest() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, ESM importer):
+        // `dep/sub` without an extension never resolves, manifest or not.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/package.json"),
+            r#"{"name":"dep","version":"1.0.0"}"#,
+        );
+        host.file(
+            abs("/workspace/node_modules/dep/sub.ts"),
+            "export const s = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let missing = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.mts"),
+            "dep/sub",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        );
+        assert!(matches!(missing, Err(ResolutionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn nodenext_require_prefers_ts_over_tsx_in_directory_index() {
+        // Guards the candidate order inside one index stem: with both
+        // `dep/index.ts` and `dep/index.tsx` present, the `.ts` candidate
+        // wins. Mutating the plan to probe `.tsx` first resolves the wrong
+        // file and fails this test.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/dep/index.tsx"),
+            "export const a = 2;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("directory index resolves");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/index.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn mode_for_importer_prefers_extension_then_package_type() {
+        let root = root();
+        let bare = MemoryHost::default();
+        for importer in [
+            "/workspace/src/main.mts",
+            "/workspace/src/main.mjs",
+            "/workspace/src/main.d.mts",
+        ] {
+            assert_eq!(
+                mode_for_importer(&bare, &root, abs(importer).as_path()),
+                ResolutionMode::Import,
+                "{importer} resolves in ESM mode",
+            );
+        }
+        for importer in [
+            "/workspace/src/main.cts",
+            "/workspace/src/main.cjs",
+            "/workspace/src/main.d.cts",
+        ] {
+            assert_eq!(
+                mode_for_importer(&bare, &root, abs(importer).as_path()),
+                ResolutionMode::Require,
+                "{importer} resolves in CJS mode",
+            );
+        }
+        // A plain `.ts` file with no package scope defaults to CJS, whatever
+        // the tsconfig `module` says (oracle: `module: nodenext` still CJS).
+        assert_eq!(
+            mode_for_importer(&bare, &root, abs("/workspace/src/main.ts").as_path()),
+            ResolutionMode::Require,
+        );
+        let mut module_scope = MemoryHost::default();
+        module_scope.file(
+            abs("/workspace/package.json"),
+            r#"{"name":"app","type":"module"}"#,
+        );
+        assert_eq!(
+            mode_for_importer(
+                &module_scope,
+                &root,
+                abs("/workspace/src/main.ts").as_path()
+            ),
+            ResolutionMode::Import,
+        );
+        // The extension beats the package type: `.mts` stays ESM inside a
+        // CommonJS package, and `.cts` stays CJS inside an ESM package.
+        assert_eq!(
+            mode_for_importer(
+                &module_scope,
+                &root,
+                abs("/workspace/src/main.cts").as_path()
+            ),
+            ResolutionMode::Require,
+        );
+        let mut commonjs_scope = MemoryHost::default();
+        commonjs_scope.file(
+            abs("/workspace/package.json"),
+            r#"{"name":"app","type":"commonjs"}"#,
+        );
+        assert_eq!(
+            mode_for_importer(
+                &commonjs_scope,
+                &root,
+                abs("/workspace/src/main.mts").as_path()
+            ),
+            ResolutionMode::Import,
+        );
+        assert_eq!(
+            mode_for_importer(
+                &commonjs_scope,
+                &root,
+                abs("/workspace/src/main.ts").as_path()
+            ),
+            ResolutionMode::Require,
+        );
+        // The nearest manifest wins over an outer one.
+        let mut nested_scope = MemoryHost::default();
+        nested_scope.file(
+            abs("/workspace/package.json"),
+            r#"{"name":"app","type":"module"}"#,
+        );
+        nested_scope.file(
+            abs("/workspace/src/package.json"),
+            r#"{"name":"inner","type":"commonjs"}"#,
+        );
+        assert_eq!(
+            mode_for_importer(
+                &nested_scope,
+                &root,
+                abs("/workspace/src/main.ts").as_path()
+            ),
+            ResolutionMode::Require,
+        );
+    }
+
+    #[test]
+    fn nodenext_require_probes_package_stem_before_directory_index() {
+        // Oracle (tsc 7.0.2, CJS mode, empty-`dep/`-directory trace): a bare
+        // package probes `dep.ts` before `dep/index.ts`. The old plan probed
+        // only `./index`, so the stem file below was missed.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("CJS importer probes the package stem");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn nodenext_require_prefers_stem_file_over_index_file() {
+        // Oracle probe order: `dep.ts` precedes `dep/index.ts`.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep.ts"),
+            "export const a = 1;\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 2;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("stem file beats directory index");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn nodenext_require_prefers_typescript_pass_over_javascript_fallback() {
+        // Oracle: `dep/index.ts` (preferred pass) beats `dep.js` (fallback
+        // pass). A single-pass `ts,tsx,…,js,jsx` order would resolve `dep.js`.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep.js"),
+            "module.exports = {};\n",
+        );
+        host.file(
+            abs("/workspace/node_modules/dep/index.ts"),
+            "export const a = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("preferred pass beats fallback pass");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/index.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn nodenext_require_resolves_legacy_index_js_with_manifest() {
+        // Oracle (tsc 7.0.2, CJS importer, manifest without `main`): the
+        // legacy `index` default resolves `index.js` when no `index.ts`
+        // exists.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/package.json"),
+            r#"{"name":"dep","version":"1.0.0"}"#,
+        );
+        host.file(
+            abs("/workspace/node_modules/dep/index.js"),
+            "module.exports = {};\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "dep",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("legacy index default resolves index.js");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/index.js").as_path()
+        );
+    }
+
+    #[test]
+    fn nodenext_require_resolves_extensionless_subpath_without_manifest() {
+        // Oracle (tsc 7.0.2, CJS mode): `dep/sub` probes `sub.ts` even with
+        // no manifest anywhere in the package.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/dep/sub.ts"),
+            "export const s = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "dep/sub",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("CJS importer probes subpath stems");
+        assert_eq!(
+            resolved.path(),
+            abs("/workspace/node_modules/dep/sub.ts").as_path()
+        );
+    }
+
+    #[test]
+    fn nodenext_require_probes_declaration_before_javascript() {
+        // Oracle (empty-directory trace): `foo.d.ts` precedes `foo.js`.
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/src/foo.d.ts"), "export {};\n");
+        host.file(abs("/workspace/src/foo.js"), "module.exports = {};\n");
+        let options = options_with_resolution("nodenext");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "./foo",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("declaration beats javascript");
+        assert_eq!(resolved.path(), abs("/workspace/src/foo.d.ts").as_path());
+    }
+
+    #[test]
+    fn nodenext_require_ignores_extensionless_file_and_json() {
+        // Oracle: neither a file literally named `foo` nor `foo.json` (even
+        // with `resolveJsonModule`) resolves an extensionless relative import.
+        let options = options_with_resolution("nodenext");
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/src/foo"), "anything\n");
+        host.file(abs("/workspace/src/foo.json"), "{}\n");
+        let missing = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "./foo",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        );
+        assert!(matches!(missing, Err(ResolutionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn nodenext_import_rejects_extensionless_exports_target() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, ESM importer):
+        // `exports` target `./index` without an extension is not resolved.
+        // The synthesized target therefore keeps the user-written guard.
+        let mut host = MemoryHost::default();
+        host.file(
+            abs("/workspace/node_modules/pkg/package.json"),
+            r#"{"name":"pkg","version":"1.0.0","exports":{".":"./index"}}"#,
+        );
+        host.file(
+            abs("/workspace/node_modules/pkg/index.ts"),
+            "export const p = 1;\n",
+        );
+        let options = options_with_resolution("nodenext");
+        let missing = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.mts"),
+            "pkg",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        );
+        assert!(matches!(missing, Err(ResolutionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn nodenext_require_resolves_extensionless_paths_target() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, CJS importer): a
+        // `paths` target without an extension probes with substitution.
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{"moduleResolution":"nodenext","baseUrl":".","paths":{"@app/*":["./lib/*"]}}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/lib/data.ts"), "export const d = 1;\n");
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.cts"),
+            "@app/data",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Require),
+            &host,
+            &mut ResolutionCache::new(),
+        )
+        .expect("paths target probes with substitution");
+        assert_eq!(resolved.path(), abs("/workspace/lib/data.ts").as_path());
+    }
+
+    #[test]
+    fn nodenext_import_rejects_extensionless_paths_target() {
+        // Oracle (tsc 7.0.2, moduleResolution nodenext, ESM importer): a
+        // `paths` target without an extension is not resolved.
+        let config = ProjectConfig::parse(
+            &root(),
+            abs("/workspace/tsconfig.json"),
+            r#"{"compilerOptions":{"moduleResolution":"nodenext","baseUrl":".","paths":{"@app/*":["./lib/*"]}}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file(abs("/workspace/lib/data.ts"), "export const d = 1;\n");
+        let missing = resolve_module_name(
+            &root(),
+            &options,
+            abs("/workspace/src/main.mts"),
+            "@app/data",
+            (ModuleResolutionKind::NodeNext, ResolutionMode::Import),
+            &host,
+            &mut ResolutionCache::new(),
+        );
+        assert!(matches!(missing, Err(ResolutionError::NotFound { .. })));
     }
 
     #[test]
@@ -801,9 +1294,12 @@
         .expect("config")
         .options()
         .clone();
+        // Oracle (tsc 7.0.2, `--traceResolution` on a scratch project with
+        // neither `module` nor `moduleResolution`): `Module resolution kind
+        // is not specified, using 'Bundler'`.
         assert_eq!(
             ModuleResolutionKind::from_options(&unset).unwrap(),
-            ModuleResolutionKind::NodeNext
+            ModuleResolutionKind::Bundler
         );
         let explicit = ProjectConfig::parse(
             &root(),
