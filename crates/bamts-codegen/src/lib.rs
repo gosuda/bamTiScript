@@ -3110,7 +3110,7 @@ fn reachable_pcs(code: &[Instruction], handlers: &[ExceptionHandler]) -> BTreeSe
             continue;
         }
         let instruction = code[pc];
-        instruction.visit_normal_successors(pc, |target| worklist.push(target));
+        normal_successors(instruction, pc, |target| worklist.push(target));
         if routes_to_handler(instruction)
             && let Some(handler) = innermost_handler(handlers, pc)
         {
@@ -3306,78 +3306,72 @@ fn innermost_handler(handlers: &[ExceptionHandler], pc: usize) -> Option<Excepti
     best.map(|(_, handler)| handler)
 }
 
-trait NormalSuccessors {
-    /// Visits each normal-control successor pc (excluding handler edges).
-    fn visit_normal_successors(self, pc: usize, visit: impl FnMut(usize));
-}
-
-impl NormalSuccessors for Instruction {
-    fn visit_normal_successors(self, pc: usize, mut visit: impl FnMut(usize)) {
-        match self {
-            Instruction::Jump { target } => visit(target.get() as usize),
-            Instruction::JumpIfTrue { target, .. } | Instruction::JumpIfFalse { target, .. } => {
-                visit(target.get() as usize);
-                visit(pc + 1);
-            }
-            // A suspension returns now; its `resume` pc is entered by a later
-            // call through the resume prologue.
-            Instruction::Suspend { resume, .. } | Instruction::Await { resume, .. } => {
-                visit(resume.get() as usize);
-            }
-            Instruction::Return { .. } | Instruction::Throw { .. } | Instruction::Halt => {}
-            Instruction::LoadConst { .. }
-            | Instruction::Move { .. }
-            | Instruction::Unary { .. }
-            | Instruction::Binary { .. }
-            | Instruction::CreateObject { .. }
-            | Instruction::ToObject { .. }
-            | Instruction::CreateArray { .. }
-            | Instruction::CreateCell { .. }
-            | Instruction::CreateClosure { .. }
-            | Instruction::GetProperty { .. }
-            | Instruction::SetProperty { .. }
-            | Instruction::DefineDataProperty { .. }
-            | Instruction::LoadOwnDescriptorSlot { .. }
-            | Instruction::DefineOwnDescriptorSlot { .. }
-            | Instruction::WithHasBinding { .. }
-            | Instruction::DeleteProperty { .. }
-            | Instruction::DefineAccessor { .. }
-            | Instruction::Call { .. }
-            | Instruction::Construct { .. }
-            | Instruction::ConstructWithNewTarget { .. }
-            | Instruction::LoadGlobal { .. }
-            | Instruction::StoreGlobal { .. }
-            | Instruction::TypeOfGlobal { .. }
-            | Instruction::LoadThis { .. }
-            | Instruction::LoadArguments { .. }
-            | Instruction::LoadNewTarget { .. }
-            | Instruction::LoadImportMeta { .. }
-            | Instruction::SuppressError { .. }
-            | Instruction::ArrayPush { .. }
-            | Instruction::ArrayExtend { .. }
-            | Instruction::ObjectSpread { .. }
-            | Instruction::SetPrototype { .. }
-            | Instruction::CreatePrivateName { .. }
-            | Instruction::CreateRegExp { .. }
-            | Instruction::GetIterator { .. }
-            | Instruction::IteratorNext { .. }
-            | Instruction::IteratorStep { .. }
-            | Instruction::IteratorResult { .. }
-            | Instruction::IteratorClose { .. }
-            | Instruction::RequireCloseResult { .. }
-            | Instruction::DisposeCapture { .. }
-            | Instruction::Import { .. }
-            | Instruction::ImportDynamic { .. }
-            | Instruction::Export { .. }
-            | Instruction::GetSuper { .. }
-            | Instruction::SetSuper { .. }
-            | Instruction::ImportAttributes { .. }
-            | Instruction::ImportDynamicAttributes { .. }
-            | Instruction::CopyDataProperties { .. }
-            | Instruction::GetTemplateObject { .. }
-            | Instruction::RequireGlobalBinding { .. }
-            | Instruction::ThrowIntrinsicError { .. } => visit(pc + 1),
+/// Visits each normal-control successor pc (excluding handler edges).
+fn normal_successors(instruction: Instruction, pc: usize, mut visit: impl FnMut(usize)) {
+    match instruction {
+        Instruction::Jump { target } => visit(target.get() as usize),
+        Instruction::JumpIfTrue { target, .. } | Instruction::JumpIfFalse { target, .. } => {
+            visit(target.get() as usize);
+            visit(pc + 1);
         }
+        // A suspension returns now; its `resume` pc is entered by a later
+        // call through the resume prologue.
+        Instruction::Suspend { resume, .. } | Instruction::Await { resume, .. } => {
+            visit(resume.get() as usize);
+        }
+        Instruction::Return { .. } | Instruction::Throw { .. } | Instruction::Halt => {}
+        Instruction::LoadConst { .. }
+        | Instruction::Move { .. }
+        | Instruction::Unary { .. }
+        | Instruction::Binary { .. }
+        | Instruction::CreateObject { .. }
+        | Instruction::ToObject { .. }
+        | Instruction::CreateArray { .. }
+        | Instruction::CreateCell { .. }
+        | Instruction::CreateClosure { .. }
+        | Instruction::GetProperty { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DefineDataProperty { .. }
+        | Instruction::LoadOwnDescriptorSlot { .. }
+        | Instruction::DefineOwnDescriptorSlot { .. }
+        | Instruction::WithHasBinding { .. }
+        | Instruction::DeleteProperty { .. }
+        | Instruction::DefineAccessor { .. }
+        | Instruction::Call { .. }
+        | Instruction::Construct { .. }
+        | Instruction::ConstructWithNewTarget { .. }
+        | Instruction::LoadGlobal { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::TypeOfGlobal { .. }
+        | Instruction::LoadThis { .. }
+        | Instruction::LoadArguments { .. }
+        | Instruction::LoadNewTarget { .. }
+        | Instruction::LoadImportMeta { .. }
+        | Instruction::SuppressError { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayExtend { .. }
+        | Instruction::ObjectSpread { .. }
+        | Instruction::SetPrototype { .. }
+        | Instruction::CreatePrivateName { .. }
+        | Instruction::CreateRegExp { .. }
+        | Instruction::GetIterator { .. }
+        | Instruction::IteratorNext { .. }
+        | Instruction::IteratorStep { .. }
+        | Instruction::IteratorResult { .. }
+        | Instruction::IteratorClose { .. }
+        | Instruction::RequireCloseResult { .. }
+        | Instruction::DisposeCapture { .. }
+        | Instruction::Import { .. }
+        | Instruction::ImportDynamic { .. }
+        | Instruction::Export { .. }
+        | Instruction::GetSuper { .. }
+        | Instruction::SetSuper { .. }
+        | Instruction::ImportAttributes { .. }
+        | Instruction::ImportDynamicAttributes { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::GetTemplateObject { .. }
+        | Instruction::RequireGlobalBinding { .. }
+        | Instruction::ThrowIntrinsicError { .. } => visit(pc + 1),
     }
 }
 
