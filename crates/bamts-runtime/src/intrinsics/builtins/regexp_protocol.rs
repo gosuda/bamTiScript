@@ -10,8 +10,7 @@ use crate::heap::Heap;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use super::array_es2023::index_key;
-use super::array_generic::tick;
+use super::array::{index_key, tick};
 use super::regexp::{builtin_exec, regexp_parts};
 use super::{
     allocate_array, allocate_string, argument, keep_root, length_of_array_like,
