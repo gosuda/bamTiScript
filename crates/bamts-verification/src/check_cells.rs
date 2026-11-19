@@ -1475,8 +1475,12 @@ fn workspace_root() -> Option<PathBuf> {
 }
 
 /// Locates the pinned authority tree: an explicit `BAMTS_AUTHORITY_ROOT`
-/// first, else the workspace checkout's `target/authority` copy. Missing
-/// trees mean missing mounts, and the case compiles exactly as before.
+/// first, else the workspace checkout's `target/authority` copy, else the
+/// in-repo `.references` testdata the authority copy is fetched from. The
+/// last fallback keeps `cargo test` hermetic: a bare checkout has no
+/// `target/authority` tree (it needs the network), yet the served `tests/lib`
+/// files are identical in both places. Missing trees mean missing mounts,
+/// and the case compiles exactly as before.
 fn mount_authority_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("BAMTS_AUTHORITY_ROOT") {
         let path = PathBuf::from(root);
@@ -1484,10 +1488,28 @@ fn mount_authority_root() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    workspace_root().and_then(|root| {
+    if let Some(root) = workspace_root() {
         let candidate = root.join("target/authority/typescript-7.0.2-tests");
-        candidate.is_dir().then_some(candidate)
-    })
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    reference_testdata_root()
+}
+
+/// The in-repo `.references` TypeScript testdata, found by walking up from
+/// this crate so worktree checkouts resolve it too.
+fn reference_testdata_root() -> Option<PathBuf> {
+    let mut directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = directory.join(".references/typescript/tsc/testdata");
+        if candidate.join("tests/lib").is_dir() {
+            return Some(candidate);
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
 }
 
 /// Copies the harness mount files a case's units reference into the temp
