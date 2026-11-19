@@ -38,9 +38,6 @@ pub(crate) fn unused_import_diagnostics(
         return Vec::new();
     }
     let pragma = pragma_factories(source);
-    if custom_factory_hidden(source, &options, &pragma) {
-        return Vec::new();
-    }
     let mut exported = HashSet::new();
     let mut declarations = Vec::new();
     collect_statements(
@@ -51,18 +48,20 @@ pub(crate) fn unused_import_diagnostics(
         &mut declarations,
         &mut exported,
     );
-    match &pragma.factory {
-        Some(factory) => {
-            exported.insert(factory.clone());
-        }
-        None => {
-            if classic_factory_used(source, &options) {
-                exported.insert("React".to_owned());
+    if is_classic_jsx(options.jsx) {
+        match &pragma.factory {
+            Some(factory) => {
+                exported.insert(factory.clone());
+            }
+            None => {
+                if classic_factory_used(source, &options) {
+                    exported.insert("React".to_owned());
+                }
             }
         }
-    }
-    if let Some(fragment) = &pragma.fragment {
-        exported.insert(fragment.clone());
+        if let Some(fragment) = &pragma.fragment {
+            exported.insert(fragment.clone());
+        }
     }
     let reads = file_reads(source, model);
     let mut diagnostics = Vec::new();
@@ -90,17 +89,6 @@ struct PragmaFactories {
     fragment: Option<String>,
 }
 
-/// A classic factory the configuration hides behind a custom name.
-fn custom_factory_hidden(
-    source: &SourceFile,
-    options: &UnusedImportOptions,
-    pragma: &PragmaFactories,
-) -> bool {
-    is_react_file(source)
-        && is_classic_jsx(options.jsx)
-        && options.jsx_custom_factory
-        && pragma.factory.is_none()
-}
 
 /// The `@jsx` and `@jsxFrag` factories a file selects in its comments.
 fn pragma_factories(source: &SourceFile) -> PragmaFactories {
@@ -523,5 +511,134 @@ mod tests {
             diagnostics[0].message(),
             "'other' is declared but its value is never read."
         );
+    }
+    #[test]
+    fn custom_factory_reports_unrelated_unused() {
+        let options = UnusedImportOptions {
+            jsx: Some(JsxEmit::React),
+            jsx_custom_factory: true,
+        };
+        let diagnostics = check_with_kind(
+            "import { unused } from \"./m\";\nexport const el = 1;\n",
+            ScriptKind::TypeScriptReact,
+            options,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+    }
+
+    #[test]
+    fn custom_factory_reports_react_itself() {
+        let options = UnusedImportOptions {
+            jsx: Some(JsxEmit::React),
+            jsx_custom_factory: true,
+        };
+        let diagnostics = check_with_kind(
+            "import React from \"react\";\nexport const el = 1;\n",
+            ScriptKind::TypeScriptReact,
+            options,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+    }
+
+    #[test]
+    fn pragma_ignored_under_automatic_jsx() {
+        let options = UnusedImportOptions {
+            jsx: Some(JsxEmit::ReactJsx),
+            jsx_custom_factory: false,
+        };
+        let diagnostics = check_with_kind(
+            "/** @jsx h */\nimport { h } from \"./r\";\nexport const el = 1;\n",
+            ScriptKind::TypeScriptReact,
+            options,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+    }
+
+    #[test]
+    fn jsx_frag_null_clears_fragment_use() {
+        let options = UnusedImportOptions {
+            jsx: Some(JsxEmit::React),
+            jsx_custom_factory: false,
+        };
+        let diagnostics = check_with_kind(
+            "/** @jsx h\n * @jsxFrag null\n */\nimport { h, Fragment } from \"./r\";\nexport const el = 1;\n",
+            ScriptKind::TypeScriptReact,
+            options,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+        assert_eq!(
+            diagnostics[0].message(),
+            "'Fragment' is declared but its value is never read."
+        );
+    }
+
+    #[test]
+    fn all_unused_multi_binding_reports_6192_at_declaration() {
+        let diagnostics = check("import { a, b } from \"./m\";\nexport {};\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6192"]);
+        assert_eq!(diagnostics[0].range().start().get(), 0, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn single_unused_in_multi_binding_reports_name() {
+        let diagnostics = check("import { a, b } from \"./m\";\nexport const x = a;\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+        assert_eq!(
+            diagnostics[0].message(),
+            "'b' is declared but its value is never read."
+        );
+    }
+
+    #[test]
+    fn import_type_and_inline_type_are_clean() {
+        let diagnostics = check("import type { T } from \"./m\";\nexport {};\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let inline = check("import { type T } from \"./m\";\nexport {};\n");
+        assert!(inline.is_empty(), "{inline:?}");
+    }
+
+    #[test]
+    fn import_equals_unused_reports() {
+        let diagnostics = check("import r = require(\"./m\");\nexport {};\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
+    }
+
+    #[test]
+    fn declaration_file_imports_are_clean() {
+        let source_text = std::sync::Arc::new(
+            crate::source::SourceText::new("import { a } from \"./m\";\n")
+                .expect("test source fits the budget")
+                .with_declaration_file(true),
+        );
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            crate::source::SourceId::new(0),
+            ScriptKind::TypeScript,
+            source_text,
+        ));
+        let file = parsed.product();
+        let (model, _) = crate::checker::binder::bind_source(file);
+        let diagnostics = unused_import_diagnostics(
+            file,
+            &model,
+            UnusedImportOptions {
+                jsx: None,
+                jsx_custom_factory: false,
+            },
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn namespace_nested_import_reports() {
+        let diagnostics = check("namespace N { import { a } from \"./m\"; }\nexport {};\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(codes(&diagnostics), ["6133"]);
     }
 }
