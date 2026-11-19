@@ -12562,6 +12562,56 @@ class B extends A {
     }
 
     #[test]
+    fn rest_parameter_with_array_annotation_types_names() {
+        let result = check_text("function f(...args: string[]) { const n: number = args; }");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn destructured_parameter_with_annotation_types_names() {
+        let result = check_text(
+            "function f({ a, b }: { a: string, b: number }) { const s: string = b; }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn object_rest_binding_computes_remaining_object() {
+        let result = check_text(
+            "declare const o: { a: number, b: string }; const { a, ...rest } = o; const s: string = rest;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn pure_object_rest_binding_keeps_source_object() {
+        let result = check_text(
+            "declare const o: { a: number }; const { ...rest } = o; const s: string = rest;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn update_expressions_type_as_number() {
+        let result = check_text("let x = 0; const s: string = x++;");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn bigint_update_expressions_type_as_bigint() {
+        let result = check_text("declare const b: bigint; const n: number = b++;");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004", "BAMTS-C060"]);
+    }
+
+    #[test]
+    fn catch_binding_types_as_unknown() {
+        let result = check_text("try {} catch (e) { const s: string = e; }");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+
+
+    #[test]
     fn index_signatures_supply_member_types_and_readonly_rules() {
         let lookup = check_text(
             "interface Dictionary { [key: string]: number }\

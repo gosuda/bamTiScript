@@ -13718,6 +13718,12 @@ impl<'src> Binder<'src> {
                         }
                         self.bind_pattern(binding, VariableKind::Let, catch_scope, handler.id());
                         self.resolve_pattern_expressions(binding, catch_scope);
+                        self.assign_binding_pattern_types(
+                            binding,
+                            self.types.unknown(),
+                            catch_scope,
+                            false,
+                        );
                     }
                     // Body declarations live in a child block like the try
                     // body above, so `function e` shadows the parameter
@@ -14392,17 +14398,41 @@ impl<'src> Binder<'src> {
                 }
             }
             BindingPattern::Object(object) => {
+                let mut omitted = Vec::new();
                 for property in &object.properties {
+                    if matches!(property.binding.data(), BindingPattern::Rest(_)) {
+                        continue;
+                    }
+                    if let Some(key) = self.property_key(&property.name) {
+                        omitted.push(key);
+                    }
+                }
+                let rename_rest = object.properties.iter().any(|property| {
+                    matches!(property.binding.data(), BindingPattern::Rest(_))
+                }) && object.properties.iter().any(|property| {
+                    matches!(property.name, PropertyName::Missing(_))
+                        && matches!(property.binding.data(), BindingPattern::Identifier(_))
+                });
+                for property in &object.properties {
+                    let binding = &property.binding;
+                    if matches!(binding.data(), BindingPattern::Rest(_)) && !rename_rest {
+                        let rest = self.object_rest_type(source, &omitted);
+                        self.assign_binding_pattern_types(binding, rest, scope, keep_literal);
+                        continue;
+                    }
+                    if rename_rest
+                        && matches!(property.name, PropertyName::Missing(_))
+                        && matches!(binding.data(), BindingPattern::Identifier(_))
+                    {
+                        let rest = self.object_rest_type(source, &omitted);
+                        self.assign_binding_pattern_types(binding, rest, scope, keep_literal);
+                        continue;
+                    }
                     let projected = self
                         .property_key(&property.name)
                         .and_then(|name| self.types.read_property_type(source, &name))
                         .unwrap_or_else(|| self.types.any());
-                    self.assign_binding_pattern_types(
-                        &property.binding,
-                        projected,
-                        scope,
-                        keep_literal,
-                    );
+                    self.assign_binding_pattern_types(binding, projected, scope, keep_literal);
                 }
             }
             BindingPattern::Array(array) => {
@@ -14422,6 +14452,32 @@ impl<'src> Binder<'src> {
             BindingPattern::Missing(_) => {}
         }
     }
+    fn object_rest_type(&mut self, source: TypeId, omitted: &[String]) -> TypeId {
+        let members = match self.types.get(source).clone() {
+            Type::Union(members) => members,
+            _ => vec![source],
+        };
+        let mut kept = Vec::new();
+        for member in members {
+            match self.types.get(member).clone() {
+                Type::Null | Type::Undefined => {}
+                Type::ObjectType(mut object) if !omitted.is_empty() => {
+                    object.properties.retain(|property| {
+                        !omitted.iter().any(|key| key.as_str() == property.name())
+                    });
+                    kept.push(self.types.object_type_with_members(object));
+                }
+                _ => kept.push(member),
+            }
+        }
+        if kept.is_empty() {
+            self.types.object_type(Vec::new())
+        } else if kept.len() == 1 {
+            kept[0]
+        } else {
+            self.types.union(&kept)
+        }
+    }
 
     fn binding_element_type(&mut self, source: TypeId, index: usize) -> TypeId {
         match self.types.get(source).clone() {
@@ -14437,6 +14493,7 @@ impl<'src> Binder<'src> {
                     .collect();
                 self.types.union(&projected)
             }
+            Type::Null | Type::Undefined => source,
             _ => self.types.any(),
         }
     }
@@ -14847,6 +14904,15 @@ impl<'src> Binder<'src> {
                 NOT_ASSIGNABLE_MESSAGE,
             );
         }
+        let fallback = if matches!(data.binding.data(), BindingPattern::Rest(_)) {
+            self.types.array(self.types.any())
+        } else {
+            self.types.any()
+        };
+        let declared = annotation
+            .or_else(|| initializer_type.map(|ty| self.types.widen(ty, false)))
+            .unwrap_or(fallback);
+        self.assign_binding_pattern_types(&data.binding, declared, scope, annotation.is_some());
         if let BindingPattern::Identifier(name) = data.binding.data()
             && let Some(symbol) = self.scopes[scope.0 as usize]
                 .values
@@ -23299,8 +23365,15 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Update(update) => {
-                let target = self.type_of_assignment_target(&update.argument, scope);
-                self.types.widen(target, false)
+                let operand = self.type_of_assignment_target(&update.argument, scope);
+                if matches!(
+                    self.types.get(operand),
+                    Type::BigInt | Type::BigIntLiteral(_)
+                ) {
+                    self.types.bigint()
+                } else {
+                    self.types.number()
+                }
             }
             Expression::Binary(binary) => {
                 let left = self.legacy_type_of_expr(&binary.left, scope);
