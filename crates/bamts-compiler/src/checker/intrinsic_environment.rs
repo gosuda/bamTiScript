@@ -1757,17 +1757,41 @@ mod tests {
     use super::*;
     #[test]
     fn lib_decl_files_cover_es_feature_globals() {
-        assert_eq!(
-            global_lib_decl_file("Promise"),
-            Some("lib.es2015.d.ts")
-        );
-        assert_eq!(global_lib_decl_file("Map"), Some("lib.es2015.d.ts"));
-        assert_eq!(
-            global_lib_decl_file("BigInt"),
-            Some("lib.es2020.bigint.d.ts")
-        );
-        assert!(!lib_decl_files_for_global("Promise", None, &[]).is_empty());
-        assert!(!lib_decl_files_for_global("Map", None, &[]).is_empty());
-        assert!(!lib_decl_files_for_global("BigInt", None, &[]).is_empty());
+        let cases: &[(&str, &str)] = &[
+            ("NaN", "lib.es5.d.ts"),
+            ("Promise", "lib.es2015.d.ts"),
+            ("Map", "lib.es2015.d.ts"),
+            ("Atomics", "lib.es2017.sharedmemory.d.ts"),
+            ("SharedArrayBuffer", "lib.es2017.sharedmemory.d.ts"),
+            ("AsyncIterable", "lib.es2018.asynciterable.d.ts"),
+            ("AsyncGenerator", "lib.es2018.asynciterable.d.ts"),
+            ("FlatArray", "lib.es2019.array.d.ts"),
+            ("BigInt", "lib.es2020.bigint.d.ts"),
+            ("BigInt64Array", "lib.es2020.bigint.d.ts"),
+            ("AggregateError", "lib.es2021.promise.d.ts"),
+            ("WeakRef", "lib.es2021.weakref.d.ts"),
+            ("FinalizationRegistry", "lib.es2021.weakref.d.ts"),
+            ("Float16Array", "lib.es2025.float16.d.ts"),
+            ("Iterator", "lib.es2025.iterator.d.ts"),
+            ("DisposableStack", "lib.esnext.disposable.d.ts"),
+            ("AsyncDisposableStack", "lib.esnext.disposable.d.ts"),
+            ("SuppressedError", "lib.esnext.disposable.d.ts"),
+            ("Temporal", "lib.esnext.temporal.d.ts"),
+            ("document", "lib.dom.d.ts"),
+            ("importScripts", "lib.webworker.importscripts.d.ts"),
+            ("WScript", "lib.scripthost.d.ts"),
+            ("ClassDecorator", "lib.decorators.legacy.d.ts"),
+        ];
+        for (global, file) in cases {
+            assert_eq!(global_lib_decl_file(global), Some(*file), "global {global}");
+            assert_eq!(
+                lib_decl_files_for_global(global, None, &[]),
+                [*file],
+                "decl files for {global}"
+            );
+        }
+        assert_eq!(global_lib_decl_file("undefined"), None);
+        assert!(lib_decl_files_for_global("undefined", None, &[]).is_empty());
+        assert_eq!(global_lib_decl_file("does-not-exist"), None);
     }
 }
