@@ -351,6 +351,7 @@ impl Walker<'_> {
                     self.walk_expr(&decorator.data().expression);
                 }
                 self.walk_computed_name(&accessor.name);
+                self.walk_initializer(accessor.initializer.as_deref());
                 if matches!(
                     accessor.modifiers.accessibility,
                     Some(Accessibility::Private)
@@ -1107,5 +1108,37 @@ mod tests {
         let outcome = check("function f() { var x = 0; [x] = [1]; return 0; }");
         let texts = messages(&outcome.locals);
         assert!(texts.contains(&"'x' is declared but its value is never read.".to_owned()));
+    }
+    #[test]
+    fn auto_accessor_initializer_read_keeps_seed_clean() {
+        let outcome = check("const seed = 1; class C { accessor x = seed; }");
+        assert!(outcome.locals.is_empty(), "{outcome:?}");
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn auto_accessor_initializer_nested_body_reports_unused() {
+        let outcome = check("class C { accessor p = () => { var z = 1; }; }");
+        assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'z' is declared but its value is never read."
+        );
+        assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn private_getter_setter_pair_reports_getter_only() {
+        let outcome = check("class C { get #x() { return 1; } set #x(v: number) {} }");
+        assert_eq!(outcome.locals.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.locals[0].message(),
+            "'#x' is declared but its value is never read."
+        );
+        assert_eq!(outcome.params.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.params[0].message(),
+            "'v' is declared but its value is never read."
+        );
     }
 }
