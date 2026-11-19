@@ -6491,6 +6491,54 @@ export var v = 1;
             "outer binding must appear only at its declaration:\n{emitted}"
         );
     }
+    /// Nested function-type parameters declare bare symbols: `each` in
+    /// `chainedSpecializationToObjectTypeLiteral.symbols` renders
+    /// `>iterator : Symbol(iterator, ...)` and the nested
+    /// `>value : Symbol(value, ...)`; the value parameter has no bind-phase
+    /// anchor, so resolve declares it at the single choke point where every
+    /// nested function type passes through. The outer parameter row on the
+    /// same path stays exactly as before.
+    #[test]
+    fn emit_symbols_binds_nested_function_type_parameters() {
+        let logical = "tests/cases/compiler/nestedFunctionTypeParamSymbolsPin.ts";
+        let case_text = "interface Sequence<T> {\n    each(iterator: (value: T) => void): void;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">iterator : Symbol(iterator,")),
+            "outer parameter keeps its row; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|l| l.starts_with(">value :")).count(),
+            1,
+            "nested value parameter must declare exactly one row; emitted:\n{emitted}"
+        );
+    }
+
+    /// Function-declaration annotations nest the same way: `declare function
+    /// f(cb: (v: boolean) => void)` in
+    /// `asyncFunctionContextuallyTypedReturns.symbols` renders `>cb` and the
+    /// nested `>v : Symbol(v, ...)`.
+    #[test]
+    fn emit_symbols_binds_annotation_nested_function_type_parameters() {
+        let logical = "tests/cases/compiler/annotationNestedFunctionTypeParamSymbolsPin.ts";
+        let case_text = "declare function f(cb: (v: boolean) => void): void;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">cb : Symbol(cb,")),
+            "outer parameter keeps its row; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|l| l.starts_with(">v :")).count(),
+            1,
+            "nested value parameter must declare exactly one row; emitted:\n{emitted}"
+        );
+    }
 
     /// Namespace export declarations render bare (`Symbol(x, ...)`), guarding
     /// against declare-time over-qualification: upstream qualifies namespace
