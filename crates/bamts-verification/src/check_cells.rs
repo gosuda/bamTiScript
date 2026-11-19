@@ -3615,7 +3615,8 @@ fn emit_unit_symbols(
         .collect();
     let occurrence_anchors =
         occurrence_decl_anchors(tokens, source, section, model.declaration_occurrences());
-    let render = |symbol_id: SymbolId| -> Option<String> {
+    let render =
+        |symbol_id: SymbolId, anchor_override: Option<SymbolDeclAnchor>| -> Option<String> {
         let index = symbol_id.get() as usize;
         let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
@@ -3636,7 +3637,9 @@ fn emit_unit_symbols(
                 return Some(format!("Symbol({name}, {declarations})"));
             }
         }
-        let anchors = if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
+        let anchors = if let Some(anchor) = anchor_override {
+            vec![anchor]
+        } else if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
             // Occurrence-covered interface member: the Decl list unions this
             // unit's per-occurrence anchors with the (qualified-name-first)
             // cross-unit overlay, so foreign-unit declarations survive for
@@ -3714,7 +3717,7 @@ fn emit_unit_symbols(
         if occurrence_covered.contains(&symbol_id) {
             continue;
         }
-        if let Some(rendered) = render(symbol_id)
+        if let Some(rendered) = render(symbol_id, None)
             && let Some(record) =
                 symbol_record_for(source, symbol.range(), symbol.name().to_owned(), rendered)
         {
@@ -3730,7 +3733,7 @@ fn emit_unit_symbols(
         if occurrence.name_range.is_empty() {
             continue;
         }
-        if let Some(rendered) = render(occurrence.symbol) {
+        if let Some(rendered) = render(occurrence.symbol, None) {
             let display = collapse_whitespace(&slice_source(source, occurrence.name_range));
             if let Some(record) =
                 symbol_record_for(source, occurrence.name_range, display, rendered)
@@ -3740,8 +3743,10 @@ fn emit_unit_symbols(
         }
     }
     // Reference records: each resolved value/type occurrence at its use site.
+    let shorthand = model.shorthand_property_ranges();
     for (range, symbol_id) in model.symbol_references() {
-        if let Some(rendered) = render(*symbol_id) {
+        let anchor_override = shorthand_anchor(tokens, source, section, *range, &shorthand);
+        if let Some(rendered) = render(*symbol_id, anchor_override) {
             let display = collapse_whitespace(&slice_source(source, *range));
             if let Some(record) = symbol_record_for(source, *range, display, rendered) {
                 records.push(record);
@@ -3823,6 +3828,8 @@ fn symbol_record_for(
 /// so the marker anchors at the specifier's full start, not the local name.
 /// Identifier and dot steps that meet no decorator are rolled back, so dotted
 /// members anchor at the last segment instead of the path head.
+/// Binding renames step left over the colon and its key, so `{ x: a }`
+/// anchors at the element start instead of the value name.
 fn symbol_decl_position(
     tokens: &[Token],
     source: &SourceText,
@@ -3858,6 +3865,10 @@ fn symbol_decl_position(
             }
             node_index = prev;
         }
+        node_index = binding_element_start(tokens, node_index);
+    }
+    if symbol.kind() == SymbolKind::Import {
+        node_index = import_specifier_start(tokens, node_index);
     }
     if symbol.kind() == SymbolKind::Import {
         node_index = import_specifier_start(tokens, node_index);
@@ -3949,6 +3960,78 @@ fn import_specifier_start(tokens: &[Token], name_index: usize) -> usize {
         return name_index;
     }
     prev_significant_token(tokens, as_index).unwrap_or(name_index)
+}
+
+/// The element a renamed binding element starts at: stepping left over the
+/// colon and its key lands on the element's first token, so `{ x: a }`
+/// anchors at `{` and computed `{ [k]: v }` anchors after balancing to `[`.
+fn binding_element_start(tokens: &[Token], name_index: usize) -> usize {
+    let Some(colon) = prev_significant_token(tokens, name_index) else {
+        return name_index;
+    };
+    if tokens[colon].kind() != TokenKind::Colon {
+        return name_index;
+    }
+    let Some(key) = prev_significant_token(tokens, colon) else {
+        return name_index;
+    };
+    if tokens[key].kind() != TokenKind::RBracket {
+        return key;
+    }
+    let mut depth = 1;
+    let mut scan = key;
+    while scan > 0 {
+        scan -= 1;
+        let token = &tokens[scan];
+        if token.is_missing() || is_trivia_token(token.kind()) {
+            continue;
+        }
+        match token.kind() {
+            TokenKind::RBracket => depth += 1,
+            TokenKind::LBracket => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 {
+        scan
+    } else {
+        name_index
+    }
+}
+
+/// The shorthand anchor for a reference use site: when the range is a
+/// recorded object-literal shorthand, the row anchors at the shorthand's
+/// full start instead of the outer binding's declaration.
+fn shorthand_anchor(
+    tokens: &[Token],
+    source: &SourceText,
+    section: &str,
+    range: TextRange,
+    shorthand: &[TextRange],
+) -> Option<SymbolDeclAnchor> {
+    if !shorthand.contains(&range) {
+        return None;
+    }
+    let index = tokens.iter().position(|token| {
+        !token.is_missing()
+            && !is_trivia_token(token.kind())
+            && token.range().start() == range.start()
+    })?;
+    let full_start = match prev_significant_token(tokens, index) {
+        Some(prev) => tokens[prev].range().end(),
+        None => Utf16Pos::ZERO,
+    };
+    let (line, character) = source.line_column(full_start).ok()?;
+    Some(SymbolDeclAnchor {
+        section: section.to_owned(),
+        line,
+        character,
+    })
 }
 
 /// Per-unit `Decl` anchors for interface member declaration occurrences,
@@ -6361,6 +6444,624 @@ export var v = 1;
     /// cannot canonicalize equal to the upstream `.symbols` baseline — the S2
     /// burn-down surface, reported as `Fail`, never a false pass.
     #[test]
+    fn import_namespace_alias_decl_anchors_at_specifier_full_start() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impns.ts
+import * as ns from \"./dep\";
+ns;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(ns, Decl(impns.ts, 0, 6))"),
+            "{emitted}"
+        );
+    }
+
+    /// Named import aliases anchor at the specifier full start, the end of
+    /// the opening brace, matching `amdDependencyCommentName4.symbols`.
+    #[test]
+    fn import_named_alias_decl_anchors_at_specifier_full_start() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impnamed.ts
+import { a as b } from \"./dep\";
+b;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(b, Decl(impnamed.ts, 0, 8))"),
+            "{emitted}"
+        );
+    }
+
+    /// Object literal members bind declaration rows named by first spelling:
+    /// `var v = {a: 1, b: 2}` renders `>a : Symbol(a, ...)` per member.
+    /// Cited baselines: `objectLiteral1.symbols`, `objectLiteralErrors.symbols`.
+    #[test]
+    fn emit_symbols_records_object_literal_member_declarations() {
+        let logical = "tests/cases/compiler/objectLiteralPin.ts";
+        let case_text = "var v = {a: 1, b: 2};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        for display in [">a : Symbol(a, Decl(objectLiteralPin.ts, 0, 9))", ">b : Symbol(b, Decl(objectLiteralPin.ts, 0, 14))"] {
+            assert!(
+                emitted.lines().any(|l| l.starts_with(display)),
+                "missing object literal member row {display}:\n{emitted}"
+            );
+        }
+    }
+
+    /// Quoted and numeric keys merge under the first spelling with unioned
+    /// anchors: `{ a: 0, 'a': 0 }` renders `>a` and `>'a'`, both
+    /// `Symbol(a, Decl(0, 9), Decl(0, 15))`. Cited baseline:
+    /// `objectLiteralErrors.symbols` (`e6`).
+    #[test]
+    fn emit_symbols_merges_quoted_object_literal_members() {
+        let logical = "tests/cases/compiler/objectLiteralQuotedPin.ts";
+        let case_text = "var e = { a: 0, 'a': 0 };\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        for display in [">a : Symbol(a, Decl(objectLiteralQuotedPin.ts, 0, 9), Decl(objectLiteralQuotedPin.ts, 0, 15))", ">'a' : Symbol(a, Decl(objectLiteralQuotedPin.ts, 0, 9), Decl(objectLiteralQuotedPin.ts, 0, 15))"] {
+            assert!(
+                emitted.lines().any(|l| l.starts_with(display)),
+                "missing merged quoted member row {display}:\n{emitted}"
+            );
+        }
+    }
+
+    /// Computed keys bind bracketed (`>[n] : Symbol([n], ...)`), and dot
+    /// reads through a literal-typed variable emit path plus leaf rows.
+    /// Cited baselines: `duplicateObjectLiteralProperty_computedName2.symbols`,
+    /// `collisionCodeGenModuleWithMemberVariable.symbols` (namespace analog).
+    #[test]
+    fn emit_symbols_records_computed_object_literal_members() {
+        let logical = "tests/cases/compiler/objectLiteralComputedPin.ts";
+        let case_text = "const n = 1;\nvar t = { [n]: 1 };\nvar s = { item: 1 };\nvar w = s.item;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">[n] : Symbol([n], Decl(objectLiteralComputedPin.ts, 1, 9))")),
+            "missing computed member row:\n{emitted}"
+        );
+        for display in [">s.item : Symbol(item, Decl(objectLiteralComputedPin.ts, 2, 9))", ">item : Symbol(item, Decl(objectLiteralComputedPin.ts, 2, 9))"] {
+            assert!(
+                emitted.lines().any(|l| l.starts_with(display)),
+                "missing object literal access row {display}:\n{emitted}"
+            );
+        }
+    }
+
+    /// Shorthand members show only the member row: `var o = {a}` renders
+    /// `>a : Symbol(a, Decl(..., 1, 9))` once, with no outer-binding use row
+    /// at the shorthand span. Cited baseline: `typeGuardFunctionOfFormThis.symbols`.
+    #[test]
+    fn emit_symbols_shorthand_member_hides_outer_use_row() {
+        let logical = "tests/cases/compiler/objectLiteralShorthandPin.ts";
+        let case_text = "var a = 1;\nvar o = {a};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 1, 9))")),
+            "missing shorthand member row:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 0, 4))")).count(),
+            1,
+            "outer binding must appear only at its declaration:\n{emitted}"
+        );
+    }
+    /// Nested function-type parameters declare bare symbols: `each` in
+    /// `chainedSpecializationToObjectTypeLiteral.symbols` renders
+    /// `>iterator : Symbol(iterator, ...)` and the nested
+    /// `>value : Symbol(value, ...)`; the value parameter has no bind-phase
+    /// anchor, so resolve declares it at the single choke point where every
+    /// nested function type passes through. The outer parameter row on the
+    /// same path stays exactly as before.
+    #[test]
+    fn emit_symbols_binds_nested_function_type_parameters() {
+        let logical = "tests/cases/compiler/nestedFunctionTypeParamSymbolsPin.ts";
+        let case_text = "interface Sequence<T> {\n    each(iterator: (value: T) => void): void;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">iterator : Symbol(iterator,")),
+            "outer parameter keeps its row; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|l| l.starts_with(">value :")).count(),
+            1,
+            "nested value parameter must declare exactly one row; emitted:\n{emitted}"
+        );
+    }
+
+    /// Function-declaration annotations nest the same way: `declare function
+    /// f(cb: (v: boolean) => void)` in
+    /// `asyncFunctionContextuallyTypedReturns.symbols` renders `>cb` and the
+    /// nested `>v : Symbol(v, ...)`.
+    #[test]
+    fn emit_symbols_binds_annotation_nested_function_type_parameters() {
+        let logical = "tests/cases/compiler/annotationNestedFunctionTypeParamSymbolsPin.ts";
+        let case_text = "declare function f(cb: (v: boolean) => void): void;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.lines().any(|l| l.starts_with(">cb : Symbol(cb,")),
+            "outer parameter keeps its row; emitted:\n{emitted}"
+        );
+        assert_eq!(
+            emitted.lines().filter(|l| l.starts_with(">v :")).count(),
+            1,
+            "nested value parameter must declare exactly one row; emitted:\n{emitted}"
+        );
+    }
+
+    /// Namespace export declarations render bare (`Symbol(x, ...)`), guarding
+    /// against declare-time over-qualification: upstream qualifies namespace
+    /// members only at access-path reference sites, which this emitter does not
+    /// yet reach.
+    #[test]
+    fn import_default_alias_decl_anchors_at_specifier_full_start() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impdefault.ts
+import { default as Foo } from \"./dep\";
+Foo;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(Foo, Decl(impdefault.ts, 0, 8))"),
+            "{emitted}"
+        );
+    }
+    /// Empty single-unit cases still emit their section header with no records.
+    #[test]
+    fn emit_symbols_baseline_emits_empty_single_unit_section() {
+        let logical = "tests/cases/compiler/emptyPin.ts";
+        let case_text = "// @target: es2015\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/emptyPin.ts] ////\n\n=== emptyPin.ts ===\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Trailing empty files keep their section headers with no records.
+    #[test]
+    fn emit_symbols_baseline_emits_empty_trailing_file_section() {
+        let logical = "tests/cases/compiler/multiEmptyPin.ts";
+        let case_text = "// @filename: a.ts\nvar a = 1;\n// @filename: b.ts\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(emitted.contains("=== a.ts ==="), "missing a section:\n{emitted}");
+        assert!(emitted.contains("=== b.ts ==="), "missing b section:\n{emitted}");
+    }
+    /// Bare intrinsic value references render without a Decl list.
+    #[test]
+    fn emit_symbols_baseline_renders_intrinsic_undefined_bare() {
+        let logical = "tests/cases/compiler/intrinsicPin.ts";
+        let case_text = "var v = undefined;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/intrinsicPin.ts] ////\n\n=== intrinsicPin.ts ===\nvar v = undefined;\n>v : Symbol(v, Decl(intrinsicPin.ts, 0, 3))\n>undefined : Symbol(undefined)\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Top-level This expressions reference the globalThis intrinsic bare.
+    #[test]
+    fn emit_symbols_baseline_renders_top_level_this_as_global_this() {
+        let logical = "tests/cases/compiler/thisPin.ts";
+        let case_text = "++this;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/thisPin.ts] ////\n\n=== thisPin.ts ===\n++this;\n>this : Symbol(globalThis)\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+    /// Recorded Es5 globals render with their single lib Decl row.
+    #[test]
+    fn emit_symbols_baseline_renders_es5_global_with_lib_decl() {
+        let logical = "tests/cases/compiler/libGlobalPin.ts";
+        let case_text = "var e = eval(\"1\");\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/libGlobalPin.ts] ////\n\n=== libGlobalPin.ts ===\nvar e = eval(\"1\");\n>e : Symbol(e, Decl(libGlobalPin.ts, 0, 3))\n>eval : Symbol(eval, Decl(lib.es5.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Recorded Dom globals render with their single lib Decl row.
+    #[test]
+    fn emit_symbols_baseline_renders_dom_global_with_lib_decl() {
+        let logical = "tests/cases/compiler/domGlobalPin.ts";
+        let case_text = "var w = window;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/domGlobalPin.ts] ////\n\n=== domGlobalPin.ts ===\nvar w = window;\n>w : Symbol(w, Decl(domGlobalPin.ts, 0, 3))\n>window : Symbol(window, Decl(lib.dom.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Merged lib globals render one Decl per declaring lib file in file order.
+    #[test]
+    fn emit_symbols_baseline_renders_merged_date_with_lib_decl_list() {
+        let logical = "tests/cases/compiler/datePin.ts";
+        let case_text = "var d = new Date();\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/datePin.ts] ////\n\n=== datePin.ts ===\nvar d = new Date();\n>d : Symbol(d, Decl(datePin.ts, 0, 3))\n>Date : Symbol(Date, Decl(lib.es5.d.ts, --, --), Decl(lib.es5.d.ts, --, --), Decl(lib.es5.d.ts, --, --), Decl(lib.scripthost.d.ts, --, --), Decl(lib.es2015.symbol.wellknown.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Merged Array globals render es5, core, iterable, and wellknown Decl rows.
+    #[test]
+    fn emit_symbols_baseline_renders_merged_array_with_lib_decl_list() {
+        let logical = "tests/cases/compiler/arrayPin.ts";
+        let case_text = "var a = Array(1, 2, 3);\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = CasePragmas {
+            options: vec![("target".to_owned(), vec!["es2015".to_owned()])],
+            no_types_and_symbols: false,
+        };
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/arrayPin.ts] ////\n\n=== arrayPin.ts ===\nvar a = Array(1, 2, 3);\n>a : Symbol(a, Decl(arrayPin.ts, 0, 3))\n>Array : Symbol(Array, Decl(lib.es5.d.ts, --, --), Decl(lib.es5.d.ts, --, --), Decl(lib.es2015.core.d.ts, --, --), Decl(lib.es2015.iterable.d.ts, --, --), Decl(lib.es2015.symbol.wellknown.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Imports without an alias keep their existing anchors: a default
+    /// import at the end of `import` and plain names at the preceding
+    /// brace or comma, matching the `>d`, `>p1` rows beside the alias
+    /// rows in `amdDependencyCommentName4.symbols`.
+    #[test]
+    fn import_without_alias_decl_positions_are_unchanged() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impplain.ts
+import d from \"./dep\";
+import { p1, q as p2 } from \"./dep\";
+d;
+p1;
+p2;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(d, Decl(impplain.ts, 0, 6))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(p1, Decl(impplain.ts, 1, 8))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(p2, Decl(impplain.ts, 1, 12))"),
+            "{emitted}"
+        );
+    }
+
+    /// `import x = require(...)` keeps its statement-start anchor at the
+    /// file origin for a leading statement, matching the `>r1` row shape
+    /// in `amdDependencyCommentName4.symbols`.
+    #[test]
+    fn import_equals_decl_position_is_unchanged() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impeq.ts
+import r1 = require(\"./dep\");
+r1;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(r1, Decl(impeq.ts, 0, 0))"),
+            "{emitted}"
+        );
+    }
+
+    /// Generator functions anchor at the `function` keyword with the star
+    /// stepped over, matching `castOfYield.symbols` (`Decl(castOfYield.ts, 0, 0)`).
+    #[test]
+    fn generator_function_decl_anchors_at_function_keyword() {
+        let logical = "tests/cases/compiler/generatorPin.ts";
+        let case_text = "function* f() {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(f, Decl(generatorPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+    }
+
+    /// Async generators anchor at `async` with star and keyword stepped over,
+    /// matching `asyncImportNestedYield.symbols` (`Decl(asyncImportNestedYield.ts, 0, 0)`).
+    #[test]
+    fn async_generator_function_decl_anchors_at_async_keyword() {
+        let logical = "tests/cases/compiler/generatorPin.ts";
+        let case_text = "async function* foo() {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(foo, Decl(generatorPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+    }
+
+    /// A plain function keeps its keyword anchor while a later generator in
+    /// the same unit anchors at the previous statement end, so the star walk
+    /// changes no non-generator row on the path.
+    #[test]
+    fn generator_after_function_decl_anchors_at_previous_statement_end() {
+        let logical = "tests/cases/compiler/generatorPin.ts";
+        let case_text = "function a() {\n}\nfunction* b() {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(a, Decl(generatorPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(b, Decl(generatorPin.ts, 1, 1))"),
+            "{emitted}"
+        );
+    }
+
+    /// Dotted namespace members anchor at the member segment: the decorator
+    /// scan must not cross the dot. Matches `declareDottedExtend.symbols`
+    /// (`>B : Symbol(B, Decl(declareDottedExtend.ts, 0, 20))`).
+    #[test]
+    fn dotted_namespace_member_decl_anchors_at_last_segment() {
+        let logical = "tests/cases/compiler/dottedPin.ts";
+        let case_text = "declare namespace A.B {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(A, Decl(dottedPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(B, Decl(dottedPin.ts, 0, 20))"),
+            "{emitted}"
+        );
+    }
+
+    /// Each segment of a three-part path anchors after its own dot, matching
+    /// `moduleImport.symbols` (`>B : Symbol(B, Decl(moduleImport.ts, 0, 12))`).
+    #[test]
+    fn dotted_namespace_segments_anchor_after_their_dot() {
+        let logical = "tests/cases/compiler/dottedPin.ts";
+        let case_text = "namespace A.B.C {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(B, Decl(dottedPin.ts, 0, 12))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(C, Decl(dottedPin.ts, 0, 14))"),
+            "{emitted}"
+        );
+    }
+
+    /// A plain namespace keeps its statement-start anchor, so the rollback
+    /// changes no non-dotted row on the path.
+    #[test]
+    fn plain_namespace_decl_position_is_unchanged() {
+        let logical = "tests/cases/compiler/dottedPin.ts";
+        let case_text = "namespace A {\nexport var v = 1;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(A, Decl(dottedPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+    }
+
+    /// Object-literal shorthand rows anchor at the shorthand's full start
+    /// instead of the outer binding, matching `shorthand-property-es5-es6`
+    /// (`>baz : Symbol(baz, Decl(test.ts, 2, 18))`).
+    #[test]
+    fn object_literal_shorthand_decl_anchors_at_shorthand() {
+        let logical = "tests/cases/compiler/shorthandPin.ts";
+        let case_text = "var foo = 1;\nvar baz = 2;\nvar bar = { foo, baz };\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(foo, Decl(shorthandPin.ts, 2, 11))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(baz, Decl(shorthandPin.ts, 2, 16))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(foo, Decl(shorthandPin.ts, 0, 3))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(baz, Decl(shorthandPin.ts, 1, 3))"),
+            "{emitted}"
+        );
+    }
+
+    /// Imported shorthand names anchor at the use site, while the import's
+    /// own row keeps the specifier anchor, matching
+    /// `systemObjectShorthandRename.symbols` (`>x (2, 12)` beside `>x (0, 8)`).
+    #[test]
+    fn imported_shorthand_decl_anchors_at_shorthand() {
+        let logical = "tests/cases/compiler/shorthandPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: shpin.ts
+import {x} from \"./dep\";
+const x2 = {x};
+// @Filename: dep.ts
+export var x = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(x, Decl(shpin.ts, 1, 12))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(x, Decl(shpin.ts, 0, 8))"),
+            "{emitted}"
+        );
+    }
+
+    /// Renamed binding elements anchor at the element start, matching
+    /// `ES5For-of27.symbols` (`>a : Symbol(a, Decl(ES5For-of27.ts, 0, 10))`).
+    #[test]
+    fn binding_rename_decl_anchors_at_element_start() {
+        let logical = "tests/cases/compiler/destructurePin.ts";
+        let case_text = "for (var {x: a} of b) {\na;\n}\nvar b = [1];\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(a, Decl(destructurePin.ts, 0, 10))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(b, Decl(destructurePin.ts, 3, 3))"),
+            "{emitted}"
+        );
+    }
+
+    /// Computed renames anchor after balancing back to the opening bracket,
+    /// matching `computedPropertiesInDestructuring2.symbols`
+    /// (`>bar3 : Symbol(bar3, Decl(computedPropertiesInDestructuring2.ts, 1, 5))`).
+    #[test]
+    fn computed_binding_rename_decl_anchors_at_bracket() {
+        let logical = "tests/cases/compiler/destructurePin.ts";
+        let case_text = "let {[k]: v} = o;\nvar k = \"a\";\nvar o = {};\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(v, Decl(destructurePin.ts, 0, 5))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(k, Decl(destructurePin.ts, 1, 3))"),
+            "{emitted}"
+        );
+    }
+
+    /// Honesty pin on a real pinned sample: `anyAsConstructor` carries a
+    /// `@target` pragma (dropped from the upstream echo) and references whose
+    /// declarations the binder anchors differently, so the emitted document
+    /// cannot canonicalize equal to the upstream `.symbols` baseline — the S2
+    /// burn-down surface, reported as `Fail`, never a false pass.
+    #[test]
     fn emit_symbols_baseline_undercoverage_fails_comparison() {
         let logical = "tests/cases/conformance/types/any/anyAsConstructor.ts";
         let units = split_case_units(logical, ANY_AS_CONSTRUCTOR_CASE);
@@ -6501,54 +7202,6 @@ export var v = 1;
             emitted.lines().filter(|l| l.starts_with(">a : Symbol(a, Decl(objectLiteralShorthandPin.ts, 0, 4))")).count(),
             1,
             "outer binding must appear only at its declaration:\n{emitted}"
-        );
-    }
-    /// Nested function-type parameters declare bare symbols: `each` in
-    /// `chainedSpecializationToObjectTypeLiteral.symbols` renders
-    /// `>iterator : Symbol(iterator, ...)` and the nested
-    /// `>value : Symbol(value, ...)`; the value parameter has no bind-phase
-    /// anchor, so resolve declares it at the single choke point where every
-    /// nested function type passes through. The outer parameter row on the
-    /// same path stays exactly as before.
-    #[test]
-    fn emit_symbols_binds_nested_function_type_parameters() {
-        let logical = "tests/cases/compiler/nestedFunctionTypeParamSymbolsPin.ts";
-        let case_text = "interface Sequence<T> {\n    each(iterator: (value: T) => void): void;\n}\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        assert!(
-            emitted.lines().any(|l| l.starts_with(">iterator : Symbol(iterator,")),
-            "outer parameter keeps its row; emitted:\n{emitted}"
-        );
-        assert_eq!(
-            emitted.lines().filter(|l| l.starts_with(">value :")).count(),
-            1,
-            "nested value parameter must declare exactly one row; emitted:\n{emitted}"
-        );
-    }
-
-    /// Function-declaration annotations nest the same way: `declare function
-    /// f(cb: (v: boolean) => void)` in
-    /// `asyncFunctionContextuallyTypedReturns.symbols` renders `>cb` and the
-    /// nested `>v : Symbol(v, ...)`.
-    #[test]
-    fn emit_symbols_binds_annotation_nested_function_type_parameters() {
-        let logical = "tests/cases/compiler/annotationNestedFunctionTypeParamSymbolsPin.ts";
-        let case_text = "declare function f(cb: (v: boolean) => void): void;\n";
-        let units = split_case_units(logical, case_text);
-        let entry = entry_virtual_path(logical, &units);
-        let case = compile_case(&units, &entry).expect("case compiles");
-        let emitted = emit_symbols_baseline(&case, logical);
-        assert!(
-            emitted.lines().any(|l| l.starts_with(">cb : Symbol(cb,")),
-            "outer parameter keeps its row; emitted:\n{emitted}"
-        );
-        assert_eq!(
-            emitted.lines().filter(|l| l.starts_with(">v :")).count(),
-            1,
-            "nested value parameter must declare exactly one row; emitted:\n{emitted}"
         );
     }
 
