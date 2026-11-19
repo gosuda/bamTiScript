@@ -3703,6 +3703,8 @@ fn symbol_record_for(
 /// token stream; for keyword-led declarations (class/function/interface/type/
 /// enum/namespace) the scan steps left over the leading keyword and modifiers
 /// so the marker anchors at the declaration keyword, not the name.
+/// For import aliases the scan steps left over `as` and the imported name,
+/// so the marker anchors at the specifier's full start, not the local name.
 fn symbol_decl_position(
     tokens: &[Token],
     source: &SourceText,
@@ -3738,6 +3740,9 @@ fn symbol_decl_position(
             }
             node_index = prev;
         }
+    }
+    if symbol.kind() == SymbolKind::Import {
+        node_index = import_specifier_start(tokens, node_index);
     }
     // Decorator walk: scan left over accessor keywords and decorator
     // expression tokens so a decorated member anchors at the decorator's
@@ -3807,6 +3812,16 @@ fn symbol_decl_position(
         None => Utf16Pos::ZERO,
     };
     source.line_column(full_start).ok()
+}
+
+fn import_specifier_start(tokens: &[Token], name_index: usize) -> usize {
+    let Some(as_index) = prev_significant_token(tokens, name_index) else {
+        return name_index;
+    };
+    if tokens[as_index].kind() != TokenKind::KwAs {
+        return name_index;
+    }
+    prev_significant_token(tokens, as_index).unwrap_or(name_index)
 }
 
 /// Per-unit `Decl` anchors for interface member declaration occurrences,
@@ -5879,6 +5894,140 @@ const x = 10;\n\
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,
             "emitted:\n{emitted}"
+        );
+    }
+
+    /// Namespace import aliases anchor at the specifier full start, the end
+    /// of `import`, matching `assertionFunctionWildcardImport1.symbols`.
+    #[test]
+    fn import_namespace_alias_decl_anchors_at_specifier_full_start() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impns.ts
+import * as ns from \"./dep\";
+ns;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(ns, Decl(impns.ts, 0, 6))"),
+            "{emitted}"
+        );
+    }
+
+    /// Named import aliases anchor at the specifier full start, the end of
+    /// the opening brace, matching `amdDependencyCommentName4.symbols`.
+    #[test]
+    fn import_named_alias_decl_anchors_at_specifier_full_start() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impnamed.ts
+import { a as b } from \"./dep\";
+b;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(b, Decl(impnamed.ts, 0, 8))"),
+            "{emitted}"
+        );
+    }
+
+    /// `default`-named import aliases anchor at the specifier full start,
+    /// matching `allowSyntheticDefaultImports7.symbols` (`Decl(a.ts, 0, 8)`).
+    #[test]
+    fn import_default_alias_decl_anchors_at_specifier_full_start() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impdefault.ts
+import { default as Foo } from \"./dep\";
+Foo;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(Foo, Decl(impdefault.ts, 0, 8))"),
+            "{emitted}"
+        );
+    }
+
+    /// Imports without an alias keep their existing anchors: a default
+    /// import at the end of `import` and plain names at the preceding
+    /// brace or comma, matching the `>d`, `>p1` rows beside the alias
+    /// rows in `amdDependencyCommentName4.symbols`.
+    #[test]
+    fn import_without_alias_decl_positions_are_unchanged() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impplain.ts
+import d from \"./dep\";
+import { p1, q as p2 } from \"./dep\";
+d;
+p1;
+p2;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(d, Decl(impplain.ts, 0, 6))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(p1, Decl(impplain.ts, 1, 8))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(p2, Decl(impplain.ts, 1, 12))"),
+            "{emitted}"
+        );
+    }
+
+    /// `import x = require(...)` keeps its statement-start anchor at the
+    /// file origin for a leading statement, matching the `>r1` row shape
+    /// in `amdDependencyCommentName4.symbols`.
+    #[test]
+    fn import_equals_decl_position_is_unchanged() {
+        let logical = "tests/cases/compiler/importAliasPin.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: impeq.ts
+import r1 = require(\"./dep\");
+r1;
+// @Filename: dep.ts
+export var v = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(r1, Decl(impeq.ts, 0, 0))"),
+            "{emitted}"
         );
     }
 
