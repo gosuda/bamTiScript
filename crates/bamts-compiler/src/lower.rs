@@ -6,10 +6,6 @@ use crate::literal::{
     has_cooked_value, number_value, string_value,
 };
 use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
-pub use crate::program::{
-    ExecutableModuleProvenance, ExecutableProgram, ProgramLowerError, ProgramLowerErrorKind,
-    ProgramLowerPhase, lower_program,
-};
 use crate::source::{ScriptKind, SourceId, TextRange, Utf16Pos};
 use crate::syntax::{
     ArrayBindingElement, ArrayElement, ArrowFunction, AssignmentArrayElement, AssignmentExpression,

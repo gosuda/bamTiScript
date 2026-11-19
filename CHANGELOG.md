@@ -100,6 +100,10 @@ version has shipped, and no tag or stable package exists while any gate in
 - Removed `bamts_runtime::run_with_telemetry` and `RunTelemetry`; call
   `bamts_runtime::run` for the same outcome. Peak RSS stays available where
   it is consumed, via `bamts_platform::peak_memory_bytes`.
+- Removed the `bamts_compiler::lower::{ExecutableModuleProvenance,
+  ExecutableProgram, ProgramLowerError, ProgramLowerErrorKind,
+  ProgramLowerPhase, lower_program}` re-exports; use
+  `bamts_compiler::program::{...}` for the same items.
 
 ### Known incomplete
 
