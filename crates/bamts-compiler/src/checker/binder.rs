@@ -20571,10 +20571,21 @@ impl<'src> Binder<'src> {
                 let property = self.function_call_member_type(&signature);
                 Some(self.project_this_type(property, owner_hint, receiver))
             }
+            Type::Never => {
+                if self.report_missing_member(lookup) {
+                    self.emit(
+                        PROPERTY_DOES_NOT_EXIST,
+                        range,
+                        PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                    );
+                    Some(self.types.error_type())
+                } else {
+                    Some(self.types.any())
+                }
+            }
             Type::Error
             | Type::Any
             | Type::Unknown
-            | Type::Never
             | Type::Void
             | Type::Null
             | Type::Undefined
