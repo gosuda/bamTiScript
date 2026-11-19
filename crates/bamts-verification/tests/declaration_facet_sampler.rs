@@ -18,6 +18,9 @@
 //!   BAMTS_FACET_SAMPLE=path/to/sample.txt \
 //!   cargo test -p bamts-verification --test declaration_facet_sampler -- --ignored --nocapture
 
+mod common;
+
+use common::{authority_case_path, authority_root, baseline_dir, repo_root};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -30,20 +33,6 @@ use bamts_verification::check_cells::{
     parse_case_pragmas, resolve_baseline_file, split_case_units,
 };
 use bamts_verification::facets::{FacetVerdict, compare_js_emit, compare_source_map};
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn authority_root() -> PathBuf {
-    PathBuf::from(env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
-        "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
-    }))
-}
-
-fn baseline_dir() -> PathBuf {
-    authority_root().join("tests/baselines/reference")
-}
 
 /// One case in the sample.
 struct SampleCase {
@@ -117,17 +106,6 @@ fn load_sample() -> Vec<SampleCase> {
             }
         })
         .collect()
-}
-
-/// Resolve the authority case source path from the logical path.
-/// logical_path is like "compiler/tests/cases/compiler/foo.ts" or
-/// "conformance/tests/cases/conformance/types/any/foo.ts"
-fn authority_case_path(logical: &str) -> PathBuf {
-    let stripped = logical
-        .strip_prefix("compiler/tests/cases/")
-        .or_else(|| logical.strip_prefix("conformance/tests/cases/"))
-        .unwrap_or(logical);
-    authority_root().join("tests/cases").join(stripped)
 }
 
 /// Baseline resolution delegates to the shared area-aware implementation
