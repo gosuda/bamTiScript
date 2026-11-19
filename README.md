@@ -14,8 +14,8 @@ bamTiScript is for compiler and runtime developers evaluating an alternative Typ
 - Workspace version `0.2.0` is pre-release. No stable package or release tag exists while any gate in `.outline/GATES.md` is open (`CHANGELOG.md`).
 - The working path today is a source build of the `bamts` CLI on Linux x64 (`docs/tutorials/quickstart.md`).
 - `bamti` and `bamti-cli` `0.1.0` are published to npm, but their platform binary packages are absent from the registry, so an npm install cannot start the tool. The `0.2.0` package manifests in `npm/` are unpublished.
-- TypeScript 7.0.2 is the compatibility oracle, not a completed compatibility claim. The project publishes no pass rate; diagnostic mapping is a classification, not a percentage (`docs/explanation/verification.md`).
-- The formal completeness ledger currently records every Quint, Lean, and Redex catalog row as `BLOCKING_FAIL` (`docs/explanation/verification.md`).
+- TypeScript 7.0.2 is the compatibility oracle, not a completed compatibility claim. The project publishes no pass rate; diagnostic mapping is a classification, not a percentage ([docs/explanation/verification.md](docs/explanation/verification.md)).
+- The formal completeness ledger currently records every Quint, Lean, and Redex catalog row as `BLOCKING_FAIL` ([docs/explanation/verification.md](docs/explanation/verification.md)).
 
 ## Example
 
