@@ -3807,6 +3807,10 @@ fn symbol_record_for(
 /// token stream; for keyword-led declarations (class/function/interface/type/
 /// enum/namespace) the scan steps left over the leading keyword and modifiers
 /// so the marker anchors at the declaration keyword, not the name.
+/// For import aliases the scan steps left over `as` and the imported name,
+/// so the marker anchors at the specifier's full start, not the local name.
+/// Identifier and dot steps that meet no decorator are rolled back, so dotted
+/// members anchor at the last segment instead of the path head.
 fn symbol_decl_position(
     tokens: &[Token],
     source: &SourceText,
@@ -3843,12 +3847,16 @@ fn symbol_decl_position(
             node_index = prev;
         }
     }
+    if symbol.kind() == SymbolKind::Import {
+        node_index = import_specifier_start(tokens, node_index);
+    }
     // Decorator walk: scan left over accessor keywords and decorator
     // expression tokens so a decorated member anchors at the decorator's
     // `@` token, not the declaration name. Runs for all symbol kinds
     // since decorators can appear on non-keyword-led members (e.g.
     // `@dec get accessor()` where `accessor` binds as `Variable(Let)`).
     let mut found_at = false;
+    let mut undecorated_start: Option<usize> = None;
     while let Some(prev) = prev_significant_token(tokens, node_index) {
         match tokens[prev].kind() {
             TokenKind::At => {
@@ -3868,6 +3876,9 @@ fn symbol_decl_position(
                         continue;
                     }
                     break;
+                }
+                if undecorated_start.is_none() {
+                    undecorated_start = Some(node_index);
                 }
                 node_index = prev;
             }
@@ -3904,6 +3915,11 @@ fn symbol_decl_position(
             _ => break,
         }
     }
+    if !found_at {
+        if let Some(start) = undecorated_start {
+            node_index = start;
+        }
+    }
     // The declaration's full start is the end of the significant token that
     // precedes it (TypeScript's `node.pos`, which counts leading trivia).
     let full_start = match prev_significant_token(tokens, node_index) {
@@ -3911,6 +3927,16 @@ fn symbol_decl_position(
         None => Utf16Pos::ZERO,
     };
     source.line_column(full_start).ok()
+}
+
+fn import_specifier_start(tokens: &[Token], name_index: usize) -> usize {
+    let Some(as_index) = prev_significant_token(tokens, name_index) else {
+        return name_index;
+    };
+    if tokens[as_index].kind() != TokenKind::KwAs {
+        return name_index;
+    }
+    prev_significant_token(tokens, as_index).unwrap_or(name_index)
 }
 
 /// Per-unit `Decl` anchors for interface member declaration occurrences,
@@ -6256,6 +6282,63 @@ export var v = 1;
         );
         assert!(
             emitted.contains("Symbol(b, Decl(generatorPin.ts, 1, 1))"),
+            "{emitted}"
+        );
+    }
+
+    /// Dotted namespace members anchor at the member segment: the decorator
+    /// scan must not cross the dot. Matches `declareDottedExtend.symbols`
+    /// (`>B : Symbol(B, Decl(declareDottedExtend.ts, 0, 20))`).
+    #[test]
+    fn dotted_namespace_member_decl_anchors_at_last_segment() {
+        let logical = "tests/cases/compiler/dottedPin.ts";
+        let case_text = "declare namespace A.B {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(A, Decl(dottedPin.ts, 0, 0))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(B, Decl(dottedPin.ts, 0, 20))"),
+            "{emitted}"
+        );
+    }
+
+    /// Each segment of a three-part path anchors after its own dot, matching
+    /// `moduleImport.symbols` (`>B : Symbol(B, Decl(moduleImport.ts, 0, 12))`).
+    #[test]
+    fn dotted_namespace_segments_anchor_after_their_dot() {
+        let logical = "tests/cases/compiler/dottedPin.ts";
+        let case_text = "namespace A.B.C {\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(B, Decl(dottedPin.ts, 0, 12))"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Symbol(C, Decl(dottedPin.ts, 0, 14))"),
+            "{emitted}"
+        );
+    }
+
+    /// A plain namespace keeps its statement-start anchor, so the rollback
+    /// changes no non-dotted row on the path.
+    #[test]
+    fn plain_namespace_decl_position_is_unchanged() {
+        let logical = "tests/cases/compiler/dottedPin.ts";
+        let case_text = "namespace A {\nexport var v = 1;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains("Symbol(A, Decl(dottedPin.ts, 0, 0))"),
             "{emitted}"
         );
     }
