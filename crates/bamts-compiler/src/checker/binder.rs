@@ -3249,6 +3249,15 @@ impl TypeTable {
                     .collect();
                 (!found.is_empty()).then(|| self.union(&found))
             }
+            Type::AppliedAlias { .. } => self
+                .prepare_applied_alias_view(index)
+                .filter(|index_view| *index_view != index)
+                .and_then(|index_view| {
+                    self.try_resolve_concrete_indexed_access(view, index_view)
+                }),
+            Type::TypeQuery { target, .. } => {
+                self.try_resolve_concrete_indexed_access(view, target)
+            }
             Type::Keyof(_) | Type::IndexedAccess { .. } => None,
             _ => Some(self.error_type()),
         }
@@ -17429,6 +17438,12 @@ impl<'src> Binder<'src> {
                 {
                     self.references.insert(expression.id(), member_symbol);
                     self.enum_member_identifier_uses.insert(expression.id());
+                    self.record_unrecorded_member_rows(
+                        enum_symbol,
+                        &member.property,
+                        expression.range(),
+                        expression.id(),
+                    );
                     return;
                 }
                 // Symbol-direct path only: computing member types here would
@@ -17439,7 +17454,7 @@ impl<'src> Binder<'src> {
                 if let Some(object_symbol) = object_symbol
                     && matches!(
                         self.symbols[object_symbol.get() as usize].kind,
-                        SymbolKind::Class | SymbolKind::Interface
+                        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Namespace
                     )
                     && !self.member_reference_recorded.contains(&expression.id())
                 {
@@ -20405,6 +20420,8 @@ impl<'src> Binder<'src> {
         index_type: TypeId,
         range: TextRange,
     ) -> TypeId {
+        self.types.materialize_applied_alias_view(object_type);
+        self.types.materialize_applied_alias_view(index_type);
         let result = self.types.indexed_access(object_type, index_type);
         if result == self.types.error_type()
             && !self.types.contains_error(object_type)
@@ -20432,6 +20449,9 @@ impl<'src> Binder<'src> {
         {
             return target;
         }
+        if !self.type_query_preserves_spelling(&query.name, scope) {
+            return target;
+        }
         let arguments = query
             .type_arguments
             .as_ref()
@@ -20444,6 +20464,43 @@ impl<'src> Binder<'src> {
             .unwrap_or_default();
         let name = self.entity_name_spelling(&query.name).into_boxed_str();
         self.types.type_query(name, arguments, target)
+    }
+
+    fn type_query_operand_symbol(
+        &mut self,
+        name: &EntityName,
+        scope: ScopeId,
+    ) -> Option<SymbolId> {
+        match name {
+            EntityName::Identifier(identifier) => {
+                let name = self.identifier_text(identifier);
+                self.lookup_value(scope, &name)
+            }
+            EntityName::Qualified { left, right } => {
+                let (member_scope, _path) = self.resolve_entity_name_scope(left, scope).ok()?;
+                let name = self.identifier_text(right);
+                self.scopes[member_scope.0 as usize].value(&name)
+            }
+            EntityName::Missing(_) => None,
+        }
+    }
+
+    /// The `typeof X` spelling survives only when `X` names a class, enum,
+    /// namespace, function, or import: upstream renders those as `typeof X`,
+    /// while value and member queries render their resolved type
+    /// (`typeof M.foo` is `string`, `typeof c` is `C`).
+    fn type_query_preserves_spelling(&mut self, name: &EntityName, scope: ScopeId) -> bool {
+        let Some(symbol) = self.type_query_operand_symbol(name, scope) else {
+            return false;
+        };
+        matches!(
+            self.symbols[symbol.get() as usize].kind,
+            SymbolKind::Class
+                | SymbolKind::Enum
+                | SymbolKind::Namespace
+                | SymbolKind::Function
+                | SymbolKind::Import
+        )
     }
     fn entity_name_spelling(&self, name: &EntityName) -> String {
         match name {
@@ -21283,13 +21340,14 @@ impl<'src> Binder<'src> {
     }
 
     fn record_key_validity(&mut self, key: TypeId) -> RecordKeyState {
-        self.record_key_validity_inner(key, &mut HashSet::new())
+        self.record_key_validity_inner(key, &mut HashSet::new(), &mut HashSet::new())
     }
 
     fn record_key_validity_inner(
         &mut self,
         key: TypeId,
         seen: &mut HashSet<SymbolId>,
+        alias_seen: &mut HashSet<TypeId>,
     ) -> RecordKeyState {
         match self.types.get(key).clone() {
             Type::String
@@ -21307,13 +21365,13 @@ impl<'src> Binder<'src> {
                 }
                 let constraint = self.types.type_parameter_constraint(symbol);
                 let state = if let Some(constraint) = constraint {
-                    self.record_key_validity_inner(constraint, seen)
+                    self.record_key_validity_inner(constraint, seen, alias_seen)
                 } else {
                     let resolved = self.resolve_named_type_symbol(symbol);
                     if resolved == key {
                         RecordKeyState::Invalid
                     } else {
-                        self.record_key_validity_inner(resolved, seen)
+                        self.record_key_validity_inner(resolved, seen, alias_seen)
                     }
                 };
                 seen.remove(&symbol);
@@ -21322,7 +21380,7 @@ impl<'src> Binder<'src> {
             Type::Union(members) => {
                 let mut state = RecordKeyState::Concrete;
                 for member in members {
-                    match self.record_key_validity_inner(member, seen) {
+                    match self.record_key_validity_inner(member, seen, alias_seen) {
                         RecordKeyState::Invalid => return RecordKeyState::Invalid,
                         RecordKeyState::Deferred => state = RecordKeyState::Deferred,
                         RecordKeyState::Concrete => {}
@@ -21333,7 +21391,7 @@ impl<'src> Binder<'src> {
             Type::Intersection(members) => {
                 let mut deferred = false;
                 for member in members {
-                    match self.record_key_validity_inner(member, seen) {
+                    match self.record_key_validity_inner(member, seen, alias_seen) {
                         RecordKeyState::Concrete => return RecordKeyState::Concrete,
                         RecordKeyState::Deferred => deferred = true,
                         RecordKeyState::Invalid => {}
@@ -21344,6 +21402,28 @@ impl<'src> Binder<'src> {
                 } else {
                     RecordKeyState::Invalid
                 }
+            }
+            Type::AppliedAlias { .. } => {
+                if !alias_seen.insert(key) {
+                    return RecordKeyState::Invalid;
+                }
+                let Some(view) = self.types.prepare_applied_alias_view(key) else {
+                    return RecordKeyState::Invalid;
+                };
+                if view == key {
+                    return RecordKeyState::Invalid;
+                }
+                let state = self.record_key_validity_inner(view, seen, alias_seen);
+                alias_seen.remove(&key);
+                state
+            }
+            Type::TypeQuery { target, .. } => {
+                if !alias_seen.insert(key) {
+                    return RecordKeyState::Invalid;
+                }
+                let state = self.record_key_validity_inner(target, seen, alias_seen);
+                alias_seen.remove(&key);
+                state
             }
             _ => RecordKeyState::Invalid,
         }
@@ -22045,6 +22125,9 @@ impl<'src> Binder<'src> {
         members: &'src [crate::syntax::TypeMemberNode],
         scope: ScopeId,
     ) -> TypeId {
+        if !self.literal_member_scopes.contains_key(&literal) {
+            self.bind_literal_members(members, literal, scope);
+        }
         let object = self.resolve_type_members(members, scope);
         let published = self.types.object_type_with_members(object);
         if let Some(member_scope) = self.literal_member_scopes.get(&literal).copied() {
@@ -23453,12 +23536,13 @@ impl<'src> Binder<'src> {
         ))
     }
     /// Records the `.symbols` reference rows for a member access whose base
-    /// resolves directly to a class or interface symbol (`this.n`, `C.s`).
-    /// Named members land at the property identifier and the whole access
-    /// path; private names (`this.#p`) render the whole path only, matching
-    /// upstream, which emits no bare `>#p` row. Members declared on a base
-    /// class are looked up through the heritage chain, so `d.foo` with `foo`
-    /// on `C` records `Symbol(C.foo, ...)`.
+    /// resolves directly to a class, interface, enum, or namespace symbol
+    /// (`this.n`, `C.s`, `E.A`, `m1.m1`). Named members land at the property
+    /// identifier and the whole access path; private names (`this.#p`) render
+    /// the whole path only, matching upstream, which emits no bare `>#p` row.
+    /// Members declared on a base class are looked up through the heritage
+    /// chain, so `d.foo` with `foo` on `C` records `Symbol(C.foo, ...)`.
+
     fn record_symbol_member_reference_rows(
         &mut self,
         owner: SymbolId,
@@ -23479,6 +23563,22 @@ impl<'src> Binder<'src> {
             self.symbol_references.push((range, member_symbol));
         }
         self.symbol_references.push((path_range, member_symbol));
+    }
+
+    /// Records path and leaf rows for one member access unless the typing
+    /// phase already recorded them for this node.
+    fn record_unrecorded_member_rows(
+        &mut self,
+        owner: SymbolId,
+        property: &'src MemberProperty,
+        path_range: TextRange,
+        expression_id: NodeId,
+    ) {
+        if self.member_reference_recorded.contains(&expression_id) {
+            return;
+        }
+        self.record_symbol_member_reference_rows(owner, property, path_range);
+        self.member_reference_recorded.insert(expression_id);
     }
 
     /// The member-scope key a `.symbols` member reference resolves under.
@@ -23533,7 +23633,7 @@ impl<'src> Binder<'src> {
             Some(symbol)
                 if matches!(
                     self.symbols[symbol.get() as usize].kind,
-                    SymbolKind::Class | SymbolKind::Interface
+                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Namespace
                 ) =>
             {
                 Some(symbol)
@@ -23560,6 +23660,8 @@ impl<'src> Binder<'src> {
         match self.symbols[owner.get() as usize].kind {
             SymbolKind::Class => self.class_member_scopes.get(&owner).copied(),
             SymbolKind::Interface => self.interface_member_scopes.get(&owner).copied(),
+            SymbolKind::Enum => self.enum_member_scopes.get(&owner).copied(),
+            SymbolKind::Namespace => self.namespace_export_scopes.get(&owner).copied(),
             _ => None,
         }
     }

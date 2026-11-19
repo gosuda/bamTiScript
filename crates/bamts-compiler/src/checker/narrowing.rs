@@ -1696,11 +1696,49 @@ impl<'a> NarrowingContext<'a> {
                         kept.push(member);
                         continue;
                     }
-                    if matches!(self.table.get(member), Type::AppliedAlias { .. }) {
+                    if matches!(
+                        self.table.get(member),
+                        Type::AppliedAlias { .. } | Type::TypeQuery { .. }
+                    ) {
                         let narrowed = self.filter(member, decide);
-                        if !matches!(self.table.get(narrowed), Type::Never) {
-                            kept.push(narrowed);
+                        if matches!(self.table.get(narrowed), Type::Never) {
+                            continue;
                         }
+                        if matches!(self.table.get(narrowed), Type::Error) {
+                            kept.push(narrowed);
+                            continue;
+                        }
+                        // Resolving a member to an opaque view (an
+                        // intersection, `any`, `unknown`) passes the view
+                        // through without consulting `decide`, but a union
+                        // member in the open world was decided directly: an
+                        // intersection member keeps the positive branch only
+                        // when a constituent matches. Decide an unchanged
+                        // opaque view so alias- and query-wrapped
+                        // intersections narrow like the bare types they stand
+                        // for.
+                        let resolved = match self.table.get(member) {
+                            Type::AppliedAlias { .. } => {
+                                self.table.applied_alias_view(member)
+                            }
+                            Type::TypeQuery { target, .. } => Some(*target),
+                            _ => None,
+                        };
+                        if let Some(view) = resolved
+                            && narrowed == view
+                            && matches!(
+                                self.table.get(view),
+                                Type::Intersection(_) | Type::Any | Type::Unknown
+                            )
+                        {
+                            match decide(self.table, self.table.get(view)) {
+                                Narrow::Keep => kept.push(narrowed),
+                                Narrow::Drop => {}
+                                Narrow::Replace(replacement) => kept.push(replacement),
+                            }
+                            continue;
+                        }
+                        kept.push(narrowed);
                         continue;
                     }
                     match decide(self.table, self.table.get(member)) {
