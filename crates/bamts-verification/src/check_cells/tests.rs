@@ -867,15 +867,15 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
     }
 
     #[test]
-    fn catch_binding_any_records_keep_caret() {
+    fn catch_binding_unknown_records_keep_caret() {
         let case_text = "try {} catch (e) { e; }\n";
         let units = split_case_units("tests/cases/compiler/anyCatchPin.ts", case_text);
         let entry = entry_virtual_path("tests/cases/compiler/anyCatchPin.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let emitted = emit_types_baseline(&case, "tests/cases/compiler/anyCatchPin.ts");
         assert!(
-            emitted.contains(">e : any\n>  : ^^^\n"),
-            "catch-clause bindings keep their caret, as objectRestCatchES5.types shows for >a : any: {emitted}"
+            emitted.contains(">e : unknown\n>  : ^^^^^^^\n"),
+            "the harness strict default types the catch binding as unknown, as controlFlowAliasingCatchVariables(useunknownincatchvariables=true).types shows for >e : unknown, and it keeps its caret like every other non-any record: {emitted}"
         );
     }
 
@@ -4196,13 +4196,133 @@ let x = b1;
 
     /// The pinned authority test tree, resolved from this crate's location so
     /// the tests do not depend on one developer's checkout. Overridable with
-    /// `BAMTS_AUTHORITY_ROOT` for a tree materialized elsewhere.
+    /// `BAMTS_AUTHORITY_ROOT` for a tree materialized elsewhere. Falls back
+    /// to the in-repo `.references` testdata the mount harness serves when no
+    /// `target/authority` tree is checked out, so receipt-independent sampler
+    /// tests run hermetically; the layout helpers below bridge the testdata
+    /// `baselines/reference` shape to the authority `tests/baselines`
+    /// `reference` shape.
     fn authority_tests_root() -> std::path::PathBuf {
-        match std::env::var("BAMTS_AUTHORITY_ROOT") {
-            Ok(root) => std::path::PathBuf::from(root),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/authority/typescript-7.0.2-tests"),
+        if let Ok(root) = std::env::var("BAMTS_AUTHORITY_ROOT") {
+            return std::path::PathBuf::from(root);
         }
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let candidate = manifest.join("../../target/authority/typescript-7.0.2-tests");
+        if candidate.is_dir() {
+            return candidate;
+        }
+        if let Some(testdata) = super::reference_testdata_root() {
+            return testdata;
+        }
+        manifest.join("../../target/authority/typescript-7.0.2-tests")
+    }
+
+    /// The baseline reference directory for an authority root: the fetched
+    /// tree keeps `tests/baselines/reference`, while the in-repo testdata
+    /// fallback keeps `baselines/reference`.
+    fn authority_reference_dir(root: &std::path::Path) -> std::path::PathBuf {
+        let canonical = root.join("tests/baselines/reference");
+        if canonical.is_dir() {
+            return canonical;
+        }
+        root.join("baselines/reference")
+    }
+
+    /// The `.types` baseline file for one enum-sample case. The fetched tree
+    /// is flat; the testdata fallback nests baselines one level down
+    /// (`compiler/`, `conformance/`), so a missing flat file falls through
+    /// to the area matching the case's suite.
+    fn enum_baseline_for(
+        reference_dir: &std::path::Path,
+        logical: &str,
+        stem: &str,
+    ) -> std::path::PathBuf {
+        let flat = reference_dir.join(format!("{stem}.types"));
+        if flat.exists() {
+            return flat;
+        }
+        let suite = if logical.starts_with("tests/cases/conformance/") {
+            "conformance"
+        } else {
+            "compiler"
+        };
+        reference_dir.join(suite).join(format!("{stem}.types"))
+    }
+
+    /// Collect nested `.js` baselines under a reference dir by case stem.
+    /// Only the in-repo testdata fallback needs this: its baselines live one
+    /// level down (`compiler/`, `conformance/`), which `baseline_groups`
+    /// deliberately excludes, so the sampler keeps its own stem map.
+    fn collect_nested_js_baselines(
+        reference: &std::path::Path,
+        out: &mut BTreeMap<String, Vec<(String, std::path::PathBuf)>>,
+    ) {
+        let mut stack = vec![reference.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some((stem, extension, suffix)) = super::split_baseline_file_name(&name)
+                else {
+                    continue;
+                };
+                if extension != "js" {
+                    continue;
+                }
+                out.entry(stem.to_owned())
+                    .or_default()
+                    .push((suffix.to_owned(), path));
+            }
+        }
+    }
+
+    /// Pick one nested `.js` baseline for a case, mirroring
+    /// `resolve_stem_baseline`: an option-matching variant wins when the case
+    /// sets options, else the plain baseline, else the smallest suffix. Zero
+    /// or ambiguous candidates resolve to no baseline and the case skips.
+    fn select_nested_js_baseline(
+        nested: &BTreeMap<String, Vec<(String, std::path::PathBuf)>>,
+        logical: &str,
+        compile_options: &[(String, String)],
+    ) -> Option<std::path::PathBuf> {
+        let stem = super::case_stem(logical);
+        let candidates = nested.get(stem)?;
+        if !compile_options.is_empty() {
+            let matches: Vec<_> = candidates
+                .iter()
+                .filter(|(suffix, _)| {
+                    !suffix.is_empty()
+                        && super::suffix_matches_options(suffix, compile_options)
+                })
+                .collect();
+            if matches.len() > 1 {
+                return None;
+            }
+            if let Some((_, path)) = matches.first() {
+                return Some((*path).clone());
+            }
+        }
+        let plains: Vec<_> = candidates
+            .iter()
+            .filter(|(suffix, _)| suffix.is_empty())
+            .collect();
+        if plains.len() > 1 {
+            return None;
+        }
+        if let Some((_, path)) = plains.first() {
+            return Some((*path).clone());
+        }
+        candidates
+            .iter()
+            .min_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, path)| path.clone())
     }
 
     /// Run the 10 build-info evidence-sweep cells through the observer's core
@@ -4338,7 +4458,8 @@ let x = b1;
         let authority_root = authority_tests_root().to_string_lossy().into_owned();
         let cases_dir = format!("{authority_root}/tests/cases/compiler");
         let conformance_dir = format!("{authority_root}/tests/cases/conformance/enums");
-        let baseline_dir = format!("{authority_root}/tests/baselines/reference");
+        let reference_dir =
+            authority_reference_dir(std::path::Path::new(&authority_root));
 
         // Collect enum-named .ts case files from both directories.
         let mut case_paths: Vec<(String, String)> = Vec::new();
@@ -4353,15 +4474,14 @@ let x = b1;
                     continue;
                 }
                 let stem = name.trim_end_matches(".ts");
-                let baseline = format!("{baseline_dir}/{stem}.types");
-                if !std::path::Path::new(&baseline).exists() {
-                    continue;
-                }
                 let logical = if *dir == cases_dir {
                     format!("tests/cases/compiler/{name}")
                 } else {
                     format!("tests/cases/conformance/enums/{name}")
                 };
+                if !enum_baseline_for(&reference_dir, &logical, stem).exists() {
+                    continue;
+                }
                 let text = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(_) => continue,
@@ -4384,7 +4504,7 @@ let x = b1;
 
         for (logical, text) in &sample {
             let stem = logical.rsplit('/').next().unwrap().trim_end_matches(".ts");
-            let baseline_path = format!("{baseline_dir}/{stem}.types");
+            let baseline_path = enum_baseline_for(&reference_dir, logical, stem);
             let units = split_case_units(logical, text);
             let entry = entry_virtual_path(logical, &units);
             let case = match compile_case(&units, &entry) {
@@ -4437,7 +4557,7 @@ let x = b1;
         let mut index = SuiteIndex {
             entries: BTreeMap::new(),
         };
-        let reference = authority.join("tests/baselines/reference");
+        let reference = authority_reference_dir(&authority);
         let mut baseline_names: Vec<String> = std::fs::read_dir(&reference)
             .expect("reference baselines")
             .flatten()
@@ -4445,6 +4565,20 @@ let x = b1;
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect();
         baseline_names.sort();
+        // The in-repo testdata fallback nests baselines one level down
+        // (`compiler/`, `conformance/`), so a flat listing finds nothing.
+        // Collect nested `.js` baselines by stem for discovery and for the
+        // groups-miss fallback below; the fetched tree always lists flat
+        // baselines, so this walk never runs there.
+        let mut nested_js: BTreeMap<String, Vec<(String, std::path::PathBuf)>> =
+            BTreeMap::new();
+        if baseline_names.is_empty() {
+            collect_nested_js_baselines(&reference, &mut nested_js);
+        }
+        let mut known_names = baseline_names.clone();
+        known_names.extend(nested_js.keys().map(|stem| format!("{stem}.js")));
+        known_names.sort();
+        known_names.dedup();
         for name in &baseline_names {
             index.entries.insert(
                 format!("{BASELINE_REFERENCE_PREFIX}{name}"),
@@ -4497,7 +4631,7 @@ let x = b1;
                 out.push((logical, text));
             }
         }
-        walk(&cases_root, &cases_root, &mut case_paths, &baseline_names);
+        walk(&cases_root, &cases_root, &mut case_paths, &known_names);
         case_paths.sort();
         case_paths.dedup();
         let stride = (case_paths.len() / sample_cap).max(1);
@@ -4518,11 +4652,22 @@ let x = b1;
             let entry = entry_virtual_path(logical, &units);
             let pragmas = parse_case_pragmas(text);
             let compile_options = compile_option_pairs(&pragmas);
-            let Some(baseline_logical) =
-                resolve_stem_baseline(&groups, logical, "js", &compile_options)
-                    .ok()
-                    .flatten()
-            else {
+            let baseline_path: Option<std::path::PathBuf> = resolve_stem_baseline(
+                &groups,
+                logical,
+                "js",
+                &compile_options,
+            )
+            .ok()
+            .flatten()
+            .map(|name| {
+                let file = name
+                    .strip_prefix(BASELINE_REFERENCE_PREFIX)
+                    .unwrap_or(&name);
+                reference.join(file)
+            })
+            .or_else(|| select_nested_js_baseline(&nested_js, logical, &compile_options));
+            let Some(baseline_path) = baseline_path else {
                 skipped += 1;
                 continue;
             };
@@ -4542,7 +4687,7 @@ let x = b1;
                 }
             };
             let expected =
-                std::fs::read_to_string(authority.join(&baseline_logical)).unwrap_or_default();
+                std::fs::read_to_string(&baseline_path).unwrap_or_default();
             let canon = |text: &str| -> Vec<String> {
                 text.replace("\r\n", "\n")
                     .replace('\r', "\n")
