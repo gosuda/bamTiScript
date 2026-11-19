@@ -30,7 +30,7 @@
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
 
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         // The lint profile's unused-local warning must not survive the filter.
         assert_eq!(actual.len(), 1, "only the checker diagnostic remains");
@@ -98,6 +98,25 @@
         );
     }
 
+    /// Out-of-bounds diagnostic offsets fail closed: the facet maps them to
+    /// a harness error instead of a 0:0 position.
+    #[test]
+    fn facet_position_rejects_out_of_bounds_offsets() {
+        let source = SourceText::new("var x = 1;\n").expect("unit text fits the source bound");
+        let in_bounds = super::errors_facet::facet_position(&source, Utf16Pos::new(4))
+            .expect("offset 4 is in-bounds");
+        assert_eq!(in_bounds, SourcePosition { line: 1, character: 4 });
+        let diagnostic = bamts_compiler::diagnostic::Diagnostic::error(
+            bamts_compiler::diagnostic::DiagnosticCode::new("BAMTS-C002"),
+            SourceId::new(0),
+            TextRange::new(Utf16Pos::new(10_000), Utf16Pos::new(10_001)).expect("ordered range"),
+            "synthetic out-of-bounds diagnostic",
+        );
+        let error = super::errors_facet::facet_position(&source, diagnostic.range().start())
+            .expect_err("offset past the end must fail");
+        assert_eq!(error.code(), ErrorCode::Schema);
+    }
+
     /// Multi-unit cases with an empty leading unit must still load every file,
     /// so import conflicts in a dependent unit are observed.
     #[test]
@@ -117,7 +136,7 @@
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
 
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         assert_eq!(
             actual.len(),
@@ -157,7 +176,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/cleanPin.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let verdict = compare_diagnostics(&[], &actual, &code_map);
         assert_eq!(verdict, FacetVerdict::Pass);
@@ -173,7 +192,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/heteroEnumReverseLookup.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -195,7 +214,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/mergedClassNamespaceAlias.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -214,7 +233,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/mergedNamespaceTypeOnly.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -231,7 +250,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/pureNamespaceTypeOnly.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -249,7 +268,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/namespaceAliasValueSide.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -271,7 +290,7 @@
             entry_virtual_path("tests/cases/compiler/mergedClassNamespaceTypeof.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -289,7 +308,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/namespaceEnumChains.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -308,7 +327,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/mergedNsExportedClass.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -326,7 +345,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/classStaticVsNsType.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -344,7 +363,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/mergedFunctionAlias.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -362,7 +381,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/constExprEnumReverse.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -380,7 +399,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/derivedLateNsAdditions.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -412,7 +431,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/ownStaticNsCollision.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -433,7 +452,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/namespaceFragmentsSilent.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -451,7 +470,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/derivedNarrowingMerge.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -469,7 +488,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/tmAa.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -487,7 +506,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/tmAb3.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -505,7 +524,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/tmAb2.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -523,7 +542,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/tmAc.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -542,7 +561,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/callableTypeCollision.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -561,7 +580,7 @@
         let entry = entry_virtual_path("tests/cases/compiler/nestedNamespaceAssign.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -1261,7 +1280,7 @@ import { everywhere, onlyInA } from \"b.foo\"; // Error
             compile_case_frontend(&units, &entry, &CasePragmas::default(), FrontendMode::Check)
                 .expect("case compiles");
         assert!(
-            collect_facet_diagnostics(&without)
+            collect_facet_diagnostics(&without).expect("facet positions are in-bounds")
                 .iter()
                 .any(|diagnostic| diagnostic.code == "TS2307")
         );
@@ -1274,7 +1293,7 @@ import { everywhere, onlyInA } from \"b.foo\"; // Error
         )
         .expect("case compiles");
         assert!(
-            !collect_facet_diagnostics(&with)
+            !collect_facet_diagnostics(&with).expect("facet positions are in-bounds")
                 .iter()
                 .any(|diagnostic| diagnostic.code == "TS2307")
         );
@@ -3237,7 +3256,7 @@ class Board {\n\
                 .unwrap(),
         )
         .unwrap();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         assert!(
             actual.is_empty(),
@@ -4464,6 +4483,8 @@ let x = b1;
     /// node can report before/after numbers.
     #[test]
     fn enum_types_facet_sample_60_cells() {
+        // Ratchet floor: the 2026-11-19 full-authority sweep measured 12 exact matches.
+        const ENUM_TYPES_EXACT_MATCH_FLOOR: usize = 12;
         let authority_root = authority_tests_root().to_string_lossy().into_owned();
         let cases_dir = format!("{authority_root}/tests/cases/compiler");
         let conformance_dir = format!("{authority_root}/tests/cases/conformance/enums");
@@ -4544,6 +4565,12 @@ let x = b1;
              mismatches={mismatches} compile_failures={compile_failures} \
              missing_baselines={missing_baselines}"
         );
+        assert!(
+            exact_matches >= ENUM_TYPES_EXACT_MATCH_FLOOR,
+            "enum .types exact matches regressed below the measured floor {}: {}",
+            ENUM_TYPES_EXACT_MATCH_FLOOR,
+            report,
+        );
         write_facet_report("types-60", &report);
     }
 
@@ -4557,6 +4584,8 @@ let x = b1;
     /// report lands under the session scratch root.
     #[test]
     fn javascript_facet_first_delta_sample() {
+        // Ratchet floor: the 2026-11-19 full-authority sweep measured 84 passes.
+        const JAVASCRIPT_FACET_PASS_FLOOR: usize = 84;
         let authority = authority_tests_root();
         let sample_cap: usize = std::env::var("BAMTS_JS_SAMPLE")
             .ok()
@@ -4833,6 +4862,12 @@ let x = b1;
                 line.chars().take(120).collect::<String>()
             ));
         }
+        assert!(
+            passes >= JAVASCRIPT_FACET_PASS_FLOOR,
+            "javascript facet passes regressed below the measured floor {}: {}",
+            JAVASCRIPT_FACET_PASS_FLOOR,
+            report,
+        );
         write_facet_report("javascript-first-delta", &report);
         assert!(!sample.is_empty(), "no javascript cases sampled");
     }
@@ -5956,7 +5991,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchFunctionShadow.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -5973,7 +6008,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchParameterVisible.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -5991,7 +6026,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchLetConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6008,7 +6043,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchClassShadow.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6024,7 +6059,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchEnumShadow.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6042,7 +6077,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchDestructuredVar.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6060,7 +6095,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchNestedVar.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6077,7 +6112,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/catchNestedVarSimple.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6097,7 +6132,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/forNestedPrecede.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6116,7 +6151,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/switchCaseFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6133,7 +6168,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/tryBlockFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6151,7 +6186,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/bracedCaseFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6168,7 +6203,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/nestedTryPrecede.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6185,7 +6220,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/nestedSwitchPrecede.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6206,7 +6241,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/nestedLoopFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6232,7 +6267,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6255,7 +6290,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6278,7 +6313,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6296,7 +6331,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/nestedLoopInnerUse.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6317,7 +6352,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/loopHeaderLetFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6341,7 +6376,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/functionLetConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6366,7 +6401,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/letFunctionConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6396,7 +6431,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6419,7 +6454,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/varLetConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6449,7 +6484,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6475,7 +6510,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/letVarConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6492,7 +6527,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/varClassConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6516,7 +6551,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/tripleConflict.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6547,7 +6582,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6572,7 +6607,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/mixedTriple.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6595,7 +6630,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/loopHeaderVarFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6619,7 +6654,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6648,7 +6683,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6672,7 +6707,7 @@ interface I {
         };
         let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6697,7 +6732,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/forBodyFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6715,7 +6750,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/forBlockBodyFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6731,7 +6766,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/forOfBodyFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6749,7 +6784,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/whileBodyFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6765,7 +6800,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/ifBodyFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6781,7 +6816,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/forInBodyFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6798,7 +6833,7 @@ interface I {
         let entry = entry_virtual_path("tests/cases/compiler/forNestedIfFunction.ts", &units);
         let case = compile_case(&units, &entry).expect("case compiles");
         let code_map = repo_code_map();
-        let mut actual = collect_facet_diagnostics(&case);
+        let mut actual = collect_facet_diagnostics(&case).expect("facet positions are in-bounds");
         actual.retain(|diagnostic| code_map.get(&diagnostic.code).is_some());
         let codes: Vec<_> = actual
             .iter()
@@ -6862,4 +6897,11 @@ interface I {
         let bom = char::from_u32(0xFEFF).unwrap();
         let text = format!("{bom}#!/usr/bin/env node\n/// <reference path=\"/.lib/a.d.ts\" />\nvar x = 1;\n");
         assert_eq!(shared_lib_refs(&text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn leading_invalid_character_does_not_end_the_reference_prologue() {
+        let section = char::from_u32(0xA7).unwrap();
+        let text = format!("{section}\n/// <reference path=\"/.lib/a.d.ts\" />\nvar x = 1;\n");
+        assert_eq!(shared_lib_refs(&text), vec!["a.d.ts".to_owned()]);
     }

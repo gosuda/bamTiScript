@@ -123,17 +123,39 @@ fn parse_category_code(rest: &str) -> Option<(String, String, String)> {
 /// follows `error` vs `warning`, and severity mirrors the compiler's
 /// error/warning split. The unit basename is carried so a cross-unit position
 /// collision cannot pass the check.
-pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
+pub(crate) fn facet_position(source: &SourceText, position: Utf16Pos) -> Result<SourcePosition> {
+    let (line, character) = source.line_column(position).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Schema,
+            format!(
+                "diagnostic offset {} lies outside its unit text: {error}",
+                position.get(),
+            ),
+        )
+    })?;
+    let line = u32::try_from(line + 1).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Schema,
+            format!("diagnostic line does not fit u32: {error}"),
+        )
+    })?;
+    let character = u32::try_from(character).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Schema,
+            format!("diagnostic character does not fit u32: {error}"),
+        )
+    })?;
+    Ok(SourcePosition { line, character })
+}
+
+pub fn collect_facet_diagnostics(case: &CheckedCase) -> Result<Vec<FacetDiagnostic>> {
     let mut diagnostics = Vec::new();
     for (unit, output) in case.reached_units() {
         let unit_name = unit_basename(&unit.virtual_path);
         let source = SourceText::new(unit.text.clone())
             .unwrap_or_else(|_| panic!("unit text was bound-checked before compile"));
         for diagnostic in output.diagnostics() {
-            let (line, character) = source
-                .line_column(diagnostic.range().start())
-                .map(|(line, character)| ((line + 1) as u32, character as u32))
-                .unwrap_or((0, 0));
+            let position = facet_position(&source, diagnostic.range().start())?;
             let severity = match diagnostic.severity() {
                 DiagnosticSeverity::Error => FacetSeverity::Error,
                 DiagnosticSeverity::Warning => FacetSeverity::Warning,
@@ -144,14 +166,14 @@ pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
             };
             diagnostics.push(FacetDiagnostic {
                 unit: unit_name.clone(),
-                position: SourcePosition { line, character },
+                position,
                 category,
                 severity,
                 code: diagnostic.code().as_str().to_owned(),
             });
         }
     }
-    diagnostics
+    Ok(diagnostics)
 }
 
 /// Union the owned `.errors.txt` baselines into the comparator's expected
@@ -203,7 +225,7 @@ pub fn check_diagnostics(
     case: &CheckedCase,
     baselines: &DiagnosticsBaselines,
 ) -> Result<DiagnosticsOutcome> {
-    let mut actual = collect_facet_diagnostics(case);
+    let mut actual = collect_facet_diagnostics(case)?;
     actual.retain(|diagnostic| !diagnostic.code.starts_with("BAMTS-W"));
     let expected = expected_facet_diagnostics(baselines)?;
     let verdict = compare_diagnostics(&expected, &actual, &ctx.code_map);
