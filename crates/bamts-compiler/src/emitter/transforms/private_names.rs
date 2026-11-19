@@ -931,9 +931,12 @@ impl Rewriter<'_> {
 
     /// Rewrites a destructuring assignment whose pattern writes private
     /// members: each private target becomes a setter that routes the write
-    /// through `__classPrivateFieldSet`, receivers that are not plain
-    /// identifiers are captured once ahead of the assignment, and the
-    /// captures lead it inside one sequence.
+    /// through `__classPrivateFieldSet`. Receivers that are not plain
+    /// identifiers are captured once, after the right-hand side, and the
+    /// captures lead the assignment inside one sequence: the right-hand side
+    /// runs first, matching destructuring evaluation order. Captures stay
+    /// outside the setter body because `this` inside the setter would bind to
+    /// the setter's own object literal.
     pub(super) fn lower_private_destructured_assignment(
         &mut self,
         expression: &Expr,
@@ -947,22 +950,36 @@ impl Rewriter<'_> {
         {
             return None;
         }
+        let right = self.rewrite_expr(&assignment.right);
         let mut captures = Vec::new();
         let left = self.rewrite_private_destructured_target(&assignment.left, &mut captures);
-        let right = self.rewrite_expr(&assignment.right);
-        let rewritten = self.node(
+        if captures.is_empty() {
+            return Some(self.node(
+                expression.range(),
+                Expression::Assignment(AssignmentExpression {
+                    operator: assignment.operator,
+                    left,
+                    right: Box::new(right),
+                }),
+            ));
+        }
+        let rhs_temp = self.expression_temp();
+        let rhs_capture = self.temp_assignment(&rhs_temp, right, expression.range());
+        let rhs_ref = self.node(
+            rhs_temp.range(),
+            Expression::Identifier(rhs_temp),
+        );
+        let mut parts = Vec::with_capacity(captures.len() + 2);
+        parts.push(rhs_capture);
+        parts.extend(captures);
+        parts.push(self.node(
             expression.range(),
             Expression::Assignment(AssignmentExpression {
                 operator: assignment.operator,
                 left,
-                right: Box::new(right),
+                right: Box::new(rhs_ref),
             }),
-        );
-        if captures.is_empty() {
-            return Some(rewritten);
-        }
-        let mut parts = captures;
-        parts.push(rewritten);
+        ));
         Some(self.sequence(parts, expression.range()))
     }
 
@@ -1049,8 +1066,9 @@ impl Rewriter<'_> {
 
     /// Rewrites one private member target inside a destructuring pattern
     /// into `({ set value(v) { __classPrivateFieldSet(receiver, state, v,
-    /// kind, f); } }).value`. A `this` or composite receiver is captured
-    /// into a hoisted temporary first; a plain identifier is used as is.
+    /// kind, f); } }).value`. A plain identifier receiver is used as is;
+    /// any other receiver is captured into a hoisted temporary by the caller,
+    /// after the right-hand side, so `this` keeps its outer binding.
     fn rewrite_private_destructured_member(
         &mut self,
         object: &Expr,
