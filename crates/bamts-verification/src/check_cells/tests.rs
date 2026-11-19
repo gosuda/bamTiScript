@@ -1403,8 +1403,8 @@ export const a2 = 3;
         let case = compile_case(&units, &entry).expect("case compiles");
         let ordered = case.units_in_document_order();
         assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered[0].0.virtual_path, "b.ts");
-        assert_eq!(ordered[1].0.virtual_path, "node_modules/dep/index.ts");
+        assert_eq!(ordered[0].0.display_name, "b.ts");
+        assert_eq!(ordered[1].0.display_name, "node_modules/dep/index.ts");
     }
     #[test]
     fn document_order_keeps_imported_entry_last() {
@@ -1415,9 +1415,9 @@ export const a2 = 3;
         let case = compile_case(&units, &entry).expect("case compiles");
         let ordered = case.units_in_document_order();
         assert_eq!(ordered.len(), 3);
-        assert_eq!(ordered[0].0.virtual_path, "node_modules/dep/index.ts");
-        assert_eq!(ordered[1].0.virtual_path, "index.ts");
-        assert_eq!(ordered[2].0.virtual_path, "b.ts");
+        assert_eq!(ordered[0].0.display_name, "node_modules/dep/index.ts");
+        assert_eq!(ordered[1].0.display_name, "index.ts");
+        assert_eq!(ordered[2].0.display_name, "b.ts");
     }
     #[test]
     fn split_baseline_file_name_variants() {
