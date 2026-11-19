@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::checker::diagnostic_messages::{Args, by_u32};
 use crate::checker::{self, ProgramCheckInput, ResolvedModuleEdge, SemanticModel};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
+use crate::emitter::transforms::ModuleExports;
 use crate::emitter::{self, EmitFileNames, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
 use crate::parser;
@@ -382,6 +383,18 @@ pub struct ProgramFrontendOutput {
     entrypoint: SourceId,
     modules: Vec<FrontendOutput>,
 }
+#[cfg(test)]
+thread_local! {
+    static MODULE_EXPORTS_COMPUTATIONS: std::cell::RefCell<HashMap<SourceId, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+fn record_module_exports_computation(source_id: SourceId) {
+    MODULE_EXPORTS_COMPUTATIONS.with(|counts| {
+        *counts.borrow_mut().entry(source_id).or_default() += 1;
+    });
+}
 
 impl ProgramFrontendOutput {
     #[must_use]
@@ -400,11 +413,36 @@ impl ProgramFrontendOutput {
     #[must_use]
     pub fn erased_exports(&self, program: &ResolvedProgram) -> HashMap<SourceId, BTreeSet<String>> {
         let mut erased = HashMap::new();
+        let mut exports = HashMap::new();
         for module in &self.modules {
             let source_id = module.source_file().source_id();
-            self.resolve_erased_exports(program, source_id, &mut erased, &mut HashSet::new());
+            self.resolve_erased_exports(
+                program,
+                source_id,
+                &mut erased,
+                &mut exports,
+                &mut HashSet::new(),
+            );
         }
         erased
+    }
+
+    fn cached_module_exports(
+        &self,
+        source_id: SourceId,
+        cache: &mut HashMap<SourceId, ModuleExports>,
+    ) -> Option<ModuleExports> {
+        if cache.contains_key(&source_id) {
+            return cache.get(&source_id).cloned();
+        }
+        let module = self.module(source_id)?;
+        #[cfg(test)]
+        record_module_exports_computation(source_id);
+        cache.insert(
+            source_id,
+            emitter::transforms::module_exports(module.source_file(), module.semantic_model()),
+        );
+        cache.get(&source_id).cloned()
     }
 
     fn resolve_erased_exports(
@@ -412,61 +450,66 @@ impl ProgramFrontendOutput {
         program: &ResolvedProgram,
         source_id: SourceId,
         erased: &mut HashMap<SourceId, BTreeSet<String>>,
+        exports_cache: &mut HashMap<SourceId, ModuleExports>,
         visiting: &mut HashSet<SourceId>,
-    ) -> BTreeSet<String> {
-        if let Some(names) = erased.get(&source_id) {
-            return names.clone();
+    ) {
+        if erased.contains_key(&source_id) {
+            return;
         }
-        let Some(module) = self.module(source_id) else {
-            return BTreeSet::new();
-        };
+        if self.module(source_id).is_none() {
+            return;
+        }
         // A cycle decides nothing: a name stays until something proves it erased.
         if !visiting.insert(source_id) {
-            return BTreeSet::new();
+            return;
         }
-        let exports =
-            emitter::transforms::module_exports(module.source_file(), module.semantic_model());
+        let Some(exports) = self.cached_module_exports(source_id, exports_cache) else {
+            return;
+        };
         let mut names = exports.types;
         let forwarded: BTreeSet<String> = exports
             .forwards
             .iter()
             .map(|(exported, ..)| exported.clone())
             .collect();
-        for (exported, specifier, imported) in exports.forwards {
-            if let Some(target) = local_dependency(program, source_id, &specifier)
-                && self
-                    .resolve_erased_exports(program, target, erased, visiting)
-                    .contains(&imported)
+        for (exported, specifier, imported) in &exports.forwards {
+            let target = local_dependency(program, source_id, specifier);
+            if let Some(target) = target {
+                self.resolve_erased_exports(program, target, erased, exports_cache, visiting);
+            }
+            if target
+                .and_then(|target| erased.get(&target))
+                .is_some_and(|target_names| target_names.contains(imported))
             {
-                names.insert(exported);
+                names.insert(exported.clone());
             } else {
                 // An explicit export outranks a local type of the same name.
-                names.remove(&exported);
+                names.remove(exported);
             }
         }
         let mut star_values = BTreeSet::new();
-        for specifier in exports.stars {
-            if let Some(target) = local_dependency(program, source_id, &specifier) {
-                let starred = self.resolve_erased_exports(program, target, erased, visiting);
-                if let Some(module) = self.module(target) {
-                    let exports = emitter::transforms::module_exports(
-                        module.source_file(),
-                        module.semantic_model(),
-                    );
-                    star_values.extend(exports.values);
+        for specifier in &exports.stars {
+            if let Some(target) = local_dependency(program, source_id, specifier) {
+                self.resolve_erased_exports(program, target, erased, exports_cache, visiting);
+                if let Some(target_exports) = exports_cache.get(&target) {
+                    star_values.extend(target_exports.values.iter().cloned());
                 }
                 // An explicit export of the same name shadows what a star brings.
-                names.extend(
-                    starred
-                        .into_iter()
-                        .filter(|name| name != "default" && !forwarded.contains(name)),
-                );
+                if let Some(starred) = erased.get(&target) {
+                    names.extend(
+                        starred
+                            .iter()
+                            .filter(|name| {
+                                name.as_str() != "default" && !forwarded.contains(name.as_str())
+                            })
+                            .cloned(),
+                    );
+                }
             }
         }
         // A name stays if any star brings it as a value.
         names.retain(|name| !exports.values.contains(name) && !star_values.contains(name));
-        erased.insert(source_id, names.clone());
-        names
+        erased.insert(source_id, names);
     }
 
     /// `(specifier, name)` for what the module's imports can name that has no
@@ -3447,5 +3490,107 @@ mod tests {
             "no map url without sourceMap: {js:?}"
         );
         std::fs::remove_dir_all(root_path).unwrap();
+    }
+    const BARREL_TYPE_COUNT: usize = 150;
+    const BARREL_STAR_COUNT: usize = 8;
+
+    fn barrel_case() -> (PathBuf, ResolvedProgram) {
+        let mut target = String::new();
+        for i in 0..BARREL_TYPE_COUNT {
+            target.push_str(&format!("export type T{i} = number;\n"));
+        }
+        for i in 0..BARREL_TYPE_COUNT {
+            target.push_str(&format!("export const V{i} = {i};\n"));
+        }
+        let mut barrel = String::new();
+        for _ in 0..BARREL_STAR_COUNT {
+            barrel.push_str("export * from \"./target\";\n");
+        }
+        barrel.push_str("export { T0 as T0a, V0 as V0a } from \"./target\";\n");
+        barrel.push_str("export { T1, V1 } from \"./target\";\n");
+        barrel.push_str("export type Local = string;\n");
+        barrel.push_str("export const localValue = 1;\n");
+        tslib_case(
+            &[
+                ("main.ts", "import \"./barrel\";\nexport {};\n"),
+                ("target.ts", target.as_str()),
+                ("barrel.ts", barrel.as_str()),
+            ],
+            r#"{"compilerOptions":{"module":"commonjs"}}"#,
+        )
+    }
+
+    fn erased_by_name(
+        output: &ProgramFrontendOutput,
+        program: &ResolvedProgram,
+    ) -> std::collections::HashMap<String, std::collections::BTreeSet<String>> {
+        let erased = output.erased_exports(program);
+        output
+            .modules()
+            .iter()
+            .map(|module| {
+                let id = module.source_file().source_id();
+                let name = program
+                    .modules()
+                    .iter()
+                    .find(|resolved| resolved.source_id() == id)
+                    .map(|resolved| {
+                        resolved
+                            .path()
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .expect("frontend module resolves");
+                (name, erased.get(&id).cloned().unwrap_or_default())
+            })
+            .collect()
+    }
+
+    fn module_exports_computations() -> std::collections::HashMap<SourceId, usize> {
+        super::MODULE_EXPORTS_COMPUTATIONS.with(|counts| counts.borrow().clone())
+    }
+
+    fn reset_module_exports_computations() {
+        super::MODULE_EXPORTS_COMPUTATIONS.with(|counts| counts.borrow_mut().clear());
+    }
+
+    #[test]
+    fn barrel_erased_exports_match_recorded_baseline() {
+        let (root_path, program) = barrel_case();
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let by_name = erased_by_name(&output, &program);
+        assert_eq!(by_name.len(), 3, "{by_name:?}");
+        let mut expected_target = std::collections::BTreeSet::new();
+        for i in 0..BARREL_TYPE_COUNT {
+            expected_target.insert(format!("T{i}"));
+        }
+        assert_eq!(by_name["target.ts"], expected_target);
+        let mut expected_barrel = expected_target.clone();
+        expected_barrel.insert("Local".to_owned());
+        expected_barrel.insert("T0a".to_owned());
+        assert_eq!(by_name["barrel.ts"], expected_barrel);
+        assert!(by_name["main.ts"].is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn barrel_module_exports_computed_once_per_module() {
+        let (root_path, program) = barrel_case();
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        reset_module_exports_computations();
+        let _ = output.erased_exports(&program);
+        let counts = module_exports_computations();
+        assert_eq!(counts.len(), output.modules().len(), "{counts:?}");
+        for module in output.modules() {
+            let id = module.source_file().source_id();
+            assert_eq!(
+                counts.get(&id),
+                Some(&1),
+                "exports of {id:?} computed {counts:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root_path);
     }
 }
