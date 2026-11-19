@@ -120,10 +120,7 @@ pub(crate) struct BuiltinTable<H: Host> {
     intl_fallback_symbol: Option<Value>,
     weak_ref_prototype: Option<Value>,
     finalization_registry_prototype: Option<Value>,
-    map_prototype: Option<Value>,
     set_prototype: Option<Value>,
-    weak_map_prototype: Option<Value>,
-    weak_set_prototype: Option<Value>,
     promise_capability_executor: Option<Value>,
     promise_finally_value: Option<Value>,
     promise_finally_throw: Option<Value>,
@@ -208,10 +205,7 @@ impl<H: Host> BuiltinTable<H> {
             intl_fallback_symbol: None,
             weak_ref_prototype: None,
             finalization_registry_prototype: None,
-            map_prototype: None,
             set_prototype: None,
-            weak_map_prototype: None,
-            weak_set_prototype: None,
             promise_capability_executor: None,
             promise_finally_value: None,
             promise_finally_throw: None,
@@ -638,33 +632,12 @@ impl<H: Host> BuiltinTable<H> {
         self.finalization_registry_prototype
             .expect("FinalizationRegistry builtins install their prototype")
     }
-    pub(crate) fn set_map_prototype(&mut self, prototype: Value) {
-        self.map_prototype = Some(prototype);
-    }
-    pub(crate) fn map_prototype(&self) -> Value {
-        self.map_prototype
-            .expect("Map builtins install their prototype")
-    }
     pub(crate) fn set_set_prototype(&mut self, prototype: Value) {
         self.set_prototype = Some(prototype);
     }
     pub(crate) fn set_prototype(&self) -> Value {
         self.set_prototype
             .expect("Set builtins install their prototype")
-    }
-    pub(crate) fn set_weak_map_prototype(&mut self, prototype: Value) {
-        self.weak_map_prototype = Some(prototype);
-    }
-    pub(crate) fn weak_map_prototype(&self) -> Value {
-        self.weak_map_prototype
-            .expect("WeakMap builtins install their prototype")
-    }
-    pub(crate) fn set_weak_set_prototype(&mut self, prototype: Value) {
-        self.weak_set_prototype = Some(prototype);
-    }
-    pub(crate) fn weak_set_prototype(&self) -> Value {
-        self.weak_set_prototype
-            .expect("WeakSet builtins install their prototype")
     }
     pub(crate) fn set_promise_capability_executor(&mut self, value: Value) {
         self.promise_capability_executor = Some(value);
@@ -915,10 +888,7 @@ impl<H: Host> BuiltinTable<H> {
             intl_fallback_symbol,
             weak_ref_prototype,
             finalization_registry_prototype,
-            map_prototype,
             set_prototype,
-            weak_map_prototype,
-            weak_set_prototype,
             promise_capability_executor,
             promise_finally_value,
             promise_finally_throw,
@@ -994,10 +964,7 @@ impl<H: Host> BuiltinTable<H> {
             *date_prototype,
             *weak_ref_prototype,
             *finalization_registry_prototype,
-            *map_prototype,
             *set_prototype,
-            *weak_map_prototype,
-            *weak_set_prototype,
             *promise_capability_executor,
             *promise_finally_value,
             *promise_finally_throw,
@@ -1610,7 +1577,7 @@ mod tests {
             Value::int32(5),
             Value::int32(6),
         );
-        let roots: Vec<Value> = (101..=147).map(Value::int32).collect();
+        let roots: Vec<Value> = (101..=144).map(Value::int32).collect();
         table.typedarray_constructor = Some(roots[0]);
         table.promise_capability_executor = Some(roots[1]);
         table.promise_finally_value = Some(roots[2]);
@@ -1620,24 +1587,21 @@ mod tests {
         table.promise_then_fulfill = Some(roots[6]);
         table.promise_then_reject = Some(roots[7]);
         table.date_prototype = Some(roots[8]);
-        table.map_prototype = Some(roots[9]);
-        table.set_prototype = Some(roots[10]);
-        table.weak_map_prototype = Some(roots[11]);
-        table.weak_set_prototype = Some(roots[12]);
-        table.bigint_constructor = Some(roots[13]);
-        table.bigint_prototype = Some(roots[14]);
-        table.symbol_match = Some(roots[15]);
-        table.symbol_replace = Some(roots[16]);
-        table.arraybuffer_constructor = Some(roots[17]);
-        table.arraybuffer_prototype = Some(roots[18]);
-        table.sharedarraybuffer_prototype = Some(roots[19]);
-        table.typedarray_prototype = Some(roots[20]);
+        table.set_prototype = Some(roots[9]);
+        table.bigint_constructor = Some(roots[10]);
+        table.bigint_prototype = Some(roots[11]);
+        table.symbol_match = Some(roots[12]);
+        table.symbol_replace = Some(roots[13]);
+        table.arraybuffer_constructor = Some(roots[14]);
+        table.arraybuffer_prototype = Some(roots[15]);
+        table.sharedarraybuffer_prototype = Some(roots[16]);
+        table.typedarray_prototype = Some(roots[17]);
         for offset in 0..builtins::typedarray::KIND_COUNT {
-            table.typedarray_constructors[offset] = Some(roots[21 + offset]);
-            table.typedarray_prototypes[offset] = Some(roots[33 + offset]);
+            table.typedarray_constructors[offset] = Some(roots[18 + offset]);
+            table.typedarray_prototypes[offset] = Some(roots[30 + offset]);
         }
-        table.sharedarraybuffer_constructor = Some(roots[45]);
-        table.wait_async_timeout = Some(roots[46]);
+        table.sharedarraybuffer_constructor = Some(roots[42]);
+        table.wait_async_timeout = Some(roots[43]);
         let mut visited = Vec::new();
         table.for_each_value(|value| visited.push(value));
         for root in roots {

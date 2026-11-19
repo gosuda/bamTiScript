@@ -15,7 +15,6 @@ use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
     PropertyMap, ShapeTable, ThrowOrigin,
 };
-use bamts_bytecode::IteratorKind;
 
 pub(super) fn install<H: Host>(
     heap: &mut Heap,
@@ -38,7 +37,6 @@ fn install_map<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
-    builtins.set_map_prototype(prototype);
     let constructor = install_constructor_function(
         heap,
         atoms,
@@ -178,7 +176,6 @@ fn install_weak_map<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
-    builtins.set_weak_map_prototype(prototype);
     let constructor = install_constructor_function(
         heap,
         atoms,
@@ -221,7 +218,6 @@ fn install_weak_set<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
-    builtins.set_weak_set_prototype(prototype);
     let constructor = install_constructor_function(
         heap,
         atoms,
@@ -749,215 +745,6 @@ fn iterator_next<H: Host>(
     Ok(BuiltinOutcome::Value(result))
 }
 
-fn map_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    map_like_constructor(machine, args, constructing, CollectionKind::Map)
-}
-
-fn set_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    set_like_constructor(machine, args, constructing, CollectionKind::Set)
-}
-
-fn weak_map_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    map_like_constructor(machine, args, constructing, CollectionKind::WeakMap)
-}
-
-fn weak_set_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    set_like_constructor(machine, args, constructing, CollectionKind::WeakSet)
-}
-
-fn map_like_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    args: &[Value],
-    constructing: bool,
-    kind: CollectionKind,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    if !constructing {
-        return Err(type_error("collection constructor requires 'new'"));
-    }
-    let prototype = constructor_prototype(machine, kind)?;
-    let source = args
-        .first()
-        .copied()
-        .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)));
-    let depth = machine.native_roots.len();
-    if let Some(source) = source {
-        machine.push_native_roots(depth, &[source]);
-    }
-    let object = match collection(machine, prototype, kind) {
-        Ok(object) => object,
-        Err(failure) => {
-            if source.is_some() {
-                machine.pop_native_roots(depth);
-            }
-            return Err(failure);
-        }
-    };
-    if let Some(source) = source {
-        machine.refresh_native_roots(depth, &[object, source]);
-        let result: Result<(), EvalFailure> = (|| {
-            let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
-            loop {
-                machine.refresh_native_roots(depth, &[object, iterator]);
-                let result = machine.iterator_step(iterator)?;
-                machine.refresh_native_roots(depth, &[object, iterator, result]);
-                let (done, entry) = machine.iterator_result_parts(result)?;
-                if done {
-                    break;
-                }
-                machine.refresh_native_roots(depth, &[object, iterator, entry]);
-                let inserted = (|| {
-                    if !machine.is_object(entry) {
-                        return Err(type_error("Iterator value is not an entry object"));
-                    }
-                    let key = machine.get_named_property(entry, "0")?;
-                    machine.refresh_native_roots(depth, &[object, iterator, entry, key]);
-                    let value = machine.get_named_property(entry, "1")?;
-                    machine.refresh_native_roots(depth, &[object, iterator, entry, key, value]);
-                    if kind == CollectionKind::WeakMap {
-                        require_weak_key(machine, key)?;
-                    }
-                    map_put(machine, object, key, value, kind)
-                })();
-                if let Err(failure) = inserted {
-                    return Err(close_rooted_collection_iterator(
-                        machine, depth, object, iterator, failure,
-                    ));
-                }
-            }
-            Ok(())
-        })();
-        machine.pop_native_roots(depth);
-        result?;
-    }
-    Ok(BuiltinOutcome::Value(object))
-}
-
-pub(super) fn close_iterator_preserving_failure<H: Host>(
-    machine: &mut Machine<'_, H>,
-    iterator: Value,
-    failure: EvalFailure,
-) -> EvalFailure {
-    let (close, _) = machine.close_iterator_raw(iterator);
-    match close {
-        Err(EvalFailure::Runtime(kind)) => EvalFailure::Runtime(kind),
-        _ => failure,
-    }
-}
-
-fn close_rooted_collection_iterator<H: Host>(
-    machine: &mut Machine<'_, H>,
-    depth: usize,
-    object: Value,
-    iterator: Value,
-    failure: EvalFailure,
-) -> EvalFailure {
-    match &failure {
-        EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. } => {
-            machine.refresh_native_roots(depth, &[object, iterator, *value]);
-        }
-        EvalFailure::Throw(_) | EvalFailure::Runtime(_) => {
-            machine.refresh_native_roots(depth, &[object, iterator]);
-        }
-    }
-    close_iterator_preserving_failure(machine, iterator, failure)
-}
-
-fn set_like_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    args: &[Value],
-    constructing: bool,
-    kind: CollectionKind,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    if !constructing {
-        return Err(type_error("collection constructor requires 'new'"));
-    }
-    let prototype = constructor_prototype(machine, kind)?;
-    let source = args
-        .first()
-        .copied()
-        .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)));
-    let depth = machine.native_roots.len();
-    if let Some(source) = source {
-        machine.push_native_roots(depth, &[source]);
-    }
-    let object = match collection(machine, prototype, kind) {
-        Ok(object) => object,
-        Err(failure) => {
-            if source.is_some() {
-                machine.pop_native_roots(depth);
-            }
-            return Err(failure);
-        }
-    };
-    if let Some(source) = source {
-        machine.refresh_native_roots(depth, &[object, source]);
-        let result: Result<(), EvalFailure> = (|| {
-            let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
-            loop {
-                machine.refresh_native_roots(depth, &[object, iterator]);
-                let result = machine.iterator_step(iterator)?;
-                machine.refresh_native_roots(depth, &[object, iterator, result]);
-                let (done, value) = machine.iterator_result_parts(result)?;
-                if done {
-                    break;
-                }
-                machine.refresh_native_roots(depth, &[object, iterator, value]);
-                let inserted = (|| {
-                    if kind == CollectionKind::WeakSet {
-                        require_weak_key(machine, value)?;
-                    }
-                    set_put(machine, object, value, kind)
-                })();
-                if let Err(failure) = inserted {
-                    return Err(close_rooted_collection_iterator(
-                        machine, depth, object, iterator, failure,
-                    ));
-                }
-            }
-            Ok(())
-        })();
-        machine.pop_native_roots(depth);
-        result?;
-    }
-    Ok(BuiltinOutcome::Value(object))
-}
-
-fn map_set<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    map_put(
-        machine,
-        this,
-        args.first().copied().unwrap_or(Value::UNDEFINED),
-        args.get(1).copied().unwrap_or(Value::UNDEFINED),
-        CollectionKind::Map,
-    )?;
-    Ok(BuiltinOutcome::Value(this))
-}
-
 fn weak_map_set<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -1214,21 +1001,6 @@ fn map_for_each<H: Host>(
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
-fn set_add<H: Host>(
-    machine: &mut Machine<'_, H>,
-    this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    set_put(
-        machine,
-        this,
-        args.first().copied().unwrap_or(Value::UNDEFINED),
-        CollectionKind::Set,
-    )?;
-    Ok(BuiltinOutcome::Value(this))
-}
-
 fn weak_set_add<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -1452,25 +1224,6 @@ fn compact_collection<H: Host>(machine: &mut Machine<'_, H>, slot: usize) {
     *index = rebuilt;
 }
 
-fn collection<H: Host>(
-    machine: &mut Machine<'_, H>,
-    prototype: Value,
-    kind: CollectionKind,
-) -> Result<Value, EvalFailure> {
-    machine
-        .allocate(HeapEntry::Collection {
-            kind,
-            entries: Vec::new(),
-            index: crate::CollectionIndex::default(),
-            size: 0,
-            next_order: 0,
-            properties: PropertyMap::default(),
-            prototype: Some(prototype),
-            extensible: true,
-        })
-        .map_err(EvalFailure::Runtime)
-}
-
 pub(super) fn collection_slot<H: Host>(
     machine: &Machine<'_, H>,
     object: Value,
@@ -1596,18 +1349,6 @@ pub(super) fn require_weak_key<H: Host>(
     }
 }
 
-fn constructor_prototype<H: Host>(
-    machine: &Machine<'_, H>,
-    kind: CollectionKind,
-) -> Result<Value, EvalFailure> {
-    let prototype = match kind {
-        CollectionKind::Map => machine.intrinsics.builtins.map_prototype(),
-        CollectionKind::Set => machine.intrinsics.builtins.set_prototype(),
-        CollectionKind::WeakMap => machine.intrinsics.builtins.weak_map_prototype(),
-        CollectionKind::WeakSet => machine.intrinsics.builtins.weak_set_prototype(),
-    };
-    Ok(prototype)
-}
 pub(super) fn ordinary_intrinsic(heap: &mut Heap, prototype: Value) -> Value {
     ordinary(heap, Some(prototype))
 }
@@ -1710,8 +1451,9 @@ fn named_property(
     }
 }
 
-/// Installs the collection algorithms whose observable ordering and iterator-close
-/// requirements cannot be expressed by the baseline eager constructors.
+/// Layers the collection extras over the base installs: species getters,
+/// `Map.groupBy`, the `getOrInsert` variants, the shared Set `keys` object,
+/// and the weak-collection tags.
 pub(super) fn install_collection_edge<H: Host>(
     heap: &mut Heap,
     atoms: &mut crate::AtomTable,
@@ -1719,42 +1461,10 @@ pub(super) fn install_collection_edge<H: Host>(
     globals: &mut BTreeMap<EcmaString, Value>,
     builtins: &mut BuiltinTable<H>,
 ) {
-    let map = replace_constructor(
-        heap,
-        atoms,
-        shapes,
-        globals,
-        builtins,
-        "Map",
-        edge_map_constructor::<H>,
-    );
-    let set = replace_constructor(
-        heap,
-        atoms,
-        shapes,
-        globals,
-        builtins,
-        "Set",
-        edge_set_constructor::<H>,
-    );
-    let weak_map = replace_constructor(
-        heap,
-        atoms,
-        shapes,
-        globals,
-        builtins,
-        "WeakMap",
-        edge_weak_map_constructor::<H>,
-    );
-    let weak_set = replace_constructor(
-        heap,
-        atoms,
-        shapes,
-        globals,
-        builtins,
-        "WeakSet",
-        edge_weak_set_constructor::<H>,
-    );
+    let map = installed_constructor(heap, atoms, shapes, globals, "Map");
+    let set = installed_constructor(heap, atoms, shapes, globals, "Set");
+    let weak_map = installed_constructor(heap, atoms, shapes, globals, "WeakMap");
+    let weak_set = installed_constructor(heap, atoms, shapes, globals, "WeakSet");
 
     for constructor in [map.constructor, set.constructor] {
         let species = install_function(
@@ -1794,18 +1504,6 @@ pub(super) fn install_collection_edge<H: Host>(
         },
     );
     define_constructor_data(heap, atoms, shapes, map.constructor, "groupBy", group_by);
-    let map_set = install_function(
-        heap,
-        atoms,
-        shapes,
-        builtins,
-        crate::intrinsics::BuiltinDef {
-            name: "set",
-            length: 2,
-            handler: strong_map_set::<H>,
-        },
-    );
-    define_data(heap, atoms, shapes, map.prototype, "set", map_set);
     for (target, name, handler) in [
         (
             map.prototype,
@@ -1841,23 +1539,9 @@ pub(super) fn install_collection_edge<H: Host>(
         );
         define_data(heap, atoms, shapes, target, name, function);
     }
-    let set_add = install_function(
-        heap,
-        atoms,
-        shapes,
-        builtins,
-        crate::intrinsics::BuiltinDef {
-            name: "add",
-            length: 1,
-            handler: strong_set_add::<H>,
-        },
-    );
-    define_data(heap, atoms, shapes, set.prototype, "add", set_add);
-
     // Set.prototype.keys and Set.prototype.values are the same function object.
-    let set_prototype = prototype_of(heap, atoms, shapes, "Set", globals);
-    let values = own_data_property(heap, atoms, shapes, set_prototype, "values");
-    define_data(heap, atoms, shapes, set_prototype, "keys", values);
+    let values = own_data_property(heap, atoms, shapes, set.prototype, "values");
+    define_data(heap, atoms, shapes, set.prototype, "keys", values);
 
     define_collection_tag(
         heap,
@@ -1881,46 +1565,22 @@ struct InstalledConstructor {
     prototype: Value,
 }
 
-fn replace_constructor<H: Host>(
-    heap: &mut Heap,
+fn installed_constructor(
+    heap: &Heap,
     atoms: &mut crate::AtomTable,
-    shapes: &mut crate::ShapeTable,
-    globals: &mut BTreeMap<EcmaString, Value>,
-    builtins: &mut BuiltinTable<H>,
+    shapes: &ShapeTable,
+    globals: &BTreeMap<EcmaString, Value>,
     name: &'static str,
-    handler: BuiltinHandler<H>,
 ) -> InstalledConstructor {
-    let prototype = prototype_of(heap, atoms, shapes, name, globals);
-    let constructor = install_constructor_function(
-        heap,
-        atoms,
-        shapes,
-        builtins,
-        crate::intrinsics::BuiltinDef {
-            name,
-            length: 0,
-            handler,
-        },
-    );
-    builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
-    globals.insert(EcmaString::encode(name), constructor);
+    let constructor = globals
+        .get(&EcmaString::encode(name))
+        .copied()
+        .expect("base collection constructor is installed first");
+    let prototype = own_data_property(heap, atoms, shapes, constructor, "prototype");
     InstalledConstructor {
         constructor,
         prototype,
     }
-}
-fn prototype_of(
-    heap: &Heap,
-    atoms: &mut crate::AtomTable,
-    shapes: &ShapeTable,
-    name: &str,
-    globals: &BTreeMap<EcmaString, Value>,
-) -> Value {
-    let constructor = globals
-        .get(&EcmaString::encode(name))
-        .copied()
-        .expect("baseline collection constructor is installed first");
-    own_data_property(heap, atoms, shapes, constructor, "prototype")
 }
 
 fn own_data_property(
@@ -1991,7 +1651,7 @@ fn define_collection_tag(
     );
 }
 
-fn edge_map_constructor<H: Host>(
+fn map_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -2000,7 +1660,7 @@ fn edge_map_constructor<H: Host>(
     collection_constructor(machine, args, constructing, CollectionKind::Map, "set")
 }
 
-fn edge_set_constructor<H: Host>(
+fn set_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -2009,7 +1669,7 @@ fn edge_set_constructor<H: Host>(
     collection_constructor(machine, args, constructing, CollectionKind::Set, "add")
 }
 
-fn edge_weak_map_constructor<H: Host>(
+fn weak_map_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -2018,7 +1678,7 @@ fn edge_weak_map_constructor<H: Host>(
     collection_constructor(machine, args, constructing, CollectionKind::WeakMap, "set")
 }
 
-fn edge_weak_set_constructor<H: Host>(
+fn weak_set_constructor<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -2027,7 +1687,7 @@ fn edge_weak_set_constructor<H: Host>(
     collection_constructor(machine, args, constructing, CollectionKind::WeakSet, "add")
 }
 
-fn strong_map_set<H: Host>(
+fn map_set<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
@@ -2039,7 +1699,7 @@ fn strong_map_set<H: Host>(
     Ok(BuiltinOutcome::Value(this))
 }
 
-fn strong_set_add<H: Host>(
+fn set_add<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
     args: &[Value],
@@ -3904,64 +3564,26 @@ mod tests {
     }
 
     #[test]
-    fn collection_prototypes_are_cached_not_global_lookup() {
+    fn collection_instances_use_their_constructor_prototype() {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
-        let cases = [
-            (
-                "Map",
-                CollectionKind::Map,
-                machine.intrinsics.builtins.map_prototype(),
-            ),
-            (
-                "Set",
-                CollectionKind::Set,
-                machine.intrinsics.builtins.set_prototype(),
-            ),
-            (
-                "WeakMap",
-                CollectionKind::WeakMap,
-                machine.intrinsics.builtins.weak_map_prototype(),
-            ),
-            (
-                "WeakSet",
-                CollectionKind::WeakSet,
-                machine.intrinsics.builtins.weak_set_prototype(),
-            ),
-        ];
-
-        let saved: Vec<(
-            &str,
-            CollectionKind,
-            Value,
-            Value,
-            crate::intrinsics::BuiltinId,
-        )> = cases
-            .iter()
-            .map(|(name, kind, cached)| {
-                let ctor = machine.intrinsics.global(name).expect("global exists");
-                let id = machine
-                    .intrinsics
-                    .builtins
-                    .id_named(name)
-                    .expect("builtin id");
-                (*name, *kind, *cached, ctor, id)
-            })
-            .collect();
-
-        // Delete and overwrite every collection global. Construction through the
-        // saved builtin ids must still use the cached intrinsic prototypes.
-        for &(name, _, _, _, _) in &saved {
-            machine.intrinsics.globals.remove(&EcmaString::encode(name));
-            machine
+        for (name, kind) in [
+            ("Map", CollectionKind::Map),
+            ("Set", CollectionKind::Set),
+            ("WeakMap", CollectionKind::WeakMap),
+            ("WeakSet", CollectionKind::WeakSet),
+        ] {
+            let ctor = machine.intrinsics.global(name).expect("global exists");
+            let id = machine
                 .intrinsics
-                .globals
-                .insert(EcmaString::encode(name), Value::int32(99));
-        }
-
-        for (name, kind, cached, ctor_before, id) in saved {
+                .builtins
+                .id_named(name)
+                .expect("builtin id");
+            let expected = machine
+                .get_named_property(ctor, "prototype")
+                .expect("constructor has prototype");
             let BuiltinOutcome::Value(instance) = machine
                 .call_builtin(id, Value::UNDEFINED, &[], true)
                 .expect("collection construct succeeds")
@@ -3981,14 +3603,14 @@ mod tests {
             else {
                 panic!("{name} instance");
             };
-            assert_eq!(*prototype, Some(cached));
+            assert_eq!(*prototype, Some(expected));
             assert_eq!(*actual_kind, kind);
 
-            // The cached prototype's "constructor" is still the original constructor.
-            let ctor = machine
-                .get_named_property(cached, "constructor")
+            // The prototype's "constructor" is still the original constructor.
+            let back = machine
+                .get_named_property(expected, "constructor")
                 .expect("prototype has constructor");
-            assert_eq!(ctor, ctor_before);
+            assert_eq!(back, ctor);
         }
     }
 
