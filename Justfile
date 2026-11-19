@@ -64,6 +64,7 @@ authority:
     cargo run --locked -p bamts-verification -- source fetch test262 --dest target/authority/test262
 
 ci-catalog: authority
+    cargo run --locked -p bamts-verification --bin bamts-verification -- authority verify --release typescript-7.0.2
     cargo run --locked -p bamts-verification --bin bamts-verification -- catalog regenerate --release typescript-7.0.2 --check
 
 ci-formal: ci-catalog
