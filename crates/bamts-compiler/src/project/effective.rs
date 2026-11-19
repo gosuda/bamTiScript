@@ -19,7 +19,7 @@ use crate::{
     source::{JsxEmit, SourceId, SourceText},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -404,12 +404,17 @@ pub fn compile_project<F: FileSystem + Clone>(
     }
     let jsx_route = program.jsx_routing_decision(ProgramOutputKind::JavaScript);
     let erased_exports = checked.erased_exports(&program);
+    let mut source_path_by_id: HashMap<SourceId, &Path> = HashMap::with_capacity(sources.len());
+    for source in sources.iter() {
+        source_path_by_id
+            .entry(source.id)
+            .or_insert(source.path.as_path());
+    }
     let mut outputs = BuildOutputs::default();
     for module in checked.modules() {
-        let source_path = sources
-            .iter()
-            .find(|source| source.id == module.source_file().source_id())
-            .map(|source| source.path.as_path())
+        let source_path = source_path_by_id
+            .get(&module.source_file().source_id())
+            .copied()
             .expect("frontend output retains every resolved module");
         let Some(planned) = planned_by_source.get(source_path) else {
             continue;

@@ -212,9 +212,7 @@ impl FrontendMode {
 
 fn dependencies_of(program: &ResolvedProgram, source_id: SourceId) -> &[ModuleEdge] {
     program
-        .modules()
-        .iter()
-        .find(|module| module.source_id() == source_id)
+        .module(source_id)
         .map_or(&[], |module| module.dependencies())
 }
 
@@ -414,6 +412,7 @@ impl ProgramFrontendOutput {
     pub fn erased_exports(&self, program: &ResolvedProgram) -> HashMap<SourceId, BTreeSet<String>> {
         let mut erased = HashMap::new();
         let mut exports = HashMap::new();
+        let by_source = self.module_index();
         for module in &self.modules {
             let source_id = module.source_file().source_id();
             self.resolve_erased_exports(
@@ -422,20 +421,32 @@ impl ProgramFrontendOutput {
                 &mut erased,
                 &mut exports,
                 &mut HashSet::new(),
+                &by_source,
             );
         }
         erased
+    }
+
+    fn module_index(&self) -> HashMap<SourceId, usize> {
+        let mut index = HashMap::with_capacity(self.modules.len());
+        for (position, module) in self.modules.iter().enumerate() {
+            index
+                .entry(module.source_file().source_id())
+                .or_insert(position);
+        }
+        index
     }
 
     fn cached_module_exports(
         &self,
         source_id: SourceId,
         cache: &mut HashMap<SourceId, ModuleExports>,
+        by_source: &HashMap<SourceId, usize>,
     ) -> Option<ModuleExports> {
         if cache.contains_key(&source_id) {
             return cache.get(&source_id).cloned();
         }
-        let module = self.module(source_id)?;
+        let module = by_source.get(&source_id).map(|&index| &self.modules[index])?;
         #[cfg(test)]
         record_module_exports_computation(source_id);
         cache.insert(
@@ -452,18 +463,19 @@ impl ProgramFrontendOutput {
         erased: &mut HashMap<SourceId, BTreeSet<String>>,
         exports_cache: &mut HashMap<SourceId, ModuleExports>,
         visiting: &mut HashSet<SourceId>,
+        by_source: &HashMap<SourceId, usize>,
     ) {
         if erased.contains_key(&source_id) {
             return;
         }
-        if self.module(source_id).is_none() {
+        if !by_source.contains_key(&source_id) {
             return;
         }
         // A cycle decides nothing: a name stays until something proves it erased.
         if !visiting.insert(source_id) {
             return;
         }
-        let Some(exports) = self.cached_module_exports(source_id, exports_cache) else {
+        let Some(exports) = self.cached_module_exports(source_id, exports_cache, by_source) else {
             return;
         };
         let mut names = exports.types;
@@ -475,7 +487,7 @@ impl ProgramFrontendOutput {
         for (exported, specifier, imported) in &exports.forwards {
             let target = local_dependency(program, source_id, specifier);
             if let Some(target) = target {
-                self.resolve_erased_exports(program, target, erased, exports_cache, visiting);
+                self.resolve_erased_exports(program, target, erased, exports_cache, visiting, by_source);
             }
             if target
                 .and_then(|target| erased.get(&target))
@@ -490,7 +502,7 @@ impl ProgramFrontendOutput {
         let mut star_values = BTreeSet::new();
         for specifier in &exports.stars {
             if let Some(target) = local_dependency(program, source_id, specifier) {
-                self.resolve_erased_exports(program, target, erased, exports_cache, visiting);
+                self.resolve_erased_exports(program, target, erased, exports_cache, visiting, by_source);
                 if let Some(target_exports) = exports_cache.get(&target) {
                     star_values.extend(target_exports.values.iter().cloned());
                 }
@@ -3531,9 +3543,7 @@ mod tests {
             .map(|module| {
                 let id = module.source_file().source_id();
                 let name = program
-                    .modules()
-                    .iter()
-                    .find(|resolved| resolved.source_id() == id)
+                    .module(id)
                     .map(|resolved| {
                         resolved
                             .path()
@@ -3589,6 +3599,39 @@ mod tests {
                 counts.get(&id),
                 Some(&1),
                 "exports of {id:?} computed {counts:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn module_lookup_returns_first_linear_match() {
+        let (root_path, program) = barrel_case();
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        for module in output.modules() {
+            let id = module.source_file().source_id();
+            let linear = output
+                .modules()
+                .iter()
+                .find(|output| output.source_file().source_id() == id)
+                .expect("module resolves linearly");
+            let indexed = output.module(id).expect("module resolves by index");
+            assert!(
+                std::ptr::eq(linear, indexed),
+                "index lookup must return the first linear match for {id:?}"
+            );
+        }
+        for module in program.modules() {
+            let id = module.source_id();
+            let linear = program
+                .modules()
+                .iter()
+                .find(|candidate| candidate.source_id() == id)
+                .expect("module resolves linearly");
+            let indexed = program.module(id).expect("module resolves by index");
+            assert!(
+                std::ptr::eq(linear, indexed),
+                "program index must return the first linear match for {id:?}"
             );
         }
         let _ = std::fs::remove_dir_all(root_path);
