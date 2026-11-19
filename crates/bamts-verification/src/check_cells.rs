@@ -22,7 +22,7 @@ use std::{
 
 use bamts_compiler::checker::{
     DeclarationOccurrence, ScopeKind, SemanticModel, SymbolId, SymbolKind, Type, TypeId,
-    render_type,
+    global_lib_decl_file, render_type,
 };
 use bamts_compiler::diagnostic::DiagnosticSeverity;
 use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
@@ -3601,10 +3601,16 @@ fn emit_unit_symbols(
         let index = symbol_id.get() as usize;
         let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
-        if matches!(symbol.kind(), SymbolKind::IntrinsicValue)
-            && (name == "undefined" || name == "globalThis")
-        {
-            return Some(format!("Symbol({name})"));
+        if matches!(
+            symbol.kind(),
+            SymbolKind::IntrinsicValue | SymbolKind::IntrinsicType
+        ) {
+            if name == "undefined" || name == "globalThis" {
+                return Some(format!("Symbol({name})"));
+            }
+            if let Some(file) = global_lib_decl_file(&name) {
+                return Some(format!("Symbol({name}, Decl({file}, --, --))"));
+            }
         }
         let anchors = if let Some(occurrence) = occurrence_anchors.get(&symbol_id) {
             // Occurrence-covered interface member: the Decl list unions this
@@ -6490,6 +6496,39 @@ export var v = 1;
         let case = compile_case(&units, &entry).expect("case compiles");
         let emitted = emit_symbols_baseline(&case, logical);
         let baseline = "//// [tests/cases/compiler/thisPin.ts] ////\n\n=== thisPin.ts ===\n++this;\n>this : Symbol(globalThis)\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+    /// Recorded Es5 globals render with their single lib Decl row.
+    #[test]
+    fn emit_symbols_baseline_renders_es5_global_with_lib_decl() {
+        let logical = "tests/cases/compiler/libGlobalPin.ts";
+        let case_text = "var e = eval(\"1\");\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/libGlobalPin.ts] ////\n\n=== libGlobalPin.ts ===\nvar e = eval(\"1\");\n>e : Symbol(e, Decl(libGlobalPin.ts, 0, 3))\n>eval : Symbol(eval, Decl(lib.es5.d.ts, --, --))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Recorded Dom globals render with their single lib Decl row.
+    #[test]
+    fn emit_symbols_baseline_renders_dom_global_with_lib_decl() {
+        let logical = "tests/cases/compiler/domGlobalPin.ts";
+        let case_text = "var w = window;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/domGlobalPin.ts] ////\n\n=== domGlobalPin.ts ===\nvar w = window;\n>w : Symbol(w, Decl(domGlobalPin.ts, 0, 3))\n>window : Symbol(window, Decl(lib.dom.d.ts, --, --))\n";
         assert_eq!(
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,

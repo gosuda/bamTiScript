@@ -545,6 +545,25 @@ impl GlobalEnvironment {
             .any(|entry| entry.name == name && !self.libs.contains(entry.lib))
     }
 }
+/// Maps a recorded global intrinsic to its single declaring lib file for `.symbols` rendering.
+#[must_use]
+pub fn global_lib_decl_file(name: &str) -> Option<&'static str> {
+    let lib = STANDARD_VALUES
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.lib)
+        .or_else(|| {
+            STANDARD_TYPES
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.lib)
+        })?;
+    match lib {
+        Lib::Es5 => Some("lib.es5.d.ts"),
+        Lib::Dom => Some("lib.dom.d.ts"),
+        _ => None,
+    }
+}
 
 const COMMONJS_WRAPPER_VALUES: &[&str] =
     &["module", "exports", "require", "__filename", "__dirname"];
