@@ -200,14 +200,25 @@ pub enum NarrowingGuard {
         negated: bool,
     },
     /// `reference === literal`. A loose `== null` comparison is represented
-    /// with `literal` as the `null | undefined` union.
+    /// with `literal` as the `null | undefined` union. `mode` records
+    /// whether the operator was `===`/`!==` or `==`/`!=`.
     Equality {
         reference: FlowKey,
         literal: TypeId,
         negated: bool,
+        mode: EqualityMode,
     },
     /// A bare reference used as a condition: truthiness narrowing.
     Truthiness { reference: FlowKey, negated: bool },
+}
+
+/// Whether an equality guard came from `===`/`!==` or `==`/`!=`. Loose
+/// equality narrows `unknown` less: `u == 42` leaves `u` unknown while
+/// `u === 42` narrows it to `42`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EqualityMode {
+    Strict,
+    Loose,
 }
 
 impl NarrowingGuard {
@@ -1113,8 +1124,11 @@ impl<'a> NarrowingContext<'a> {
                 property, negated, ..
             } => self.narrow_in(current, property, *negated),
             NarrowingGuard::Equality {
-                literal, negated, ..
-            } => self.narrow_equality(current, *literal, *negated),
+                literal,
+                negated,
+                mode,
+                ..
+            } => self.narrow_equality(current, *literal, *negated, *mode),
             NarrowingGuard::Truthiness { negated, .. } => self.narrow_truthiness(current, *negated),
         };
         if narrowed != current {
@@ -1195,6 +1209,20 @@ impl<'a> NarrowingContext<'a> {
     /// unchanged.
     #[must_use]
     pub fn narrow_typeof(&mut self, ty: TypeId, name: TypeofName, negated: bool) -> TypeId {
+        if matches!(self.table.get(ty), Type::Unknown) {
+            if negated {
+                return ty;
+            }
+            return match name {
+                TypeofName::String => self.table.string(),
+                TypeofName::Number => self.table.number(),
+                TypeofName::Boolean => self.table.boolean(),
+                TypeofName::BigInt => self.table.bigint(),
+                TypeofName::Symbol => self.table.symbol_type(),
+                TypeofName::Undefined => self.table.undefined_type(),
+                _ => ty,
+            };
+        }
         self.filter(ty, &|table, candidate| match candidate {
             Type::Named(_)
             | Type::Object
@@ -1250,9 +1278,33 @@ impl<'a> NarrowingContext<'a> {
     /// intersection (`x === "a"` narrows `string` to `"a"`); negative
     /// removes only the members the literal fully covers (`x !== "a"` drops
     /// the `"a"` member but keeps `string`). A `null | undefined` union
-    /// literal models loose `== null`.
+    /// literal models loose `== null`. Strict equality on `unknown` narrows
+    /// to the compared type when that type is not itself a union or
+    /// intersection; loose `==` leaves `unknown` untouched.
     #[must_use]
-    pub fn narrow_equality(&mut self, ty: TypeId, literal: TypeId, negated: bool) -> TypeId {
+    pub fn narrow_equality(
+        &mut self,
+        ty: TypeId,
+        literal: TypeId,
+        negated: bool,
+        mode: EqualityMode,
+    ) -> TypeId {
+        if !negated
+            && mode == EqualityMode::Strict
+            && matches!(self.table.get(ty), Type::Unknown)
+            && !matches!(
+                self.table.get(literal),
+                Type::Union(_)
+                    | Type::Intersection(_)
+                    | Type::Any
+                    | Type::Unknown
+                    | Type::Error
+                    | Type::Never
+                    | Type::Void
+            )
+        {
+            return literal;
+        }
         if negated {
             self.subtract(ty, literal)
         } else {
@@ -1718,9 +1770,7 @@ impl<'a> NarrowingContext<'a> {
                         // intersections narrow like the bare types they stand
                         // for.
                         let resolved = match self.table.get(member) {
-                            Type::AppliedAlias { .. } => {
-                                self.table.applied_alias_view(member)
-                            }
+                            Type::AppliedAlias { .. } => self.table.applied_alias_view(member),
                             Type::TypeQuery { target, .. } => Some(*target),
                             _ => None,
                         };
@@ -2134,13 +2184,27 @@ impl<'a> NarrowingContext<'a> {
         literal_side: &Expr,
         resolver: &dyn GuardResolver,
         negated: bool,
-        loose: bool,
+        loose_equality: bool,
     ) -> Option<NarrowingGuard> {
         let reference = flow_key_of(reference_side, resolver)?;
         let mut literal = self
             .literal_type(literal_side, resolver)
-            .or_else(|| self.undefined_identifier(literal_side, resolver))?;
-        if loose && matches!(self.table.get(literal), Type::Null | Type::Undefined) {
+            .or_else(|| self.undefined_identifier(literal_side, resolver))
+            .or_else(|| {
+                if loose_equality {
+                    return None;
+                }
+                let typed = resolver.expression_type(literal_side);
+                if matches!(
+                    self.table.get(typed),
+                    Type::Any | Type::Error | Type::Unknown | Type::Never | Type::Void
+                ) {
+                    None
+                } else {
+                    Some(typed)
+                }
+            })?;
+        if loose_equality && matches!(self.table.get(literal), Type::Null | Type::Undefined) {
             literal = self
                 .table
                 .union(&[self.table.null_type(), self.table.undefined_type()]);
@@ -2149,6 +2213,11 @@ impl<'a> NarrowingContext<'a> {
             reference,
             literal,
             negated,
+            mode: if loose_equality {
+                EqualityMode::Loose
+            } else {
+                EqualityMode::Strict
+            },
         })
     }
 
@@ -2436,21 +2505,123 @@ mod tests {
         let mut context = NarrowingContext::new(&mut table, &mut facts);
 
         // `x === "a"` narrows a union containing string to the literal.
-        assert_eq!(context.narrow_equality(union, a, false), a);
+        assert_eq!(
+            context.narrow_equality(union, a, false, EqualityMode::Strict),
+            a
+        );
         // `x !== "a"` removes only the exact literal member.
-        assert_eq!(context.narrow_equality(literal_union, a, true), b);
+        assert_eq!(
+            context.narrow_equality(literal_union, a, true, EqualityMode::Strict),
+            b
+        );
         // `x !== "a"` cannot subtract from the primitive: it stays whole.
-        assert_eq!(context.narrow_equality(string, a, true), string);
+        assert_eq!(
+            context.narrow_equality(string, a, true, EqualityMode::Strict),
+            string
+        );
         // Nullability: `x === null` keeps null, `x !== null` removes it.
-        assert_eq!(context.narrow_equality(nullable, null, false), null);
-        assert_eq!(context.narrow_equality(nullable, null, true), string);
+        assert_eq!(
+            context.narrow_equality(nullable, null, false, EqualityMode::Strict),
+            null
+        );
+        assert_eq!(
+            context.narrow_equality(nullable, null, true, EqualityMode::Strict),
+            string
+        );
         // A `null | undefined` union literal (loose `== null`) intersects to
         // exactly the nullish members and subtracts both.
-        assert_eq!(context.narrow_equality(nullish, nullish, false), nullish);
-        assert_eq!(context.narrow_equality(nullable, nullish, true), string);
+        assert_eq!(
+            context.narrow_equality(nullish, nullish, false, EqualityMode::Strict),
+            nullish
+        );
+        assert_eq!(
+            context.narrow_equality(nullable, nullish, true, EqualityMode::Strict),
+            string
+        );
         // Opaque input is never refined.
-        assert_eq!(context.narrow_equality(any, a, false), any);
-        assert_eq!(context.narrow_equality(any, a, true), any);
+        assert_eq!(
+            context.narrow_equality(any, a, false, EqualityMode::Strict),
+            any
+        );
+        assert_eq!(
+            context.narrow_equality(any, a, true, EqualityMode::Strict),
+            any
+        );
+    }
+
+    #[test]
+    fn strict_equality_narrows_unknown_to_the_compared_type() {
+        let mut table = TypeTable::new();
+        let (unknown, string, number, null, undefined) = (
+            table.unknown(),
+            table.string(),
+            table.number(),
+            table.null_type(),
+            table.undefined_type(),
+        );
+        let a = table.string_literal("a");
+        let union = table.union(&[string, number]);
+        let intersection = table.intersection(vec![string, number]);
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        assert_eq!(
+            context.narrow_equality(unknown, a, false, EqualityMode::Strict),
+            a
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, string, false, EqualityMode::Strict),
+            string
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, null, false, EqualityMode::Strict),
+            null
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, undefined, false, EqualityMode::Strict),
+            undefined
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, union, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, intersection, false, EqualityMode::Strict),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, a, false, EqualityMode::Loose),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_equality(unknown, a, true, EqualityMode::Strict),
+            unknown
+        );
+    }
+
+    #[test]
+    fn typeof_narrows_unknown_to_the_primitive_type() {
+        let mut table = TypeTable::new();
+        let (unknown, string, number) = (table.unknown(), table.string(), table.number());
+        let mut facts = FlowFacts::new();
+        let mut context = NarrowingContext::new(&mut table, &mut facts);
+
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::String, false),
+            string
+        );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::Number, false),
+            number
+        );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::String, true),
+            unknown
+        );
+        assert_eq!(
+            context.narrow_typeof(unknown, TypeofName::Object, false),
+            unknown
+        );
     }
 
     // ---- in narrowing -------------------------------------------------------
@@ -3080,6 +3251,63 @@ mod tests {
         assert_eq!(branch_type, Some(string));
     }
 
+    /// Reversed null and undefined guards narrow like their canonical
+    /// order: `null === x` keeps only null, `undefined !== x` drops only
+    /// undefined. Authority: nullOrUndefinedTypeGuardIsOrderIndependent.ts.
+    #[test]
+    fn null_or_undefined_guards_narrow_in_either_operand_order() {
+        let (parsed, checked) = check_text(
+            "function f(a: string | null, b: string | undefined) {\n\
+             if (null === a) { a; }\n\
+             if (undefined !== b) { b; } }",
+        );
+        let (source_file, model) = (parsed.product(), checked.product());
+        let mut tests = Vec::new();
+        if_tests(source_file.statements(), &mut tests);
+        let resolver = ModelResolver {
+            source: source_file,
+            model,
+            class_type: model.types().any(),
+        };
+        let mut table = model.types().clone();
+        let (null, string) = (table.null_type(), table.string());
+        let narrowed = {
+            let mut facts = FlowFacts::new();
+            let mut context = NarrowingContext::new(&mut table, &mut facts);
+            let guards = context.guards_from(tests[0], &resolver, false);
+            let [
+                NarrowingGuard::Equality {
+                    reference, negated, ..
+                },
+            ] = guards.as_slice()
+            else {
+                panic!("expected one equality guard, got {guards:?}");
+            };
+            assert!(!negated);
+            let a = reference.root_symbol();
+            context.declare(a, model.symbol_type(a));
+            let branch = context.branch(FlowNodeId::ROOT);
+            context.apply_guards(branch, &guards);
+            let first = context.type_at(branch, &FlowKey::root(a));
+            let guards = context.guards_from(tests[1], &resolver, false);
+            let [
+                NarrowingGuard::Equality {
+                    reference, negated, ..
+                },
+            ] = guards.as_slice()
+            else {
+                panic!("expected one equality guard, got {guards:?}");
+            };
+            assert!(negated);
+            let b = reference.root_symbol();
+            context.declare(b, model.symbol_type(b));
+            let branch = context.branch(FlowNodeId::ROOT);
+            context.apply_guards(branch, &guards);
+            (first, context.type_at(branch, &FlowKey::root(b)))
+        };
+        assert_eq!(narrowed, (Some(null), Some(string)));
+    }
+
     #[test]
     fn property_equality_discriminates_the_root_union() {
         let (parsed, checked) = check_text(
@@ -3107,6 +3335,7 @@ mod tests {
                     reference,
                     literal,
                     negated,
+                    ..
                 },
             ] = guards.as_slice()
             else {
@@ -3216,6 +3445,7 @@ mod tests {
                     reference,
                     literal,
                     negated,
+                    ..
                 },
             ] = guards.as_slice()
             else {
@@ -3319,18 +3549,21 @@ mod tests {
 
         // Equality: the error member survives subtraction and intersection.
         assert_eq!(
-            context.narrow_equality(nullable_or_error, null, true),
+            context.narrow_equality(nullable_or_error, null, true, EqualityMode::Strict),
             string_or_error
         );
         assert_eq!(
-            context.narrow_equality(nullable_or_error, null, false),
+            context.narrow_equality(nullable_or_error, null, false, EqualityMode::Strict),
             error_or_null
         );
         assert_eq!(
-            context.narrow_equality(string_or_error, a, false),
+            context.narrow_equality(string_or_error, a, false, EqualityMode::Strict),
             a_or_error
         );
-        assert_eq!(context.narrow_equality(a_or_error, a, true), error);
+        assert_eq!(
+            context.narrow_equality(a_or_error, a, true, EqualityMode::Strict),
+            error
+        );
 
         // Instanceof: the error member survives subtraction.
         assert_eq!(
