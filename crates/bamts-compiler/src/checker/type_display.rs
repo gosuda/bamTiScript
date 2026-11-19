@@ -723,20 +723,23 @@ fn render_object_into(
 /// Baseline proof: `tests/baselines/reference/numericLiteralTypes1.types`
 /// rows `>A2 : 1` (source `1.0`), `>A3 : 1` (source `1e0`), `>A4 : 1`
 /// (source `10e-1`).
+/// Non-finite baseline: `tests/baselines/reference/compiler/fakeInfinity1.types`
+/// rows `>PositiveInfinity : Infinity` (source `1e999`),
+/// `>NegativeInfinity : -Infinity` (source `-1e999`).
 /// Counterexample checked: `tests/baselines/reference/literalTypes1.types`
 /// row `>c2 : 100` (source `100`), confirming plain integers pass through.
 fn render_number_literal(text: &str) -> String {
     match number_value(text) {
-        Some(value) if value.is_finite() => {
+        Some(value) => {
             if value == 0.0 {
                 "0".to_owned()
-            } else if value == value.trunc() && value.abs() < 1e21 {
+            } else if value.is_finite() && value == value.trunc() && value.abs() < 1e21 {
                 format!("{value:.0}")
             } else {
                 format_number(value)
             }
         }
-        _ => text.to_owned(),
+        None => text.to_owned(),
     }
 }
 
@@ -861,8 +864,9 @@ fn render_string_literal(value: &EcmaString) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_signature, render_signature_declaration, render_string_literal, render_type,
-        render_type_annotated, render_type_declaration, render_type_grouped,
+        render_number_literal, render_signature, render_signature_declaration,
+        render_string_literal, render_type, render_type_annotated, render_type_declaration,
+        render_type_grouped,
     };
     use bamts_bytecode::EcmaString;
     use std::sync::Arc;
@@ -1030,6 +1034,27 @@ mod tests {
         assert_eq!(render_type(model, gg), "0.001");
         let hh = typed_expression_of(model, &source, "hh", text.find("let z8").unwrap());
         assert_eq!(render_type(model, hh), "1.5");
+    }
+
+    #[test]
+    fn nonfinite_number_literals_render_like_tsc() {
+        // Upstream baseline:
+        // tests/baselines/reference/compiler/fakeInfinity1.types
+        // rows `>PositiveInfinity : Infinity` (source `1e999`),
+        // `>NegativeInfinity : -Infinity` (source `-1e999`).
+        // Oracle (tsc 7.0.2, `const b: B = 'x'` with `type B = 1e-999`):
+        // `Type '"x"' is not assignable to type '0'`, and `type C = -0`
+        // reports `Type '"x"' is not assignable to type '0'`.
+        assert_eq!(render_number_literal("1e999"), "Infinity");
+        assert_eq!(render_number_literal("-1e999"), "-Infinity");
+        assert_eq!(render_number_literal("1e-999"), "0");
+        assert_eq!(render_number_literal("-0"), "0");
+        assert_eq!(render_number_literal("-0.0"), "0");
+        let text = "const a = 1e999;\nlet z = a;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+        let a = typed_expression_of(model, &source, "a", text.find("let z").unwrap());
+        assert_eq!(render_type(model, a), "Infinity");
     }
 
     /// The renderer reads `declared_return` before the semantic `return_type`,
