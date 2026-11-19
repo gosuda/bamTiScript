@@ -1765,7 +1765,6 @@ pub fn plan_relative_module(
     importer: impl AsRef<Path>,
     specifier: &str,
     flavor: ResolutionFlavor,
-    resolve_json_module: bool,
 ) -> Result<ResolutionPlan, ModuleResolutionError> {
     if specifier.is_empty() {
         return Err(ModuleResolutionError::EmptySpecifier);
@@ -1788,16 +1787,10 @@ pub fn plan_relative_module(
         })?;
     let requested = root.resolve_from(directory, specifier)?;
     let mut candidates = Vec::new();
-    append_file_candidates(
-        &mut candidates,
-        &requested,
-        flavor,
-        resolve_json_module,
-        specifier,
-    )?;
+    append_file_candidates(&mut candidates, &requested, flavor, specifier)?;
     if requested.extension().is_none() {
         let index = requested.join("index");
-        append_extensionless_candidates(&mut candidates, &index, flavor, resolve_json_module);
+        append_extensionless_candidates(&mut candidates, &index, flavor);
     }
     Ok(ResolutionPlan {
         specifier: Arc::from(specifier),
@@ -1809,12 +1802,10 @@ fn append_file_candidates(
     output: &mut Vec<PathBuf>,
     requested: &Path,
     flavor: ResolutionFlavor,
-    resolve_json_module: bool,
     specifier: &str,
 ) -> Result<(), ModuleResolutionError> {
     let Some(extension) = requested.extension().and_then(|value| value.to_str()) else {
-        append_unique(output, requested.to_path_buf());
-        append_extensionless_candidates(output, requested, flavor, resolve_json_module);
+        append_extensionless_candidates(output, requested, flavor);
         return Ok(());
     };
     let substitutions: &[&str] = match extension {
@@ -1847,30 +1838,21 @@ fn append_file_candidates(
     Ok(())
 }
 
-fn append_extensionless_candidates(
-    output: &mut Vec<PathBuf>,
-    stem: &Path,
-    flavor: ResolutionFlavor,
-    resolve_json_module: bool,
-) {
-    let runtime = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
-    if flavor == ResolutionFlavor::Types {
-        append_with_extension(output, stem, "d.ts");
-        append_with_extension(output, stem, "d.mts");
-        append_with_extension(output, stem, "d.cts");
-    }
-    for extension in runtime {
+fn append_extensionless_candidates(output: &mut Vec<PathBuf>, stem: &Path, flavor: ResolutionFlavor) {
+    // Oracle (tsc 7.0.2, empty-directory `--traceResolution` under nodenext CJS
+    // and bundler): an extensionless stem probes `ts, tsx, d.ts, js, jsx`, in
+    // that order, and never the bare stem itself, `mts/cts/mjs/cjs`, or `json`
+    // (a lone `foo.json` does not resolve, even with `resolveJsonModule`).
+    // `ResolutionFlavor::Types` hoists the declaration candidate first.
+    let ordered: &[&str] = match flavor {
+        ResolutionFlavor::Types => &["d.ts", "ts", "tsx", "js", "jsx"],
+        ResolutionFlavor::Runtime => &["ts", "tsx", "d.ts", "js", "jsx"],
+    };
+    for extension in ordered {
         append_with_extension(output, stem, extension);
     }
-    if flavor == ResolutionFlavor::Runtime {
-        append_with_extension(output, stem, "d.ts");
-        append_with_extension(output, stem, "d.mts");
-        append_with_extension(output, stem, "d.cts");
-    }
-    if resolve_json_module {
-        append_with_extension(output, stem, "json");
-    }
 }
+
 
 fn append_with_extension(output: &mut Vec<PathBuf>, path: &Path, extension: &str) {
     let mut candidate = path.to_path_buf();
@@ -2827,7 +2809,6 @@ mod tests {
             abs("/workspace/corpus/cases/dot-prop.ts"),
             "../projects/dot-prop/index.js",
             ResolutionFlavor::Runtime,
-            false,
         )
         .expect("relative JS plan");
         assert_eq!(
@@ -2845,7 +2826,6 @@ mod tests {
             abs("/workspace/corpus/cases/ohash.ts"),
             "../projects/ohash/src/crypto/node",
             ResolutionFlavor::Runtime,
-            false,
         )
         .expect("extension and index plan");
         let expected_index = abs("/workspace/corpus/projects/ohash/src/crypto/node/index.ts");
@@ -2853,6 +2833,67 @@ mod tests {
         assert_eq!(
             directory.select(|path| path.ends_with("index.ts")),
             Some(expected_index.as_path())
+        );
+    }
+
+    #[test]
+    fn relative_module_plan_extensionless_order_matches_upstream_probes() {
+        // Oracle (tsc 7.0.2, `--traceResolution` on an extensionless relative
+        // import with an empty directory present, nodenext CJS and bundler):
+        // the stem probes are `ts, tsx, d.ts, js, jsx`, then the same family
+        // under `index/`. The `duplicatePackage*` baselines show the same
+        // `a.ts, a.tsx, a.d.ts, index.ts, index.tsx, index.d.ts` preferred
+        // order for bare packages.
+        let project = root();
+        let plan = plan_relative_module(
+            &project,
+            abs("/workspace/corpus/cases/ohash.ts"),
+            "../projects/ohash/src/crypto/node",
+            ResolutionFlavor::Runtime,
+        )
+        .expect("extensionless plan");
+        let stem = abs("/workspace/corpus/projects/ohash/src/crypto/node");
+        let stem_candidate = |extension: &str| {
+            let mut path = stem.clone();
+            path.set_extension(extension);
+            path
+        };
+        let index_candidate = |extension: &str| {
+            let mut path = stem.join("index");
+            path.set_extension(extension);
+            path
+        };
+        assert_eq!(
+            plan.candidates(),
+            &[
+                stem_candidate("ts"),
+                stem_candidate("tsx"),
+                stem_candidate("d.ts"),
+                stem_candidate("js"),
+                stem_candidate("jsx"),
+                index_candidate("ts"),
+                index_candidate("tsx"),
+                index_candidate("d.ts"),
+                index_candidate("js"),
+                index_candidate("jsx"),
+            ]
+        );
+        let types_plan = plan_relative_module(
+            &project,
+            abs("/workspace/corpus/cases/ohash.ts"),
+            "../projects/ohash/src/crypto/node",
+            ResolutionFlavor::Types,
+        )
+        .expect("extensionless types plan");
+        assert_eq!(
+            &types_plan.candidates()[..5],
+            &[
+                stem_candidate("d.ts"),
+                stem_candidate("ts"),
+                stem_candidate("tsx"),
+                stem_candidate("js"),
+                stem_candidate("jsx"),
+            ]
         );
     }
 
@@ -2866,7 +2907,6 @@ mod tests {
                 &importer,
                 "node:fs",
                 ResolutionFlavor::Runtime,
-                false
             ),
             Err(ModuleResolutionError::BareSpecifier { .. })
         ));
@@ -2876,7 +2916,6 @@ mod tests {
                 &importer,
                 "./x.ts?raw",
                 ResolutionFlavor::Runtime,
-                false
             ),
             Err(ModuleResolutionError::UrlLikeSpecifier { .. })
         ));
@@ -2886,7 +2925,6 @@ mod tests {
                 &importer,
                 "../../outside",
                 ResolutionFlavor::Runtime,
-                false
             )
             .is_err()
         );

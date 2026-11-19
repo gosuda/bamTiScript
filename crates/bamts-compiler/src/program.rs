@@ -31,7 +31,7 @@ use crate::{
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
         resolution::{
             ModuleResolutionKind, ResolutionCache, ResolutionHost, ResolutionMode,
-            resolve_module_name, resolve_type_reference,
+            mode_for_importer, resolve_module_name, resolve_type_reference,
         },
     },
     scanner,
@@ -801,7 +801,6 @@ impl ProgramLoader {
             overlay_worklist: Vec::new(),
             type_overlays: Vec::new(),
             session_bytes: 0,
-            ambient,
             cancel,
         };
         let mut root_ids = Vec::with_capacity(canonical_roots.len());
@@ -914,13 +913,7 @@ impl ProgramLoader {
         })?;
         let specifier = format!("./{}", relative.to_string_lossy().replace('\\', "/"));
         let synthetic_importer = self.root.path().join("__bamts_program__.ts");
-        let plan = plan_relative_module(
-            &self.root,
-            synthetic_importer,
-            &specifier,
-            flavor,
-            self.options.resolve_json_module(),
-        )
+        let plan = plan_relative_module(&self.root, synthetic_importer, &specifier, flavor)
         .map_err(|source| ProgramLoadError::InvalidSpecifier {
             diagnostic: diagnostic(
                 self.root.path(),
@@ -987,6 +980,26 @@ impl ProgramLoader {
                 path: path.to_path_buf(),
                 source: file_system_io(error),
             }),
+        }
+    }
+
+    /// Derives the resolution mode for edges out of `path`. Under
+    /// `node16`/`nodenext` the importer decides: the extension first, then
+    /// the nearest `package.json` `type`, defaulting to CJS. Under every
+    /// other kind the mode follows the edge syntax through
+    /// [`ambient_resolution_mode`]: a plain `.ts` import resolves with
+    /// `import` conditions even though upstream prints `Resolving in CJS
+    /// mode` (tsc 7.0.2, Bundler default, `conditions 'import', 'types'`).
+    fn file_resolution_mode(&self, path: &Path) -> ResolutionMode {
+        let kind = ModuleResolutionKind::from_options(&self.options)
+            .unwrap_or(ModuleResolutionKind::Bundler);
+        match kind {
+            ModuleResolutionKind::Node16 | ModuleResolutionKind::NodeNext => {
+                mode_for_importer(&LoaderResolutionHost(self.fs.as_ref()), &self.root, path)
+            }
+            ModuleResolutionKind::Bundler | ModuleResolutionKind::Classic => {
+                ambient_resolution_mode(&self.options)
+            }
         }
     }
 
@@ -1253,13 +1266,7 @@ impl ProgramLoader {
             return self.resolve_classic_edge(importer, edge, flavor);
         }
         if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
-            let plan = plan_relative_module(
-                &self.root,
-                importer,
-                &edge.specifier,
-                flavor,
-                self.options.resolve_json_module(),
-            )
+            let plan = plan_relative_module(&self.root, importer, &edge.specifier, flavor)
             .map_err(|source| ProgramLoadError::InvalidSpecifier {
                 diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                 source,
@@ -1501,7 +1508,6 @@ struct LoadState<'a> {
     overlay_worklist: Vec<PathBuf>,
     type_overlays: Vec<(SourceId, usize, PathBuf)>,
     session_bytes: usize,
-    ambient: ResolutionMode,
     cancel: &'a CancellationToken,
 }
 
@@ -1654,8 +1660,9 @@ impl LoadState<'_> {
                     let parsed = parser::parse_with_cancel(scanned, self.cancel.clone())
                         .map_err(|_| cancelled_load(&path))?;
                     check_load_cancel(self.cancel, &path)?;
+                    let file_mode = self.loader.file_resolution_mode(&path);
                     let mut unresolved =
-                        collect_edges(parsed.product(), self.ambient).map_err(|range| {
+                        collect_edges(parsed.product(), file_mode).map_err(|range| {
                             ProgramLoadError::IllFormedModuleSpecifier {
                                 importer: path.clone(),
                                 range,
@@ -1678,7 +1685,7 @@ impl LoadState<'_> {
                     {
                         unresolved.push(UnresolvedEdge {
                             kind: ModuleEdgeKind::StaticRuntime,
-                            mode: self.ambient,
+                            mode: file_mode,
                             specifier: Arc::clone(specifier),
                             range: parsed.product().range(),
                             directive: None,
@@ -2844,11 +2851,13 @@ const fn edge_kind(flavor: ResolutionFlavor) -> ModuleEdgeKind {
     }
 }
 
-/// Derives the ambient module resolution mode from the module format option.
+/// Derives the program-global module resolution mode from the module format option.
 ///
-/// Edges without an explicit mode — plain imports, re-exports, dynamic
-/// imports, and synthetic JSX runtime demands — resolve with this mode. Only
-/// `import … = require(…)` pins [`ResolutionMode::Require`] per edge.
+/// The loader-wide `commonjs` flag and the synthetic JSX runtime import style use
+/// this mode, as does every per-file edge under `bundler`/`classic` through
+/// [`ProgramLoader::file_resolution_mode`]. Only under `node16`/`nodenext` do
+/// per-file edges resolve the importer instead; `import … = require(…)` still
+/// pins [`ResolutionMode::Require`] per edge in every kind.
 fn ambient_resolution_mode(options: &CompilerOptions) -> ResolutionMode {
     if options
         .module()
