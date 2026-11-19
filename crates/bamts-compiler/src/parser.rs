@@ -2433,9 +2433,9 @@ impl Parser {
                     let extra = self.parse_lhs_expression(LhsContext::Expression);
                     let _type_arguments = self.try_parse_type_arguments_in_heritage();
                     self.error_at(
-                        EXPECTED_TOKEN,
+                        DiagnosticCode::new("1174"),
                         extra.range(),
-                        "only one extends clause is allowed",
+                        "Classes can only extend a single class.",
                     );
                 }
             } else if self.at(TokenKind::KwImplements) {
@@ -8413,11 +8413,8 @@ mod tests {
         ] {
             let recovered = parse_ts(source);
             let diagnostics = errors(&recovered);
-            assert!(
-                diagnostics.iter().any(|d| d.code().as_str() == "1183"),
-                "expected TS1183 for {source:?}, got: {:?}",
-                diagnostics.iter().map(|d| (d.code().as_str(), d.message())).collect::<Vec<_>>()
-            );
+            let codes: Vec<_> = diagnostics.iter().map(|d| d.code().as_str()).collect();
+            assert_eq!(codes, ["1183"], "expected exactly TS1183 for {source:?}");
             let Statement::TypeAlias(alias) = recovered.product().statements()[0].data() else {
                 panic!("expected a type alias for {source:?}");
             };
@@ -8427,6 +8424,34 @@ mod tests {
             assert!(
                 matches!(object.members.as_slice(), [member] if matches!(member.data(), TypeMember::Method(_))),
                 "expected one method member for {source:?}"
+            );
+        }
+        for source in [
+            "type T = { get foo() { return 0 }; bar: string };",
+            "interface I { get foo() { return 0 }\nbar: string; }",
+        ] {
+            let recovered = parse_ts(source);
+            let diagnostics = errors(&recovered);
+            let codes: Vec<_> = diagnostics.iter().map(|d| d.code().as_str()).collect();
+            assert_eq!(codes, ["1183"], "expected exactly TS1183 for {source:?}");
+            let (members, len) = match recovered.product().statements()[0].data() {
+                Statement::TypeAlias(alias) => {
+                    let TypeNode::Object(object) = alias.type_node.data() else {
+                        panic!("expected an object type for {source:?}");
+                    };
+                    (object.members.as_slice(), 2)
+                }
+                Statement::Interface(declaration) => (declaration.members.as_slice(), 2),
+                _ => panic!("expected a type alias or interface for {source:?}"),
+            };
+            assert_eq!(members.len(), len, "the member after the body must survive for {source:?}");
+            assert!(
+                matches!(members[0].data(), TypeMember::Method(_)),
+                "expected a method member first for {source:?}"
+            );
+            assert!(
+                matches!(members[1].data(), TypeMember::Property(_)),
+                "expected a property member after the body for {source:?}"
             );
         }
     }
@@ -9448,16 +9473,31 @@ mod tests {
 
     #[test]
     fn heritage_list_continues_past_comma() {
-        let parsed = parse_ts("class C extends A, B {\n}");
+        let text = "class C extends A, B {\n}";
+        let parsed = parse_ts(text);
         let extra = errors(&parsed);
-        assert!(
-            extra.iter().any(|d| d.message() == "only one extends clause is allowed"),
-            "expected an extra-extends diagnostic, got: {:?}",
+        assert_eq!(
+            extra.len(),
+            1,
+            "expected exactly the extra-extends diagnostic, got: {:?}",
             extra.iter().map(|d| (d.code().as_str(), d.message())).collect::<Vec<_>>()
+        );
+        assert_eq!(extra[0].code().as_str(), "1174", "expected TS1174 for {text:?}");
+        assert_eq!(
+            extra[0].message(),
+            "Classes can only extend a single class.",
+            "expected the TS1174 template for {text:?}"
+        );
+        let at = text.find(", B").expect("extra expression") + 2;
+        assert_eq!(
+            (extra[0].range().start().get(), extra[0].range().end().get()),
+            (at, at + 1),
+            "the diagnostic anchors on the extra expression"
         );
         assert_clean("class C implements I, J {\n}");
         assert_clean("interface I extends A, B {\n}");
     }
+
     #[test]
     fn type_literal_accessors_parse_without_syntax_errors() {
         for text in [
@@ -9468,11 +9508,8 @@ mod tests {
         ] {
             let parsed = parse_ts(text);
             let diagnostics = errors(&parsed);
-            assert!(
-                diagnostics.iter().any(|d| d.code().as_str() == "1183"),
-                "expected TS1183 for {text:?}, got: {:?}",
-                diagnostics.iter().map(|d| (d.code().as_str(), d.message())).collect::<Vec<_>>()
-            );
+            let codes: Vec<_> = diagnostics.iter().map(|d| d.code().as_str()).collect();
+            assert_eq!(codes, ["1183"], "expected exactly TS1183 for {text:?}");
         }
         assert_clean("interface Z {\n    get foo(): number;\n}\n");
     }
