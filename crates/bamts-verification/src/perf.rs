@@ -987,6 +987,10 @@ fn load_baseline(path: Option<&Path>, host: &HostManifest) -> Result<Option<Base
 /// The peak is the resident-set peak on Linux, reset when the window opens, and
 /// the sampled physical-footprint peak on macOS, which can miss a spike shorter
 /// than a millisecond. A window cannot overlap another on Linux.
+/// The window opens before `work` runs: when it cannot start, `work` never
+/// runs and the setup error is returned. On Linux the reset needs a writable
+/// `/proc/self/clear_refs`, which a sandbox may deny while `VmHWM` stays
+/// readable; that denial surfaces as [`PerfErrorCode::HarnessError`].
 fn measure_peak<T>(work: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
     let window = bamts_platform::PeakWindow::start().map_err(platform_error)?;
     let output = work()?;
@@ -2538,26 +2542,67 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Whether this host can open a peak-memory window.
+    ///
+    /// On Linux the window resets the kernel high-water mark through
+    /// `/proc/self/clear_refs`, which a sandbox may deny while leaving
+    /// `VmHWM` readable. The probe runs the real open-and-close path, so it
+    /// stays correct on hosts that sample instead of resetting.
+    fn peak_window_available() -> bool {
+        match bamts_platform::PeakWindow::start() {
+            Ok(window) => window.finish().is_ok(),
+            Err(_) => false,
+        }
+    }
+
     #[test]
     fn the_peak_window_reports_a_touched_allocation() {
         const BYTES: usize = 64 * 1024 * 1024;
-        let (marker, peak) = measure_peak(|| {
-            let block = vec![1_u8; BYTES];
-            // Hold it long enough for the 1 ms macOS sampler to see it.
-            thread::sleep(Duration::from_millis(150));
-            assert_eq!(block.iter().filter(|byte| **byte == 1).count(), BYTES);
-            Ok("done")
-        })
-        .unwrap();
-        assert_eq!(marker, "done");
-        assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
+        if peak_window_available() {
+            let (marker, peak) = measure_peak(|| {
+                let block = vec![1_u8; BYTES];
+                // Hold it long enough for the 1 ms macOS sampler to see it.
+                thread::sleep(Duration::from_millis(150));
+                assert_eq!(block.iter().filter(|byte| **byte == 1).count(), BYTES);
+                Ok("done")
+            })
+            .unwrap();
+            assert_eq!(marker, "done");
+            assert!(peak >= BYTES as u64, "peak {peak} is below the allocation");
+        } else {
+            let error = measure_peak(|| Ok("done")).unwrap_err();
+            assert_eq!(error.code, PerfErrorCode::HarnessError);
+            assert!(
+                error.detail.contains("clear_refs"),
+                "the precondition names the missing capability: {error}"
+            );
+        }
     }
 
     #[test]
     fn a_failed_measurement_returns_the_work_error() {
-        let error =
-            measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) }).unwrap_err();
-        assert!(error.detail.contains("work failed"));
+        if peak_window_available() {
+            let error =
+                measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) })
+                    .unwrap_err();
+            assert!(error.detail.contains("work failed"));
+        } else {
+            // The window cannot start, so the work must never run: the setup
+            // error is the correct result, not the work error.
+            let error = measure_peak(|| -> Result<()> {
+                panic!("work ran although the peak window could not start")
+            })
+            .unwrap_err();
+            assert_eq!(error.code, PerfErrorCode::HarnessError);
+            assert!(
+                error.detail.contains("clear_refs"),
+                "the precondition names the missing capability: {error}"
+            );
+            assert!(
+                !error.detail.contains("work failed"),
+                "unstarted work reports no work error: {error}"
+            );
+        }
     }
 
     fn scripted(script: Vec<std::result::Result<u64, bamts_platform::PlatformError>>) -> u64 {
