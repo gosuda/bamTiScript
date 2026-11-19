@@ -12882,6 +12882,23 @@ class B extends A {
     }
 
     #[test]
+    fn boolean_wrapper_members_carry_their_declared_types() {
+        let wrong_target = check_text("declare const b: boolean; const n: number = b.toString();");
+        assert_eq!(
+            checker_codes(&wrong_target),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "{:?}",
+            wrong_target.diagnostics()
+        );
+        let right_target = check_text("declare const b: boolean; const s: string = b.toString();");
+        assert!(
+            checker_codes(&right_target).is_empty(),
+            "{:?}",
+            right_target.diagnostics()
+        );
+    }
+
+    #[test]
     fn boolean_symbol_and_bigint_wrappers_resolve() {
         let boolean = check_text("declare const b: boolean; b.toString();");
         assert!(
