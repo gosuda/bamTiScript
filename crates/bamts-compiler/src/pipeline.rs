@@ -690,6 +690,15 @@ fn tslib_helper_diagnostics_for_files(
     files: &[TslibHelperFile<'_>],
     context: &TslibHelperContext,
 ) -> HashMap<SourceId, Vec<Diagnostic>> {
+    let mut cache = TslibDiskCache::default();
+    tslib_helper_diagnostics_for_files_cached(files, context, &mut cache)
+}
+
+fn tslib_helper_diagnostics_for_files_cached(
+    files: &[TslibHelperFile<'_>],
+    context: &TslibHelperContext,
+    cache: &mut TslibDiskCache,
+) -> HashMap<SourceId, Vec<Diagnostic>> {
     let mut diagnostics: HashMap<SourceId, Vec<Diagnostic>> = HashMap::new();
     let mut reported: HashSet<(String, String)> = HashSet::new();
     for file in files {
@@ -726,7 +735,28 @@ fn tslib_helper_diagnostics_for_files(
                 ));
             continue;
         };
-        let exports = tslib_export_names(files, &target);
+        let exports = match tslib_export_names(files, &target, cache) {
+            Some(exports) => exports,
+            None => {
+                let span = sites[0].1;
+                let message = by_u32(2354)
+                    .and_then(|entry| entry.format(Args::new(["tslib"])).ok())
+                    .unwrap_or_else(|| {
+                        "This syntax requires an imported helper but module 'tslib' cannot be found."
+                            .to_owned()
+                    });
+                diagnostics
+                    .entry(file.source_id)
+                    .or_default()
+                    .push(Diagnostic::error(
+                        MISSING_TSLIB_MODULE,
+                        file.source_id,
+                        span,
+                        message,
+                    ));
+                continue;
+            }
+        };
         let identity = tslib_identity(files, &target);
         for (helper, span) in ordered_first_sites(&sites) {
             if exports.contains(helper) {
@@ -1881,44 +1911,77 @@ fn ambient_tslib_present(source: &SourceFile) -> bool {
     })
 }
 
+/// Parsed on-disk `tslib` export names keyed by canonical path, shared by every
+/// file of one [`compile_program_frontend`] call instead of re-reading and
+/// re-parsing per needing module. `None` records an unreadable copy so the
+/// failure reports TS2354 once per path.
+#[derive(Default)]
+struct TslibDiskCache {
+    names: HashMap<std::path::PathBuf, Option<std::collections::BTreeSet<String>>>,
+}
+
 /// Value export names of the resolved `tslib`, for the TS2343 presence check.
+/// Returns `None` when an on-disk copy cannot be used (non-regular, oversize,
+/// or unparseable), so the caller reports TS2354 instead of TS2343.
 fn tslib_export_names(
     files: &[TslibHelperFile<'_>],
     target: &TslibTarget,
-) -> std::collections::BTreeSet<String> {
-    let mut names = std::collections::BTreeSet::new();
-    let disk_source;
-    let source = match target {
-        TslibTarget::File(id) => files
-            .iter()
-            .find(|file| file.source_id == *id)
-            .map(|file| file.source),
-        TslibTarget::OnDisk(path) => {
-            disk_source = tslib_on_disk_source(path);
-            disk_source.as_ref()
-        }
-        TslibTarget::Ambient(id) => files
-            .iter()
-            .find(|file| file.source_id == *id)
-            .map(|file| file.source),
-    };
-    let Some(source) = source else {
-        return names;
-    };
+    cache: &mut TslibDiskCache,
+) -> Option<std::collections::BTreeSet<String>> {
     match target {
-        TslibTarget::File(_) | TslibTarget::OnDisk(_) => {
-            collect_value_exports(source, source.statements(), &mut names)
+        TslibTarget::File(id) => {
+            let source = files
+                .iter()
+                .find(|file| file.source_id == *id)
+                .map(|file| file.source)?;
+            let mut names = std::collections::BTreeSet::new();
+            collect_value_exports(source, source.statements(), &mut names);
+            Some(names)
         }
-        TslibTarget::Ambient(_) => collect_ambient_tslib_exports(source, &mut names),
+        TslibTarget::OnDisk(path) => {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if let Some(cached) = cache.names.get(&key) {
+                return cached.clone();
+            }
+            let names = tslib_on_disk_source(path).map(|source| {
+                let mut names = std::collections::BTreeSet::new();
+                collect_value_exports(&source, source.statements(), &mut names);
+                names
+            });
+            cache.names.insert(key, names.clone());
+            names
+        }
+        TslibTarget::Ambient(id) => {
+            let source = files
+                .iter()
+                .find(|file| file.source_id == *id)
+                .map(|file| file.source)?;
+            let mut names = std::collections::BTreeSet::new();
+            collect_ambient_tslib_exports(source, &mut names);
+            Some(names)
+        }
     }
-    names
 }
+
+/// Cap for an on-disk `tslib` read: far above the real package, bounding a
+/// hostile copy. Oversize reads report TS2354 instead of loading the file.
+const TSLIB_ON_DISK_READ_CAP: u64 = 16 * 1024 * 1024;
 
 /// Read and parse a `tslib` copy the loader never pulled into the program.
 /// Import-free `tslib` packages still satisfy `importHelpers`, so exports are
-/// collected from the file on disk.
+/// collected from the file on disk. Only regular files up to the read cap are
+/// used; anything else is `None` so the check reports TS2354.
 fn tslib_on_disk_source(path: &std::path::Path) -> Option<SourceFile> {
-    let text = std::fs::read_to_string(path).ok()?;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    use std::io::Read as _;
+    file.take(TSLIB_ON_DISK_READ_CAP + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > TSLIB_ON_DISK_READ_CAP {
+        return None;
+    }
     let source_id = SourceId::new(u32::MAX);
     let script_kind = match path.extension().and_then(|ext| ext.to_str()) {
         Some("ts" | "mts" | "cts") => ScriptKind::TypeScript,
@@ -1933,14 +1996,17 @@ fn tslib_on_disk_source(path: &std::path::Path) -> Option<SourceFile> {
 }
 
 /// Identity key for cross-file TS2343 deduplication: same helper from the same
-/// `tslib` copy reports once.
+/// `tslib` copy reports once. On-disk copies canonicalize so two probes of one
+/// file share an identity.
 fn tslib_identity(files: &[TslibHelperFile<'_>], target: &TslibTarget) -> String {
     match target {
         TslibTarget::File(id) => files.iter().find(|file| file.source_id == *id).map_or_else(
             || "tslib".to_owned(),
             |file| file.path.to_string_lossy().into_owned(),
         ),
-        TslibTarget::OnDisk(path) => path.to_string_lossy().into_owned(),
+        TslibTarget::OnDisk(path) => std::fs::canonicalize(path)
+            .map(|canonical| canonical.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
         TslibTarget::Ambient(id) => format!("ambient:{id:?}"),
     }
 }
@@ -2636,6 +2702,238 @@ mod tests {
         let reported = entry_diagnostics(&output, "TS2354");
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert_eq!(reported[0].0, 0, "{reported:?}");
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn oversize_or_non_regular_on_disk_tslib_is_unresolved() {
+        static NEXT_DISK_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "bamts-pipeline-tslib-disk-{}-{}",
+            std::process::id(),
+            NEXT_DISK_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create disk fixture");
+        let path = root.join("tslib.js");
+        std::fs::write(&path, "export function __awaiter() {}\n").expect("write small tslib");
+        assert!(
+            super::tslib_on_disk_source(&path).is_some(),
+            "a small regular tslib copy parses"
+        );
+        let big = "x".repeat(super::TSLIB_ON_DISK_READ_CAP as usize + 1);
+        std::fs::write(&path, big).expect("write oversize tslib");
+        assert!(
+            super::tslib_on_disk_source(&path).is_none(),
+            "an oversize tslib copy is unresolved (TS2354)"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("link.js");
+            symlink("/dev/null", &link).expect("link a non-regular file");
+            assert!(
+                super::tslib_on_disk_source(&link).is_none(),
+                "a non-regular tslib path is unresolved (TS2354)"
+            );
+        }
+        let dir_js = root.join("dir.js");
+        std::fs::create_dir_all(&dir_js).expect("create dir with js extension");
+        assert!(
+            super::tslib_on_disk_source(&dir_js).is_none(),
+            "a non-regular tslib path is unresolved (TS2354)"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn oversize_on_disk_tslib_reports_ts2354_not_ts2343() {
+        let (root_path, program) = tslib_case(
+            &[(
+                "main.ts",
+                "export {};\nexport async function foo(): Promise<void> {}\n",
+            )],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let tslib = root_path.join("node_modules/tslib/tslib.d.ts");
+        std::fs::create_dir_all(tslib.parent().expect("tslib has a parent"))
+            .expect("create tslib dir");
+        std::fs::write(
+            &tslib,
+            "x".repeat(super::TSLIB_ON_DISK_READ_CAP as usize + 1),
+        )
+        .expect("write oversize tslib");
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let missing = entry_diagnostics(&output, "TS2354");
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(
+            entry_diagnostics(&output, "TS2343").is_empty(),
+            "an unreadable copy is unresolved, not a missing helper"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn extends_helper_missing_reports_ts2343_with_es5_gating() {
+        let source = "export {};\nclass Base {}\nclass Child extends Base {}\n";
+        let missing = [(
+            "node_modules/tslib/tslib.d.ts",
+            "export const notAHelper: any;\n",
+        )];
+        let mut files: Vec<(&str, &str)> = vec![("main.ts", source)];
+        files.extend(missing);
+        let (root_path, program) = tslib_case(
+            &files,
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es5"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2343");
+        assert!(
+            reported.iter().any(|(_, message)| message.contains("__extends")),
+            "missing __extends reports TS2343: {reported:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+        let (root_path, program) = tslib_case(
+            &[("main.ts", source)],
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        assert!(entry_diagnostics(&output, "TS2354").is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn standard_decorator_helpers_missing_report_es_decorate() {
+        let source = "export {};\nfunction dec(value: any, context: any): any {}\n@dec class C {}\n";
+        let (root_path, program) = tslib_case(
+            &[
+                ("main.ts", source),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2343");
+        assert!(
+            reported.iter().any(|(_, message)| message.contains("__esDecorate")),
+            "missing __esDecorate reports TS2343: {reported:?}"
+        );
+        assert!(
+            reported.iter().any(|(_, message)| message.contains("__runInitializers")),
+            "missing __runInitializers reports TS2343: {reported:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn async_generator_helpers_follow_target_gating() {
+        let source = "export async function* g() {}\n";
+        let (root_path, program) = tslib_case(
+            &[
+                ("main.ts", source),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2343");
+        assert!(
+            reported.iter().any(|(_, message)| message.contains("__asyncGenerator")),
+            "missing __asyncGenerator reports TS2343: {reported:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+        let (root_path, program) = tslib_case(
+            &[("main.ts", source)],
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2018"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        assert!(entry_diagnostics(&output, "TS2354").is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn template_object_helper_needs_es5() {
+        let source = "export {};\nfunction tag(s: any): any {}\nconst v = tag`x`;\n";
+        let (root_path, program) = tslib_case(
+            &[
+                ("main.ts", source),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es5"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2343");
+        assert!(
+            reported.iter().any(|(_, message)| message.contains("__makeTemplateObject")),
+            "missing __makeTemplateObject reports TS2343: {reported:?}"
+        );
+        let _ = std::fs::remove_dir_all(root_path);
+        let (root_path, program) = tslib_case(
+            &[("main.ts", source)],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn missing_helper_reports_once_per_tslib_copy() {
+        let (root_path, program) = tslib_case(
+            &[
+                (
+                    "main.ts",
+                    "import './other';\nexport async function foo(): Promise<void> {}\n",
+                ),
+                (
+                    "other.ts",
+                    "export async function bar(): Promise<void> {}\n",
+                ),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let mut count = 0;
+        for module in output.modules() {
+            count += module
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code().as_str() == "TS2343"
+                        && diagnostic.message().contains("__awaiter")
+                })
+                .count();
+        }
+        assert_eq!(count, 1, "one TS2343 per helper per tslib copy");
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn helper_check_is_silent_without_import_helpers() {
+        let (root_path, program) = tslib_case(
+            &[(
+                "main.ts",
+                "export {};\nexport async function foo(): Promise<void> {}\n",
+            )],
+            r#"{"compilerOptions":{"module":"commonjs","target":"es2015"}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        assert!(entry_diagnostics(&output, "TS2354").is_empty());
         let _ = std::fs::remove_dir_all(root_path);
     }
 
