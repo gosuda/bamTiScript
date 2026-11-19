@@ -16,7 +16,7 @@ use crate::{
     pipeline::{FrontendMode, compile_program_frontend_with_lints},
     program::{JsxRoutingDecision, ProgramLoader, ProgramOutputKind},
     service::filesystem::{FileSystem, FileSystemError},
-    source::{JsxEmit, SourceId, SourceText},
+    source::{JsxEmit, SourceId, SourceText, TextRange, Utf16Pos},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -93,6 +93,9 @@ pub struct EffectiveProject {
     references: Arc<[ProjectReference]>,
     build_info_path: Option<PathBuf>,
     config: TsConfig,
+    /// The tsconfig text this project was loaded from, when one exists.
+    /// Diagnostics that must anchor inside the configuration read it.
+    config_source: Option<Arc<str>>,
 }
 
 impl EffectiveProject {
@@ -113,10 +116,11 @@ impl EffectiveProject {
             .map_err(ProjectCompileError::Path)?;
         // Direct CLI compilation supplies its own roots and no configuration
         // document: the effective options come only from the overrides.
-        let (raw, diagnostic_patterns) = match &request.source_files {
+        let (raw, diagnostic_patterns, config_source) = match &request.source_files {
             Some(_) => (
                 JsonObject::from_entries(Vec::new()),
                 DiagnosticPatterns::default(),
+                None,
             ),
             None => {
                 let source = match fs.read(&config_path) {
@@ -131,7 +135,9 @@ impl EffectiveProject {
                     }
                     Err(error) => return Err(ProjectCompileError::FileSystem(error)),
                 };
-                load_merged_raw(&root, &config_path, &source, fs)?
+                let (raw, patterns, merged_source) =
+                    load_merged_raw(&root, &config_path, &source, fs)?;
+                (raw, patterns, Some(merged_source))
             }
         };
         let raw = apply_overrides(&root, &cwd, raw, &request.overrides)?;
@@ -152,6 +158,7 @@ impl EffectiveProject {
             references: Arc::from(config.references()),
             build_info_path,
             config,
+            config_source,
         })
     }
 
@@ -183,6 +190,11 @@ impl EffectiveProject {
     #[must_use]
     pub fn build_info_path(&self) -> Option<&Path> {
         self.build_info_path.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) const fn config_source(&self) -> Option<&Arc<str>> {
+        self.config_source.as_ref()
     }
 
     #[must_use]
@@ -225,6 +237,9 @@ pub struct ProjectSource {
 pub struct ProjectCompileResult {
     pub diagnostics: Vec<Diagnostic>,
     pub sources: Arc<[ProjectSource]>,
+    /// The tsconfig text anchoring a positioned configuration diagnostic.
+    /// Rendering uses it for the file location; `--listFiles` never lists it.
+    pub tsconfig_source: Option<ProjectSource>,
     pub outputs: BuildOutputs,
     pub emitted: bool,
     pub up_to_date: bool,
@@ -237,9 +252,7 @@ pub fn compile_project<F: FileSystem + Clone>(
     options: &ProjectCompileOptions,
     fs: &F,
 ) -> Result<ProjectCompileResult, ProjectCompileError> {
-    if project.options().out_file().is_some() {
-        return compile_project_out_file(project, options, fs);
-    }
+    let (mut diagnostics, tsconfig_source) = removed_out_file_diagnostics(project);
     if project.options().source_map() && project.options().inline_source_map() {
         return Err(ProjectCompileError::UnsupportedOption {
             option: "sourceMap with inlineSourceMap",
@@ -348,8 +361,9 @@ pub fn compile_project<F: FileSystem + Clone>(
             &outputs_present,
         ) {
             return Ok(ProjectCompileResult {
-                diagnostics: Vec::new(),
+                diagnostics,
                 sources,
+                tsconfig_source: tsconfig_source.clone(),
                 outputs: BuildOutputs::default(),
                 emitted: false,
                 up_to_date: true,
@@ -363,11 +377,10 @@ pub fn compile_project<F: FileSystem + Clone>(
         FrontendMode::Check,
         &LintTable::new(LintProfile::Default),
     );
-    let mut diagnostics = checked
+    diagnostics.extend(checked
         .modules()
         .iter()
-        .flat_map(|module| module.diagnostics().iter().cloned())
-        .collect::<Vec<_>>();
+        .flat_map(|module| module.diagnostics().iter().cloned()));
     let pre_emit_errors = diagnostics
         .iter()
         .any(|diagnostic| !diagnostic.is_warning());
@@ -377,6 +390,7 @@ pub fn compile_project<F: FileSystem + Clone>(
         return Ok(ProjectCompileResult {
             diagnostics,
             sources,
+            tsconfig_source: tsconfig_source.clone(),
             outputs: BuildOutputs::default(),
             emitted: false,
             up_to_date: false,
@@ -476,6 +490,7 @@ pub fn compile_project<F: FileSystem + Clone>(
     Ok(ProjectCompileResult {
         diagnostics,
         sources,
+        tsconfig_source,
         outputs,
         emitted,
         up_to_date: false,
@@ -483,109 +498,244 @@ pub fn compile_project<F: FileSystem + Clone>(
     })
 }
 
-/// Loads, checks, and bundle-emits a materialized `outFile` project through
-/// the same shared program graph as [`compile_project`]. There is no
-/// per-file output plan: every retained input concatenates into the one
-/// bundle [`emit_out_file_javascript`] produces. The up-to-date shortcut
-/// does not apply to bundles; the build-info record is still refreshed so
-/// reference orchestration observes the emitted file.
-fn compile_project_out_file<F: FileSystem + Clone>(
+/// TypeScript 7.0.2 removed `outFile`: any project that still declares it
+/// compiles per-file and reports TS5102 at the option key. The diagnostic
+/// anchors at the `outFile` key when the loaded configuration text carries
+/// one, at `compilerOptions` when the loaded text carries that object but no
+/// `outFile` key, and unanchored otherwise (extended base or direct route).
+fn removed_out_file_diagnostics(
     project: &EffectiveProject,
-    options: &ProjectCompileOptions,
-    fs: &F,
-) -> Result<ProjectCompileResult, ProjectCompileError> {
-    let loader =
-        ProgramLoader::with_file_system(project.root(), project.options(), Arc::new(fs.clone()))
-            .map_err(|error| ProjectCompileError::Load(Arc::from(error.to_string())))?;
-    let program = loader
-        .load_roots(project.source_files())
-        .map_err(|error| ProjectCompileError::Load(Arc::from(error.to_string())))?;
-    let sources: Arc<[ProjectSource]> = program
-        .modules()
-        .iter()
-        .map(|module| ProjectSource {
-            id: module.source_id(),
-            path: module.path().to_path_buf(),
-            text: Arc::clone(module.source()),
-        })
-        .collect::<Vec<_>>()
-        .into();
-    let checked = compile_program_frontend_with_lints(
-        &program,
-        FrontendMode::Check,
-        &LintTable::new(LintProfile::Default),
+) -> (Vec<Diagnostic>, Option<ProjectSource>) {
+    if project.options().out_file().is_none() {
+        return (Vec::new(), None);
+    }
+    let catalog = crate::checker::diagnostic_messages::by_u32(5102)
+        .expect("TS5102 is in the generated catalog");
+    let range = out_file_diagnostic_range(project);
+    let diagnostic = Diagnostic::error(
+        catalog.diagnostic_code(),
+        SourceId::new(u32::MAX),
+        range,
+        catalog
+            .format(crate::checker::diagnostic_messages::Args::new(["outFile"]))
+            .expect("arity matches"),
     );
-    let mut diagnostics = checked
-        .modules()
-        .iter()
-        .flat_map(|module| module.diagnostics().iter().cloned())
-        .collect::<Vec<_>>();
-    let pre_emit_errors = diagnostics
-        .iter()
-        .any(|diagnostic| !diagnostic.is_warning());
-    let should_emit = options.emit && !project.options().no_emit();
-    if !should_emit || (project.options().no_emit_on_error() && pre_emit_errors) {
-        diagnostics.sort();
-        diagnostics.dedup();
-        return Ok(ProjectCompileResult {
-            diagnostics,
-            sources,
-            outputs: BuildOutputs::default(),
-            emitted: false,
-            up_to_date: false,
-            build_info: None,
-        });
+    (vec![diagnostic], out_file_diagnostic_source(project, range))
+}
+
+/// The tsconfig source anchoring `range`, when `range` points into the loaded
+/// configuration text. An empty range is unanchored: no source is returned
+/// so rendering prints a bare `error TS5102` with no file prefix.
+fn out_file_diagnostic_source(
+    project: &EffectiveProject,
+    range: TextRange,
+) -> Option<ProjectSource> {
+    if range == TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid") {
+        return None;
     }
-    if project.options().emit_declaration_only() {
-        return Err(ProjectCompileError::UnsupportedOption {
-            option: "emitDeclarationOnly with outFile",
-        });
-    }
-    if project.options().composite() {
-        return Err(ProjectCompileError::UnsupportedOption {
-            option: "composite with outFile",
-        });
-    }
-    if project.options().declaration() {
-        return Err(ProjectCompileError::UnsupportedOption {
-            option: "declaration with outFile",
-        });
-    }
-    let frontend = compile_program_frontend_with_lints(
-        &program,
-        FrontendMode::JavaScript,
-        &LintTable::new(LintProfile::Default),
-    );
-    let (bundle, bundle_diagnostics) =
-        bundle_javascript(&program, &frontend, &checked, project.options());
-    diagnostics.extend(bundle_diagnostics);
-    let bundle = bundle.map_err(ProjectCompileError::Emit)?;
-    diagnostics.sort();
-    diagnostics.dedup();
-    let mut outputs = BuildOutputs::default();
-    let emitted = if project.options().no_emit_on_error() && pre_emit_errors {
-        false
-    } else {
-        outputs
-            .files
-            .insert(bundle.path.clone(), bundle.code.into_bytes());
-        true
-    };
-    let build_info = build_state(project, &program, None, options)?.map(|(path, mut info)| {
-        if emitted {
-            info.outputs.insert(bundle.path.clone());
-        }
-        (path, info)
-    });
-    Ok(ProjectCompileResult {
-        diagnostics,
-        sources,
-        outputs,
-        emitted,
-        up_to_date: false,
-        build_info: build_info.filter(|_| emitted),
+    let source = Arc::clone(project.config_source()?);
+    let text = Arc::new(crate::source::SourceText::new(source).ok()?);
+    Some(ProjectSource {
+        id: SourceId::new(u32::MAX),
+        path: project.config_path().to_path_buf(),
+        text,
     })
 }
+
+/// The UTF-16 range anchoring the TS5102 `outFile` diagnostic: the `outFile`
+/// key inside `compilerOptions` when the loaded text declares it, else the
+/// `compilerOptions` key itself, else an empty range.
+fn out_file_diagnostic_range(project: &EffectiveProject) -> TextRange {
+    let empty = || TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid");
+    let Some(source) = project.config_source() else {
+        return empty();
+    };
+    let Some(compiler_options) = config_key_offset(source, "compilerOptions") else {
+        return empty();
+    };
+    let position = match config_object_value_offset(source, compiler_options) {
+        Some(value) => config_key_offset(&source[value..], "outFile")
+            .map_or(compiler_options, |offset| value + offset),
+        None => compiler_options,
+    };
+    let offset = super::tsconfig::utf16_offset(source, position);
+    TextRange::new(Utf16Pos::new(offset), Utf16Pos::new(offset)).expect("endpoints are ordered")
+}
+
+/// Byte offset of the value following the `key: ` pair whose key opens at
+/// `key_offset` (the opening-quote offset [`config_key_offset`] returned).
+fn config_object_value_offset(source: &str, key_offset: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = key_offset;
+    while bytes.get(index) != Some(&b'"') {
+        index += 1;
+    }
+    index += 1;
+    while bytes.get(index) != Some(&b'"') {
+        if bytes.get(index) == Some(&b'\\') {
+            index += 1;
+        }
+        index += 1;
+    }
+    index += 1;
+    skip_json_trivia(bytes, &mut index);
+    if bytes.get(index) != Some(&b':') {
+        return None;
+    }
+    index += 1;
+    skip_json_trivia(bytes, &mut index);
+    (bytes.get(index) == Some(&b'{')).then_some(index)
+}
+
+/// Byte offset of `key`'s opening quote among the top-level entries of the
+/// JSON object that starts at `source`. `source` begins at the opening brace
+/// of that object. Strings and comments are skipped; a key only counts when
+/// a colon follows it.
+fn config_key_offset(source: &str, key: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    skip_json_trivia(bytes, &mut index);
+    if bytes.get(index) != Some(&b'{') {
+        return None;
+    }
+    index += 1;
+    loop {
+        skip_json_trivia(bytes, &mut index);
+        match bytes.get(index) {
+            None => return None,
+            Some(b'}') => return None,
+            Some(b'"') => {
+                let start = index;
+                index += 1;
+                let mut closed = false;
+                while let Some(&byte) = bytes.get(index) {
+                    if byte == b'\\' {
+                        index += 2;
+                    } else if byte == b'"' {
+                        closed = true;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                let matches_key = source.get(start + 1..index) == Some(key);
+                index += 1;
+                skip_json_trivia(bytes, &mut index);
+                if bytes.get(index) != Some(&b':') {
+                    return None;
+                }
+                index += 1;
+                if matches_key {
+                    return Some(start);
+                }
+                skip_json_value(bytes, &mut index);
+                skip_json_trivia(bytes, &mut index);
+                if bytes.get(index) == Some(&b',') {
+                    index += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn skip_json_trivia(bytes: &[u8], index: &mut usize) {
+    loop {
+        match bytes.get(*index) {
+            Some(b' ' | b'\t' | b'\r' | b'\n') => *index += 1,
+            Some(b'/') if bytes.get(*index + 1) == Some(&b'/') => {
+                while let Some(&byte) = bytes.get(*index) {
+                    if byte == b'\n' {
+                        break;
+                    }
+                    *index += 1;
+                }
+            }
+            Some(b'/') if bytes.get(*index + 1) == Some(&b'*') => {
+                *index += 2;
+                while let Some(&byte) = bytes.get(*index) {
+                    if byte == b'*' && bytes.get(*index + 1) == Some(&b'/') {
+                        *index += 2;
+                        break;
+                    }
+                    *index += 1;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+fn skip_json_value(bytes: &[u8], index: &mut usize) {
+    skip_json_trivia(bytes, index);
+    match bytes.get(*index) {
+        Some(b'"') => {
+            *index += 1;
+            while let Some(&byte) = bytes.get(*index) {
+                if byte == b'\\' {
+                    *index += 2;
+                } else if byte == b'"' {
+                    *index += 1;
+                    return;
+                } else {
+                    *index += 1;
+                }
+            }
+        }
+        Some(b'{') | Some(b'[') => {
+            let (open, close) = if bytes[*index] == b'{' { (b'{', b'}') } else { (b'[', b']') };
+            let mut depth = 0usize;
+            loop {
+                match bytes.get(*index) {
+                    Some(b'"') => {
+                        *index += 1;
+                        let mut closed = false;
+                        while let Some(&byte) = bytes.get(*index) {
+                            if byte == b'\\' {
+                                *index += 2;
+                            } else if byte == b'"' {
+                                *index += 1;
+                                closed = true;
+                                break;
+                            } else {
+                                *index += 1;
+                            }
+                        }
+                        if !closed {
+                            return;
+                        }
+                    }
+                    Some(&byte) if byte == open => {
+                        depth += 1;
+                        *index += 1;
+                    }
+                    Some(&byte) if byte == close => {
+                        depth -= 1;
+                        *index += 1;
+                        if depth == 0 {
+                            return;
+                        }
+                    }
+                    Some(_) => *index += 1,
+                    None => return,
+                }
+            }
+        }
+        Some(_) => {
+            while let Some(&byte) = bytes.get(*index) {
+                if matches!(byte, b',' | b'}' | b']') {
+                    break;
+                }
+                *index += 1;
+            }
+        }
+        None => {}
+    }
+}
+
 
 /// One surface's source-map naming computed at the emitter boundary.
 struct SurfaceMapNames {
@@ -876,232 +1026,6 @@ fn per_module_emit_options(
     (emit_options, diagnostics)
 }
 
-/// Filename extensions the project loader reads as JavaScript sources. A
-/// bundle keeps them only under `allowJs`, matching the loader's own gate.
-const JS_INPUT_EXTENSIONS: [&str; 4] = [".js", ".jsx", ".mjs", ".cjs"];
-
-/// One `outFile` bundle: the single JavaScript file every input concatenates into.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OutFileBundle {
-    /// The output path the `outFile` option resolved to.
-    pub path: PathBuf,
-    /// The concatenated bundle text. When `sourceMap` is on it ends with one
-    /// `sourceMappingURL` comment and no trailing newline.
-    pub code: String,
-}
-
-/// Emits the `outFile` bundle JavaScript for an already resolved program.
-///
-/// Every module prints through the ordinary per-file emit in program order,
-/// so the concatenation is exactly the single-file AMD wrapper with one
-/// addition: under AMD, UMD, or System a module's factory carries the module name its
-/// source path takes relative to the common source directory, without the
-/// extension. A file without module syntax prints unwrapped, the way it
-/// prints alone. Under any other module kind only the script files join the
-/// bundle, because those formats cannot name a `define` and the manifest
-/// carries no output for them. With `sourceMap` on, one `sourceMappingURL`
-/// comment computed from the bundle path closes the file.
-///
-/// Declaration sources (`.d.ts`, `.d.mts`, `.d.cts`), JSON inputs, and
-/// JavaScript inputs without `allowJs` never join the bundle: upstream's
-/// output mapping produces no JavaScript for them. The bundle carries one
-/// `"use strict"` prologue at its top when `alwaysStrict` is on and at
-/// least one unwrapped script joins it.
-pub fn emit_out_file_javascript(
-    program: &crate::program::ResolvedProgram,
-    frontend: &crate::pipeline::ProgramFrontendOutput,
-    options: &CompilerOptions,
-) -> Result<OutFileBundle, Arc<str>> {
-    bundle_javascript(program, frontend, frontend, options).0
-}
-
-fn bundle_javascript(
-    program: &crate::program::ResolvedProgram,
-    frontend: &crate::pipeline::ProgramFrontendOutput,
-    checked: &crate::pipeline::ProgramFrontendOutput,
-    options: &CompilerOptions,
-) -> (Result<OutFileBundle, Arc<str>>, Vec<Diagnostic>) {
-    let Some(out_file) = options.out_file() else {
-        return (
-            Err(Arc::from("outFile bundle emit requires the outFile option")),
-            Vec::new(),
-        );
-    };
-    let wraps = |options: &EmitOptions| {
-        matches!(
-            options.module,
-            Some(ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System)
-        )
-    };
-    let kept: Vec<&crate::program::ResolvedModule> = program
-        .modules()
-        .iter()
-        .filter(|module| {
-            if super::output::is_declaration_source(module.path()) {
-                return false;
-            }
-            let name = module
-                .path()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if name.ends_with(".json") {
-                return false;
-            }
-            if JS_INPUT_EXTENSIONS
-                .iter()
-                .any(|extension| name.ends_with(extension))
-            {
-                return options.allow_js();
-            }
-            true
-        })
-        .collect();
-    let common_source_dir = bundle_common_source_dir(kept.iter().map(|module| module.path()));
-    let has_script = kept.iter().any(|module| {
-        frontend
-            .module(module.source_id())
-            .is_some_and(|output| !crate::checker::source_is_module(output.source_file()))
-    });
-    let erased_exports = checked.erased_exports(program);
-    let jsx_route = program.jsx_routing_decision(ProgramOutputKind::JavaScript);
-    let mut diagnostics = Vec::new();
-    let mut code = String::new();
-    if has_script && options.always_strict() {
-        code.push_str("\"use strict\";\n");
-    }
-    for module in &kept {
-        let Some(output) = frontend.module(module.source_id()) else {
-            return (
-                Err(Arc::from(format!(
-                    "outFile bundle emit has no frontend output for {}",
-                    module.path().display()
-                ))),
-                diagnostics,
-            );
-        };
-        let is_module = crate::checker::source_is_module(output.source_file());
-        let (mut emit_options, option_diagnostics) = per_module_emit_options(
-            options,
-            program,
-            checked,
-            &erased_exports,
-            jsx_route,
-            module.source_id(),
-        );
-        emit_options.declaration = false;
-        emit_options.declaration_map = false;
-        emit_options.source_map = false;
-        emit_options.inline_source_map = false;
-        emit_options.inline_sources = false;
-        emit_options.always_strict = false;
-        if is_module && wraps(&emit_options) {
-            emit_options.bundle_module_name = Some(Arc::from(bundle_module_name(
-                module.path(),
-                &common_source_dir,
-            )));
-        } else if is_module {
-            continue;
-        }
-        diagnostics.extend(option_diagnostics);
-        let source_name = Arc::from(module.path().to_string_lossy().as_ref());
-        let mut js_path = module.path().to_path_buf();
-        js_path.set_extension("js");
-        let names = EmitFileNames {
-            source_name,
-            js_file_name: Some(Arc::from(js_path.to_string_lossy().as_ref())),
-            ..EmitFileNames::default()
-        };
-        let emitted = emitter::emit_checked(
-            output.source_file(),
-            output.semantic_model(),
-            &emit_options,
-            &names,
-        );
-        diagnostics.extend(emitted.diagnostics.iter().cloned());
-        let Some(javascript) = emitted.javascript else {
-            return (
-                Err(Arc::from(format!(
-                    "outFile bundle emit produced no JavaScript for {}",
-                    module.path().display()
-                ))),
-                diagnostics,
-            );
-        };
-        code.push_str(&javascript.code);
-    }
-    if options.source_map() && !options.inline_source_map() {
-        let url = bundle_map_url(out_file, options, &common_source_dir);
-        code.push_str("//# sourceMappingURL=");
-        code.push_str(&url);
-    }
-    (
-        Ok(OutFileBundle {
-            path: out_file.to_path_buf(),
-            code,
-        }),
-        diagnostics,
-    )
-}
-
-/// The common source directory of the bundle inputs: the longest path prefix
-/// they share, which may sit above the project root when one input lives in
-/// a sibling directory.
-fn bundle_common_source_dir<'a>(paths: impl Iterator<Item = &'a Path>) -> PathBuf {
-    let mut common: Option<PathBuf> = None;
-    for path in paths {
-        let Some(parent) = path.parent() else {
-            continue;
-        };
-        common = Some(match common {
-            None => parent.to_path_buf(),
-            Some(previous) => previous
-                .components()
-                .zip(parent.components())
-                .take_while(|(left, right)| left == right)
-                .map(|(component, _)| component)
-                .collect::<PathBuf>(),
-        });
-    }
-    common.unwrap_or_default()
-}
-
-/// The AMD module name for one bundle input: its path relative to the common
-/// source directory without the extension, with forward slashes.
-fn bundle_module_name(source: &Path, common_source_dir: &Path) -> String {
-    let relative = source
-        .strip_prefix(common_source_dir)
-        .unwrap_or(source)
-        .to_string_lossy();
-    let stem = relative.rsplit_once('.').map_or(relative.as_ref(), |(stem, _)| stem);
-    stem.replace('\\', "/")
-}
-
-/// The `sourceMappingURL` the bundle's trailing comment carries: the map
-/// basename, or the `mapRoot`-resolved address when a root is configured.
-fn bundle_map_url(out_file: &Path, options: &CompilerOptions, common_source_dir: &Path) -> String {
-    let identity = format!(
-        "{}.map",
-        out_file
-            .file_name()
-            .map_or_else(|| String::from("out.js"), |name| name.to_string_lossy().into_owned())
-    );
-    match options.map_root().filter(|root| !root.is_empty()) {
-        Some(root) if is_url_like(root) || root.starts_with('/') => {
-            join_url_segments(root, &identity)
-        }
-        Some(root) => {
-            let base = common_source_dir.join(root);
-            let url = relative_path_between(
-                out_file.parent().unwrap_or_else(|| Path::new("")),
-                &base.join(&identity),
-            );
-            slash_text(&url)
-        }
-        None => identity,
-    }
-}
 
 /// What a Node module mode emits for one file: the extension decides, then the
 /// `type` of the nearest `package.json`, and a file with neither is CommonJS.
@@ -1432,7 +1356,7 @@ fn load_merged_raw(
     config_path: &Path,
     source: &str,
     fs: &dyn FileSystem,
-) -> Result<(JsonObject, DiagnosticPatterns), ProjectCompileError> {
+) -> Result<(JsonObject, DiagnosticPatterns, Arc<str>), ProjectCompileError> {
     let chain = resolve_extends(
         root,
         config_path,
@@ -1442,7 +1366,8 @@ fn load_merged_raw(
     )
     .map_err(ProjectCompileError::Config)?;
     let derived = parse_object(source).map_err(ProjectCompileError::Config)?;
-    merge_config_layers(root, &chain, config_path, &derived)
+    let (merged, patterns) = merge_config_layers(root, &chain, config_path, &derived)?;
+    Ok((merged, patterns, Arc::from(source)))
 }
 
 fn parse_object(source: &str) -> Result<JsonObject, TsConfigError> {
@@ -2157,7 +2082,7 @@ pub fn load_reference_closure(
                 ProjectCompileError::FileSystem(error)
             }
         })?;
-        let (raw, _) = load_merged_raw(root, &path, &source, fs)?;
+        let (raw, ..) = load_merged_raw(root, &path, &source, fs)?;
         let config =
             TsConfig::parse_value(root, &path, raw).map_err(ProjectCompileError::Config)?;
         let mut referenced = BTreeSet::new();
@@ -2582,352 +2507,91 @@ mod tests {
         ));
     }
 
-    fn out_file_bundle(
-        fixture: &Fixture,
-        filesystem: &OsFileSystem,
-    ) -> (ProjectCompileResult, String) {
-        let project =
-            EffectiveProject::load(&fixture.request("tsconfig.json"), filesystem).unwrap();
-        let result =
-            compile_project(&project, &ProjectCompileOptions::default(), filesystem).unwrap();
-        assert!(result.emitted);
-        let path = fixture.0.join("dist/bundle.js");
-        let code = std::str::from_utf8(&result.outputs.files[&path])
-            .expect("bundle is text")
-            .to_owned();
-        (result, code)
-    }
 
     #[test]
-    fn out_file_amd_bundle_names_two_modules_in_dependency_order() {
-        let fixture = Fixture::new();
-        fixture.write("src/b.ts", "export const b = 2;\n");
-        fixture.write(
-            "src/a.ts",
-            "import { b } from \"./b\";\nexport const a = b + 1;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","src/b.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        let dependency = code.find("define(\"b\"").expect("named b factory");
-        let importer = code.find("define(\"a\"").expect("named a factory");
-        assert!(dependency < importer);
-    }
-
-    #[test]
-    fn out_file_bundle_carries_one_strict_prologue_before_modules() {
+    fn removed_out_file_reports_positioned_ts5102_and_emits_per_file() {
         let fixture = Fixture::new();
         fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write("src/b.ts", "console.log(\"side\");\n");
         fixture.write(
             "tsconfig.json",
-            r#"{"files":["src/a.ts","src/b.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","alwaysStrict":true}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(code.starts_with("\"use strict\";\n"), "{code}");
-        assert_eq!(code.matches("\"use strict\";").count(), 2);
-        assert!(code.contains("define(\"a\""));
-    }
-
-    #[test]
-    fn out_file_commonjs_bundle_skips_modules() {
-        let fixture = Fixture::new();
-        fixture.write("src/b.ts", "export const b = 2;\n");
-        fixture.write(
-            "src/a.ts",
-            "import { b } from \"./b\";\nexport const a = b;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","src/b.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"commonjs"}}"#,
+            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js"}}"#,
         );
         let filesystem = fixture.filesystem();
         let project =
             EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
         let result =
             compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
-        let code = std::str::from_utf8(&result.outputs.files[&fixture.0.join("dist/bundle.js")])
-            .expect("bundle is text");
-        assert!(code.is_empty());
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code().as_str() == "5102")
+            .expect("TS5102 is reported");
+        assert_eq!(
+            diagnostic.message(),
+            "Option 'outFile' has been removed. Please remove it from your configuration."
+        );
+        assert!(result.tsconfig_source.is_some(), "positioned at the tsconfig key");
+        assert!(
+            result.outputs.files.contains_key(&fixture.0.join("src/a.js")),
+            "per-file output still emits: {:?}",
+            result.outputs.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !result.outputs.files.contains_key(&fixture.0.join("dist/bundle.js")),
+            "no bundle is produced"
+        );
     }
 
     #[test]
-    fn out_file_system_bundle_names_modules_in_dependency_order() {
-        let fixture = Fixture::new();
-        fixture.write("src/b.ts", "export const b = 2;\n");
-        fixture.write(
-            "src/a.ts",
-            "import { b } from \"./b\";\nexport const a = b;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","src/b.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"system"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        let dependency = code
-            .find("System.register(\"b\",")
-            .expect("named b register");
-        let importer = code
-            .find("System.register(\"a\",")
-            .expect("named a register");
-        assert!(dependency < importer, "{code}");
-    }
-
-    #[test]
-    fn out_file_emit_declaration_only_is_unsupported() {
+    fn removed_out_file_via_extends_is_unpositioned_and_emits_per_file() {
         let fixture = Fixture::new();
         fixture.write("src/a.ts", "export const a = 1;\n");
         fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","emitDeclarationOnly":true}}"#,
+            "base.json",
+            r#"{"compilerOptions":{"outFile":"out.js"}}"#,
         );
-        let filesystem = fixture.filesystem();
-        let project =
-            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
-        let error = compile_project(&project, &ProjectCompileOptions::default(), &filesystem)
-            .expect_err("emitDeclarationOnly outFile is rejected");
-        assert!(matches!(
-            error,
-            ProjectCompileError::UnsupportedOption {
-                option: "emitDeclarationOnly with outFile"
-            }
-        ));
-    }
-
-    #[test]
-    fn out_file_declaration_is_unsupported() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
         fixture.write(
             "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","declaration":true}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let project =
-            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
-        let error = compile_project(&project, &ProjectCompileOptions::default(), &filesystem)
-            .expect_err("declaration outFile is rejected");
-        assert!(matches!(
-            error,
-            ProjectCompileError::UnsupportedOption {
-                option: "declaration with outFile"
-            }
-        ));
-    }
-
-    #[test]
-    fn out_file_composite_is_unsupported() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","composite":true}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let project =
-            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
-        let error = compile_project(&project, &ProjectCompileOptions::default(), &filesystem)
-            .expect_err("composite outFile is rejected");
-        assert!(matches!(
-            error,
-            ProjectCompileError::UnsupportedOption {
-                option: "composite with outFile"
-            }
-        ));
-    }
-
-    #[test]
-    fn out_file_bundle_reports_emit_diagnostics() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export class C { #x = 1; }\n");
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","target":"es5"}}"#,
+            r#"{"extends":"./base.json","files":["src/a.ts"]}"#,
         );
         let filesystem = fixture.filesystem();
         let project =
             EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
         let result =
             compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
-        assert!(result.emitted);
         assert!(
             result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code()
-                    == emitter::transforms::codes::CLASS_REQUIRES_ES2015),
-            "{:?}",
-            result.diagnostics
+                .any(|diagnostic| diagnostic.code().as_str() == "5102"),
+            "TS5102 is reported"
         );
-    }
-
-    #[test]
-    fn out_file_bundle_elides_type_only_cross_file_imports() {
-        let fixture = Fixture::new();
-        fixture.write("src/types.ts", "export type T = number;\n");
-        fixture.write(
-            "src/a.ts",
-            "export { T } from \"./types\";\nexport const a = 1;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","src/types.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd"}}"#,
-        );
-        fixture.write(
-            "tsconfig.perfile.json",
-            r#"{"files":["src/a.ts","src/types.ts"],"compilerOptions":{"module":"amd"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let single = EffectiveProject::load(&fixture.request("tsconfig.perfile.json"), &filesystem)
-            .unwrap();
-        let single_result =
-            compile_project(&single, &ProjectCompileOptions::default(), &filesystem).unwrap();
-        let single_code = std::str::from_utf8(
-            &single_result.outputs.files[&fixture.0.join("src/a.js")],
-        )
-        .expect("per-file emit is text");
         assert!(
-            !single_code.contains("\"./types\""),
-            "per-file oracle elides the type-only re-export: {single_code}"
+            result.tsconfig_source.is_none(),
+            "extends-supplied outFile leaves the diagnostic unanchored"
         );
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
+        assert!(result.outputs.files.contains_key(&fixture.0.join("src/a.js")));
+    }
+
+    #[test]
+    fn removed_out_file_from_cli_override_is_unpositioned_on_direct_roots() {
+        let fixture = Fixture::new();
+        fixture.write("a.ts", "export const x = 1;\n");
+        let filesystem = fixture.filesystem();
+        let mut request = fixture.direct_request(&["a.ts"]);
+        request.overrides.out_file = Some(fixture.0.join("x.js"));
+        let project = EffectiveProject::load(&request, &filesystem).unwrap();
+        let result =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
         assert!(
-            code.contains("define(\"a\", [\"require\", \"exports\"]"),
-            "{code}"
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code().as_str() == "5102"),
+            "TS5102 is reported on the direct route"
         );
-    }
-
-    #[test]
-    fn out_file_bundle_honors_verbatim_module_syntax() {
-        let fixture = Fixture::new();
-        fixture.write("src/types.ts", "export type T = number;\n");
-        fixture.write(
-            "src/a.ts",
-            "import { T } from \"./types\";\nexport const a: T = 1;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","src/types.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","verbatimModuleSyntax":true}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(
-            code.contains("define(\"a\", [\"require\", \"exports\", \"./types\"]"),
-            "{code}"
-        );
-    }
-
-    #[test]
-    fn out_file_bundle_names_sibling_directories_by_relative_path() {
-        let fixture = Fixture::new();
-        fixture.write("lib/b.ts", "export const b = 2;\n");
-        fixture.write(
-            "src/a.ts",
-            "import { b } from \"../lib/b\";\nexport const a = b;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","lib/b.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(code.contains("define(\"lib/b\""), "{code}");
-        assert!(code.contains("define(\"src/a\""), "{code}");
-    }
-
-    #[test]
-    fn out_file_bundle_keeps_dotted_directory_names() {
-        let fixture = Fixture::new();
-        fixture.write("a.b/c.ts", "export const c = 1;\n");
-        fixture.write(
-            "a.b/d.ts",
-            "import { c } from \"./c\";\nexport const d = c;\n",
-        );
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["a.b/d.ts","a.b/c.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(code.contains("define(\"c\""), "{code}");
-        assert!(code.contains("define(\"d\""), "{code}");
-    }
-
-    #[test]
-    fn out_file_bundle_skips_declaration_inputs() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write("types/foo.d.mts", "export declare const x: number;\n");
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts","types/foo.d.mts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(code.contains("define(\"a\""), "{code}");
-        assert!(!code.contains("foo"), "{code}");
-    }
-
-    #[test]
-    fn out_file_bundle_closes_with_source_map_comment() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","sourceMap":true}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(code.ends_with("//# sourceMappingURL=bundle.js.map"), "{code}");
-    }
-
-    #[test]
-    fn out_file_bundle_resolves_map_url_through_map_root() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"outFile":"dist/bundle.js","module":"amd","sourceMap":true,"mapRoot":"https://cdn.example/"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let (_, code) = out_file_bundle(&fixture, &filesystem);
-        assert!(
-            code.ends_with("//# sourceMappingURL=https://cdn.example/bundle.js.map"),
-            "{code}"
-        );
-    }
-
-    #[test]
-    fn out_file_bundle_requires_the_option() {
-        let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write(
-            "tsconfig.json",
-            r#"{"files":["src/a.ts"],"compilerOptions":{"module":"amd"}}"#,
-        );
-        let filesystem = fixture.filesystem();
-        let project =
-            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
-        let loader = ProgramLoader::with_file_system(
-            project.root(),
-            project.options(),
-            Arc::new(filesystem),
-        )
-        .unwrap();
-        let program = loader.load_roots(project.source_files()).unwrap();
-        let frontend = compile_program_frontend_with_lints(
-            &program,
-            FrontendMode::JavaScript,
-            &LintTable::new(LintProfile::Default),
-        );
-        let error = emit_out_file_javascript(&program, &frontend, project.options())
-            .expect_err("bundle emit requires outFile");
-        assert_eq!(error.as_ref(), "outFile bundle emit requires the outFile option");
+        assert!(result.tsconfig_source.is_none(), "direct route has no tsconfig anchor");
+        assert!(result.outputs.files.contains_key(&fixture.0.join("a.js")));
     }
 
     #[test]

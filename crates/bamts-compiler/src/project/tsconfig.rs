@@ -595,7 +595,7 @@ fn package_extends_path(specifier: &str) -> String {
     }
 }
 
-fn utf16_offset(source: &str, byte: usize) -> usize {
+pub(crate) fn utf16_offset(source: &str, byte: usize) -> usize {
     let mut u16_pos = 0;
     for (i, ch) in source.char_indices() {
         if i >= byte {

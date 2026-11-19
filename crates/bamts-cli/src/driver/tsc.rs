@@ -153,10 +153,13 @@ pub(super) fn execute_tsc_in_context(
     }
     // JavaScript-artifact emission — declarations, source maps, and
     // multi-root programs — routes through the canonical project pipeline
-    // over one inferred configuration-free project. The remaining
-    // single-root compile keeps the native executable driver, which only
-    // maps '--jsx preserve'.
+    // over one inferred configuration-free project. TypeScript 7.0.2 removed
+    // `outFile`: a direct `--outFile` still compiles per-file through that
+    // pipeline so the TS5102 diagnostic flows from `compile_project`. The
+    // remaining single-root compile keeps the native executable driver, which
+    // only maps '--jsx preserve'.
     let artifact_route = command.file_names.len() > 1
+        || command.option_str("outFile").is_some()
         || (!command.flag("noEmit") && (command.flag("declaration") || command.flag("sourceMap")));
     if !artifact_route
         && command

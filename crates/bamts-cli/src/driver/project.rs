@@ -210,10 +210,7 @@ pub(super) fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOver
         out_dir: command.option_str("outDir").map(PathBuf::from),
         root_dir: command.option_str("rootDir").map(PathBuf::from),
         map_root: command.option_str("mapRoot").map(Arc::from),
-        out_file: command
-            .option_str("outFile")
-            .or_else(|| command.option_str("out"))
-            .map(PathBuf::from),
+        out_file: command.option_str("outFile").map(PathBuf::from),
         always_strict: boolean("alwaysStrict"),
         ts_build_info_file: command.option_str("tsBuildInfoFile").map(PathBuf::from),
         strict: boolean("strict"),
@@ -307,7 +304,7 @@ pub(super) fn project_result_outcome(
         .iter()
         .map(|source| slash_text(&source.path))
         .collect::<Vec<_>>();
-    let sources = result
+    let mut sources = result
         .sources
         .iter()
         .zip(&names)
@@ -317,6 +314,17 @@ pub(super) fn project_result_outcome(
             text: &source.text,
         })
         .collect::<Vec<_>>();
+    let tsconfig_name = result
+        .tsconfig_source
+        .as_ref()
+        .map(|tsconfig| slash_text(&tsconfig.path));
+    if let (Some(tsconfig), Some(name)) = (&result.tsconfig_source, &tsconfig_name) {
+        sources.push(DiagnosticSource {
+            id: tsconfig.id,
+            name,
+            text: &tsconfig.text,
+        });
+    }
     let format = if command.pretty() {
         TscDiagnosticFormat::Pretty
     } else {
