@@ -309,7 +309,8 @@ fn shared_lib_target(value: &str) -> Option<&str> {
 /// Only the prologue counts, mirroring the compiler's own loader
 /// (`collect_reference_directives` scans tokens up to the first statement
 /// and honors only `LineComment` tokens, rejecting a fourth slash): a
-/// `////` line is inert, a directive after the first compiled line is
+/// `////` line is inert, `Unknown` tokens stay trivia as in the parser,
+/// and a directive after the first compiled line is
 /// inert, and block-comment bodies never name a target. The scan is a
 /// small state machine over the prologue: a `#!` shebang counts only as
 /// the first line, block comments may span lines, closing `*/` resumes
@@ -323,7 +324,7 @@ pub(super) fn shared_lib_refs(text: &str) -> Vec<String> {
     let scanned = scanned.into_product();
     for token in scanned.tokens() {
         match token.kind() {
-            TokenKind::Whitespace | TokenKind::Shebang | TokenKind::BlockComment => {}
+            TokenKind::Whitespace | TokenKind::Shebang | TokenKind::BlockComment | TokenKind::Unknown => {}
             TokenKind::LineComment => {
                 let Some(comment) = scanned.token_text(token) else {
                     continue;
