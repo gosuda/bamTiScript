@@ -22197,6 +22197,17 @@ impl<'src> Binder<'src> {
             if let Some(&symbol) = self.signature_parameter_symbols.get(&parameter.name.id()) {
                 self.symbol_types[symbol.get() as usize] = type_id;
                 self.type_state[symbol.get() as usize] = TypeState::Done(type_id);
+            } else {
+                let nested_name = self.identifier_text(&parameter.name);
+                let nested = self.declare(
+                    nested_name.as_ref(),
+                    SymbolKind::Parameter,
+                    child,
+                    parameter.name.id(),
+                    parameter.name.range(),
+                );
+                self.symbol_types[nested.get() as usize] = type_id;
+                self.type_state[nested.get() as usize] = TypeState::Done(type_id);
             }
             parameters.push(FunctionParameter::new(
                 self.identifier_text(&parameter.name).into_owned(),
