@@ -1114,6 +1114,13 @@ impl<'table> TypeRelations<'table> {
                             .expect("guard checked constraint");
                         self.relates(constraint, target, strictness)
                     }
+                    Type::Never => true,
+                    Type::Intersection(sources) => sources
+                        .iter()
+                        .any(|member| self.relates(*member, target, strictness)),
+                    Type::Union(sources) => sources
+                        .iter()
+                        .all(|member| self.relates(*member, target, strictness)),
                     _ => false,
                 }
             }
@@ -2924,6 +2931,38 @@ mod tests {
         assert!(relations.assignable(v, t));
         assert!(!relations.assignable(foo_constraint, t));
         assert!(relations.assignable(t, t));
+    }
+
+    #[test]
+    fn type_parameter_targets_accept_never_and_decompose_composite_sources() {
+        let mut table = TypeTable::new();
+        let foo_constraint =
+            table.object_type(vec![PropertyType::new("foo", false, table.string())]);
+        let t_symbol = SymbolId::new(721);
+        let u_symbol = SymbolId::new(722);
+        let v_symbol = SymbolId::new(723);
+        table.set_type_parameter_constraint(t_symbol, foo_constraint);
+        table.set_type_parameter_constraint(u_symbol, foo_constraint);
+        let v_constraint = table.named(t_symbol);
+        table.set_type_parameter_constraint(v_symbol, v_constraint);
+        let (t, u, v) = (
+            table.named(t_symbol),
+            table.named(u_symbol),
+            table.named(v_symbol),
+        );
+        let string = table.string();
+        let never = table.never();
+        let t_and_string = table.intersection(vec![t, string]);
+        let u_and_string = table.intersection(vec![u, string]);
+        let t_or_v = table.union(&[t, v]);
+        let t_or_u = table.union(&[t, u]);
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.assignable(never, t));
+        assert!(relations.assignable(t_and_string, t));
+        assert!(!relations.assignable(u_and_string, t));
+        assert!(relations.assignable(t_or_v, t));
+        assert!(!relations.assignable(t_or_u, t));
     }
 
     #[test]
