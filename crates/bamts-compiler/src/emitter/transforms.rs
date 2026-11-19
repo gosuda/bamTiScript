@@ -17596,6 +17596,86 @@ console.log(JSON.stringify([bar, bar4, log]));
             "{code}"
         );
     }
+    #[test]
+    fn private_destructured_array_evaluates_rhs_before_receiver() {
+        let output = emit_at(
+            "class C {\n    #x = 0;\n    m(holder: any, rhs: any) {\n        [holder.c.#x] = [rhs()];\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("__classPrivateFieldSet("),
+            "private write routes through the setter: {code}"
+        );
+        assert!(
+            !code.contains("__classPrivateFieldSet(holder.c,"),
+            "composite receiver is captured, not inlined: {code}"
+        );
+        assert!(
+            !code.contains("#x"),
+            "no raw private name survives lowering: {code}"
+        );
+        let rhs = code.find("rhs()").unwrap_or_else(|| panic!("rhs call emits: {code}"));
+        let receiver = code.find("holder.c").unwrap_or_else(|| panic!("receiver emits: {code}"));
+        assert!(
+            rhs < receiver,
+            "right-hand side runs before the receiver capture: {code}"
+        );
+    }
+
+    #[test]
+    fn private_destructured_object_keeps_outer_this() {
+        let output = emit_at(
+            "class C {\n    #x = 0;\n    m(rhs: any) {\n        ({ a: this.#x } = rhs());\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            !code.contains("__classPrivateFieldSet(this,"),
+            "`this` must be captured outside the setter body: {code}"
+        );
+        assert!(
+            code.contains("__classPrivateFieldSet("),
+            "private write routes through the setter: {code}"
+        );
+        assert!(
+            !code.contains("#x"),
+            "no raw private name survives lowering: {code}"
+        );
+        let rhs = code.find("rhs()").unwrap_or_else(|| panic!("rhs call emits: {code}"));
+        let receiver = code.find("= this").unwrap_or_else(|| panic!("this capture emits: {code}"));
+        assert!(
+            rhs < receiver,
+            "right-hand side runs before the receiver capture: {code}"
+        );
+    }
+
+    #[test]
+    fn private_destructured_nested_parenthesized_target_lowers() {
+        let output = emit_at(
+            "class C {\n    #x = 0;\n    m(holder: any, rhs: any) {\n        [{ a: (holder.p.#x) }] = [rhs()];\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("__classPrivateFieldSet("),
+            "parenthesized target still lowers: {code}"
+        );
+        assert!(
+            !code.contains("__classPrivateFieldSet(holder.p,"),
+            "composite receiver is captured, not inlined: {code}"
+        );
+        assert!(
+            !code.contains("#x"),
+            "no raw private name survives lowering: {code}"
+        );
+        let rhs = code.find("rhs()").unwrap_or_else(|| panic!("rhs call emits: {code}"));
+        let receiver = code.find("holder.p").unwrap_or_else(|| panic!("receiver emits: {code}"));
+        assert!(
+            rhs < receiver,
+            "right-hand side runs before the receiver capture: {code}"
+        );
+    }
 
     #[test]
     fn private_field_helpers_print_in_first_use_order() {
