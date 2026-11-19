@@ -197,7 +197,7 @@ impl Walker<'_> {
             ForBinding::Variable(declaration) => {
                 self.walk_var_declaration(declaration, declaration.range);
             }
-            ForBinding::Target(_) => {}
+            ForBinding::Target(target) => self.walk_target_reads(target),
         }
     }
 
@@ -1347,6 +1347,30 @@ mod tests {
             "{outcome:?}"
         );
         assert!(outcome.params.is_empty(), "{outcome:?}");
+    }
+    #[test]
+    fn for_in_target_computed_key_nested_body_reports_unused() {
+        let text = "let o: any; let obj: any; for (o[(() => { const z = 1; return \"k\"; })()] in obj) {}";
+        let outcome = check(text);
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        let expected = text.find("const z").expect("z declaration") + "const ".len();
+        assert_eq!(
+            outcome.locals[0].range().start().get(),
+            expected,
+            "{outcome:?}"
+        );
+    }
+    #[test]
+    fn for_of_target_destructuring_default_nested_body_reports_unused() {
+        let text = "let x: any; let items: any[][] = []; for ([x = (() => { const z = 1; return 1; })()] of items) {} x;";
+        let outcome = check(text);
+        assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
+        let expected = text.find("const z").expect("z declaration") + "const ".len();
+        assert_eq!(
+            outcome.locals[0].range().start().get(),
+            expected,
+            "{outcome:?}"
+        );
     }
     #[test]
     fn update_target_computed_key_nested_body_reports_unused() {
