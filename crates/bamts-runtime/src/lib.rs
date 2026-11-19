@@ -41,7 +41,7 @@ use bamts_bytecode::{
 pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
 use heap::Heap;
-use intrinsics::builtins::typedarray_all::{self, ElementKind, LengthSlot};
+use intrinsics::builtins::typedarray::{self, ElementKind, LengthSlot};
 
 mod external_modules;
 mod gc;
@@ -9690,11 +9690,11 @@ impl<'a, H: Host> Machine<'a, H> {
             if let PropertyKey::Named(name) = key
                 && let HeapEntry::TypedArray { .. } = &self.heap[node]
                 && let Some(typed_index) =
-                    typedarray_all::typed_array_index(self.atoms.resolve(*name))
+                    typedarray::typed_array_index(self.atoms.resolve(*name))
             {
                 let view = self.value_for_runtime_index(node)?;
                 let value = match typed_index {
-                    Some(offset) => typedarray_all::read_element(self, view, offset)?,
+                    Some(offset) => typedarray::read_element(self, view, offset)?,
                     None => Value::UNDEFINED,
                 };
                 return Ok(GetOutcome::Value(value));
@@ -9787,11 +9787,11 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             if let HeapEntry::TypedArray { .. } = &self.heap[node]
                 && let Some(typed_index) =
-                    typedarray_all::typed_array_index(self.atoms.resolve(atom))
+                    typedarray::typed_array_index(self.atoms.resolve(atom))
             {
                 let view = self.value_for_runtime_index(node)?;
                 let value = match typed_index {
-                    Some(offset) => typedarray_all::read_element(self, view, offset)?,
+                    Some(offset) => typedarray::read_element(self, view, offset)?,
                     None => Value::UNDEFINED,
                 };
                 return Ok(GetOutcome::Value(value));
@@ -9851,7 +9851,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// or out-of-bounds views expose zero accessible elements.
     fn typed_array_length_at(&self, index: usize) -> Option<usize> {
         let view = self.value_for_runtime_index(index).ok()?;
-        let bounds = typedarray_all::typed_array_bounds(self, view).ok()?;
+        let bounds = typedarray::typed_array_bounds(self, view).ok()?;
         (!bounds.out_of_bounds).then_some(bounds.element_length)
     }
 
@@ -9940,7 +9940,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::TypedArray { properties, .. } => {
                 if let Some(typed_index) =
-                    typedarray_all::typed_array_index(self.atoms.resolve(atom))
+                    typedarray::typed_array_index(self.atoms.resolve(atom))
                 {
                     return typed_index
                         .zip(self.typed_array_length_at(index))
@@ -10128,7 +10128,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::TypedArray { properties, .. } => {
                 if let PropertyKey::Named(atom) = key
                     && let Some(typed_index) =
-                        typedarray_all::typed_array_index(self.atoms.resolve(*atom))
+                        typedarray::typed_array_index(self.atoms.resolve(*atom))
                 {
                     return typed_index
                         .zip(self.typed_array_length_at(index))
@@ -10418,7 +10418,7 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(true);
         }
         if matches!(self.heap[index], HeapEntry::TypedArray { .. })
-            && matches!(&key, PropertyKey::Named(name) if typedarray_all::typed_array_index(self.atoms.resolve(*name)).is_some())
+            && matches!(&key, PropertyKey::Named(name) if typedarray::typed_array_index(self.atoms.resolve(*name)).is_some())
         {
             self.set_own_data(index, key, value)?;
             return Ok(true);
@@ -10980,14 +10980,14 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
     ) -> Result<(), EvalFailure> {
         if let PropertyKey::Named(name) = &key
-            && let Some(typed_index) = typedarray_all::typed_array_index(self.atoms.resolve(*name))
+            && let Some(typed_index) = typedarray::typed_array_index(self.atoms.resolve(*name))
             && matches!(self.heap[index], HeapEntry::TypedArray { .. })
         {
             let Some(offset) = typed_index else {
                 return Ok(());
             };
             let view = self.value_for_runtime_index(index)?;
-            typedarray_all::write_element(self, view, offset, value)?;
+            typedarray::write_element(self, view, offset, value)?;
             return Ok(());
         }
         if self.is_array_length_key(index, &key) {
@@ -11401,7 +11401,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
                 if let PropertyKey::Named(name) = &key
-                    && typedarray_all::typed_array_index(self.atoms.resolve(*name)).is_some()
+                    && typedarray::typed_array_index(self.atoms.resolve(*name)).is_some()
                     && matches!(self.heap[index], HeapEntry::TypedArray { .. })
                 {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -11627,11 +11627,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.reify_function_properties(index)?;
                 if let PropertyKey::Named(name) = key
                     && let Some(typed_index) =
-                        typedarray_all::typed_array_index(self.atoms.resolve(*name))
+                        typedarray::typed_array_index(self.atoms.resolve(*name))
                     && matches!(self.heap[index], HeapEntry::TypedArray { .. })
                 {
                     let view = self.value_for_runtime_index(index)?;
-                    let bounds = typedarray_all::typed_array_bounds(self, view)?;
+                    let bounds = typedarray::typed_array_bounds(self, view)?;
                     return Ok(typed_index.is_none_or(|offset| {
                         bounds.out_of_bounds || offset >= bounds.element_length
                     }));
@@ -13708,7 +13708,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .into_iter()
                         .filter(|key| match key {
                             PropertyKey::Named(atom) => {
-                                typedarray_all::typed_array_index(self.atoms.resolve(*atom))
+                                typedarray::typed_array_index(self.atoms.resolve(*atom))
                                     .is_none()
                             }
                             _ => true,
@@ -13892,7 +13892,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties.get(&self.shapes, key).map_or_else(
                     || {
                         key.as_string(&self.atoms)
-                            .and_then(typedarray_all::typed_array_index)
+                            .and_then(typedarray::typed_array_index)
                             .flatten()
                             .is_some_and(|offset| {
                                 self.typed_array_length_at(index)

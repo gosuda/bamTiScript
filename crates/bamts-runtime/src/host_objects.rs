@@ -550,7 +550,7 @@ impl<H: Host> Machine<'_, H> {
                             return Ok(format!("[{}]", kind.name()));
                         }
                         let (_, total, values) =
-                            crate::intrinsics::builtins::typedarray_all::debug_elements(
+                            crate::intrinsics::builtins::typedarray::debug_elements(
                                 self,
                                 value,
                                 INSPECT_MAX_ITEMS,
@@ -714,18 +714,18 @@ mod tests {
             .expect("bytes copy succeeds");
         machine
             .allocate(HeapEntry::TypedArray {
-                kind: crate::intrinsics::builtins::typedarray_all::ElementKind::Uint8,
+                kind: crate::intrinsics::builtins::typedarray::ElementKind::Uint8,
                 buffer: handle.value(),
                 byte_offset: 0,
-                byte_length: crate::intrinsics::builtins::typedarray_all::LengthSlot::Fixed(
+                byte_length: crate::intrinsics::builtins::typedarray::LengthSlot::Fixed(
                     byte_length,
                 ),
-                array_length: crate::intrinsics::builtins::typedarray_all::LengthSlot::Fixed(
+                array_length: crate::intrinsics::builtins::typedarray::LengthSlot::Fixed(
                     byte_length,
                 ),
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.builtins.typed_array_prototype(
-                    crate::intrinsics::builtins::typedarray_all::ElementKind::Uint8,
+                    crate::intrinsics::builtins::typedarray::ElementKind::Uint8,
                 )),
                 extensible: true,
             })

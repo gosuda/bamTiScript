@@ -251,7 +251,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C1.3"
 cluster = "C1"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/math_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/math.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
@@ -287,7 +287,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C3.2"
 cluster = "C3"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/typedarray_all.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/typedarray.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
@@ -359,7 +359,7 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C5.4"
 cluster = "C5"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/error_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/error.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
@@ -395,13 +395,13 @@ catalogs = ["test262"]
 [[leaf]]
 id = "C8.1"
 cluster = "C8"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/json_edge.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/json.rs"]
 catalogs = ["test262"]
 
 [[leaf]]
 id = "C8.2"
 cluster = "C8"
-owns = ["crates/bamts-runtime/src/intrinsics/builtins/date_full.rs"]
+owns = ["crates/bamts-runtime/src/intrinsics/builtins/date.rs"]
 catalogs = ["test262"]
 
 [[leaf]]

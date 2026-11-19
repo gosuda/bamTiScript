@@ -340,16 +340,16 @@
 
     #[test]
     fn typed_array_canonical_numeric_keys_never_become_ordinary_properties() {
-        assert!(typedarray_all::typed_array_index(&EcmaString::encode("4294967295")).is_some());
+        assert!(typedarray::typed_array_index(&EcmaString::encode("4294967295")).is_some());
         for key in ["-0", "NaN", "Infinity", "1.5"] {
             assert_eq!(
-                typedarray_all::typed_array_index(&EcmaString::encode(key)),
+                typedarray::typed_array_index(&EcmaString::encode(key)),
                 Some(None),
                 "{key}"
             );
         }
         assert_eq!(
-            typedarray_all::typed_array_index(&EcmaString::encode("01")),
+            typedarray::typed_array_index(&EcmaString::encode("01")),
             None
         );
 

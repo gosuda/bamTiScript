@@ -663,7 +663,7 @@ fn iterator_next<H: Host>(
                 .map_err(EvalFailure::Runtime)?
                 .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
             let item = if matches!(&machine.heap[source_index], HeapEntry::TypedArray { .. }) {
-                let bounds = crate::intrinsics::builtins::typedarray_all::typed_array_bounds(
+                let bounds = crate::intrinsics::builtins::typedarray::typed_array_bounds(
                     machine, source,
                 )?;
                 if bounds.out_of_bounds {
@@ -671,7 +671,7 @@ fn iterator_next<H: Host>(
                 }
                 match usize::try_from(cursor) {
                     Ok(index) if !bounds.out_of_bounds && index < bounds.element_length => {
-                        let value = crate::intrinsics::builtins::typedarray_all::read_element(
+                        let value = crate::intrinsics::builtins::typedarray::read_element(
                             machine, source, index,
                         )?;
                         let next = cursor

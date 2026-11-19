@@ -4,7 +4,7 @@ use crate::heap::Heap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
-use super::super::date_full::TimeZoneRule;
+use super::super::date::TimeZoneRule;
 use super::super::temporal::temporal_record;
 use super::options::{
     Options, boolean_option, canonicalize_locale_list, coerce_options_to_object,
