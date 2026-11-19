@@ -560,9 +560,32 @@ pub fn global_lib_decl_file(name: &str) -> Option<&'static str> {
                 .map(|entry| entry.lib)
         })?;
     match lib {
+        Lib::Always => None,
         Lib::Es5 => Some("lib.es5.d.ts"),
+        Lib::Es2015 => Some("lib.es2015.d.ts"),
+        Lib::Es2015Core => Some("lib.es2015.core.d.ts"),
+        Lib::Es2017SharedMemory => Some("lib.es2017.sharedmemory.d.ts"),
+        Lib::Es2018AsyncIterable => Some("lib.es2018.asynciterable.d.ts"),
+        Lib::Es2019Array => Some("lib.es2019.array.d.ts"),
+        Lib::Es2020BigInt => Some("lib.es2020.bigint.d.ts"),
+        Lib::Es2021WeakRef => Some("lib.es2021.weakref.d.ts"),
+        Lib::Es2021Promise => Some("lib.es2021.promise.d.ts"),
+        Lib::Es2025Float16 => Some("lib.es2025.float16.d.ts"),
+        Lib::Es2025Iterator => Some("lib.es2025.iterator.d.ts"),
+        Lib::EsnextDisposable => Some("lib.esnext.disposable.d.ts"),
+        Lib::EsnextTemporal => Some("lib.esnext.temporal.d.ts"),
         Lib::Dom => Some("lib.dom.d.ts"),
-        _ => None,
+        Lib::WebworkerImportscripts => Some("lib.webworker.importscripts.d.ts"),
+        Lib::Scripthost => Some("lib.scripthost.d.ts"),
+        Lib::DecoratorsLegacy => Some("lib.decorators.legacy.d.ts"),
+        Lib::Es2016Array => Some("lib.es2016.array.include.d.ts"),
+        Lib::Es2017String => Some("lib.es2017.string.d.ts"),
+        Lib::Es2019Symbol => Some("lib.es2019.symbol.d.ts"),
+        Lib::Es2019String => Some("lib.es2019.string.d.ts"),
+        Lib::Es2020String => Some("lib.es2020.string.d.ts"),
+        Lib::Es2021String => Some("lib.es2021.string.d.ts"),
+        Lib::Es2022At => Some("lib.es2022.array.d.ts"),
+        Lib::Es2023Array => Some("lib.es2023.array.d.ts"),
     }
 }
 
@@ -1729,3 +1752,22 @@ const STANDARD_TYPES: &[LibEntry] = &[
         lib: Lib::Es5,
     },
 ];
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn lib_decl_files_cover_es_feature_globals() {
+        assert_eq!(
+            global_lib_decl_file("Promise"),
+            Some("lib.es2015.d.ts")
+        );
+        assert_eq!(global_lib_decl_file("Map"), Some("lib.es2015.d.ts"));
+        assert_eq!(
+            global_lib_decl_file("BigInt"),
+            Some("lib.es2020.bigint.d.ts")
+        );
+        assert!(!lib_decl_files_for_global("Promise", None, &[]).is_empty());
+        assert!(!lib_decl_files_for_global("Map", None, &[]).is_empty());
+        assert!(!lib_decl_files_for_global("BigInt", None, &[]).is_empty());
+    }
+}
