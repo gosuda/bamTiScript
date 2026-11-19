@@ -29240,7 +29240,7 @@ mod tests {
         SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeId, TypeParameterBounds,
         TypeTable, bind_source,
     };
-    use crate::diagnostic::{Diagnostic, DiagnosticCode};
+    use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
     use crate::syntax::VariableKind;
     use std::borrow::Cow;
@@ -29350,6 +29350,15 @@ mod tests {
     }
 
     #[test]
+    fn any_receiver_private_access_honors_declared_names() {
+        let (_, declared) = bound("class C { #x = 1; }\ndeclare const a: any;\na.#x;\n");
+        assert!(declared.is_empty(), "{declared:?}");
+        let (_, undeclared) = bound("declare const a: any;\na.#y;\n");
+        let codes: Vec<_> = undeclared.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [PROPERTY_DOES_NOT_EXIST]);
+    }
+
+    #[test]
     fn getter_name_records_inferred_return_type() {
         let (model, _) = bound("class C { get x() { return 1; } }");
         let found: Vec<TypeId> = model
@@ -29361,99 +29370,145 @@ mod tests {
         assert_eq!(found.len(), 1, "getter name gets one record");
         assert!(matches!(model.types().get(found[0]), Type::Number));
     }
-    fn has_strict_eval(diagnostics: &[Diagnostic], code: DiagnosticCode) -> bool {
-        diagnostics.iter().any(|d| d.code() == code)
-    }
 
     #[test]
     fn strict_module_param_named_arguments_reports_ts1215() {
         let (_, diagnostics) = bound("export {};\nfunction f(arguments: number) {}\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_MODULE);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (22, 31),
             "{diagnostics:?}"
         );
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS),
-            "{diagnostics:?}"
+        assert_eq!(
+            diagnostic.message(),
+            "Invalid use of 'arguments'. Modules are automatically in strict mode."
         );
     }
 
     #[test]
     fn strict_var_named_eval_reports_ts1100() {
         let (_, diagnostics) = bound("\"use strict\";\nvar eval;\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_STRICT_MODE);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (18, 22),
             "{diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostic.message(),
+            "Invalid use of 'eval' in strict mode."
         );
     }
 
     #[test]
     fn strict_property_named_arguments_is_silent() {
         let (_, diagnostics) = bound("\"use strict\";\nvar o = { arguments: 1 };\n");
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
     fn strict_class_method_param_named_arguments_reports_ts1210() {
         let (_, diagnostics) = bound("class C {\nfoo(arguments: number) {}\n}\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_CLASS);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (14, 23),
             "{diagnostics:?}"
         );
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
-            "{diagnostics:?}"
+        assert_eq!(
+            diagnostic.message(),
+            "Code contained in a class is evaluated in JavaScript's strict mode which does not allow this use of 'arguments'. For more information, see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Strict_mode."
         );
     }
 
     #[test]
     fn strict_catch_binding_named_eval_reports_ts1100() {
         let (_, diagnostics) = bound("\"use strict\";\ntry {} catch (eval) {}\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_STRICT_MODE);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (28, 32),
             "{diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostic.message(),
+            "Invalid use of 'eval' in strict mode."
         );
     }
 
     #[test]
     fn strict_assignment_to_arguments_reports_ts1100() {
         let (_, diagnostics) = bound("\"use strict\";\narguments = 1;\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        let strict = &diagnostics[0];
+        assert_eq!(strict.code(), EVAL_OR_ARGUMENTS_IN_STRICT_MODE);
+        assert_eq!(
+            (strict.range().start().get(), strict.range().end().get()),
+            (14, 23),
             "{diagnostics:?}"
+        );
+        assert_eq!(
+            strict.message(),
+            "Invalid use of 'arguments' in strict mode."
+        );
+        let unbound = &diagnostics[1];
+        assert_eq!(unbound.code(), CANNOT_FIND_NAME);
+        assert_eq!(
+            (unbound.range().start().get(), unbound.range().end().get()),
+            (14, 23),
+            "{diagnostics:?}"
+        );
+        assert_eq!(
+            unbound.message(),
+            "Cannot find name in any enclosing scope."
         );
     }
 
     #[test]
     fn strict_ambient_function_named_eval_is_silent() {
         let (_, diagnostics) = bound("\"use strict\";\ndeclare function eval(): void;\n");
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
     fn strict_interface_method_param_named_arguments_reports_ts1100() {
         let (_, diagnostics) =
             bound("\"use strict\";\ninterface I {\nfoo(arguments: number): void;\n}\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_STRICT_MODE);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (32, 41),
             "{diagnostics:?}"
         );
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
-            "{diagnostics:?}"
+        assert_eq!(
+            diagnostic.message(),
+            "Invalid use of 'arguments' in strict mode."
         );
     }
 
@@ -29462,43 +29517,66 @@ mod tests {
         let (_, diagnostics) = bound(
             "export {};\nfunction f(a: number) { return a; }\nclass C {\nmethod(x: string) { return x; }\n}\n",
         );
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS)
-                && !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
     fn strict_type_literal_param_named_arguments_reports_ts1100_once() {
         let (_, diagnostics) = bound("\"use strict\";\nvar v: (arguments: number) => void;\n");
-        let count = diagnostics
-            .iter()
-            .filter(|d| d.code() == EVAL_OR_ARGUMENTS_IN_STRICT_MODE)
-            .count();
-        assert_eq!(count, 1, "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_STRICT_MODE);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (22, 31),
+            "{diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostic.message(),
+            "Invalid use of 'arguments' in strict mode."
+        );
     }
 
     #[test]
     fn strict_dynamic_import_script_function_named_arguments_reports_ts1100() {
         let (_, diagnostics) = bound("var p = import('./x');\nfunction arguments() {}\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_STRICT_MODE),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_STRICT_MODE);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (32, 41),
             "{diagnostics:?}"
         );
-        assert!(
-            !has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_MODULE),
-            "{diagnostics:?}"
+        assert_eq!(
+            diagnostic.message(),
+            "Invalid use of 'arguments' in strict mode."
         );
     }
 
     #[test]
     fn strict_constructor_param_property_named_arguments_reports_ts1210() {
         let (_, diagnostics) = bound("class C {\nconstructor(public arguments: number) {}\n}\n");
-        assert!(
-            has_strict_eval(&diagnostics, EVAL_OR_ARGUMENTS_IN_CLASS),
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code(), EVAL_OR_ARGUMENTS_IN_CLASS);
+        assert_eq!(
+            (
+                diagnostic.range().start().get(),
+                diagnostic.range().end().get()
+            ),
+            (29, 38),
             "{diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostic.message(),
+            "Code contained in a class is evaluated in JavaScript's strict mode which does not allow this use of 'arguments'. For more information, see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Strict_mode."
         );
     }
 
