@@ -545,6 +545,52 @@ mod tests {
             assert_eq!(mapped.message(), expected, "{code}: {message}");
         }
     }
+    #[test]
+    fn real_parser_messages_project_onto_expected_ts_codes() {
+        use crate::source::{ScriptKind, SourceText};
+        use std::sync::Arc;
+        fn native_messages(source: &str) -> Vec<Diagnostic> {
+            let scanned = crate::scanner::scan(
+                SourceId::new(7),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(source).expect("test source fits the budget")),
+            );
+            crate::parser::parse(scanned).into_parts().1
+        }
+        let import_diagnostics = native_messages("import { \"a\" } from \"m\";\n");
+        let import_native = import_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message().contains("string import name requires"))
+            .expect("parser reports the string import name");
+        assert_eq!(import_native.code().as_str(), "BAMTS-P001");
+        let import_mapped = map_parse_diagnostic(import_native);
+        assert_eq!(import_mapped.code().as_str(), "TS1003");
+        assert_eq!(import_mapped.message(), "Identifier expected.");
+        let for_diagnostics = native_messages("for (async of x) {}\n");
+        let for_native = for_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message().contains("for-of target"))
+            .expect("parser reports the async for-of target");
+        assert_eq!(for_native.code().as_str(), "BAMTS-P001");
+        let for_mapped = map_parse_diagnostic(for_native);
+        assert_eq!(for_mapped.code().as_str(), "TS1106");
+        assert_eq!(
+            for_mapped.message(),
+            "The left-hand side of a 'for...of' statement may not be 'async'."
+        );
+    }
+
+    #[test]
+    fn near_miss_substrings_fall_back_to_ts1005() {
+        for message in [
+            "expected `async` to begin the function",
+            "a for-of target cannot be awaited",
+            "async function declaration requires a name",
+        ] {
+            let mapped = map_parse_diagnostic(&native("BAMTS-P001", 0, 1, message));
+            assert_eq!(mapped.code().as_str(), "TS1005", "{message}");
+        }
+    }
 
     #[test]
     fn unmapped_codes_keep_identity() {
