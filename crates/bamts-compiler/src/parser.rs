@@ -2430,8 +2430,13 @@ impl Parser {
                         );
                         break;
                     }
-                    let _expression = self.parse_lhs_expression(LhsContext::Expression);
+                    let extra = self.parse_lhs_expression(LhsContext::Expression);
                     let _type_arguments = self.try_parse_type_arguments_in_heritage();
+                    self.error_at(
+                        EXPECTED_TOKEN,
+                        extra.range(),
+                        "only one extends clause is allowed",
+                    );
                 }
             } else if self.at(TokenKind::KwImplements) {
                 let range = self.cur().range();
@@ -7150,18 +7155,18 @@ impl Parser {
             return None;
         }
         let function = self.parse_function_type_signature(false);
-        // A body after an accessor signature parses without a syntax
-        // diagnostic; tsc accepts `get foo() { ... }` in a type literal at
-        // parse time (`tsc --noCheck` is clean) and reports TS1183 at check
-        // time. Consuming the block here also keeps the body from cascading
-        // into spurious errors on the members that follow it.
         if self.at(TokenKind::LBrace) {
             let context = KeywordContext {
                 in_function: true,
                 await_reserved: false,
                 yield_reserved: false,
             };
-            let _body = self.with_keyword_context(context, Self::parse_block);
+            let body = self.with_keyword_context(context, Self::parse_block);
+            self.error_at(
+                DiagnosticCode::new("1183"),
+                body.range(),
+                "An implementation cannot be declared in ambient contexts.",
+            );
         }
 
         Some(self.node(
@@ -8402,23 +8407,16 @@ mod tests {
 
     #[test]
     fn type_member_accessor_with_body_parses_as_method() {
-        // tsc accepts a type-member accessor body at parse time (`tsc
-        // --noCheck` reports nothing) and rejects it at check time with
-        // TS1183, while a plain `foo() {}` stays a parse error. The parser
-        // therefore consumes the body without a syntax diagnostic; the
-        // ambient-implementation error belongs to the checker.
         for source in [
             "type T = { get foo() { return 0 } };",
             "type T = { set foo(v: number) { } };",
         ] {
             let recovered = parse_ts(source);
+            let diagnostics = errors(&recovered);
             assert!(
-                errors(&recovered).is_empty(),
-                "expected no errors for {source:?}, got: {:?}",
-                errors(&recovered)
-                    .iter()
-                    .map(|d| (d.code().as_str(), d.message()))
-                    .collect::<Vec<_>>()
+                diagnostics.iter().any(|d| d.code().as_str() == "1183"),
+                "expected TS1183 for {source:?}, got: {:?}",
+                diagnostics.iter().map(|d| (d.code().as_str(), d.message())).collect::<Vec<_>>()
             );
             let Statement::TypeAlias(alias) = recovered.product().statements()[0].data() else {
                 panic!("expected a type alias for {source:?}");
@@ -9450,11 +9448,16 @@ mod tests {
 
     #[test]
     fn heritage_list_continues_past_comma() {
-        assert_clean("class C extends A, B {\n}");
+        let parsed = parse_ts("class C extends A, B {\n}");
+        let extra = errors(&parsed);
+        assert!(
+            extra.iter().any(|d| d.message() == "only one extends clause is allowed"),
+            "expected an extra-extends diagnostic, got: {:?}",
+            extra.iter().map(|d| (d.code().as_str(), d.message())).collect::<Vec<_>>()
+        );
         assert_clean("class C implements I, J {\n}");
         assert_clean("interface I extends A, B {\n}");
     }
-
     #[test]
     fn type_literal_accessors_parse_without_syntax_errors() {
         for text in [
@@ -9462,17 +9465,16 @@ mod tests {
             "type B = {\n    set foo(v: any) { }\n};\n",
             "interface X {\n    get foo() { return 0 }\n}\n",
             "interface Y {\n    set foo(v: any) { }\n}\n",
-            "interface Z {\n    get foo(): number;\n}\n",
         ] {
+            let parsed = parse_ts(text);
+            let diagnostics = errors(&parsed);
             assert!(
-                errors(&parse_ts(text)).is_empty(),
-                "expected no errors for {text:?}, got: {:?}",
-                errors(&parse_ts(text))
-                    .iter()
-                    .map(|d| (d.code().as_str(), d.message()))
-                    .collect::<Vec<_>>()
+                diagnostics.iter().any(|d| d.code().as_str() == "1183"),
+                "expected TS1183 for {text:?}, got: {:?}",
+                diagnostics.iter().map(|d| (d.code().as_str(), d.message())).collect::<Vec<_>>()
             );
         }
+        assert_clean("interface Z {\n    get foo(): number;\n}\n");
     }
 
 
