@@ -44,8 +44,9 @@ use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
 use bamts_compiler::project::{
     CompilerOptions, JsonObject, JsonValue, ProjectConfig, ProjectRoot, parse_jsonc,
 };
+use bamts_compiler::scanner;
 use bamts_compiler::source::SourceText;
-use bamts_compiler::source::{JsxEmit, SourceId, TextRange, Utf16Pos};
+use bamts_compiler::source::{JsxEmit, ScriptKind, SourceId, TextRange, Utf16Pos};
 use bamts_compiler::syntax::{Token, TokenKind};
 
 use crate::catalog::CaseConfiguration;
@@ -772,57 +773,25 @@ fn shared_lib_target(value: &str) -> Option<&str> {
 /// scanning the same line, and the first other content ends the prologue.
 fn shared_lib_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    let bytes = text.as_bytes();
-    let mut pos = 0;
-    if text.starts_with('\u{feff}') {
-        pos = 3;
-    }
-    if bytes.get(pos) == Some(&b'#') && bytes.get(pos + 1) == Some(&b'!') {
-        while pos < bytes.len() && bytes[pos] != b'\n' {
-            pos += 1;
-        }
-    }
-    while pos < bytes.len() {
-        let byte = bytes[pos];
-        if matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
-            pos += 1;
-            continue;
-        }
-        if bytes[pos..].starts_with("\u{feff}".as_bytes()) {
-            pos += 3;
-            continue;
-        }
-        if byte == b'/' && bytes.get(pos + 1) == Some(&b'/') {
-            let start = pos;
-            while pos < bytes.len() && bytes[pos] != b'\n' {
-                pos += 1;
-            }
-            let comment = &text[start..pos];
-            let comment_bytes = comment.as_bytes();
-            if comment_bytes.get(2) == Some(&b'/')
-                && comment_bytes.get(3) != Some(&b'/')
-            {
-                push_directive_refs(comment, &mut refs);
-            }
-            continue;
-        }
-        if byte == b'/' && bytes.get(pos + 1) == Some(&b'*') {
-            pos += 2;
-            let mut closed = false;
-            while pos < bytes.len() {
-                if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
-                    pos += 2;
-                    closed = true;
-                    break;
+    let Ok(source) = SourceText::new(text) else {
+        return refs;
+    };
+    let scanned = scanner::scan(SourceId::new(0), ScriptKind::TypeScript, Arc::new(source));
+    let scanned = scanned.into_product();
+    for token in scanned.tokens() {
+        match token.kind() {
+            TokenKind::Whitespace | TokenKind::Shebang | TokenKind::BlockComment => {}
+            TokenKind::LineComment => {
+                let Some(comment) = scanned.token_text(token) else {
+                    continue;
+                };
+                let comment_bytes = comment.as_bytes();
+                if comment_bytes.get(2) == Some(&b'/') && comment_bytes.get(3) != Some(&b'/') {
+                    push_directive_refs(comment, &mut refs);
                 }
-                pos += 1;
             }
-            if !closed {
-                break;
-            }
-            continue;
+            _ => break,
         }
-        break;
     }
     refs.sort();
     refs

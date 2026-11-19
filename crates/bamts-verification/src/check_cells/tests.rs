@@ -6818,12 +6818,39 @@ interface I {
 
     #[test]
     fn multiline_block_comment_before_a_directive_counts() {
-        let text = "/*\nline one\nline two\n*/\n/// <reference path=\"/.lib/c.d.ts\" />\nvar x = 1;\n";
+        let text = "/*\nline one\nline two\n*/ /// <reference path=\"/.lib/c.d.ts\" />\nvar x = 1;\n";
         assert_eq!(shared_lib_refs(text), vec!["c.d.ts".to_owned()]);
     }
 
     #[test]
     fn directive_inside_a_block_comment_body_is_inert() {
-        let text = "/* /// <reference path=\"/.lib/d.d.ts\" /> */\nvar x = 1;\n";
+        let text = "   /* /// <reference path=\"/.lib/d.d.ts\" /> */\nvar x = 1;\n";
         assert_eq!(shared_lib_refs(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nbsp_before_a_directive_counts() {
+        let nbsp = char::from_u32(0xA0).unwrap();
+        let text = format!("{nbsp}/// <reference path=\"/.lib/a.d.ts\" />\nvar x = 1;\n");
+        assert_eq!(shared_lib_refs(&text), vec!["a.d.ts".to_owned()]);
+    }
+
+    #[test]
+    fn carriage_return_separates_line_comment_directives() {
+        let text = "/// <reference path=\"/.lib/a.d.ts\" />\r/// <reference path=\"/.lib/b.d.ts\" />\rvar x = 1;\n";
+        assert_eq!(shared_lib_refs(text), vec!["a.d.ts".to_owned(), "b.d.ts".to_owned()]);
+    }
+
+    #[test]
+    fn line_separator_inside_a_comment_ends_the_directive() {
+        let sep = char::from_u32(0x2028).unwrap();
+        let text = format!("/// note{sep}<reference path=\"/.lib/x.d.ts\" />\nvar x = 1;\n");
+        assert_eq!(shared_lib_refs(&text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bom_before_shebang_disables_the_shebang() {
+        let bom = char::from_u32(0xFEFF).unwrap();
+        let text = format!("{bom}#!/usr/bin/env node\n/// <reference path=\"/.lib/a.d.ts\" />\nvar x = 1;\n");
+        assert_eq!(shared_lib_refs(&text), Vec::<String>::new());
     }
