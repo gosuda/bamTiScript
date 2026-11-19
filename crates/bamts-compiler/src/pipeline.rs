@@ -265,9 +265,6 @@ fn program_emit_options(
     options.no_emit_helpers = check.no_emit_helpers();
     options.remove_comments = check.remove_comments();
     options.verbatim_module_syntax = program.verbatim_module_syntax();
-    options.source_map = program.source_map();
-    options.inline_source_map = program.inline_source_map();
-    options.inline_sources = program.inline_sources();
 
     // JSX routing is JavaScript-specific and already shared with the CLI path,
     // which applies the same overrides from `program.jsx()` after its base
@@ -594,6 +591,1490 @@ fn unresolved_import_diagnostics(
         .collect()
 }
 
+/// TS2343 for downlevel syntax whose `tslib` export is absent.
+const MISSING_HELPER_IN_TSLIB: DiagnosticCode = DiagnosticCode::new("TS2343");
+/// TS2354 for downlevel syntax when `tslib` cannot be resolved.
+const MISSING_TSLIB_MODULE: DiagnosticCode = DiagnosticCode::new("TS2354");
+
+/// tsc helper names the emitter catalog does not define. The walk attributes
+/// these exactly where the reference baselines place them; the emitter half
+/// stays untouched until downleveling learns these forms.
+const ES_DECORATE: &str = "__esDecorate";
+const RUN_INITIALIZERS: &str = "__runInitializers";
+const SET_FUNCTION_NAME: &str = "__setFunctionName";
+const PROP_KEY: &str = "__propKey";
+const ASYNC_GENERATOR: &str = "__asyncGenerator";
+const AWAIT_HELPER: &str = "__await";
+const ASYNC_DELEGATOR: &str = "__asyncDelegator";
+const ASYNC_VALUES: &str = "__asyncValues";
+const MAKE_TEMPLATE_OBJECT: &str = "__makeTemplateObject";
+
+/// Inputs deciding whether downlevel syntax needs an imported helper. The
+/// target predicates reuse [`LanguageFeature`] exactly as lowering does, so
+/// the check and the emit cannot disagree on when a helper is required.
+struct TslibHelperContext {
+    target: crate::emitter::ScriptTarget,
+    es_module_interop: bool,
+    experimental_decorators: bool,
+    emit_decorator_metadata: bool,
+    module_kind: Option<crate::emitter::ModuleKind>,
+}
+
+/// One file's view for the helper check.
+struct TslibHelperFile<'a> {
+    source_id: SourceId,
+    source: &'a SourceFile,
+    path: &'a std::path::Path,
+    module_kind: Option<crate::emitter::ModuleKind>,
+    is_module: bool,
+    is_declaration_file: bool,
+}
+
+enum TslibTarget {
+    File(SourceId),
+    Ambient(SourceId),
+}
+
+/// Program-wide missing-helper diagnostics keyed by needing file. TS2354
+/// reports once per file at its first needing site; TS2343 reports once per
+/// helper for each distinct `tslib` copy, at that helper's first site.
+fn tslib_helper_diagnostics_for_program(
+    program: &ResolvedProgram,
+    parsed: &[Recovered<SourceFile>],
+) -> HashMap<SourceId, Vec<Diagnostic>> {
+    if program.import_helpers() != Some(true) {
+        return HashMap::new();
+    }
+    let context = TslibHelperContext {
+        target: program.check_options().target(),
+        module_kind: None,
+        es_module_interop: program.es_module_interop().unwrap_or(true),
+        experimental_decorators: program.experimental_decorators(),
+        emit_decorator_metadata: program.emit_decorator_metadata(),
+    };
+    let mut by_id: HashMap<SourceId, (usize, &SourceFile)> = HashMap::new();
+    for (index, file) in parsed.iter().enumerate() {
+        by_id.insert(file.product().source_id(), (index, file.product()));
+    }
+    let mut files: Vec<TslibHelperFile<'_>> = Vec::new();
+    for (index, module) in program.modules().iter().enumerate() {
+        let Some((_, source)) = by_id.get(&module.source_id()) else {
+            continue;
+        };
+        let file_name = module
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        files.push(TslibHelperFile {
+            source_id: module.source_id(),
+            source,
+            path: module.path(),
+            module_kind: program.emit_module_kind(index),
+            is_module: crate::checker::source_is_module(source),
+            is_declaration_file: file_name.ends_with(".d.ts")
+                || file_name.ends_with(".d.mts")
+                || file_name.ends_with(".d.cts"),
+        });
+    }
+    tslib_helper_diagnostics_for_files(&files, &context)
+}
+
+/// Core check over explicit file views, so unit tests exercise it without a
+/// resolved program.
+fn tslib_helper_diagnostics_for_files(
+    files: &[TslibHelperFile<'_>],
+    context: &TslibHelperContext,
+) -> HashMap<SourceId, Vec<Diagnostic>> {
+    let mut diagnostics: HashMap<SourceId, Vec<Diagnostic>> = HashMap::new();
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    for file in files {
+        if !file.is_module || file.is_declaration_file {
+            continue;
+        }
+        let context = TslibHelperContext {
+            target: context.target,
+            module_kind: file.module_kind,
+            es_module_interop: context.es_module_interop,
+            experimental_decorators: context.experimental_decorators,
+            emit_decorator_metadata: context.emit_decorator_metadata,
+        };
+        let sites = tslib_helper_sites(file.source, &context);
+        if sites.is_empty() {
+            continue;
+        }
+        let Some(target) = resolve_tslib(files, file) else {
+            let span = sites[0].1;
+            let message = by_u32(2354)
+                .and_then(|entry| entry.format(Args::new(["tslib"])).ok())
+                .unwrap_or_else(|| {
+                    "This syntax requires an imported helper but module 'tslib' cannot be found."
+                        .to_owned()
+                });
+            diagnostics
+                .entry(file.source_id)
+                .or_default()
+                .push(Diagnostic::error(
+                    MISSING_TSLIB_MODULE,
+                    file.source_id,
+                    span,
+                    message,
+                ));
+            continue;
+        };
+        let exports = tslib_export_names(files, &target);
+        let identity = tslib_identity(files, &target);
+        for (helper, span) in ordered_first_sites(&sites) {
+            if exports.contains(helper) {
+                continue;
+            }
+            if !reported.insert((helper.to_owned(), identity.clone())) {
+                continue;
+            }
+            let message = by_u32(2343)
+                .and_then(|entry| entry.format(Args::new(["tslib", helper])).ok())
+                .unwrap_or_else(|| {
+                    format!(
+                        "This syntax requires an imported helper named '{helper}' which does not exist in 'tslib'. Consider upgrading your version of 'tslib'."
+                    )
+                });
+            diagnostics
+                .entry(file.source_id)
+                .or_default()
+                .push(Diagnostic::error(
+                    MISSING_HELPER_IN_TSLIB,
+                    file.source_id,
+                    span,
+                    message,
+                ));
+        }
+    }
+    diagnostics
+}
+
+/// First span per helper in walk order, helper names sorted alphabetically
+/// within one span to match the reference order.
+fn ordered_first_sites(
+    sites: &[(&'static str, crate::source::TextRange)],
+) -> Vec<(&'static str, crate::source::TextRange)> {
+    let mut first: HashMap<&'static str, crate::source::TextRange> = HashMap::new();
+    for &(helper, span) in sites {
+        first.entry(helper).or_insert(span);
+    }
+    let mut ordered: Vec<(&'static str, crate::source::TextRange)> = first.into_iter().collect();
+    ordered.sort_by(|left, right| {
+        left.1
+            .start()
+            .cmp(&right.1.start())
+            .then_with(|| left.0.cmp(right.0))
+    });
+    ordered
+}
+
+/// Syntax walk collecting the first site that needs each `tslib` helper.
+/// Spans mirror the reference baselines exactly; see each `record` call.
+struct TslibHelperWalk<'a> {
+    context: &'a TslibHelperContext,
+    source: &'a SourceFile,
+    sites: Vec<(&'static str, crate::source::TextRange)>,
+    ambient: bool,
+    in_async_generator: bool,
+}
+
+/// First-spanning sites in source order for one file.
+fn tslib_helper_sites(
+    source: &SourceFile,
+    context: &TslibHelperContext,
+) -> Vec<(&'static str, crate::source::TextRange)> {
+    let mut walk = TslibHelperWalk {
+        context,
+        source,
+        sites: Vec::new(),
+        ambient: false,
+        in_async_generator: false,
+    };
+    walk.stmts(source.statements());
+    walk.sites
+}
+
+impl TslibHelperWalk<'_> {
+    fn record(&mut self, helper: &'static str, span: crate::source::TextRange) {
+        if !self.ambient {
+            self.sites.push((helper, span));
+        }
+    }
+
+    fn stmts(&mut self, statements: &[crate::syntax::Stmt]) {
+        for statement in statements {
+            self.stmt(statement);
+        }
+    }
+
+    fn stmt(&mut self, statement: &crate::syntax::Stmt) {
+        use crate::syntax::Statement;
+        match statement.data() {
+            Statement::Import(import) => self.import_decl(import, statement.range()),
+            Statement::ImportEquals(_) => {}
+            Statement::Export(export) => self.export_decl(export, statement.range()),
+            Statement::Variable(declaration) => {
+                self.variable_declaration(declaration, statement.range())
+            }
+            Statement::Function(function) => self.function_declaration(&function.function),
+            Statement::Class(class) => self.class_decl(class),
+            Statement::Expression(statement) => self.expr(&statement.expression),
+            Statement::If(branch) => {
+                self.expr(&branch.test);
+                self.stmt(&branch.consequent);
+                if let Some(alternate) = &branch.alternate {
+                    self.stmt(alternate);
+                }
+            }
+            Statement::Block(block) => self.stmts(&block.data().statements),
+            Statement::Switch(switch) => {
+                self.expr(&switch.discriminant);
+                for case in &switch.cases {
+                    if let Some(test) = &case.data().test {
+                        self.expr(test);
+                    }
+                    self.stmts(&case.data().consequent);
+                }
+            }
+            Statement::For(statement) => {
+                if let Some(initializer) = &statement.initializer {
+                    self.for_initializer(initializer);
+                }
+                if let Some(test) = &statement.test {
+                    self.expr(test);
+                }
+                if let Some(update) = &statement.update {
+                    self.expr(update);
+                }
+                self.stmt(&statement.body);
+            }
+            Statement::ForIn(statement) => {
+                self.for_binding(&statement.binding);
+                self.expr(&statement.object);
+                self.stmt(&statement.body);
+            }
+            Statement::ForOf(statement) => {
+                self.for_binding(&statement.binding);
+                self.expr(&statement.iterable);
+                self.stmt(&statement.body);
+            }
+            Statement::While(statement) => {
+                self.expr(&statement.test);
+                self.stmt(&statement.body);
+            }
+            Statement::DoWhile(statement) => {
+                self.stmt(&statement.body);
+                self.expr(&statement.test);
+            }
+            Statement::Try(statement) => {
+                self.stmts(&statement.block.data().statements);
+                if let Some(handler) = &statement.handler {
+                    if let Some(binding) = &handler.data().binding {
+                        self.binding_pattern(binding);
+                    }
+                    self.stmts(&handler.data().body.data().statements);
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.stmts(&finalizer.data().statements);
+                }
+            }
+            Statement::With(statement) => {
+                self.expr(&statement.object);
+                self.stmt(&statement.body);
+            }
+            Statement::Labeled(statement) => self.stmt(&statement.body),
+            Statement::Return(statement) => {
+                if let Some(argument) = &statement.argument {
+                    self.expr(argument);
+                }
+            }
+            Statement::Throw(statement) => self.expr(&statement.argument),
+            Statement::Namespace(namespace) => self.stmts(&namespace.body.data().statements),
+            Statement::Declare(inner) => {
+                let ambient = std::mem::replace(&mut self.ambient, true);
+                self.stmt(inner);
+                self.ambient = ambient;
+            }
+            Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Debugger
+            | Statement::Empty
+            | Statement::Interface(_)
+            | Statement::TypeAlias(_)
+            | Statement::Enum(_)
+            | Statement::Missing(_) => {}
+        }
+    }
+
+    fn for_initializer(&mut self, initializer: &crate::syntax::ForInitializer) {
+        match initializer {
+            crate::syntax::ForInitializer::Variable(declaration) => {
+                self.variable_declaration(declaration, declaration.range);
+            }
+            crate::syntax::ForInitializer::Expression(expression) => self.expr(expression),
+        }
+    }
+
+    fn for_binding(&mut self, binding: &crate::syntax::ForBinding) {
+        match binding {
+            crate::syntax::ForBinding::Variable(declaration) => {
+                if matches!(
+                    declaration.kind,
+                    crate::syntax::VariableKind::Using | crate::syntax::VariableKind::AwaitUsing
+                ) {
+                    self.need_using(declaration.range);
+                }
+                for declarator in &declaration.declarations {
+                    self.binding_pattern(&declarator.data().binding);
+                    if let Some(initializer) = &declarator.data().initializer {
+                        self.expr(initializer);
+                    }
+                }
+            }
+            crate::syntax::ForBinding::Target(target) => {
+                self.assignment_target(target);
+            }
+        }
+    }
+
+    fn variable_declaration(
+        &mut self,
+        declaration: &crate::syntax::VariableDeclaration,
+        span: crate::source::TextRange,
+    ) {
+        use crate::syntax::VariableKind;
+        if matches!(
+            declaration.kind,
+            VariableKind::Using | VariableKind::AwaitUsing
+        ) {
+            self.need_using(span);
+        }
+        for declarator in &declaration.declarations {
+            let binding = &declarator.data().binding;
+            self.binding_pattern(binding);
+            if let Some(initializer) = &declarator.data().initializer {
+                self.async_arrow_initializer(binding, initializer);
+                self.expr(initializer);
+            }
+        }
+    }
+
+    fn need_using(&mut self, span: crate::source::TextRange) {
+        use crate::emitter::transforms::LanguageFeature;
+        if self.context.target.supports(LanguageFeature::Using) {
+            return;
+        }
+        self.record(
+            crate::emitter::helpers::HelperKind::AddDisposableResource.ident(),
+            span,
+        );
+        self.record(
+            crate::emitter::helpers::HelperKind::DisposeResources.ident(),
+            span,
+        );
+    }
+    fn expr(&mut self, expression: &crate::syntax::Expr) {
+        use crate::syntax::Expression;
+        match expression.data() {
+            Expression::Identifier(_)
+            | Expression::This
+            | Expression::Super
+            | Expression::Literal(_)
+            | Expression::Meta(_)
+            | Expression::Missing(_) => {}
+            Expression::Template(template) => {
+                for element in &template.expressions {
+                    self.expr(element);
+                }
+            }
+            Expression::TaggedTemplate(tagged) => {
+                if !self
+                    .context
+                    .target
+                    .supports(crate::emitter::transforms::LanguageFeature::Classes)
+                {
+                    self.record(
+                        MAKE_TEMPLATE_OBJECT,
+                        self.tagged_template_span(tagged, expression.range()),
+                    );
+                }
+                self.expr(&tagged.tag);
+                for element in &tagged.template.expressions {
+                    self.expr(element);
+                }
+            }
+            Expression::Array(array) => {
+                for element in &array.elements {
+                    match element {
+                        crate::syntax::ArrayElement::Expression(inner) => self.expr(inner),
+                        crate::syntax::ArrayElement::Spread(spread) => {
+                            self.expr(&spread.argument);
+                        }
+                        crate::syntax::ArrayElement::Elision
+                        | crate::syntax::ArrayElement::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Object(object) => {
+                for member in &object.members {
+                    self.object_member(member);
+                }
+            }
+            Expression::Function(function) => {
+                self.function_like(&function.function, None);
+            }
+            Expression::Class(class) => self.class_decl(&class.class),
+            Expression::Arrow(function) => {
+                self.arrow_like(function, None);
+            }
+            Expression::Call(call) => {
+                self.expr(&call.callee);
+                for argument in &call.arguments {
+                    match argument {
+                        crate::syntax::CallArgument::Expression(inner) => self.expr(inner),
+                        crate::syntax::CallArgument::Spread(spread) => {
+                            self.expr(&spread.argument);
+                        }
+                        crate::syntax::CallArgument::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Member(member) => self.member_read(member, expression.range()),
+            Expression::New(call) => {
+                self.expr(&call.callee);
+                for argument in &call.arguments {
+                    match argument {
+                        crate::syntax::CallArgument::Expression(inner) => self.expr(inner),
+                        crate::syntax::CallArgument::Spread(spread) => {
+                            self.expr(&spread.argument);
+                        }
+                        crate::syntax::CallArgument::Missing(_) => {}
+                    }
+                }
+            }
+            Expression::Await(awaited) => self.expr(&awaited.argument),
+            Expression::Yield(resumption) => {
+                if resumption.delegate
+                    && self.in_async_generator
+                    && !self
+                        .context
+                        .target
+                        .supports(crate::emitter::transforms::LanguageFeature::AsyncIteration)
+                {
+                    let span = self.yield_span(expression.range());
+                    self.record(ASYNC_DELEGATOR, span);
+                    self.record(ASYNC_VALUES, span);
+                }
+                if let Some(argument) = &resumption.argument {
+                    self.expr(argument);
+                }
+            }
+            Expression::Unary(unary) => self.expr(&unary.argument),
+            Expression::Update(update) => {
+                if let crate::syntax::AssignmentTarget::Member(member) = update.argument.data() {
+                    if self.is_private_member(&member.property) && self.private_fields_active() {
+                        let span = update.argument.range();
+                        self.record(
+                            crate::emitter::helpers::HelperKind::ClassPrivateFieldGet.ident(),
+                            span,
+                        );
+                        self.record(
+                            crate::emitter::helpers::HelperKind::ClassPrivateFieldSet.ident(),
+                            span,
+                        );
+                        self.assignment_target_no_write(&update.argument);
+                    } else {
+                        self.assignment_target(&update.argument);
+                    }
+                } else {
+                    self.assignment_target(&update.argument);
+                }
+            }
+            Expression::Binary(binary) => {
+                if binary.operator == crate::syntax::BinaryOperator::In {
+                    self.private_name_in(&binary.left);
+                }
+                self.expr(&binary.left);
+                self.expr(&binary.right);
+            }
+            Expression::Logical(logical) => {
+                self.expr(&logical.left);
+                self.expr(&logical.right);
+            }
+            Expression::Conditional(conditional) => {
+                self.expr(&conditional.test);
+                self.expr(&conditional.consequent);
+                self.expr(&conditional.alternate);
+            }
+            Expression::Assignment(assignment) => {
+                self.assignment_expression(assignment);
+            }
+            Expression::Sequence(sequence) => {
+                for element in &sequence.expressions {
+                    self.expr(element);
+                }
+            }
+            Expression::Parenthesized(inner) => self.expr(inner),
+            Expression::As(cast) => self.expr(&cast.expression),
+            Expression::Satisfies(cast) => self.expr(&cast.expression),
+            Expression::TypeAssertion(cast) => self.expr(&cast.expression),
+            Expression::NonNull(inner) => self.expr(&inner.expression),
+            Expression::Import(import) => {
+                self.expr(&import.source);
+                if let Some(options) = &import.options {
+                    self.expr(options);
+                }
+            }
+            Expression::JsxElement(element) => self.jsx_children(&element.children),
+            Expression::JsxFragment(fragment) => self.jsx_children(&fragment.children),
+            Expression::JsxSelfClosingElement(element) => {
+                for attribute in &element.attributes {
+                    self.jsx_attribute(attribute);
+                }
+            }
+        }
+    }
+
+    fn jsx_children(&mut self, children: &[crate::syntax::JsxChild]) {
+        for child in children {
+            match child {
+                crate::syntax::JsxChild::Element(element) => self.expr(element),
+                crate::syntax::JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        self.expr(expression);
+                    }
+                }
+                crate::syntax::JsxChild::Spread(spread) => self.expr(&spread.data().expression),
+                crate::syntax::JsxChild::Text(_) => {}
+            }
+        }
+    }
+
+    fn jsx_attribute(&mut self, attribute: &crate::syntax::JsxAttributeItem) {
+        if let crate::syntax::JsxAttributeItem::Attribute(attribute) = attribute {
+            if let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
+                &attribute.data().initializer
+            {
+                if let Some(expression) = &container.data().expression {
+                    self.expr(expression);
+                }
+            }
+        }
+    }
+
+    fn function_declaration(&mut self, function: &crate::syntax::FunctionLike) {
+        self.function_like(function, function.name.as_ref().map(|name| name.range()));
+    }
+
+    fn arrow_like(
+        &mut self,
+        function: &crate::syntax::ArrowFunction,
+        name: Option<&crate::syntax::IdentifierNode>,
+    ) {
+        use crate::emitter::transforms::LanguageFeature;
+        if function.is_async
+            && !self
+                .context
+                .target
+                .supports(LanguageFeature::AsyncFunctions)
+        {
+            if let Some(name) = name {
+                self.record(
+                    crate::emitter::helpers::HelperKind::Awaiter.ident(),
+                    name.range(),
+                );
+            }
+        }
+        for parameter in &function.parameters {
+            self.parameter(parameter);
+        }
+        let outer = std::mem::replace(&mut self.in_async_generator, false);
+        match &function.body {
+            crate::syntax::FunctionBody::Block(block) => self.stmts(&block.data().statements),
+            crate::syntax::FunctionBody::Expression(expression) => self.expr(expression),
+            crate::syntax::FunctionBody::Missing(_) => {}
+        }
+        self.in_async_generator = outer;
+    }
+
+    fn function_like(
+        &mut self,
+        function: &crate::syntax::FunctionLike,
+        span: Option<crate::source::TextRange>,
+    ) {
+        use crate::emitter::transforms::LanguageFeature;
+        let is_async_generator = function.is_async && function.is_generator;
+        let span = span.or_else(|| function.name.as_ref().map(|name| name.range()));
+        if function.is_async
+            && !self
+                .context
+                .target
+                .supports(LanguageFeature::AsyncFunctions)
+        {
+            if let Some(span) = span {
+                self.record(crate::emitter::helpers::HelperKind::Awaiter.ident(), span);
+            }
+        }
+        if is_async_generator
+            && !self
+                .context
+                .target
+                .supports(LanguageFeature::AsyncIteration)
+        {
+            if let Some(span) = span {
+                self.record(ASYNC_GENERATOR, span);
+                self.record(AWAIT_HELPER, span);
+            }
+        }
+        if function.is_generator && !self.context.target.supports(LanguageFeature::Generators) {
+            if let Some(span) = span {
+                self.record(crate::emitter::helpers::HelperKind::Generator.ident(), span);
+            }
+        }
+        for parameter in &function.parameters {
+            self.parameter(parameter);
+        }
+        if function.body.is_some() {
+            let outer = std::mem::replace(&mut self.in_async_generator, is_async_generator);
+            match function.body.as_ref() {
+                Some(crate::syntax::FunctionBody::Block(block)) => {
+                    self.stmts(&block.data().statements);
+                }
+                Some(crate::syntax::FunctionBody::Expression(expression)) => {
+                    self.expr(expression);
+                }
+                Some(crate::syntax::FunctionBody::Missing(_)) | None => {}
+            }
+            self.in_async_generator = outer;
+        }
+    }
+
+    fn parameter(&mut self, parameter: &crate::syntax::ParameterNode) {
+        let data = parameter.data();
+        for decorator in &data.decorators {
+            self.parameter_decorator(decorator);
+        }
+        self.binding_pattern(&data.binding);
+        if let Some(initializer) = &data.initializer {
+            self.expr(initializer);
+        }
+    }
+
+    fn class_decl(&mut self, class: &crate::syntax::ClassDeclaration) {
+        let anonymous = class.name.is_none();
+        self.class_decorators(&class.decorators, anonymous);
+        if let Some(heritage) = &class.extends {
+            if !self
+                .context
+                .target
+                .supports(crate::emitter::transforms::LanguageFeature::Classes)
+            {
+                self.record(
+                    crate::emitter::helpers::HelperKind::Extends.ident(),
+                    self.extends_span(heritage),
+                );
+            }
+            self.expr(&heritage.expression);
+        }
+        for member in &class.members {
+            self.member(member);
+        }
+    }
+
+    fn member(&mut self, member: &crate::syntax::ClassMemberNode) {
+        use crate::syntax::ClassMember;
+        match member.data() {
+            ClassMember::Constructor(constructor) => {
+                for parameter in &constructor.parameters {
+                    self.parameter(parameter);
+                }
+                self.stmts(&constructor.body.data().statements);
+            }
+            ClassMember::Method(method) => {
+                let computed = matches!(method.name, crate::syntax::PropertyName::Computed(_));
+                self.member_decorators(&method.function.decorators, true, computed);
+                let name = match &method.name {
+                    crate::syntax::PropertyName::Identifier(name) => Some(name.range()),
+                    crate::syntax::PropertyName::String(literal) => Some(literal.range()),
+                    crate::syntax::PropertyName::Number(literal) => Some(literal.range()),
+                    crate::syntax::PropertyName::Private(name) => Some(name.range()),
+                    crate::syntax::PropertyName::Computed(expression) => {
+                        self.expr(expression);
+                        None
+                    }
+                    crate::syntax::PropertyName::Missing(_) => None,
+                };
+                self.function_like(&method.function, name);
+            }
+            ClassMember::Property(property) => {
+                let computed = matches!(property.name, crate::syntax::PropertyName::Computed(_));
+                self.member_decorators(&property.decorators, false, computed);
+                self.property_name(&property.name);
+                if let Some(initializer) = &property.initializer {
+                    self.expr(initializer);
+                }
+            }
+            ClassMember::AutoAccessor(accessor) => {
+                let computed = matches!(accessor.name, crate::syntax::PropertyName::Computed(_));
+                self.member_decorators(&accessor.decorators, true, computed);
+                self.property_name(&accessor.name);
+                if let Some(initializer) = &accessor.initializer {
+                    self.expr(initializer);
+                }
+            }
+            ClassMember::StaticBlock(block) => self.stmts(&block.data().statements),
+            ClassMember::IndexSignature(_) | ClassMember::Missing(_) | ClassMember::Semicolon => {}
+        }
+    }
+
+    fn property_name(&mut self, name: &crate::syntax::PropertyName) {
+        if let crate::syntax::PropertyName::Computed(expression) = name {
+            self.expr(expression);
+        }
+    }
+
+    fn object_member(&mut self, member: &crate::syntax::ObjectMemberNode) {
+        use crate::syntax::ObjectMember;
+        match member.data() {
+            ObjectMember::Property(property) => {
+                self.property_name(&property.name);
+                self.expr(&property.value);
+            }
+            ObjectMember::Method(method) => {
+                let name = match &method.name {
+                    crate::syntax::PropertyName::Identifier(name) => Some(name.range()),
+                    crate::syntax::PropertyName::String(literal) => Some(literal.range()),
+                    crate::syntax::PropertyName::Number(literal) => Some(literal.range()),
+                    crate::syntax::PropertyName::Private(name) => Some(name.range()),
+                    crate::syntax::PropertyName::Computed(expression) => {
+                        self.expr(expression);
+                        None
+                    }
+                    crate::syntax::PropertyName::Missing(_) => None,
+                };
+                self.function_like(&method.function, name);
+            }
+            ObjectMember::Spread(spread) => {
+                if !self
+                    .context
+                    .target
+                    .supports(crate::emitter::transforms::LanguageFeature::Classes)
+                {
+                    self.record(
+                        crate::emitter::helpers::HelperKind::Assign.ident(),
+                        spread.argument.range(),
+                    );
+                }
+                self.expr(&spread.argument);
+            }
+            ObjectMember::Missing(_) => {}
+        }
+    }
+
+    fn binding_pattern(&mut self, pattern: &crate::syntax::Pattern) {
+        use crate::syntax::BindingPattern;
+        match pattern.data() {
+            BindingPattern::Identifier(_) => {}
+            BindingPattern::Object(object) => {
+                for property in &object.properties {
+                    self.property_name(&property.name);
+                    if let crate::syntax::BindingPattern::Rest(rest) = property.binding.data() {
+                        self.object_rest(&rest.argument);
+                    }
+                    self.binding_pattern(&property.binding);
+                    if let Some(initializer) = &property.initializer {
+                        self.expr(initializer);
+                    }
+                }
+            }
+            BindingPattern::Array(array) => {
+                for element in &array.elements {
+                    if let crate::syntax::ArrayBindingElement::Binding(inner) = element {
+                        self.binding_pattern(inner);
+                    }
+                }
+            }
+            BindingPattern::Rest(rest) => {
+                self.binding_pattern(&rest.argument);
+            }
+            BindingPattern::Assignment(assignment) => {
+                self.binding_pattern(&assignment.left);
+                self.expr(&assignment.right);
+            }
+            BindingPattern::Missing(_) => {}
+        }
+    }
+
+    fn object_rest(&mut self, argument: &crate::syntax::Pattern) {
+        use crate::emitter::transforms::LanguageFeature;
+        if !self
+            .context
+            .target
+            .supports(LanguageFeature::ObjectRestSpread)
+        {
+            if let crate::syntax::BindingPattern::Identifier(name) = argument.data() {
+                self.record(
+                    crate::emitter::helpers::HelperKind::Rest.ident(),
+                    name.range(),
+                );
+            }
+        }
+    }
+
+    fn assignment_target(&mut self, target: &crate::syntax::AssignmentTargetNode) {
+        use crate::syntax::AssignmentTarget;
+        match target.data() {
+            AssignmentTarget::Identifier(_) => {}
+            AssignmentTarget::Member(member) => {
+                self.private_write(&member.property, target.range());
+                self.expr(&member.object);
+                if let crate::syntax::MemberProperty::Computed(inner) = &member.property {
+                    self.expr(inner);
+                }
+            }
+            AssignmentTarget::Object(object) => {
+                for property in &object.properties {
+                    self.property_name(&property.name);
+                    if property.rest {
+                        if let AssignmentTarget::Identifier(name) = property.target.data() {
+                            if !self.context.target.supports(
+                                crate::emitter::transforms::LanguageFeature::ObjectRestSpread,
+                            ) {
+                                self.record(
+                                    crate::emitter::helpers::HelperKind::Rest.ident(),
+                                    name.range(),
+                                );
+                            }
+                        }
+                    }
+                    self.assignment_target(&property.target);
+                    if let Some(initializer) = &property.initializer {
+                        self.expr(initializer);
+                    }
+                }
+            }
+            AssignmentTarget::Array(array) => {
+                for element in &array.elements {
+                    match element {
+                        crate::syntax::AssignmentArrayElement::Target(inner)
+                        | crate::syntax::AssignmentArrayElement::Rest(inner) => {
+                            self.assignment_target(inner);
+                        }
+                        crate::syntax::AssignmentArrayElement::Elision
+                        | crate::syntax::AssignmentArrayElement::Missing(_) => {}
+                    }
+                }
+            }
+            AssignmentTarget::Missing(_) | AssignmentTarget::Invalid(_) => {}
+        }
+    }
+
+    fn assignment_expression(&mut self, assignment: &crate::syntax::AssignmentExpression) {
+        if let crate::syntax::AssignmentTarget::Member(member) = assignment.left.data() {
+            if self.is_private_member(&member.property) && self.private_fields_active() {
+                let span = assignment.left.range();
+                if assignment.operator != crate::syntax::AssignmentOperator::Assign {
+                    self.record(
+                        crate::emitter::helpers::HelperKind::ClassPrivateFieldGet.ident(),
+                        span,
+                    );
+                }
+                self.record(
+                    crate::emitter::helpers::HelperKind::ClassPrivateFieldSet.ident(),
+                    span,
+                );
+            }
+        }
+        if !matches!(
+            assignment.left.data(),
+            crate::syntax::AssignmentTarget::Member(_)
+        ) {
+            self.assignment_target(&assignment.left);
+        } else {
+            self.assignment_target_no_write(&assignment.left);
+        }
+        self.expr(&assignment.right);
+    }
+
+    fn assignment_target_no_write(&mut self, target: &crate::syntax::AssignmentTargetNode) {
+        if let crate::syntax::AssignmentTarget::Member(member) = target.data() {
+            self.expr(&member.object);
+            if let crate::syntax::MemberProperty::Computed(inner) = &member.property {
+                self.expr(inner);
+            }
+        }
+    }
+
+    fn private_fields_active(&self) -> bool {
+        use crate::emitter::transforms::LanguageFeature;
+        self.context.target.supports(LanguageFeature::Classes)
+            && !self.context.target.supports(LanguageFeature::ClassFields)
+    }
+    fn is_private_member(&self, property: &crate::syntax::MemberProperty) -> bool {
+        matches!(property, crate::syntax::MemberProperty::Private(_))
+    }
+
+    fn private_write(
+        &mut self,
+        property: &crate::syntax::MemberProperty,
+        span: crate::source::TextRange,
+    ) {
+        if self.is_private_member(property) && self.private_fields_active() {
+            self.record(
+                crate::emitter::helpers::HelperKind::ClassPrivateFieldSet.ident(),
+                span,
+            );
+        }
+    }
+
+    fn private_name_in(&mut self, operand: &crate::syntax::Expr) {
+        if let crate::syntax::Expression::Identifier(name) = operand.data() {
+            if name.data().token().kind() == crate::syntax::TokenKind::PrivateIdentifier
+                && self.private_fields_active()
+            {
+                self.record(
+                    crate::emitter::helpers::HelperKind::ClassPrivateFieldIn.ident(),
+                    name.range(),
+                );
+            }
+        }
+    }
+
+    fn class_decorators(&mut self, decorators: &[crate::syntax::DecoratorNode], anonymous: bool) {
+        use crate::emitter::helpers::HelperKind;
+        for decorator in decorators {
+            let span = decorator.range();
+            if self.context.experimental_decorators {
+                self.record(HelperKind::Decorate.ident(), span);
+                if self.context.emit_decorator_metadata {
+                    self.record(HelperKind::Metadata.ident(), span);
+                }
+            } else {
+                self.record(ES_DECORATE, span);
+                self.record(RUN_INITIALIZERS, span);
+                if anonymous {
+                    self.record(SET_FUNCTION_NAME, span);
+                }
+            }
+            self.expr(&decorator.data().expression);
+        }
+    }
+
+    fn member_decorators(
+        &mut self,
+        decorators: &[crate::syntax::DecoratorNode],
+        needs_function_name: bool,
+        computed: bool,
+    ) {
+        use crate::emitter::helpers::HelperKind;
+        for decorator in decorators {
+            let span = decorator.range();
+            if self.context.experimental_decorators {
+                self.record(HelperKind::Decorate.ident(), span);
+                if self.context.emit_decorator_metadata {
+                    self.record(HelperKind::Metadata.ident(), span);
+                }
+            } else {
+                self.record(ES_DECORATE, span);
+                self.record(RUN_INITIALIZERS, span);
+                if needs_function_name && !computed {
+                    self.record(SET_FUNCTION_NAME, span);
+                }
+                if computed {
+                    self.record(PROP_KEY, span);
+                }
+            }
+            self.expr(&decorator.data().expression);
+        }
+    }
+
+    fn parameter_decorator(&mut self, decorator: &crate::syntax::DecoratorNode) {
+        use crate::emitter::helpers::HelperKind;
+        let span = decorator.range();
+        self.record(HelperKind::Param.ident(), span);
+        if self.context.emit_decorator_metadata {
+            self.record(HelperKind::Metadata.ident(), span);
+        }
+        self.expr(&decorator.data().expression);
+    }
+
+    fn import_decl(
+        &mut self,
+        import: &crate::syntax::ImportDeclaration,
+        span: crate::source::TextRange,
+    ) {
+        use crate::syntax::ImportBinding;
+        if import.type_only || !self.interop_active() {
+            return;
+        }
+        let Some(clause) = &import.clause else {
+            return;
+        };
+        match &clause.binding {
+            Some(ImportBinding::Namespace(_)) => {
+                self.record(
+                    crate::emitter::helpers::HelperKind::ImportStar.ident(),
+                    span,
+                );
+            }
+            Some(ImportBinding::Named(specifiers)) => {
+                for specifier in specifiers {
+                    if specifier.data().mode == crate::syntax::ImportSpecifierMode::Value
+                        && self.module_export_text(&specifier.data().imported) == "default"
+                    {
+                        self.record(
+                            crate::emitter::helpers::HelperKind::ImportDefault.ident(),
+                            specifier.range(),
+                        );
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn export_decl(
+        &mut self,
+        export: &crate::syntax::ExportDeclaration,
+        span: crate::source::TextRange,
+    ) {
+        use crate::syntax::{ExportDeclaration, ExportDefaultValue, ExportNamedDeclaration};
+        match export {
+            ExportDeclaration::All(all) => {
+                if all.type_only {
+                    return;
+                }
+                if all.exported.is_some() {
+                    if self.interop_active() {
+                        self.record(
+                            crate::emitter::helpers::HelperKind::ImportStar.ident(),
+                            span,
+                        );
+                    }
+                } else if self.downlevel_module() {
+                    self.record(
+                        crate::emitter::helpers::HelperKind::ExportStar.ident(),
+                        span,
+                    );
+                }
+            }
+            ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only,
+                specifiers,
+                source,
+                ..
+            }) => {
+                if *type_only || source.is_none() {
+                    return;
+                }
+                if !self.interop_active() {
+                    return;
+                }
+                for specifier in specifiers {
+                    if self.module_export_text(&specifier.data().local) == "default" {
+                        self.record(
+                            crate::emitter::helpers::HelperKind::ImportDefault.ident(),
+                            specifier.range(),
+                        );
+                    }
+                }
+            }
+            ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+                self.stmt(inner)
+            }
+            ExportDeclaration::Default(default) => match &default.value {
+                ExportDefaultValue::Function(function) => {
+                    let span = function.name.as_ref().map(|name| name.range());
+                    self.function_like(function, span);
+                }
+                ExportDefaultValue::Class(class) => self.class_decl(class),
+                ExportDefaultValue::Expression(expression) => self.expr(expression),
+                ExportDefaultValue::Interface(_) | ExportDefaultValue::Missing(_) => {}
+            },
+            ExportDeclaration::Assignment(expression) => self.expr(expression),
+        }
+    }
+
+    fn interop_active(&self) -> bool {
+        use crate::emitter::ModuleKind;
+        self.context.es_module_interop
+            && matches!(
+                self.context.module_kind,
+                Some(ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd)
+            )
+    }
+
+    fn downlevel_module(&self) -> bool {
+        use crate::emitter::ModuleKind;
+        matches!(
+            self.context.module_kind,
+            Some(ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System)
+        )
+    }
+
+    fn extends_span(&self, heritage: &crate::syntax::ClassHeritage) -> crate::source::TextRange {
+        let expression = heritage.expression.range();
+        let mut keyword = None;
+        for token in self.source.tokens() {
+            if token.kind() == crate::syntax::TokenKind::KwExtends
+                && token.range().end() <= expression.start()
+            {
+                keyword = Some(token.range());
+            }
+        }
+        keyword.map_or(expression, |keyword| {
+            crate::source::TextRange::new(keyword.start(), expression.end()).unwrap_or(expression)
+        })
+    }
+
+    fn tagged_template_span(
+        &self,
+        tagged: &crate::syntax::TaggedTemplateExpression,
+        fallback: crate::source::TextRange,
+    ) -> crate::source::TextRange {
+        let first = tagged
+            .template
+            .elements
+            .first()
+            .map(|element| element.range().start());
+        let last = tagged
+            .template
+            .elements
+            .last()
+            .map(|element| element.range().end());
+        match (first, last) {
+            (Some(start), Some(end)) => {
+                let start = crate::source::Utf16Pos::new(start.get().saturating_sub(1));
+                let end = crate::source::Utf16Pos::new(end.get().saturating_add(1));
+                crate::source::TextRange::new(start, end).unwrap_or(fallback)
+            }
+            _ => fallback,
+        }
+    }
+
+    fn yield_span(&self, node: crate::source::TextRange) -> crate::source::TextRange {
+        let end = crate::source::Utf16Pos::new(node.start().get().saturating_add(5));
+        crate::source::TextRange::new(node.start(), end).unwrap_or(node)
+    }
+
+    fn async_arrow_initializer(
+        &mut self,
+        binding: &crate::syntax::Pattern,
+        initializer: &crate::syntax::Expr,
+    ) {
+        if let crate::syntax::BindingPattern::Identifier(name) = binding.data() {
+            let mut candidate = initializer;
+            while let crate::syntax::Expression::Parenthesized(inner) = candidate.data() {
+                candidate = inner;
+            }
+            if let crate::syntax::Expression::Arrow(function) = candidate.data() {
+                if function.is_async {
+                    self.arrow_like(function, Some(name));
+                }
+            }
+        }
+    }
+
+    fn module_export_text(&self, name: &crate::syntax::ModuleExportName) -> String {
+        match name {
+            crate::syntax::ModuleExportName::Identifier(identifier) => self
+                .source
+                .token_text(identifier.data().token())
+                .unwrap_or_default()
+                .to_owned(),
+            crate::syntax::ModuleExportName::String(literal) => self
+                .source
+                .token_text(literal.data().token())
+                .map_or_else(String::new, |text| {
+                    text.trim_matches(|character| character == '\'' || character == '"')
+                        .to_owned()
+                }),
+            crate::syntax::ModuleExportName::Missing(_) => String::new(),
+        }
+    }
+    fn member_read(
+        &mut self,
+        member: &crate::syntax::MemberExpression,
+        span: crate::source::TextRange,
+    ) {
+        if self.is_private_member(&member.property) && self.private_fields_active() {
+            self.record(
+                crate::emitter::helpers::HelperKind::ClassPrivateFieldGet.ident(),
+                span,
+            );
+        }
+        self.expr(&member.object);
+        if let crate::syntax::MemberProperty::Computed(inner) = &member.property {
+            self.expr(inner);
+        }
+    }
+}
+fn resolve_tslib(files: &[TslibHelperFile<'_>], from: &TslibHelperFile<'_>) -> Option<TslibTarget> {
+    let mut candidates: std::collections::HashMap<String, SourceId> =
+        std::collections::HashMap::new();
+    for file in files {
+        candidates.insert(file.path.to_string_lossy().into_owned(), file.source_id);
+    }
+    let mut directory = from.path.parent();
+    while let Some(dir) = directory {
+        for name in [
+            "tslib.d.ts",
+            "tslib.ts",
+            "tslib.d.mts",
+            "tslib.mts",
+            "tslib.d.cts",
+            "tslib.cts",
+            "tslib.tsx",
+            "tslib.ts",
+            "tslib.jsx",
+            "tslib.js",
+        ] {
+            let probe = dir.join("node_modules").join("tslib").join(name);
+            if let Some(id) = candidates.get(&probe.to_string_lossy().into_owned()) {
+                return Some(TslibTarget::File(*id));
+            }
+        }
+        for name in ["index.d.ts", "index.ts", "index.tsx", "index.js"] {
+            let probe = dir.join("node_modules").join("tslib").join(name);
+            if let Some(id) = candidates.get(&probe.to_string_lossy().into_owned()) {
+                return Some(TslibTarget::File(*id));
+            }
+        }
+        directory = dir.parent();
+    }
+    files.iter().find_map(|file| {
+        ambient_tslib_present(file.source).then_some(TslibTarget::Ambient(file.source_id))
+    })
+}
+
+/// Whether the file declares an ambient `tslib` module.
+fn ambient_tslib_present(source: &SourceFile) -> bool {
+    use crate::syntax::{NamespaceName, Statement};
+    source.statements().iter().any(|statement| {
+        let mut current = statement;
+        loop {
+            match current.data() {
+                Statement::Declare(inner) => current = inner,
+                Statement::Namespace(namespace) => {
+                    return matches!(&namespace.name, NamespaceName::StringLiteral(literal) if source.token_text(literal.data().token()).is_some_and(|text| text.trim_matches(|character| character == '\'' || character == '"') == "tslib"));
+                }
+                Statement::Export(crate::syntax::ExportDeclaration::Named(crate::syntax::ExportNamedDeclaration::Declaration(inner))) => current = inner,
+                _ => return false,
+            }
+        }
+    })
+}
+
+/// Value export names of the resolved `tslib`, for the TS2343 presence check.
+fn tslib_export_names(
+    files: &[TslibHelperFile<'_>],
+    target: &TslibTarget,
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let source = match target {
+        TslibTarget::File(id) => files
+            .iter()
+            .find(|file| file.source_id == *id)
+            .map(|file| file.source),
+        TslibTarget::Ambient(id) => files
+            .iter()
+            .find(|file| file.source_id == *id)
+            .map(|file| file.source),
+    };
+    let Some(source) = source else {
+        return names;
+    };
+    match target {
+        TslibTarget::File(_) => collect_value_exports(source, source.statements(), &mut names),
+        TslibTarget::Ambient(_) => collect_ambient_tslib_exports(source, &mut names),
+    }
+    names
+}
+
+/// Identity key for cross-file TS2343 deduplication: same helper from the same
+/// `tslib` copy reports once.
+fn tslib_identity(files: &[TslibHelperFile<'_>], target: &TslibTarget) -> String {
+    match target {
+        TslibTarget::File(id) => files.iter().find(|file| file.source_id == *id).map_or_else(
+            || "tslib".to_owned(),
+            |file| file.path.to_string_lossy().into_owned(),
+        ),
+        TslibTarget::Ambient(id) => format!("ambient:{id:?}"),
+    }
+}
+
+/// Value export names of top-level statements. `export {}` contributes none;
+/// `export =` and `export *` are not followed.
+fn collect_value_exports(
+    source: &SourceFile,
+    statements: &[crate::syntax::Stmt],
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, Statement};
+    for statement in statements {
+        match statement.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => {
+                collect_exported_declaration(source, inner, names);
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only: false,
+                specifiers,
+                ..
+            })) => {
+                for specifier in specifiers {
+                    let exported = export_name_text(source, &specifier.data().exported);
+                    if !exported.is_empty() {
+                        names.insert(exported);
+                    }
+                }
+            }
+            Statement::Declare(inner) => {
+                collect_declared_exports(source, inner, names);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Value export names inside `declare module "tslib"`.
+fn collect_ambient_tslib_exports(
+    source: &SourceFile,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::syntax::{NamespaceName, Statement};
+    for statement in source.statements() {
+        let mut current = statement;
+        loop {
+            match current.data() {
+                Statement::Declare(inner) => current = inner,
+                Statement::Export(crate::syntax::ExportDeclaration::Named(
+                    crate::syntax::ExportNamedDeclaration::Declaration(inner),
+                )) => current = inner,
+                Statement::Namespace(namespace) => {
+                    if matches!(&namespace.name, NamespaceName::StringLiteral(literal) if source.token_text(literal.data().token()).is_some_and(|text| text.trim_matches(|character| character == '\'' || character == '"') == "tslib"))
+                    {
+                        collect_value_exports(source, &namespace.body.data().statements, names);
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Names a value declaration exports under `export`.
+fn collect_exported_declaration(
+    source: &SourceFile,
+    inner: &crate::syntax::Stmt,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::syntax::Statement;
+    match inner.data() {
+        Statement::Variable(declaration) => {
+            for declarator in &declaration.declarations {
+                collect_binding_names(&declarator.data().binding, names, source);
+            }
+        }
+        Statement::Function(function) => {
+            if let Some(name) = &function.function.name {
+                if let Some(text) = source.token_text(name.data().token()) {
+                    names.insert(text.to_owned());
+                }
+            }
+        }
+        Statement::Class(class) => {
+            if let Some(name) = &class.name {
+                if let Some(text) = source.token_text(name.data().token()) {
+                    names.insert(text.to_owned());
+                }
+            }
+        }
+        Statement::Enum(declaration) => {
+            if let Some(text) = source.token_text(declaration.name.data().token()) {
+                names.insert(text.to_owned());
+            }
+        }
+        Statement::Namespace(namespace) => {
+            if let crate::syntax::NamespaceName::Identifier { name, .. } = &namespace.name {
+                if let Some(text) = source.token_text(name.data().token()) {
+                    names.insert(text.to_owned());
+                }
+            }
+        }
+        Statement::Declare(inner) => collect_declared_exports(source, inner, names),
+        _ => {}
+    }
+}
+
+/// `declare`-wrapped declarations still export when named.
+fn collect_declared_exports(
+    source: &SourceFile,
+    inner: &crate::syntax::Stmt,
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::syntax::Statement;
+    match inner.data() {
+        Statement::Export(_) => collect_value_exports(source, std::slice::from_ref(inner), names),
+        _ => collect_exported_declaration(source, inner, names),
+    }
+}
+
+/// Identifier names bound by a pattern.
+fn collect_binding_names(
+    pattern: &crate::syntax::Pattern,
+    names: &mut std::collections::BTreeSet<String>,
+    source: &SourceFile,
+) {
+    use crate::syntax::BindingPattern;
+    match pattern.data() {
+        BindingPattern::Identifier(name) => {
+            if let Some(text) = source.token_text(name.data().token()) {
+                names.insert(text.to_owned());
+            }
+        }
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_binding_names(&property.binding, names, source);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let crate::syntax::ArrayBindingElement::Binding(inner) = element {
+                    collect_binding_names(inner, names, source);
+                }
+            }
+        }
+        BindingPattern::Rest(rest) => collect_binding_names(&rest.argument, names, source),
+        BindingPattern::Assignment(assignment) => {
+            collect_binding_names(&assignment.left, names, source)
+        }
+        BindingPattern::Missing(_) => {}
+    }
+}
+
+/// Exported name text for an export specifier side.
+fn export_name_text(source: &SourceFile, name: &crate::syntax::ModuleExportName) -> String {
+    match name {
+        crate::syntax::ModuleExportName::Identifier(identifier) => source
+            .token_text(identifier.data().token())
+            .unwrap_or_default()
+            .to_owned(),
+        crate::syntax::ModuleExportName::String(literal) => source
+            .token_text(literal.data().token())
+            .map_or_else(String::new, |text| {
+                text.trim_matches(|character| character == '\'' || character == '"')
+                    .to_owned()
+            }),
+        crate::syntax::ModuleExportName::Missing(_) => String::new(),
+    }
+}
+
 pub fn compile_program_frontend_with_cancel(
     program: &ResolvedProgram,
     mode: FrontendMode,
@@ -641,6 +2122,7 @@ pub fn compile_program_frontend_with_cancel(
         .map_err(Cancelled::from)?;
         cancel.check()?;
         let program_diagnostics = checked.diagnostics();
+        let tslib_diagnostics = tslib_helper_diagnostics_for_program(program, &parsed);
         let mut modules = Vec::with_capacity(parsed.len());
         for (index, parsed) in parsed.into_iter().enumerate() {
             cancel.check()?;
@@ -669,14 +2151,11 @@ pub fn compile_program_frontend_with_cancel(
             js_path.set_extension(if keeps_jsx { "jsx" } else { "js" });
             let names = EmitFileNames {
                 source_name,
-                js_file_name: js_path.file_name().map(|name| {
-                    Arc::from(name.to_string_lossy().into_owned().into_boxed_str())
-                }),
+                js_file_name: Some(Arc::from(
+                    js_path.to_string_lossy().into_owned().into_boxed_str(),
+                )),
                 declaration_file_name: None,
                 source_root: None,
-                js_source_name: module.path().file_name().map(|name| {
-                    Arc::from(name.to_string_lossy().into_owned().into_boxed_str())
-                }),
                 ..EmitFileNames::default()
             };
             let emit = if let Some(options) = program_emit_options(program, mode, index) {
@@ -697,6 +2176,9 @@ pub fn compile_program_frontend_with_cancel(
                     .cloned(),
             );
             diagnostics.extend(unresolved_import_diagnostics(module, &ambient_modules));
+            if let Some(extra) = tslib_diagnostics.get(&source_id) {
+                diagnostics.extend(extra.iter().cloned());
+            }
             if let Some(output) = &emit {
                 diagnostics.extend(output.diagnostics.iter().cloned());
             }
@@ -973,6 +2455,145 @@ mod tests {
         assert_eq!(reported.len(), 2, "{reported:?}");
         assert!(reported[0].contains("'missing'"), "{reported:?}");
         assert!(reported[1].contains("'./gone'"), "{reported:?}");
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    fn tslib_case(files: &[(&str, &str)], config: &str) -> (PathBuf, ResolvedProgram) {
+        static NEXT_TSLIB_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-tslib-{}-{}",
+            std::process::id(),
+            NEXT_TSLIB_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root_path);
+        for (name, text) in files {
+            let path = root_path.join(name);
+            std::fs::create_dir_all(path.parent().expect("a file has a parent"))
+                .expect("create fixture directory");
+            std::fs::write(path, text).expect("write fixture file");
+        }
+        let root = ProjectRoot::new(std::fs::canonicalize(&root_path).expect("canonical fixture"))
+            .expect("valid project root");
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), config)
+            .expect("valid project config");
+        let program = ProgramLoader::new(&root, config.options())
+            .expect("construct loader")
+            .tolerating_unresolved_imports()
+            .load("main.ts")
+            .expect("load fixture program");
+        (root_path, program)
+    }
+
+    fn entry_diagnostics(output: &ProgramFrontendOutput, code: &str) -> Vec<(usize, String)> {
+        let entry = output
+            .modules()
+            .iter()
+            .find(|module| module.source_file().source_id() == output.entrypoint_id())
+            .expect("entrypoint module present");
+        let source = entry.source_file().source_text();
+        entry
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str() == code)
+            .map(|diagnostic| {
+                let (line, _) = source
+                    .line_column(diagnostic.range().start())
+                    .expect("diagnostic range is in bounds");
+                (line, diagnostic.message().to_owned())
+            })
+            .collect()
+    }
+
+    const TSLIB_HELPERS_CONFIG: &str =
+        r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015"}}"#;
+
+    #[test]
+    fn missing_tslib_helper_reports_ts2343_at_async_name() {
+        let (root_path, program) = tslib_case(
+            &[
+                (
+                    "main.ts",
+                    "export {};\nexport async function foo(): Promise<void> {}\n",
+                ),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2343");
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].0, 1, "{reported:?}");
+        assert!(reported[0].1.contains("__awaiter"), "{reported:?}");
+        assert!(reported[0].1.contains("tslib"), "{reported:?}");
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn declared_tslib_helper_is_silent() {
+        let (root_path, program) = tslib_case(
+            &[
+                (
+                    "main.ts",
+                    "export {};\nexport async function foo(): Promise<void> {}\n",
+                ),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export declare function __awaiter(thisArg: any, _arguments: any, P: Function, generator: Function): any;\n",
+                ),
+            ],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        assert!(entry_diagnostics(&output, "TS2354").is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn missing_tslib_module_reports_ts2354() {
+        let (root_path, program) = tslib_case(
+            &[(
+                "main.ts",
+                "export {};\nexport async function foo(): Promise<void> {}\n",
+            )],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2354");
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].0, 1, "{reported:?}");
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn script_file_needs_no_tslib_check() {
+        let (root_path, program) = tslib_case(
+            &[("main.ts", "async function foo(): Promise<void> {}\n")],
+            TSLIB_HELPERS_CONFIG,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        assert!(entry_diagnostics(&output, "TS2343").is_empty());
+        assert!(entry_diagnostics(&output, "TS2354").is_empty());
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn import_star_without_tslib_reports_ts2354_at_statement() {
+        let (root_path, program) = tslib_case(
+            &[(
+                "main.ts",
+                "import * as path from \"path\";\ndeclare module \"path\";\npath.resolve();\nexport {};\n",
+            )],
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015","esModuleInterop":true}}"#,
+        );
+        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let reported = entry_diagnostics(&output, "TS2354");
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].0, 0, "{reported:?}");
         let _ = std::fs::remove_dir_all(root_path);
     }
 
@@ -1458,33 +3079,6 @@ mod tests {
         assert!(
             !js.starts_with("\"use strict\";\n"),
             "ES module output should not have strict prologue, got: {js:?}"
-        );
-        std::fs::remove_dir_all(root_path).unwrap();
-    }
-
-    #[test]
-    fn source_map_program_closes_emit_with_external_map_url() {
-        let source = "export const value: number = 1;";
-        let config = r#"{"compilerOptions":{"sourceMap":true}}"#;
-        let (root_path, program) = program_fixture_with_config(source, config);
-        assert!(program.source_map());
-        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
-        let js = entrypoint_javascript(&output);
-        assert!(
-            js.ends_with("//# sourceMappingURL=main.js.map"),
-            "external map url closes the emit: {js:?}"
-        );
-        std::fs::remove_dir_all(root_path).unwrap();
-    }
-
-    #[test]
-    fn program_without_source_map_emits_no_map_url() {
-        let (root_path, program) = program_fixture("export const value: number = 1;");
-        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
-        let js = entrypoint_javascript(&output);
-        assert!(
-            !js.contains("sourceMappingURL"),
-            "no map url without sourceMap: {js:?}"
         );
         std::fs::remove_dir_all(root_path).unwrap();
     }
