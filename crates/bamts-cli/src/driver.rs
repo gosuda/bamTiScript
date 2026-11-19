@@ -1421,6 +1421,90 @@ exit 2
     }
 
     #[test]
+    fn tsc_project_out_file_reports_positioned_ts5102_and_emits_per_file() {
+        let fixture = TscFixture::new();
+        fixture.write("src/main.ts", "export const answer = 42;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/main.ts"],"compilerOptions":{"outFile":"dist/bundle.js"}}"#,
+        );
+        let outcome = execute_tsc_in(
+            &parse_tsc_args(["-p", "tsconfig.json", "--pretty", "false"]).expect("project parses"),
+            &fixture.0,
+        )
+        .expect("project executes");
+        assert_eq!(
+            outcome.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsGenerated.code()
+        );
+        let stdout = String::from_utf8(outcome.stdout).expect("UTF-8 diagnostics");
+        assert!(
+            stdout.contains("tsconfig.json(1,45): error TS5102:"),
+            "positioned at the outFile key: {stdout}"
+        );
+        assert!(
+            stdout.contains("Option 'outFile' has been removed."),
+            "{stdout}"
+        );
+        assert!(fixture.0.join("src/main.js").is_file(), "per-file output still emits");
+        assert!(
+            !fixture.0.join("dist/bundle.js").exists(),
+            "no bundle is produced"
+        );
+    }
+
+    #[test]
+    fn tsc_project_out_file_via_extends_is_unpositioned() {
+        let fixture = TscFixture::new();
+        fixture.write("src/main.ts", "export const answer = 42;\n");
+        fixture.write("base.json", r#"{"compilerOptions":{"outFile":"out.js"}}"#);
+        fixture.write(
+            "tsconfig.json",
+            r#"{"extends":"./base.json","files":["src/main.ts"]}"#,
+        );
+        let outcome = execute_tsc_in(
+            &parse_tsc_args(["-p", "tsconfig.json", "--pretty", "false"]).expect("project parses"),
+            &fixture.0,
+        )
+        .expect("project executes");
+        assert_eq!(
+            outcome.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsGenerated.code()
+        );
+        let stdout = String::from_utf8(outcome.stdout).expect("UTF-8 diagnostics");
+        assert!(stdout.contains("error TS5102:"), "{stdout}");
+        assert!(
+            stdout.lines().any(|line| line.starts_with("error TS5102:")),
+            "no file position: {stdout}"
+        );
+        assert!(fixture.0.join("src/main.js").is_file());
+    }
+
+    #[test]
+    fn tsc_direct_out_file_reports_ts5102_and_emits_per_file() {
+        let fixture = TscFixture::new();
+        fixture.write("a.ts", "export const x = 1;\n");
+        let outcome = execute_tsc_in(
+            &parse_tsc_args(["--outFile", "x.js", "--ignoreConfig", "--pretty", "false", "a.ts"])
+                .expect("direct parses"),
+            &fixture.0,
+        )
+        .expect("direct executes");
+        assert_eq!(
+            outcome.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsGenerated.code()
+        );
+        let stdout = String::from_utf8(outcome.stdout).expect("UTF-8 diagnostics");
+        assert!(stdout.contains("error TS5102:"), "{stdout}");
+        assert!(
+            stdout.lines().any(|line| line.starts_with("error TS5102:")),
+            "TS5102 is unpositioned: {stdout}"
+        );
+        assert!(fixture.0.join("a.js").is_file(), "per-file output still emits");
+        assert!(!fixture.0.join("x.js").exists(), "no bundle is produced");
+    }
+
+    #[test]
     fn tsc_build_orders_references_and_stops_after_error() {
         let fixture = TscFixture::new();
         fixture.write("lib/src/lib.ts", "export const lib = 1;\n");

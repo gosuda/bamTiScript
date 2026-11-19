@@ -243,10 +243,7 @@ impl ParsedTscCommand {
                 jsx_preserve,
             },
             output: OutputOptions {
-                file: self
-                    .option_str("outFile")
-                    .or_else(|| self.option_str("out"))
-                    .map(str::to_owned),
+                file: self.option_str("outFile").map(str::to_owned),
                 dir: self.option_str("outDir").map(str::to_owned),
                 emit_declarations: self.flag("declaration"),
                 source_maps: self.flag("sourceMap"),
@@ -358,7 +355,6 @@ const DIRECT_CONSUMED: &[&str] = &[
     "noEmit",
     "noEmitOnError",
     "noImplicitAny",
-    "out",
     "outDir",
     "outFile",
     "pretty",
@@ -419,7 +415,6 @@ const PROJECT_CONSUMED: &[&str] = &[
     "noEmit",
     "noEmitOnError",
     "noImplicitAny",
-    "out",
     "outDir",
     "outFile",
     "pretty",
@@ -1159,7 +1154,6 @@ const COMPILER: &[OptionSpec] = &[
     flag("checkJs", None),
     enum_opt("jsx", None, JSX),
     string_opt("outFile", None),
-    string_opt("out", None),
     string_opt("outDir", None),
     string_opt("rootDir", None),
     tsconfig_flag("composite"),
@@ -1685,9 +1679,10 @@ mod tests {
     }
 
     #[test]
-    fn out_alias_maps_to_output_file() {
-        let cli = parse(&["--out", "bundle.js", "a.ts"]).to_cli_args();
-        assert_eq!(cli.output.file.as_deref(), Some("bundle.js"));
+    fn out_flag_is_an_unknown_compiler_option() {
+        let text = parse_err(&["--out", "bundle.js", "a.ts"]).pretty_false();
+        assert!(text.contains("error TS5023:"));
+        assert!(text.contains("Unknown compiler option '--out'."));
     }
 
     #[test]

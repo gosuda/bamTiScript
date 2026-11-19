@@ -1896,29 +1896,7 @@ fn produce_project_javascript(
             BTreeMap::new()
         } else {
             let loaded = load_project_program(&fixture.input_files, &config, &project_dir)?;
-            if config.options().out_file().is_some() {
-                let frontend = compile_program_frontend(&loaded, FrontendMode::JavaScript);
-                let bundle = bamts_compiler::project::emit_out_file_javascript(
-                    &loaded,
-                    &frontend,
-                    config.options(),
-                )
-                .map_err(|error| ProjectEmitError::Compile(error.to_string()))?;
-                let relative = bundle.path.strip_prefix(&project_dir).map_err(|error| {
-                    ProjectEmitError::Compile(format!(
-                        "outFile path {} leaves the project: {error}",
-                        bundle.path.display()
-                    ))
-                })?;
-                let name = relative
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                BTreeMap::from([(name, bundle.code)])
-            } else {
-                project_javascript_outputs(&loaded, &config, &project_dir)
-            }
+            project_javascript_outputs(&loaded, &config, &project_dir)
         };
         let produced_names: Vec<String> = produced.keys().cloned().collect();
         if produced_names != expected {
