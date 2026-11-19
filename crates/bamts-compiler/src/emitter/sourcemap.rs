@@ -1834,4 +1834,161 @@ mod tests {
         let member = segments.iter().find(|(line, _, _, _)| *line == 1);
         assert_eq!(member, Some(&(1, 4, 1, 4)));
     }
+    #[test]
+    fn declaration_namespace_open_brace_maps_space_and_brace() {
+        let source = "namespace m2 {\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let first: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 0)
+            .collect();
+        assert_eq!(
+            first,
+            vec![(0, 0, 0, 0), (0, 18, 0, 10), (0, 20, 0, 12), (0, 21, 0, 13)]
+        );
+        let second: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 1)
+            .collect();
+        assert_eq!(second, vec![(1, 1, 1, 1)]);
+    }
+
+    #[test]
+    fn declaration_interface_open_brace_maps_space_only() {
+        let source = "interface I {\n    x: number;\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let first: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 0)
+            .collect();
+        assert_eq!(first, vec![(0, 0, 0, 0), (0, 9, 0, 9), (0, 10, 0, 10)]);
+        let last: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 2)
+            .collect();
+        assert_eq!(last, vec![(2, 1, 2, 1)]);
+    }
+
+    #[test]
+    fn declaration_class_open_brace_maps_space_only() {
+        let source = "export class Foo {\n    bar(): void;\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let first: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 0)
+            .collect();
+        assert_eq!(first, vec![(0, 0, 0, 0), (0, 21, 0, 13), (0, 24, 0, 16)]);
+        let last: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 2)
+            .collect();
+        assert_eq!(last, vec![(2, 1, 2, 1)]);
+    }
+
+    #[test]
+    fn declaration_call_signature_maps_leading_paren() {
+        let source = "interface I {\n    (x: number): void;\n}\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let member = segments.iter().find(|(line, _, _, _)| *line == 1);
+        assert_eq!(member, Some(&(1, 4, 1, 4)));
+    }
+
+    #[test]
+    fn declaration_object_call_signature_maps_leading_paren() {
+        let source = "declare var m2: {\n    (): void;\n};\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let member = segments.iter().find(|(line, _, _, _)| *line == 1);
+        assert_eq!(member, Some(&(1, 4, 1, 4)));
+    }
+
+    #[test]
+    fn declaration_variable_kind_maps_unconditionally() {
+        let source = "var m2: number;\n";
+        let declaration = emit(
+            source,
+            &EmitOptions {
+                declaration: true,
+                declaration_map: true,
+                target: ScriptTarget::Es2015,
+                ..EmitOptions::default()
+            },
+        )
+        .declaration
+        .expect("declaration output");
+        let map = declaration.source_map.expect("declaration source map");
+        let segments = decode_all_segments(&map.encode_mappings());
+        let first: Vec<(usize, i64, i64, i64)> = segments
+            .iter()
+            .copied()
+            .filter(|(line, _, _, _)| *line == 0)
+            .take(3)
+            .collect();
+        assert_eq!(first, vec![(0, 0, 0, 0), (0, 8, 0, 0), (0, 12, 0, 4)]);
+    }
 }
