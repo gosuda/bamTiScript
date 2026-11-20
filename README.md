@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/gosuda/bamTiScript/actions/workflows/ci.yml/badge.svg?branch=main)](.github/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Built with Depot](https://depot.dev/badges/built-with-depot.svg)](https://depot.dev?utm_source=gosuda)
 
 bamTiScript is a pre-release clean-room TypeScript compiler and JavaScript runtime in Rust: it accepts the TypeScript 7.0.2 `tsc` argument model and, on Linux x64, compiles a source file to a native executable.
 
