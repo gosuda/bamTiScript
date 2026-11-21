@@ -914,16 +914,16 @@ impl ProgramLoader {
         let specifier = format!("./{}", relative.to_string_lossy().replace('\\', "/"));
         let synthetic_importer = self.root.path().join("__bamts_program__.ts");
         let plan = plan_relative_module(&self.root, synthetic_importer, &specifier, flavor)
-        .map_err(|source| ProgramLoadError::InvalidSpecifier {
-            diagnostic: diagnostic(
-                self.root.path(),
-                &specifier,
-                edge_kind(flavor),
-                TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO)
-                    .expect("equal range endpoints are valid"),
-            ),
-            source,
-        })?;
+            .map_err(|source| ProgramLoadError::InvalidSpecifier {
+                diagnostic: diagnostic(
+                    self.root.path(),
+                    &specifier,
+                    edge_kind(flavor),
+                    TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO)
+                        .expect("equal range endpoints are valid"),
+                ),
+                source,
+            })?;
         self.canonical_selection(plan.candidates(), flavor)
     }
 
@@ -1267,10 +1267,10 @@ impl ProgramLoader {
         }
         if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(&self.root, importer, &edge.specifier, flavor)
-            .map_err(|source| ProgramLoadError::InvalidSpecifier {
-                diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
-                source,
-            })?;
+                .map_err(|source| ProgramLoadError::InvalidSpecifier {
+                    diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
+                    source,
+                })?;
             return Ok(self
                 .canonical_selection(plan.candidates(), flavor)?
                 .map(ResolvedEdgeTarget::Local));

@@ -4,18 +4,17 @@ use std::{
     sync::Arc,
 };
 
+use super::{DocumentSnapshot, ServiceError, ServiceState, filesystem::FileSystem};
 use crate::checker::binder::{PropertyAnchor, PropertyAnchorKind, PropertyId};
 use crate::{
     checker::{
-        PropertyType, SemanticModel, SymbolId, SymbolKind, Type, TypeId, TypeTable,
-        render_type,
+        PropertyType, SemanticModel, SymbolId, SymbolKind, Type, TypeId, TypeTable, render_type,
     },
     diagnostic::DiagnosticSeverity,
     scanner,
     source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos},
     syntax::{Accessibility, Token, TokenKind, VariableKind},
 };
-use super::{DocumentSnapshot, ServiceError, ServiceState, filesystem::FileSystem};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Completion {
@@ -339,14 +338,11 @@ fn member_access_dot(document: &DocumentSnapshot, position: Utf16Pos) -> Option<
         return matches!(dot.kind(), TokenKind::Dot | TokenKind::QuestionDot)
             .then_some(dot.range());
     }
-    let (index, dot) = tokens
-        .iter()
-        .enumerate()
-        .rfind(|(_, token)| {
-            !token.is_missing()
-                && matches!(token.kind(), TokenKind::Dot | TokenKind::QuestionDot)
-                && token.range().end() <= position
-        })?;
+    let (index, dot) = tokens.iter().enumerate().rfind(|(_, token)| {
+        !token.is_missing()
+            && matches!(token.kind(), TokenKind::Dot | TokenKind::QuestionDot)
+            && token.range().end() <= position
+    })?;
     let blocked = tokens[index + 1..]
         .iter()
         .any(|token| !token.is_missing() && token.range().start() < position);

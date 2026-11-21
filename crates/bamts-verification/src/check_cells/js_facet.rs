@@ -305,7 +305,9 @@ pub fn emit_javascript_baseline(
 /// The bundle output name (`outFile`) upstream gives every unit's JavaScript
 /// output, as a basename. Upstream's per-unit output path is the `outFile`
 /// path itself, and the baseline prints only its basename.
-pub(super) fn bundle_output_name(options: &CompilerOptions) -> std::result::Result<Option<String>, String> {
+pub(super) fn bundle_output_name(
+    options: &CompilerOptions,
+) -> std::result::Result<Option<String>, String> {
     let Some(path) = options.out_file() else {
         return Ok(None);
     };

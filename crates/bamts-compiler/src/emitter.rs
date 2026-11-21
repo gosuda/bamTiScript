@@ -1371,7 +1371,6 @@ impl Emitter<'_> {
         self.comment_cursor = self.comment_cursor.max(element_start);
     }
 
-
     /// Block comments between an element's end and its separator or closer,
     /// stopping at the first other token. They trail the element: they lead
     /// neither the separator nor the next element, so the leading queue
@@ -1450,10 +1449,7 @@ impl Emitter<'_> {
         let end = self
             .tokens
             .partition_point(|token| token.range().start() < found);
-        if !self.tokens[start..end]
-            .iter()
-            .all(Self::is_trivia)
-        {
+        if !self.tokens[start..end].iter().all(Self::is_trivia) {
             return;
         }
         let newline = if self.options.remove_comments {
@@ -1476,8 +1472,16 @@ impl Emitter<'_> {
     /// Prints a control keyword, the comments between it and its `(`, and
     /// the paren. Without comments this is byte- and map-identical to the
     /// plain combined print.
-    fn emit_keyword_open_paren(&mut self, keyword: &str, anchor: TextRange, combined: &str, open_pos: Utf16Pos) {
-        let kw_start = self.keyword_start_before(open_pos, keyword).unwrap_or(anchor.start());
+    fn emit_keyword_open_paren(
+        &mut self,
+        keyword: &str,
+        anchor: TextRange,
+        combined: &str,
+        open_pos: Utf16Pos,
+    ) {
+        let kw_start = self
+            .keyword_start_before(open_pos, keyword)
+            .unwrap_or(anchor.start());
         let kw_end = Utf16Pos::new(kw_start.get().saturating_add(keyword.len()));
         let comments: Vec<_> = self
             .trailing_element_comments(kw_end)
@@ -1503,7 +1507,6 @@ impl Emitter<'_> {
         self.emit_comment_gap(anchor_end, open_pos);
         self.raw_mapped_token("(", open_pos, 1);
     }
-
 
     /// Prints the comments that close a file.
     fn write_closing_comments(&mut self) {
@@ -2511,7 +2514,11 @@ impl<'a> Emitter<'a> {
                 let while_end = Utf16Pos::new(while_pos.get().saturating_add(5));
                 let while_range = TextRange::new(while_pos, while_end).unwrap_or(self.anchor);
                 let open_pos = self
-                    .source_pos_of(TextRange::new(while_end, statement.test.range().start()).unwrap_or(self.anchor), '(')
+                    .source_pos_of(
+                        TextRange::new(while_end, statement.test.range().start())
+                            .unwrap_or(self.anchor),
+                        '(',
+                    )
                     .unwrap_or(statement.test.range().start());
                 self.emit_keyword_open_paren("while", while_range, " while (", open_pos);
                 self.emit_glued_leading_comments(statement.test.range().start());
@@ -2720,7 +2727,6 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_block_body(&mut self, block: &BlockNode, range: TextRange, layout: BlockLayout) {
-
         let map_open_brace = layout != BlockLayout::FunctionBody;
         let may_preserve = layout != BlockLayout::Statement;
         if block.data().statements.is_empty() {
@@ -4578,7 +4584,11 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_token("(", open_pos, 1);
         }
         let open_end =
-            Utf16Pos::new(open_pos.get().saturating_add(if call.optional { 2 } else { 1 }));
+            Utf16Pos::new(
+                open_pos
+                    .get()
+                    .saturating_add(if call.optional { 2 } else { 1 }),
+            );
         let close_pos = self.source_pos_of_last(range, ')').unwrap_or(range.end());
         self.emit_arguments(&call.arguments, open_end, close_pos);
         self.raw_mapped_token(")", close_pos, 1);

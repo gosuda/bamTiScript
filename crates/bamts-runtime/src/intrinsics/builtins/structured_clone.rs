@@ -1129,27 +1129,29 @@ mod tests {
             clone_value_with_transfer(&mut machine, callable, &[]),
             Err(StructuredCloneFailure::DataClone(DataCloneError::Callable))
         ));
-        let bytes =
-            {
-                let handle = ArrayBufferHandle::allocate(&mut machine, 3, None).unwrap();
-                handle
-                    .with_bytes_mut(&mut machine, |target| target.copy_from_slice(&[1, 2, 3]))
-                    .unwrap();
-                machine
-                    .allocate(HeapEntry::TypedArray {
-                        kind: super::super::typedarray::ElementKind::Uint8,
-                        buffer: handle.value(),
-                        byte_offset: 0,
-                        byte_length: super::super::typedarray::LengthSlot::Fixed(3),
-                        array_length: super::super::typedarray::LengthSlot::Fixed(3),
-                        properties: PropertyMap::default(),
-                        prototype: Some(machine.intrinsics.builtins.typed_array_prototype(
-                            super::super::typedarray::ElementKind::Uint8,
-                        )),
-                        extensible: true,
-                    })
-                    .unwrap()
-            };
+        let bytes = {
+            let handle = ArrayBufferHandle::allocate(&mut machine, 3, None).unwrap();
+            handle
+                .with_bytes_mut(&mut machine, |target| target.copy_from_slice(&[1, 2, 3]))
+                .unwrap();
+            machine
+                .allocate(HeapEntry::TypedArray {
+                    kind: super::super::typedarray::ElementKind::Uint8,
+                    buffer: handle.value(),
+                    byte_offset: 0,
+                    byte_length: super::super::typedarray::LengthSlot::Fixed(3),
+                    array_length: super::super::typedarray::LengthSlot::Fixed(3),
+                    properties: PropertyMap::default(),
+                    prototype: Some(
+                        machine
+                            .intrinsics
+                            .builtins
+                            .typed_array_prototype(super::super::typedarray::ElementKind::Uint8),
+                    ),
+                    extensible: true,
+                })
+                .unwrap()
+        };
         assert!(matches!(
             clone_value_with_transfer(&mut machine, bytes, &[]),
             Err(StructuredCloneFailure::DataClone(

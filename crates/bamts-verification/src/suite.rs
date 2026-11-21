@@ -4,35 +4,35 @@
 //! isolated behind fetch/extract helpers. Snapshot digests are walk-order
 //! independent via [`BTreeMap`].
 
-pub mod completion;
 mod ci;
+pub mod completion;
 mod runner;
 mod snapshot;
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
-use serde::{Deserialize, Serialize};
-use crate::lane::LaneBinding;
-use crate::ts_ledger::{Backend, Facet, Partition, TsLedger};
-use crate::Result;
 pub use self::ci::{
     audit_ledger, build_classified_ledger, build_provisional_ledger, classify_cell, run_ci,
     write_suite_ledger,
 };
+pub(crate) use self::runner::PlannedCell;
 pub use self::runner::{
     CompilerLaneObservation, backend_name, budget_for, classify_truncation, compute_shard_key,
     enforce_aot_scratch_cap, enforce_aot_scratch_size, observe_compiler_lane, parse_shards,
     run_suite, run_suite_with_telemetry, shard_index,
+};
+pub(crate) use self::snapshot::{
+    TempDir, extract_archive, fetch_archive, read_verified_snapshot_asset, single_archive_root,
 };
 pub use self::snapshot::{
     classify_logical_path, decode_case_source, load_bound_compiler_snapshot,
     materialize_from_extracted, read_verified_asset, sync_suite, verify_snapshot,
     walk_extracted_tree,
 };
-pub(crate) use self::runner::PlannedCell;
-pub(crate) use self::snapshot::{
-    TempDir, extract_archive, fetch_archive, read_verified_snapshot_asset, single_archive_root,
+use crate::Result;
+use crate::lane::LaneBinding;
+use crate::ts_ledger::{Backend, Facet, Partition, TsLedger};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
 };
 /// Pinned npm publication time used for every deterministic `generatedAt`.
 pub const PINNED_GENERATED_AT: &str = "2026-07-08T15:55:18.431Z";
@@ -320,20 +320,20 @@ pub struct ImportedAsset {
 pub(crate) const COMPILER_CATALOG: &str = "typescript-7.0.2";
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::ci::{classify_s2_entry, provisional_entry};
     use super::runner::{enforce_no_silent_skip, scratch_case_spec, status_name};
     use super::snapshot::{
         case_inputs_from_index, compiler_snapshot_input, index_content_digest,
         reject_tar_verbose_line,
     };
+    use super::*;
+    use crate::ErrorCode;
     use crate::check_cells::{self, CheckContext};
     use crate::corpus::{ArtifactDirectory, ExecutionMode as CorpusExecutionMode, bounded_output};
     use crate::lane::{LaneOutcome, LaneRequest};
     use crate::schema::sha256_hex;
     use crate::shard::ExecutionMode;
     use crate::ts_ledger::{ReasonCode, Status, TimeoutClass, TsLedgerReader, TsLedgerWriter};
-    use crate::ErrorCode;
     use std::collections::BTreeSet;
     use std::fs;
 
@@ -604,8 +604,16 @@ mod tests {
             assert!(ok.1.is_none());
             assert!(ok.2.is_none());
         }
-        assert!(classify_logical_path("tests/lib/readme.md").unwrap().is_none());
-        assert!(classify_logical_path("tests/lib/react.d.ts.map").unwrap().is_none());
+        assert!(
+            classify_logical_path("tests/lib/readme.md")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            classify_logical_path("tests/lib/react.d.ts.map")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -625,8 +633,7 @@ mod tests {
             .get("tests/lib/react16.d.ts")
             .expect("support file indexed");
         assert!(matches!(entry.asset_kind, AssetKind::SupportFile));
-        let bytes =
-            read_verified_snapshot_asset(&snapshot, "tests/lib/react16.d.ts").unwrap();
+        let bytes = read_verified_snapshot_asset(&snapshot, "tests/lib/react16.d.ts").unwrap();
         assert_eq!(bytes, b"declare module \"react\" {}\n");
         assert!(
             snapshot

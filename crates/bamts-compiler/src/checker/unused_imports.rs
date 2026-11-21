@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use crate::diagnostic::Diagnostic;
 use crate::source::{JsxEmit, ScriptKind, TextRange};
 use crate::syntax::{
-    IdentifierNode, ImportBinding, ImportDeclaration, ImportEqualsDeclaration,
-    ImportSpecifierMode, SourceFile, Statement, Stmt,
+    IdentifierNode, ImportBinding, ImportDeclaration, ImportEqualsDeclaration, ImportSpecifierMode,
+    SourceFile, Statement, Stmt,
 };
 
 use super::binder::{ScopeId, SemanticModel};
@@ -86,7 +86,6 @@ struct PragmaFactories {
     factory: Option<String>,
     fragment: Option<String>,
 }
-
 
 /// The `@jsx` and `@jsxFrag` factories a file selects in its comments.
 fn pragma_factories(source: &SourceFile) -> PragmaFactories {
@@ -380,7 +379,11 @@ mod tests {
         let expected_a = text.find("{ a }").expect("a binding") + "{ ".len();
         let expected_d = text.find("import d ").expect("d binding") + "import ".len();
         let expected_ns = text.find("* as ns").expect("ns binding") + "* as ".len();
-        assert_eq!(starts, [expected_a, expected_d, expected_ns], "{diagnostics:?}");
+        assert_eq!(
+            starts,
+            [expected_a, expected_d, expected_ns],
+            "{diagnostics:?}"
+        );
         let messages: Vec<_> = diagnostics.iter().map(Diagnostic::message).collect();
         assert!(messages.contains(&"'a' is declared but its value is never read."));
         assert!(messages.contains(&"'d' is declared but its value is never read."));

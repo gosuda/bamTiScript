@@ -2619,9 +2619,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if peak_window_available() {
-            let error =
-                measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) })
-                    .unwrap_err();
+            let error = measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) })
+                .unwrap_err();
             assert!(error.detail.contains("work failed"));
         } else {
             // The window cannot start, so the work must never run: the setup

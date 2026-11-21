@@ -447,7 +447,9 @@ impl ProgramFrontendOutput {
         if cache.contains_key(&source_id) {
             return cache.get(&source_id).cloned();
         }
-        let module = by_source.get(&source_id).map(|&index| &self.modules[index])?;
+        let module = by_source
+            .get(&source_id)
+            .map(|&index| &self.modules[index])?;
         #[cfg(test)]
         record_module_exports_computation(source_id);
         cache.insert(
@@ -488,7 +490,14 @@ impl ProgramFrontendOutput {
         for (exported, specifier, imported) in &exports.forwards {
             let target = local_dependency(program, source_id, specifier);
             if let Some(target) = target {
-                self.resolve_erased_exports(program, target, erased, exports_cache, visiting, by_source);
+                self.resolve_erased_exports(
+                    program,
+                    target,
+                    erased,
+                    exports_cache,
+                    visiting,
+                    by_source,
+                );
             }
             if target
                 .and_then(|target| erased.get(&target))
@@ -503,7 +512,14 @@ impl ProgramFrontendOutput {
         let mut star_values = BTreeSet::new();
         for specifier in &exports.stars {
             if let Some(target) = local_dependency(program, source_id, specifier) {
-                self.resolve_erased_exports(program, target, erased, exports_cache, visiting, by_source);
+                self.resolve_erased_exports(
+                    program,
+                    target,
+                    erased,
+                    exports_cache,
+                    visiting,
+                    by_source,
+                );
                 if let Some(target_exports) = exports_cache.get(&target) {
                     star_values.extend(target_exports.values.iter().cloned());
                 }
@@ -547,7 +563,9 @@ impl ProgramFrontendOutput {
 
     #[must_use]
     pub fn module(&self, source_id: SourceId) -> Option<&FrontendOutput> {
-        self.index.get(&source_id).map(|&position| &self.modules[position])
+        self.index
+            .get(&source_id)
+            .map(|&position| &self.modules[position])
     }
 }
 
@@ -1540,9 +1558,10 @@ impl TslibHelperWalk<'_> {
                     self.property_name(&property.name);
                     if property.rest
                         && let AssignmentTarget::Identifier(name) = property.target.data()
-                        && !self.context.target.supports(
-                            crate::emitter::transforms::LanguageFeature::ObjectRestSpread,
-                        )
+                        && !self
+                            .context
+                            .target
+                            .supports(crate::emitter::transforms::LanguageFeature::ObjectRestSpread)
                     {
                         self.record(
                             crate::emitter::helpers::HelperKind::Rest.ident(),
@@ -1837,7 +1856,10 @@ impl TslibHelperWalk<'_> {
         let index = self
             .extends_keywords
             .partition_point(|keyword| keyword.end() <= expression.start());
-        let keyword = index.checked_sub(1).and_then(|at| self.extends_keywords.get(at)).copied();
+        let keyword = index
+            .checked_sub(1)
+            .and_then(|at| self.extends_keywords.get(at))
+            .copied();
         keyword.map_or(expression, |keyword| {
             crate::source::TextRange::new(keyword.start(), expression.end()).unwrap_or(expression)
         })
@@ -1884,7 +1906,10 @@ impl TslibHelperWalk<'_> {
             && function.function.name.is_none()
             && function.function.is_async
             && !function.function.is_generator
-            && !self.context.target.supports(LanguageFeature::AsyncFunctions)
+            && !self
+                .context
+                .target
+                .supports(LanguageFeature::AsyncFunctions)
         {
             self.record(
                 crate::emitter::helpers::HelperKind::Awaiter.ident(),
@@ -2053,7 +2078,9 @@ fn tslib_on_disk_source(path: &std::path::Path) -> Option<SourceFile> {
     let file = std::fs::File::open(path).ok()?;
     let mut text = String::new();
     use std::io::Read as _;
-    file.take(TSLIB_ON_DISK_READ_CAP + 1).read_to_string(&mut text).ok()?;
+    file.take(TSLIB_ON_DISK_READ_CAP + 1)
+        .read_to_string(&mut text)
+        .ok()?;
     if text.len() as u64 > TSLIB_ON_DISK_READ_CAP {
         return None;
     }
@@ -2066,7 +2093,8 @@ fn tslib_on_disk_source(path: &std::path::Path) -> Option<SourceFile> {
         _ => return None,
     };
     let text = SourceText::new(text).ok()?;
-    let (source, _) = parser::parse(scanner::scan(source_id, script_kind, Arc::new(text))).into_parts();
+    let (source, _) =
+        parser::parse(scanner::scan(source_id, script_kind, Arc::new(text))).into_parts();
     Some(source)
 }
 
@@ -2335,14 +2363,15 @@ pub fn compile_program_frontend_with_cancel(
             js_path.set_extension(if keeps_jsx { "jsx" } else { "js" });
             let names = EmitFileNames {
                 source_name,
-                js_file_name: js_path.file_name().map(|name| {
-                    Arc::from(name.to_string_lossy().into_owned().into_boxed_str())
-                }),
+                js_file_name: js_path
+                    .file_name()
+                    .map(|name| Arc::from(name.to_string_lossy().into_owned().into_boxed_str())),
                 declaration_file_name: None,
                 source_root: None,
-                js_source_name: module.path().file_name().map(|name| {
-                    Arc::from(name.to_string_lossy().into_owned().into_boxed_str())
-                }),
+                js_source_name: module
+                    .path()
+                    .file_name()
+                    .map(|name| Arc::from(name.to_string_lossy().into_owned().into_boxed_str())),
                 ..EmitFileNames::default()
             };
             let emit = if let Some(options) = program_emit_options(program, mode, index) {
@@ -2698,8 +2727,10 @@ mod tests {
             .collect()
     }
 
-
-    fn entry_ranges(output: &ProgramFrontendOutput, code: &str) -> Vec<(usize, usize, usize, usize, String)> {
+    fn entry_ranges(
+        output: &ProgramFrontendOutput,
+        code: &str,
+    ) -> Vec<(usize, usize, usize, usize, String)> {
         let entry = output
             .modules()
             .iter()
@@ -2727,7 +2758,6 @@ mod tests {
             })
             .collect()
     }
-
 
     const TSLIB_HELPERS_CONFIG: &str =
         r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015"}}"#;
@@ -2905,7 +2935,9 @@ mod tests {
         let output = compile_program_frontend(&program, FrontendMode::Check);
         let reported = entry_diagnostics(&output, "TS2343");
         assert!(
-            reported.iter().any(|(_, message)| message.contains("__extends")),
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("__extends")),
             "missing __extends reports TS2343: {reported:?}"
         );
         let _ = std::fs::remove_dir_all(root_path);
@@ -2921,7 +2953,8 @@ mod tests {
 
     #[test]
     fn standard_decorator_helpers_missing_report_es_decorate() {
-        let source = "export {};\nfunction dec(value: any, context: any): any {}\n@dec class C {}\n";
+        let source =
+            "export {};\nfunction dec(value: any, context: any): any {}\n@dec class C {}\n";
         let (root_path, program) = tslib_case(
             &[
                 ("main.ts", source),
@@ -2935,11 +2968,15 @@ mod tests {
         let output = compile_program_frontend(&program, FrontendMode::Check);
         let reported = entry_diagnostics(&output, "TS2343");
         assert!(
-            reported.iter().any(|(_, message)| message.contains("__esDecorate")),
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("__esDecorate")),
             "missing __esDecorate reports TS2343: {reported:?}"
         );
         assert!(
-            reported.iter().any(|(_, message)| message.contains("__runInitializers")),
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("__runInitializers")),
             "missing __runInitializers reports TS2343: {reported:?}"
         );
         let _ = std::fs::remove_dir_all(root_path);
@@ -2961,7 +2998,9 @@ mod tests {
         let output = compile_program_frontend(&program, FrontendMode::Check);
         let reported = entry_diagnostics(&output, "TS2343");
         assert!(
-            reported.iter().any(|(_, message)| message.contains("__asyncGenerator")),
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("__asyncGenerator")),
             "missing __asyncGenerator reports TS2343: {reported:?}"
         );
         let _ = std::fs::remove_dir_all(root_path);
@@ -2991,14 +3030,13 @@ mod tests {
         let output = compile_program_frontend(&program, FrontendMode::Check);
         let reported = entry_diagnostics(&output, "TS2343");
         assert!(
-            reported.iter().any(|(_, message)| message.contains("__makeTemplateObject")),
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("__makeTemplateObject")),
             "missing __makeTemplateObject reports TS2343: {reported:?}"
         );
         let _ = std::fs::remove_dir_all(root_path);
-        let (root_path, program) = tslib_case(
-            &[("main.ts", source)],
-            TSLIB_HELPERS_CONFIG,
-        );
+        let (root_path, program) = tslib_case(&[("main.ts", source)], TSLIB_HELPERS_CONFIG);
         let output = compile_program_frontend(&program, FrontendMode::Check);
         assert!(entry_diagnostics(&output, "TS2343").is_empty());
         let _ = std::fs::remove_dir_all(root_path);
@@ -3056,14 +3094,20 @@ mod tests {
 
     #[test]
     fn tslib_helper_table_reports_each_walk_helper() {
-        const ES5: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es5"}}"#;
-        const ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015"}}"#;
-        const ES2018: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2018"}}"#;
-        const ES2020: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2020"}}"#;
-        const ES2022: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2022"}}"#;
+        const ES5: &str =
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es5"}}"#;
+        const ES2015: &str =
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015"}}"#;
+        const ES2018: &str =
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2018"}}"#;
+        const ES2020: &str =
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2020"}}"#;
+        const ES2022: &str =
+            r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2022"}}"#;
         const EXP_ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015","experimentalDecorators":true,"emitDecoratorMetadata":true}}"#;
         const EXP_NO_METADATA_ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"commonjs","target":"es2015","experimentalDecorators":true}}"#;
-        const MODULE_ES2015: &str = r#"{"compilerOptions":{"importHelpers":true,"module":"es2015","target":"es2015"}}"#;
+        const MODULE_ES2015: &str =
+            r#"{"compilerOptions":{"importHelpers":true,"module":"es2015","target":"es2015"}}"#;
         struct Row {
             name: &'static str,
             source: &'static str,
@@ -3105,7 +3149,10 @@ mod tests {
                 source: "export async function* g() {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__asyncGenerator", 0, 23, 0, 24), ("__await", 0, 23, 0, 24)],
+                expected: &[
+                    ("__asyncGenerator", 0, 23, 0, 24),
+                    ("__await", 0, 23, 0, 24),
+                ],
             },
             Row {
                 name: "async_delegator_quad",
@@ -3184,7 +3231,10 @@ mod tests {
                 source: "export {};\ndeclare var dec: any;\n@dec\nclass C {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[("__esDecorate", 2, 0, 2, 4), ("__runInitializers", 2, 0, 2, 4)],
+                expected: &[
+                    ("__esDecorate", 2, 0, 2, 4),
+                    ("__runInitializers", 2, 0, 2, 4),
+                ],
             },
             Row {
                 name: "member_method_decorator_set_function_name",
@@ -3371,10 +3421,7 @@ mod tests {
                 source: "export default async function* () {}\n",
                 extra: &[],
                 config: ES2015,
-                expected: &[
-                    ("__asyncGenerator", 0, 0, 0, 36),
-                    ("__await", 0, 0, 0, 36),
-                ],
+                expected: &[("__asyncGenerator", 0, 0, 0, 36), ("__await", 0, 0, 0, 36)],
             },
             Row {
                 name: "oracle_paren_function_init_reports_at_function",
@@ -3488,7 +3535,10 @@ mod tests {
         for row in rows {
             let mut files: Vec<(&str, &str)> = vec![
                 ("main.ts", row.source),
-                ("node_modules/tslib/tslib.d.ts", "export const notAHelper: any;\n"),
+                (
+                    "node_modules/tslib/tslib.d.ts",
+                    "export const notAHelper: any;\n",
+                ),
             ];
             files.extend_from_slice(row.extra);
             let (root_path, program) = tslib_case(&files, row.config);
@@ -3508,7 +3558,13 @@ mod tests {
             );
             for (
                 (helper, start_line, start_column, end_line, end_column),
-                (actual_start_line, actual_start_column, actual_end_line, actual_end_column, message),
+                (
+                    actual_start_line,
+                    actual_start_column,
+                    actual_end_line,
+                    actual_end_column,
+                    message,
+                ),
             ) in row.expected.iter().zip(reported.iter())
             {
                 let expected_message = format!(
@@ -3636,7 +3692,11 @@ mod tests {
         assert!(bytes.len() % 4 == 0, "inline map payload pads to a quartet");
         let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
         for quartet in bytes.chunks_exact(4) {
-            let pad = quartet.iter().rev().take_while(|unit| **unit == b'=').count();
+            let pad = quartet
+                .iter()
+                .rev()
+                .take_while(|unit| **unit == b'=')
+                .count();
             let mut word: u32 = 0;
             for (position, unit) in quartet.iter().enumerate() {
                 if *unit != b'=' {
@@ -3662,10 +3722,7 @@ mod tests {
                     "main.ts",
                     "import \"./other\";\nexport async function foo(): Promise<void> {}\n",
                 ),
-                (
-                    "other.ts",
-                    "export function* g() {}\n",
-                ),
+                ("other.ts", "export function* g() {}\n"),
                 (
                     "node_modules/tslib/tslib.d.ts",
                     "export const notAHelper: any;\n",
@@ -3752,9 +3809,15 @@ mod tests {
     fn shared_import_module_exports_computed_once() {
         let (root_path, program) = tslib_case(
             &[
-                ("main.ts", "import \"./other\";\nimport \"./shared\";\nexport {};\n"),
+                (
+                    "main.ts",
+                    "import \"./other\";\nimport \"./shared\";\nexport {};\n",
+                ),
                 ("other.ts", "import \"./shared\";\nexport const a = 1;\n"),
-                ("shared.ts", "export type T = number;\nexport const v = 1;\n"),
+                (
+                    "shared.ts",
+                    "export type T = number;\nexport const v = 1;\n",
+                ),
             ],
             r#"{"compilerOptions":{"module":"commonjs"}}"#,
         );
@@ -3778,9 +3841,10 @@ mod tests {
                 program
                     .module(module.source_file().source_id())
                     .is_some_and(|resolved| {
-                        resolved.path().file_name().is_some_and(|name| {
-                            name.to_string_lossy() == "shared.ts"
-                        })
+                        resolved
+                            .path()
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy() == "shared.ts")
                     })
             })
             .expect("shared module present");
@@ -3882,7 +3946,13 @@ mod tests {
         );
         let output = compile_program_frontend(&program, FrontendMode::Check);
         let reported = entry_diagnostics(&output, "TS2343");
-        let order = ["__asyncGenerator", "__await", "__generator", "__asyncDelegator", "__asyncValues"];
+        let order = [
+            "__asyncGenerator",
+            "__await",
+            "__generator",
+            "__asyncDelegator",
+            "__asyncValues",
+        ];
         assert_eq!(reported.len(), order.len(), "{reported:?}");
         for (index, helper) in order.iter().enumerate() {
             assert!(
@@ -4638,8 +4708,7 @@ mod tests {
                             starred
                                 .iter()
                                 .filter(|name| {
-                                    name.as_str() != "default"
-                                        && !forwarded.contains(name.as_str())
+                                    name.as_str() != "default" && !forwarded.contains(name.as_str())
                                 })
                                 .cloned(),
                         );

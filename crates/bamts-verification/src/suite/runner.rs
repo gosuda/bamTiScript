@@ -1,21 +1,3 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
-use bamts_compiler::parser::parse;
-use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
-use bamts_compiler::program::ProgramLoader;
-use bamts_compiler::project::resolution_trace::display_path;
-use bamts_compiler::project::{ProjectConfig, ProjectRoot};
-use bamts_compiler::scanner::scan;
-use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
-use bamts_compiler::syntax::{Token, TokenKind};
-use bamts_compiler::telemetry::{PhaseTotals, TelemetryCollector};
-use serde::Deserialize;
 use super::ci::{audit_ledger, facet_owning_slice, filters_need_workspace_pins};
 use super::snapshot::{
     TempDir, case_inputs_from_index, compiler_snapshot_input, decode_case_source,
@@ -41,6 +23,24 @@ use crate::schema::sha256_hex;
 use crate::shard::{ExecutionMode, ObligationKey};
 use crate::ts_ledger::{Backend, Entry, Facet, Status, TimeoutClass, TsLedger};
 use crate::{ErrorCode, Result, VerificationError};
+use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
+use bamts_compiler::parser::parse;
+use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
+use bamts_compiler::program::ProgramLoader;
+use bamts_compiler::project::resolution_trace::display_path;
+use bamts_compiler::project::{ProjectConfig, ProjectRoot};
+use bamts_compiler::scanner::scan;
+use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
+use bamts_compiler::syntax::{Token, TokenKind};
+use bamts_compiler::telemetry::{PhaseTotals, TelemetryCollector};
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 const FRONTEND_DEFAULT_MS: u64 = 5_000;
 const FRONTEND_CAP_MS: u64 = 30_000;
@@ -655,7 +655,10 @@ pub(super) fn scratch_case_spec(id: &str) -> CaseSpec {
     }
 }
 
-pub(super) fn enforce_no_silent_skip(planned: &[PlannedCell], results: &[CellResult]) -> Result<()> {
+pub(super) fn enforce_no_silent_skip(
+    planned: &[PlannedCell],
+    results: &[CellResult],
+) -> Result<()> {
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for result in results {
         seen.insert((

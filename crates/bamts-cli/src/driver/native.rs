@@ -1,9 +1,9 @@
-use super::*;
 use super::process::*;
+use super::*;
 use bamts_compiler::program::lower_program;
 use bamts_compiler::program::lower_program_with_cancel;
-use bamts_runtime::run_linked_program_tiered;
 use bamts_runtime::WarmupPolicy;
+use bamts_runtime::run_linked_program_tiered;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -12,7 +12,10 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::atomic::Ordering;
 
-pub(super) fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
+pub(super) fn check(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+) -> Result<CommandOutcome, DriverError> {
     let diagnostics = render_program_diagnostics(args, frontend);
     if frontend
         .output
@@ -533,7 +536,9 @@ pub(super) fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverEr
 }
 
 #[cfg(unix)]
-pub(super) fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+pub(super) fn fallback_cache_root_path_in_context(
+    context: &ExecutionContext,
+) -> Result<PathBuf, DriverError> {
     let parent = validate_fallback_parent_chain_in_context(context.temp_dir(), context)?;
     Ok(parent.join(format!(
         "bamts-cache-{}",
@@ -542,7 +547,9 @@ pub(super) fn fallback_cache_root_path_in_context(context: &ExecutionContext) ->
 }
 
 #[cfg(not(unix))]
-pub(super) fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+pub(super) fn fallback_cache_root_path_in_context(
+    context: &ExecutionContext,
+) -> Result<PathBuf, DriverError> {
     #[cfg(windows)]
     if is_windows_temp_directory(context.temp_dir(), context) {
         return Err(DriverError::UnsafeFallbackCacheRoot {
@@ -586,12 +593,16 @@ pub(super) fn is_windows_temp_directory(directory: &Path, context: &ExecutionCon
 }
 
 #[cfg(unix)]
-pub(super) fn fallback_cache_user_key_in_context(context: &ExecutionContext) -> Result<String, DriverError> {
+pub(super) fn fallback_cache_user_key_in_context(
+    context: &ExecutionContext,
+) -> Result<String, DriverError> {
     Ok(effective_uid_in_context(context)?.to_string())
 }
 
 #[cfg(not(unix))]
-pub(super) fn fallback_cache_user_key_in_context(context: &ExecutionContext) -> Result<String, DriverError> {
+pub(super) fn fallback_cache_user_key_in_context(
+    context: &ExecutionContext,
+) -> Result<String, DriverError> {
     Ok(context
         .env("USERNAME")
         .or_else(|| context.env("USER"))
@@ -827,7 +838,10 @@ impl Drop for TemporaryLinkFiles {
     }
 }
 
-pub(super) fn publish_linked_executable(temporary: &Path, destination: &Path) -> Result<(), DriverError> {
+pub(super) fn publish_linked_executable(
+    temporary: &Path,
+    destination: &Path,
+) -> Result<(), DriverError> {
     match fs::rename(temporary, destination) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

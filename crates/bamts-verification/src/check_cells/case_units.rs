@@ -166,12 +166,11 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
     for line in text.split_inclusive('\n') {
         let line_start = offset;
         offset += line.len();
-        let name = directive_parts(line.trim_end_matches(['\n', '\r'])).and_then(
-            |(name, value)| {
+        let name =
+            directive_parts(line.trim_end_matches(['\n', '\r'])).and_then(|(name, value)| {
                 name.eq_ignore_ascii_case("filename")
                     .then(|| value.trim().to_owned())
-            },
-        );
+            });
         if let Some(name) = name.filter(|name| !name.is_empty()) {
             markers.push((line_start, name));
         }
@@ -324,7 +323,10 @@ pub(super) fn shared_lib_refs(text: &str) -> Vec<String> {
     let scanned = scanned.into_product();
     for token in scanned.tokens() {
         match token.kind() {
-            TokenKind::Whitespace | TokenKind::Shebang | TokenKind::BlockComment | TokenKind::Unknown => {}
+            TokenKind::Whitespace
+            | TokenKind::Shebang
+            | TokenKind::BlockComment
+            | TokenKind::Unknown => {}
             TokenKind::LineComment => {
                 let Some(comment) = scanned.token_text(token) else {
                     continue;

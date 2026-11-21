@@ -29,7 +29,8 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_array, allocate_string, define_data, install_function, length_of_array_like, type_error,
+    allocate_array, allocate_string, define_data, install_function, length_of_array_like,
+    type_error,
 };
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};

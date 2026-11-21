@@ -1,10 +1,14 @@
 use super::*;
+use crate::cli::tsc_args::TscDispatchMode;
+use crate::cli::tsc_args::TscExitStatus;
+use crate::cli::tsc_args::TscOptionValue;
+use crate::output::StdAtomicFs;
+use crate::output::publish_atomic;
+use bamts_compiler::project::JsonObject;
+use bamts_compiler::project::JsonValue;
 use bamts_compiler::project::build_mode::BuildInfo;
 use bamts_compiler::project::canonical::slash_text;
-use bamts_compiler::project::effective::compile_project;
-use bamts_compiler::project::effective::compile_project_references;
 use bamts_compiler::project::effective::EffectiveProject;
-use bamts_compiler::project::effective::load_reference_closure;
 use bamts_compiler::project::effective::MaterializeError;
 use bamts_compiler::project::effective::ProjectBuildOptions;
 use bamts_compiler::project::effective::ProjectCompileError;
@@ -12,19 +16,15 @@ use bamts_compiler::project::effective::ProjectCompileOptions;
 use bamts_compiler::project::effective::ProjectCompileResult;
 use bamts_compiler::project::effective::ProjectLoadRequest;
 use bamts_compiler::project::effective::ProjectOptionOverrides;
-use bamts_compiler::project::JsonObject;
-use bamts_compiler::project::JsonValue;
+use bamts_compiler::project::effective::compile_project;
+use bamts_compiler::project::effective::compile_project_references;
+use bamts_compiler::project::effective::load_reference_closure;
 use bamts_compiler::project::references::resolve_config_file_name;
 use bamts_compiler::service::filesystem::OsFileSystem;
-use crate::cli::tsc_args::TscDispatchMode;
-use crate::cli::tsc_args::TscExitStatus;
-use crate::cli::tsc_args::TscOptionValue;
-use crate::output::publish_atomic;
-use crate::output::StdAtomicFs;
-use serde::ser::SerializeMap;
-use serde::ser::Serializer;
-use serde::ser::SerializeSeq;
 use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::ser::SerializeSeq;
+use serde::ser::Serializer;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -459,7 +459,9 @@ pub(super) fn unsupported_option_outcome(option: &str) -> CommandOutcome {
 /// trailing newline. The writer failure is the io error itself, and a JSON
 /// serialization failure (non-finite number) is reported as io::InvalidData
 /// through the same typed [`DriverError::ShowConfigRender`] channel.
-pub(super) fn render_show_config_document<T: Serialize>(document: &T) -> Result<Vec<u8>, DriverError> {
+pub(super) fn render_show_config_document<T: Serialize>(
+    document: &T,
+) -> Result<Vec<u8>, DriverError> {
     let mut buffer = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(
         &mut buffer,
@@ -732,7 +734,10 @@ impl Serialize for ProjectShowConfig<'_> {
 /// `node16`, …), and path-like fields that the effective-config loader
 /// rewrote to absolute form are relativized back against the config
 /// directory so the output matches TypeScript's `--showConfig` text.
-pub(super) fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -> JsonValue {
+pub(super) fn canonicalize_compiler_options(
+    options: &JsonValue,
+    config_directory: &Path,
+) -> JsonValue {
     const ENUM_OPTIONS: &[&str] = &[
         "target",
         "module",
@@ -934,7 +939,9 @@ impl Serialize for SerializeReferenceEntry<'_> {
 }
 
 /// Renders a showConfig document and wraps it in a success outcome.
-pub(super) fn show_config_outcome<T: Serialize>(document: &T) -> Result<CommandOutcome, DriverError> {
+pub(super) fn show_config_outcome<T: Serialize>(
+    document: &T,
+) -> Result<CommandOutcome, DriverError> {
     Ok(CommandOutcome {
         stdout: render_show_config_document(document)?,
         exit_code: TscExitStatus::Success.code(),

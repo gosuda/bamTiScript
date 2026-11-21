@@ -804,10 +804,7 @@ fn split_steps<H: Host>(
             search_at = advance_string_index(string, search_at, unicode);
             continue;
         }
-        let piece = allocate_string(
-            machine,
-            slice_units(string, piece_start..search_at),
-        )?;
+        let piece = allocate_string(machine, slice_units(string, piece_start..search_at))?;
         keep_root(machine, depth, piece);
         pieces.push(piece);
         if pieces.len() == limit {
@@ -833,10 +830,7 @@ fn split_steps<H: Host>(
         }
         search_at = piece_start;
     }
-    let tail = allocate_string(
-        machine,
-        slice_units(string, piece_start..size),
-    )?;
+    let tail = allocate_string(machine, slice_units(string, piece_start..size))?;
     pieces.push(tail);
     allocate_array(machine, pieces)
 }

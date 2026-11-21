@@ -1,4 +1,3 @@
-use std::{collections::BTreeSet, fs, path::Path};
 use super::runner::{compute_shard_key, run_suite};
 use super::snapshot::{
     index_content_digest, io_err, sha256_hex_concat, verify_snapshot, write_then_verify,
@@ -14,6 +13,7 @@ use crate::ts_ledger::{
     Status, SuiteOracle, TimeoutClass, Totals, TsLedger, TsLedgerReader, TsLedgerWriter,
 };
 use crate::{ErrorCode, Result, VerificationError};
+use std::{collections::BTreeSet, fs, path::Path};
 
 /// Audit a ledger for completeness against discovered case inputs.
 pub fn audit_ledger(

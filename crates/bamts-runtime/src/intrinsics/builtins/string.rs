@@ -667,7 +667,6 @@ fn is_js_whitespace(unit: u16) -> bool {
     )
 }
 
-
 fn to_upper<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -1194,7 +1193,8 @@ fn at<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = string_receiver(machine, this)?;
-    let relative = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let relative =
+        to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let index = if relative >= 0.0 {
         relative
     } else {
@@ -1489,8 +1489,9 @@ fn pad<H: Host>(
     at_start: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = string_receiver(machine, this)?;
-    let target = to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
-        .clamp(0.0, MAX_SAFE_INTEGER);
+    let target =
+        to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?
+            .clamp(0.0, MAX_SAFE_INTEGER);
     if target <= source.len_units() as f64 {
         return Ok(BuiltinOutcome::Value(allocate_string(machine, source)?));
     }
