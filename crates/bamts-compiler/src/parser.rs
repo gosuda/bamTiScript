@@ -459,7 +459,11 @@ fn is_trivia(kind: TokenKind) -> bool {
 /// document. The scanner token stream here is that document exactly when this
 /// returns true; anything else keeps the TypeScript-grammar diagnostics.
 fn json_tokens_form_data(tokens: &[Token], source: &SourceText) -> bool {
-    let mut reader = JsonDataReader { tokens, source, index: 0 };
+    let mut reader = JsonDataReader {
+        tokens,
+        source,
+        index: 0,
+    };
     reader.value(0) && reader.at_end()
 }
 
@@ -2071,7 +2075,11 @@ impl Parser {
                     && !is_await
                     && self.lexeme(*identifier.data().token()) == "async"
                 {
-                    self.error_at(EXPECTED_TOKEN, expression.range(), "a for-of target cannot be `async`");
+                    self.error_at(
+                        EXPECTED_TOKEN,
+                        expression.range(),
+                        "a for-of target cannot be `async`",
+                    );
                 }
                 self.bump();
                 let target = self.expression_to_target(expression);

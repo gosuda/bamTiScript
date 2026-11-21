@@ -1836,7 +1836,11 @@ fn append_file_candidates(
     Ok(())
 }
 
-fn append_extensionless_candidates(output: &mut Vec<PathBuf>, stem: &Path, flavor: ResolutionFlavor) {
+fn append_extensionless_candidates(
+    output: &mut Vec<PathBuf>,
+    stem: &Path,
+    flavor: ResolutionFlavor,
+) {
     // Oracle (tsc 7.0.2, empty-directory `--traceResolution` under nodenext CJS
     // and bundler): an extensionless stem probes `ts, tsx, d.ts, js, jsx`, in
     // that order, and never the bare stem itself, `mts/cts/mjs/cjs`, or `json`
@@ -1850,7 +1854,6 @@ fn append_extensionless_candidates(output: &mut Vec<PathBuf>, stem: &Path, flavo
         append_with_extension(output, stem, extension);
     }
 }
-
 
 fn append_with_extension(output: &mut Vec<PathBuf>, path: &Path, extension: &str) {
     let mut candidate = path.to_path_buf();
@@ -2900,21 +2903,11 @@ mod tests {
         let project = root();
         let importer = abs("/workspace/corpus/cases/main.ts");
         assert!(matches!(
-            plan_relative_module(
-                &project,
-                &importer,
-                "node:fs",
-                ResolutionFlavor::Runtime,
-            ),
+            plan_relative_module(&project, &importer, "node:fs", ResolutionFlavor::Runtime,),
             Err(ModuleResolutionError::BareSpecifier { .. })
         ));
         assert!(matches!(
-            plan_relative_module(
-                &project,
-                &importer,
-                "./x.ts?raw",
-                ResolutionFlavor::Runtime,
-            ),
+            plan_relative_module(&project, &importer, "./x.ts?raw", ResolutionFlavor::Runtime,),
             Err(ModuleResolutionError::UrlLikeSpecifier { .. })
         ));
         assert!(

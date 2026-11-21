@@ -158,7 +158,9 @@ pub(super) fn terminate_managed_process(child: &mut std::process::Child) -> io::
     child.wait().map(|_| ())
 }
 
-pub(super) fn join_child_pipe(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+pub(super) fn join_child_pipe(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+) -> io::Result<Vec<u8>> {
     reader
         .join()
         .map_err(|_| io::Error::other("managed child pipe reader panicked"))?

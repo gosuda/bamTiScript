@@ -377,10 +377,12 @@ pub fn compile_project<F: FileSystem + Clone>(
         FrontendMode::Check,
         &LintTable::new(LintProfile::Default),
     );
-    diagnostics.extend(checked
-        .modules()
-        .iter()
-        .flat_map(|module| module.diagnostics().iter().cloned()));
+    diagnostics.extend(
+        checked
+            .modules()
+            .iter()
+            .flat_map(|module| module.diagnostics().iter().cloned()),
+    );
     let pre_emit_errors = diagnostics
         .iter()
         .any(|diagnostic| !diagnostic.is_warning());
@@ -546,7 +548,8 @@ fn out_file_diagnostic_source(
 /// key inside `compilerOptions` when the loaded text declares it, else the
 /// `compilerOptions` key itself, else an empty range.
 fn out_file_diagnostic_range(project: &EffectiveProject) -> TextRange {
-    let empty = || TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid");
+    let empty =
+        || TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid");
     let Some(source) = project.config_source() else {
         return empty();
     };
@@ -686,7 +689,11 @@ fn skip_json_value(bytes: &[u8], index: &mut usize) {
             }
         }
         Some(b'{') | Some(b'[') => {
-            let (open, close) = if bytes[*index] == b'{' { (b'{', b'}') } else { (b'[', b']') };
+            let (open, close) = if bytes[*index] == b'{' {
+                (b'{', b'}')
+            } else {
+                (b'[', b']')
+            };
             let mut depth = 0usize;
             loop {
                 match bytes.get(*index) {
@@ -735,7 +742,6 @@ fn skip_json_value(bytes: &[u8], index: &mut usize) {
         None => {}
     }
 }
-
 
 /// One surface's source-map naming computed at the emitter boundary.
 struct SurfaceMapNames {
@@ -1009,11 +1015,8 @@ fn per_module_emit_options(
     emit_options.verbatim_module_syntax = options.verbatim_module_syntax();
     emit_options.keeps_imports = options.keeps_imports();
     emit_options.strict_null_checks = options.strict_null_checks();
-    emit_options.erased_imports = Arc::new(checked.erased_imports(
-        program,
-        erased_exports,
-        source_id,
-    ));
+    emit_options.erased_imports =
+        Arc::new(checked.erased_imports(program, erased_exports, source_id));
     match jsx_route {
         JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
             emit_options.jsx = program.jsx();
@@ -1025,7 +1028,6 @@ fn per_module_emit_options(
     }
     (emit_options, diagnostics)
 }
-
 
 /// What a Node module mode emits for one file: the extension decides, then the
 /// `type` of the nearest `package.json`, and a file with neither is CommonJS.
@@ -2507,7 +2509,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn removed_out_file_reports_positioned_ts5102_and_emits_per_file() {
         let fixture = Fixture::new();
@@ -2530,14 +2531,23 @@ mod tests {
             diagnostic.message(),
             "Option 'outFile' has been removed. Please remove it from your configuration."
         );
-        assert!(result.tsconfig_source.is_some(), "positioned at the tsconfig key");
         assert!(
-            result.outputs.files.contains_key(&fixture.0.join("src/a.js")),
+            result.tsconfig_source.is_some(),
+            "positioned at the tsconfig key"
+        );
+        assert!(
+            result
+                .outputs
+                .files
+                .contains_key(&fixture.0.join("src/a.js")),
             "per-file output still emits: {:?}",
             result.outputs.files.keys().collect::<Vec<_>>()
         );
         assert!(
-            !result.outputs.files.contains_key(&fixture.0.join("dist/bundle.js")),
+            !result
+                .outputs
+                .files
+                .contains_key(&fixture.0.join("dist/bundle.js")),
             "no bundle is produced"
         );
     }
@@ -2546,10 +2556,7 @@ mod tests {
     fn removed_out_file_via_extends_is_unpositioned_and_emits_per_file() {
         let fixture = Fixture::new();
         fixture.write("src/a.ts", "export const a = 1;\n");
-        fixture.write(
-            "base.json",
-            r#"{"compilerOptions":{"outFile":"out.js"}}"#,
-        );
+        fixture.write("base.json", r#"{"compilerOptions":{"outFile":"out.js"}}"#);
         fixture.write(
             "tsconfig.json",
             r#"{"extends":"./base.json","files":["src/a.ts"]}"#,
@@ -2570,7 +2577,12 @@ mod tests {
             result.tsconfig_source.is_none(),
             "extends-supplied outFile leaves the diagnostic unanchored"
         );
-        assert!(result.outputs.files.contains_key(&fixture.0.join("src/a.js")));
+        assert!(
+            result
+                .outputs
+                .files
+                .contains_key(&fixture.0.join("src/a.js"))
+        );
     }
 
     #[test]
@@ -2590,7 +2602,10 @@ mod tests {
                 .any(|diagnostic| diagnostic.code().as_str() == "5102"),
             "TS5102 is reported on the direct route"
         );
-        assert!(result.tsconfig_source.is_none(), "direct route has no tsconfig anchor");
+        assert!(
+            result.tsconfig_source.is_none(),
+            "direct route has no tsconfig anchor"
+        );
         assert!(result.outputs.files.contains_key(&fixture.0.join("a.js")));
     }
 

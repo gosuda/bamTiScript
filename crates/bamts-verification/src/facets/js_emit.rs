@@ -1,6 +1,6 @@
 use super::{FacetVerdict, compare_structural};
-use crate::corpus::{CaseSpec, NodeOracle, OracleOutcome};
 use crate::Result;
+use crate::corpus::{CaseSpec, NodeOracle, OracleOutcome};
 
 /// Line-wise comparator for `.js` emit baselines.
 ///
@@ -74,7 +74,10 @@ pub fn compare_js_cases(
     Ok(compare_js(&expected, &actual))
 }
 
-pub(super) fn compare_js_outcomes(expected: &OracleOutcome, actual: &OracleOutcome) -> FacetVerdict {
+pub(super) fn compare_js_outcomes(
+    expected: &OracleOutcome,
+    actual: &OracleOutcome,
+) -> FacetVerdict {
     if !expected.is_reliable() {
         return FacetVerdict::Fail {
             reason: "expected JS outcome is unreliable (timeout or truncated stdout)".to_owned(),

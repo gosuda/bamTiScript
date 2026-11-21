@@ -1,10 +1,19 @@
+use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
+use crate::cli::{
+    diagnostic_format::{self as tsc_diagnostics, TscDiagnosticFormat},
+    tsc_args::ParsedTscCommand,
+};
+use crate::context::ExecutionContext;
+use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
 use bamts::discover_project;
 use bamts_compiler::CancellationToken;
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
     FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_cancel,
 };
-use bamts_compiler::program::{ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram};
+use bamts_compiler::program::{
+    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram,
+};
 use bamts_compiler::{
     diagnostic::{Diagnostic, DiagnosticReport, DiagnosticSeverity},
     diagnostics_parser::map_parse_diagnostics,
@@ -20,13 +29,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::AtomicUsize;
-use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
-use crate::cli::{
-    diagnostic_format::{self as tsc_diagnostics, TscDiagnosticFormat},
-    tsc_args::ParsedTscCommand,
-};
-use crate::context::ExecutionContext;
-use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
 
 mod native;
 mod process;
@@ -34,14 +36,16 @@ mod project;
 mod tsc;
 
 pub use native::compile_program;
-pub use tsc::execute_tsc;
 #[cfg(any(test, target_env = "msvc"))]
- pub(crate) use process::capture_process_with_cancel;
+pub(crate) use process::capture_process_with_cancel;
+pub use tsc::execute_tsc;
 
-#[cfg(test)]
-use native::{RunInputs, claim_published_executable, content_hash, probe_toolchain, run_aot, run_jit};
 #[cfg(all(test, windows))]
 use native::fallback_cache_root_path_in_context;
+#[cfg(test)]
+use native::{
+    RunInputs, claim_published_executable, content_hash, probe_toolchain, run_aot, run_jit,
+};
 #[cfg(all(test, unix))]
 use native::{
     effective_uid, ensure_private_fallback_cache_root, fallback_cache_root_path, link_executable,
@@ -393,8 +397,12 @@ pub fn execute_in_context_with_cancel(
             let frontend = load_program_frontend_in_context_with_cancel(args, context, &cancel)?;
             match args.mode {
                 Mode::Check => native::check(args, &frontend),
-                Mode::Compile => native::compile_in_context_with_cancel(args, &frontend, context, &cancel),
-                Mode::Run => native::run_in_context_with_cancel(args, &frontend, context, &cancel, &limits),
+                Mode::Compile => {
+                    native::compile_in_context_with_cancel(args, &frontend, context, &cancel)
+                }
+                Mode::Run => {
+                    native::run_in_context_with_cancel(args, &frontend, context, &cancel, &limits)
+                }
                 Mode::Explain => unreachable!("explain handled without a program"),
             }
         }
@@ -1446,7 +1454,10 @@ exit 2
             stdout.contains("Option 'outFile' has been removed."),
             "{stdout}"
         );
-        assert!(fixture.0.join("src/main.js").is_file(), "per-file output still emits");
+        assert!(
+            fixture.0.join("src/main.js").is_file(),
+            "per-file output still emits"
+        );
         assert!(
             !fixture.0.join("dist/bundle.js").exists(),
             "no bundle is produced"
@@ -1485,8 +1496,15 @@ exit 2
         let fixture = TscFixture::new();
         fixture.write("a.ts", "export const x = 1;\n");
         let outcome = execute_tsc_in(
-            &parse_tsc_args(["--outFile", "x.js", "--ignoreConfig", "--pretty", "false", "a.ts"])
-                .expect("direct parses"),
+            &parse_tsc_args([
+                "--outFile",
+                "x.js",
+                "--ignoreConfig",
+                "--pretty",
+                "false",
+                "a.ts",
+            ])
+            .expect("direct parses"),
             &fixture.0,
         )
         .expect("direct executes");
@@ -1500,7 +1518,10 @@ exit 2
             stdout.lines().any(|line| line.starts_with("error TS5102:")),
             "TS5102 is unpositioned: {stdout}"
         );
-        assert!(fixture.0.join("a.js").is_file(), "per-file output still emits");
+        assert!(
+            fixture.0.join("a.js").is_file(),
+            "per-file output still emits"
+        );
         assert!(!fixture.0.join("x.js").exists(), "no bundle is produced");
     }
 

@@ -153,16 +153,17 @@ pub fn mode_for_importer(
     root: &ProjectRoot,
     importer: &Path,
 ) -> ResolutionMode {
-    match importer.extension().and_then(|extension| extension.to_str()) {
+    match importer
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
         Some(extension)
-            if extension.eq_ignore_ascii_case("mts")
-                || extension.eq_ignore_ascii_case("mjs") =>
+            if extension.eq_ignore_ascii_case("mts") || extension.eq_ignore_ascii_case("mjs") =>
         {
             return ResolutionMode::Import;
         }
         Some(extension)
-            if extension.eq_ignore_ascii_case("cts")
-                || extension.eq_ignore_ascii_case("cjs") =>
+            if extension.eq_ignore_ascii_case("cts") || extension.eq_ignore_ascii_case("cjs") =>
         {
             return ResolutionMode::Require;
         }
@@ -1384,8 +1385,7 @@ fn try_node_modules(
         // below already probes stems, and its trace prints no miss line.
         if (host.directory_exists(&package_root)
             || host.file_exists(&package_root.join("package.json"))
-            || (kind != ModuleResolutionKind::Bundler
-                && host.directory_exists(&node_modules)))
+            || (kind != ModuleResolutionKind::Bundler && host.directory_exists(&node_modules)))
             && let Some(resolved) = resolve_installed_package(
                 (root, options),
                 importer,
@@ -1806,14 +1806,9 @@ fn try_type_roots(
 ) -> Result<Option<ResolvedModule>, ResolutionError> {
     let (root, options) = context;
     for type_root in options.type_roots() {
-        if let Some(resolved) = probe_type_root(
-            (root, options),
-            type_root,
-            specifier,
-            strategy,
-            host,
-            trace,
-        )? {
+        if let Some(resolved) =
+            probe_type_root((root, options), type_root, specifier, strategy, host, trace)?
+        {
             return Ok(Some(resolved));
         }
     }
@@ -1870,7 +1865,6 @@ fn probe_type_root(
         trace,
     )
 }
-
 
 fn try_types_package(
     context: (&ProjectRoot, &CompilerOptions),

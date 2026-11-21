@@ -1429,8 +1429,9 @@ fn collect_imported_types_for_source<'a>(
             let Some(symbol) = lookup_identifier(model, source, &import.local) else {
                 continue;
             };
-            let Some(ImportTarget::Namespace { source: target_source }) =
-                tables.imports.get(&(source_id, symbol))
+            let Some(ImportTarget::Namespace {
+                source: target_source,
+            }) = tables.imports.get(&(source_id, symbol))
             else {
                 continue;
             };
@@ -1558,7 +1559,12 @@ fn build_imported_symbol_type<'a>(
     if resolution.candidates.len() != 1 {
         return None;
     }
-    match resolution.candidates.iter().next().expect("checked single candidate") {
+    match resolution
+        .candidates
+        .iter()
+        .next()
+        .expect("checked single candidate")
+    {
         ExportCandidate::Value(linked) => {
             let linked = *linked;
             let source_model = tables.files.get(&linked.source)?;
@@ -1583,7 +1589,9 @@ fn build_imported_symbol_type<'a>(
                             Type::AppliedClass { symbol, .. } if *symbol == linked.symbol
                         )
                         .then_some(return_type)
-                        .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
+                        .filter(|_| {
+                            signatures.all(|entry| entry.signature.return_type() == return_type)
+                        })
                     })
                 }
                 (SymbolKind::Interface | SymbolKind::TypeAlias, _) => Some(value_type_id),

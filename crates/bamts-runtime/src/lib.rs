@@ -9689,8 +9689,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             if let PropertyKey::Named(name) = key
                 && let HeapEntry::TypedArray { .. } = &self.heap[node]
-                && let Some(typed_index) =
-                    typedarray::typed_array_index(self.atoms.resolve(*name))
+                && let Some(typed_index) = typedarray::typed_array_index(self.atoms.resolve(*name))
             {
                 let view = self.value_for_runtime_index(node)?;
                 let value = match typed_index {
@@ -9786,8 +9785,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 return Ok(GetOutcome::Value(value));
             }
             if let HeapEntry::TypedArray { .. } = &self.heap[node]
-                && let Some(typed_index) =
-                    typedarray::typed_array_index(self.atoms.resolve(atom))
+                && let Some(typed_index) = typedarray::typed_array_index(self.atoms.resolve(atom))
             {
                 let view = self.value_for_runtime_index(node)?;
                 let value = match typed_index {
@@ -9939,9 +9937,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 property_lookup(properties, &self.shapes, &PropertyKey::Named(atom))
             }
             HeapEntry::TypedArray { properties, .. } => {
-                if let Some(typed_index) =
-                    typedarray::typed_array_index(self.atoms.resolve(atom))
-                {
+                if let Some(typed_index) = typedarray::typed_array_index(self.atoms.resolve(atom)) {
                     return typed_index
                         .zip(self.typed_array_length_at(index))
                         .is_some_and(|(offset, length)| offset < length)
@@ -13708,8 +13704,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .into_iter()
                         .filter(|key| match key {
                             PropertyKey::Named(atom) => {
-                                typedarray::typed_array_index(self.atoms.resolve(*atom))
-                                    .is_none()
+                                typedarray::typed_array_index(self.atoms.resolve(*atom)).is_none()
                             }
                             _ => true,
                         })

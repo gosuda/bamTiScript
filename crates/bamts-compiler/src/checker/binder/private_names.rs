@@ -60,8 +60,7 @@ impl<'src> Binder<'src> {
     /// The `#`-prefixed lookup key for a private member reference, or an
     /// empty key when the property is not a private name.
     pub(super) fn private_member_key(&self, property: &MemberProperty) -> EcmaString {
-        self.member_symbol_name(property)
-            .unwrap_or_default()
+        self.member_symbol_name(property).unwrap_or_default()
     }
 
     /// Whether `#name` is declared in any class member scope in the program.
@@ -73,7 +72,11 @@ impl<'src> Binder<'src> {
 
     /// The class that owns `#name` lookup for this receiver, when the
     /// receiver denotes a class instance, static side, or `this`.
-    pub(super) fn private_member_owner(&self, object: &'src Expr, object_type: TypeId) -> Option<SymbolId> {
+    pub(super) fn private_member_owner(
+        &self,
+        object: &'src Expr,
+        object_type: TypeId,
+    ) -> Option<SymbolId> {
         if let Some(symbol) = self.resolved_expression_reference(object)
             && self.symbols[symbol.get() as usize].kind == SymbolKind::Class
         {

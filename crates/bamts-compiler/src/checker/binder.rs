@@ -36,16 +36,16 @@ use super::{
     CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
     CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, CONSTRUCTOR_TYPE_PARAMETERS,
     DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-    DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION,
-    EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
-    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-    IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE, IMPLICIT_ANY_FROM_INITIALIZER_CYCLE,
-    IMPLICIT_ANY_RETURN_FROM_CYCLE, IMPORT_CONFLICTS_WITH_LOCAL, INTERFACE_NAME_IS_PRIMITIVE,
-    INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE,
-    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
-    NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    DUPLICATE_DECLARATION, DUPLICATE_LABEL, ENUM_USED_BEFORE_DECLARATION, EXCESS_PROPERTY,
+    EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
+    FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
+    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPLICIT_ANY_ANONYMOUS_RETURN_FROM_CYCLE,
+    IMPLICIT_ANY_FROM_INITIALIZER_CYCLE, IMPLICIT_ANY_RETURN_FROM_CYCLE,
+    IMPORT_CONFLICTS_WITH_LOCAL, INTERFACE_NAME_IS_PRIMITIVE, INVALID_ASSIGNMENT_TARGET,
+    INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE,
+    MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION,
+    NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
     PARAMETER_INITIALIZER_IN_SIGNATURE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
     PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, REST_PARAMETER_ARRAY_TYPE,
     REST_PARAMETER_NOT_LAST, SET_ACCESSOR_PARAMETER_INITIALIZER,
@@ -119,12 +119,12 @@ const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL_MESSAGE: &str =
 mod date;
 #[path = "binder/primitives.rs"]
 mod primitives;
-#[path = "binder/strict_eval.rs"]
-mod strict_eval;
-#[path = "binder/rest_spread.rs"]
-mod rest_spread;
 #[path = "binder/private_names.rs"]
 mod private_names;
+#[path = "binder/rest_spread.rs"]
+mod rest_spread;
+#[path = "binder/strict_eval.rs"]
+mod strict_eval;
 
 /// Maximum depth of recursive type resolution before the checker emits
 /// `TYPE_NESTING_TOO_DEEP` and returns the error type. Set higher than the
@@ -2304,38 +2304,59 @@ impl TypeTable {
             }
             Type::Tuple(shape) => {
                 let shape = shape.clone();
-                shape.prefix.iter().copied().chain(shape.rest).chain(shape.suffix.iter().copied())
+                shape
+                    .prefix
+                    .iter()
+                    .copied()
+                    .chain(shape.rest)
+                    .chain(shape.suffix.iter().copied())
                     .any(|element| self.template_mentions_parameter(element, parameters, visiting))
             }
             Type::Union(members) | Type::Intersection(members) => {
                 let members = members.clone();
-                members.iter().copied()
+                members
+                    .iter()
+                    .copied()
                     .any(|member| self.template_mentions_parameter(member, parameters, visiting))
             }
             Type::ObjectType(object) => {
                 let object = object.clone();
-                object.properties.iter().map(|property| property.type_id())
-                    .chain(object.call_signatures.iter().flat_map(|signature| {
-                        Self::signature_member_types(signature)
-                    }))
-                    .chain(object.construct_signatures.iter().flat_map(|entry| {
-                        Self::signature_member_types(&entry.signature)
-                    }))
+                object
+                    .properties
+                    .iter()
+                    .map(|property| property.type_id())
+                    .chain(
+                        object
+                            .call_signatures
+                            .iter()
+                            .flat_map(|signature| Self::signature_member_types(signature)),
+                    )
+                    .chain(
+                        object
+                            .construct_signatures
+                            .iter()
+                            .flat_map(|entry| Self::signature_member_types(&entry.signature)),
+                    )
                     .chain(object.index_signatures.iter().flat_map(|index| {
-                        index.parameters.iter().map(|parameter| parameter.type_id())
+                        index
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.type_id())
                             .chain(std::iter::once(index.value_type))
                     }))
                     .any(|member| self.template_mentions_parameter(member, parameters, visiting))
             }
             Type::Function(signature) => {
                 let members = Self::signature_member_types(signature);
-                members.into_iter()
+                members
+                    .into_iter()
                     .any(|member| self.template_mentions_parameter(member, parameters, visiting))
             }
             Type::AppliedClass { arguments, .. } => {
                 let arguments = arguments.clone();
-                arguments.iter().copied()
-                    .any(|argument| self.template_mentions_parameter(argument, parameters, visiting))
+                arguments.iter().copied().any(|argument| {
+                    self.template_mentions_parameter(argument, parameters, visiting)
+                })
             }
             Type::AppliedAlias { symbol, arguments } => {
                 let arguments = arguments.clone();
@@ -2367,26 +2388,44 @@ impl TypeTable {
             Type::This { constraint, .. } => {
                 self.template_mentions_parameter(*constraint, parameters, visiting)
             }
-            Type::ConstructorType { arguments, structural, .. } => {
+            Type::ConstructorType {
+                arguments,
+                structural,
+                ..
+            } => {
                 let arguments = arguments.clone();
-                arguments.iter().copied().chain(std::iter::once(*structural))
+                arguments
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(*structural))
                     .any(|member| self.template_mentions_parameter(member, parameters, visiting))
             }
-            Type::TypeQuery { arguments, target, .. } => {
+            Type::TypeQuery {
+                arguments, target, ..
+            } => {
                 let arguments = arguments.clone();
-                arguments.iter().copied().chain(std::iter::once(*target))
+                arguments
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(*target))
                     .any(|member| self.template_mentions_parameter(member, parameters, visiting))
             }
             _ => false,
         }
     }
     fn signature_member_types(signature: &FunctionSignature) -> Vec<TypeId> {
-        signature.parameters().iter().map(|parameter| parameter.type_id())
+        signature
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.type_id())
             .chain(std::iter::once(signature.return_type()))
             .chain(signature.declared_return())
-            .chain(signature.type_parameter_bounds().iter().flat_map(|bounds| {
-                bounds.constraint().into_iter().chain(bounds.default())
-            }))
+            .chain(
+                signature
+                    .type_parameter_bounds()
+                    .iter()
+                    .flat_map(|bounds| bounds.constraint().into_iter().chain(bounds.default())),
+            )
             .collect()
     }
     #[must_use]
@@ -28959,15 +28998,14 @@ mod tests {
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
         CANNOT_FIND_TYPE, CONSTRUCTOR_TYPE_PARAMETERS, ConstructEntry,
-        DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION,
-        EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-        FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, FunctionParameter, FunctionSignature,
-        GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
-        NAMESPACE_NO_EXPORTED_MEMBER, ObjectType, PROPERTY_DOES_NOT_EXIST,
-        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
-        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
-        SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeId, TypeParameterBounds,
-        TypeTable, bind_source,
+        DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
+        FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+        FunctionParameter, FunctionSignature, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
+        MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, ObjectType,
+        PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, PropertyType,
+        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
+        TupleShape, Type, TypeId, TypeParameterBounds, TypeTable, bind_source,
     };
     use crate::checker::{
         EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
@@ -29025,8 +29063,11 @@ mod tests {
                     "kept member keeps its number type",
                 );
             }
-            let mut names: Vec<String> =
-                object.properties.iter().map(|property| property.name().to_owned()).collect();
+            let mut names: Vec<String> = object
+                .properties
+                .iter()
+                .map(|property| property.name().to_owned())
+                .collect();
             names.sort();
             kept.push(names);
         }
@@ -29055,8 +29096,11 @@ mod tests {
         let Type::ObjectType(object) = model.types().get(model.symbol_type(rest)) else {
             panic!("rest past a null member is a single object type");
         };
-        let mut names: Vec<String> =
-            object.properties.iter().map(|property| property.name().to_owned()).collect();
+        let mut names: Vec<String> = object
+            .properties
+            .iter()
+            .map(|property| property.name().to_owned())
+            .collect();
         names.sort();
         assert_eq!(names, ["b"]);
         assert_eq!(object.properties[0].type_id(), model.types().number());
@@ -32445,9 +32489,8 @@ namespace undefined { export var x = 42; }",
 
     #[test]
     fn dynamic_computed_class_members_bind_distinct_symbols() {
-        let (model, diagnostics) = bound(
-            "declare const k: any;\nclass C {\n    [k] = 1;\n    [k]() { return 2; }\n}",
-        );
+        let (model, diagnostics) =
+            bound("declare const k: any;\nclass C {\n    [k] = 1;\n    [k]() { return 2; }\n}");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let class = value_symbol(&model, "C");
         let members: Vec<SymbolId> = model

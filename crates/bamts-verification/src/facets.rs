@@ -413,9 +413,9 @@ fn excerpt(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, fs, path::Path};
     use crate::ErrorCode;
     use crate::corpus::{CaseSpec, NodeOracle, OracleOutcome, Provenance};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     fn js_reason(expected: &str, actual: &str) -> String {
         match compare_js_emit(expected, actual) {
@@ -1499,8 +1499,11 @@ interface A {
         // correspondences below. Checker codes emitted without a tsc-verified
         // counterpart stay unmapped: the registry rows name their compiler
         // constants (verification/diagnostic-code-map.json).
-        const MAPPED_PARSER_CODES: [(&str, u32); 3] =
-            [("BAMTS-P017", 1163), ("BAMTS-P020", 1141), ("BAMTS-P021", 1048)];
+        const MAPPED_PARSER_CODES: [(&str, u32); 3] = [
+            ("BAMTS-P017", 1163),
+            ("BAMTS-P020", 1141),
+            ("BAMTS-P021", 1048),
+        ];
         const UNMAPPED_CHECKER_CODES: [&str; 19] = [
             "BAMTS-C060",
             "BAMTS-C061",
@@ -1531,9 +1534,7 @@ interface A {
                 assert!(entry.ts_code.is_none());
                 continue;
             }
-            if let Some((_, ts_code)) =
-                MAPPED_PARSER_CODES.iter().find(|(name, _)| *name == code)
-            {
+            if let Some((_, ts_code)) = MAPPED_PARSER_CODES.iter().find(|(name, _)| *name == code) {
                 assert_eq!(entry.status, DiagnosticMappingStatus::Mapped, "{code}");
                 assert_eq!(entry.ts_code, Some(*ts_code), "{code}");
                 mapped += 1;
@@ -1564,15 +1565,38 @@ interface A {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let map = load_diagnostic_code_map(&root).expect("committed diagnostic code map");
         assert_eq!(map.typescript_code("BAMTS-C067"), Some(2353));
-        let expected =
-            [diag(1, 31, DiagnosticCategory::Error, FacetSeverity::Error, "TS2353")];
-        let actual =
-            [diag(1, 31, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-C067")];
-        assert_eq!(compare_diagnostics(&expected, &actual, &map), FacetVerdict::Pass);
-        let suggested =
-            [diag(12, 20, DiagnosticCategory::Error, FacetSeverity::Error, "TS2561")];
-        let same_site =
-            [diag(12, 20, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-C067")];
+        let expected = [diag(
+            1,
+            31,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "TS2353",
+        )];
+        let actual = [diag(
+            1,
+            31,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "BAMTS-C067",
+        )];
+        assert_eq!(
+            compare_diagnostics(&expected, &actual, &map),
+            FacetVerdict::Pass
+        );
+        let suggested = [diag(
+            12,
+            20,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "TS2561",
+        )];
+        let same_site = [diag(
+            12,
+            20,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "BAMTS-C067",
+        )];
         assert!(compare_diagnostics(&suggested, &same_site, &map).is_fail());
     }
 
@@ -1581,15 +1605,38 @@ interface A {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let map = load_diagnostic_code_map(&root).expect("committed diagnostic code map");
         assert_eq!(map.typescript_code("BAMTS-P017"), Some(1163));
-        let expected =
-            [diag(2, 4, DiagnosticCategory::Error, FacetSeverity::Error, "TS1163")];
-        let actual =
-            [diag(2, 4, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-P017")];
-        assert_eq!(compare_diagnostics(&expected, &actual, &map), FacetVerdict::Pass);
-        let diverged =
-            [diag(3, 4, DiagnosticCategory::Error, FacetSeverity::Error, "TS2304")];
-        let same_site =
-            [diag(3, 4, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-P017")];
+        let expected = [diag(
+            2,
+            4,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "TS1163",
+        )];
+        let actual = [diag(
+            2,
+            4,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "BAMTS-P017",
+        )];
+        assert_eq!(
+            compare_diagnostics(&expected, &actual, &map),
+            FacetVerdict::Pass
+        );
+        let diverged = [diag(
+            3,
+            4,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "TS2304",
+        )];
+        let same_site = [diag(
+            3,
+            4,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "BAMTS-P017",
+        )];
         assert!(compare_diagnostics(&diverged, &same_site, &map).is_fail());
     }
 
@@ -1598,11 +1645,24 @@ interface A {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let map = load_diagnostic_code_map(&root).expect("committed diagnostic code map");
         assert_eq!(map.typescript_code("BAMTS-P020"), Some(1141));
-        let expected =
-            [diag(1, 23, DiagnosticCategory::Error, FacetSeverity::Error, "TS1141")];
-        let actual =
-            [diag(1, 23, DiagnosticCategory::Error, FacetSeverity::Error, "BAMTS-P020")];
-        assert_eq!(compare_diagnostics(&expected, &actual, &map), FacetVerdict::Pass);
+        let expected = [diag(
+            1,
+            23,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "TS1141",
+        )];
+        let actual = [diag(
+            1,
+            23,
+            DiagnosticCategory::Error,
+            FacetSeverity::Error,
+            "BAMTS-P020",
+        )];
+        assert_eq!(
+            compare_diagnostics(&expected, &actual, &map),
+            FacetVerdict::Pass
+        );
     }
 
     #[test]

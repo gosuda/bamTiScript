@@ -910,21 +910,20 @@ impl Rewriter<'_> {
                 .properties
                 .iter()
                 .any(|property| self.pattern_has_private_target(&property.target)),
-            AssignmentTarget::Array(pattern) => pattern.elements.iter().any(|element| {
-                match element {
+            AssignmentTarget::Array(pattern) => {
+                pattern.elements.iter().any(|element| match element {
                     AssignmentArrayElement::Target(target)
                     | AssignmentArrayElement::Rest(target) => {
                         self.pattern_has_private_target(target)
                     }
                     AssignmentArrayElement::Elision | AssignmentArrayElement::Missing(_) => false,
-                }
-            }),
+                })
+            }
             AssignmentTarget::Member(member) => {
                 matches!(member.property, MemberProperty::Private(_))
             }
-            AssignmentTarget::Invalid(operand) => asserted_member(operand).is_some_and(|member| {
-                matches!(member.property, MemberProperty::Private(_))
-            }),
+            AssignmentTarget::Invalid(operand) => asserted_member(operand)
+                .is_some_and(|member| matches!(member.property, MemberProperty::Private(_))),
             _ => false,
         }
     }
@@ -965,10 +964,7 @@ impl Rewriter<'_> {
         }
         let rhs_temp = self.expression_temp();
         let rhs_capture = self.temp_assignment(&rhs_temp, right, expression.range());
-        let rhs_ref = self.node(
-            rhs_temp.range(),
-            Expression::Identifier(rhs_temp),
-        );
+        let rhs_ref = self.node(rhs_temp.range(), Expression::Identifier(rhs_temp));
         let mut parts = Vec::with_capacity(captures.len() + 2);
         parts.push(rhs_capture);
         parts.extend(captures);
@@ -999,10 +995,8 @@ impl Rewriter<'_> {
                     .iter()
                     .map(|property| AssignmentObjectProperty {
                         name: self.rewrite_property_name(&property.name),
-                        target: self.rewrite_private_destructured_target(
-                            &property.target,
-                            captures,
-                        ),
+                        target: self
+                            .rewrite_private_destructured_target(&property.target, captures),
                         initializer: property
                             .initializer
                             .as_deref()
@@ -1020,11 +1014,9 @@ impl Rewriter<'_> {
                     .elements
                     .iter()
                     .map(|element| match element {
-                        AssignmentArrayElement::Target(inner) => {
-                            AssignmentArrayElement::Target(
-                                self.rewrite_private_destructured_target(inner, captures),
-                            )
-                        }
+                        AssignmentArrayElement::Target(inner) => AssignmentArrayElement::Target(
+                            self.rewrite_private_destructured_target(inner, captures),
+                        ),
                         AssignmentArrayElement::Rest(inner) => AssignmentArrayElement::Rest(
                             self.rewrite_private_destructured_target(inner, captures),
                         ),
@@ -1122,7 +1114,12 @@ impl Rewriter<'_> {
                 expression: Box::new(call),
             }),
         );
-        let block = self.node(range, Block { statements: vec![statement] });
+        let block = self.node(
+            range,
+            Block {
+                statements: vec![statement],
+            },
+        );
         let binding = self.node(
             value_name.range(),
             BindingPattern::Identifier(value_name.clone()),

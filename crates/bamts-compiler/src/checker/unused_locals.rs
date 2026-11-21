@@ -1052,7 +1052,11 @@ mod tests {
         let x = by_name(&outcome.locals, "x");
         assert_eq!(f[0].code().as_str(), "6133", "{outcome:?}");
         assert_eq!(x[0].code().as_str(), "6133", "{outcome:?}");
-        assert_eq!(f[0].range().start().get(), text.find("f()").expect("f name"), "{outcome:?}");
+        assert_eq!(
+            f[0].range().start().get(),
+            text.find("f()").expect("f name"),
+            "{outcome:?}"
+        );
         assert_eq!(
             x[0].range().start().get(),
             text.find("var x").expect("x declaration") + "var ".len(),
@@ -1085,7 +1089,11 @@ mod tests {
         assert_eq!(sorted_names(&outcome.locals), ["h"], "{outcome:?}");
         let h = by_name(&outcome.locals, "h");
         assert_eq!(h[0].code().as_str(), "6133", "{outcome:?}");
-        assert_eq!(h[0].range().start().get(), text.find("h(").expect("h name"), "{outcome:?}");
+        assert_eq!(
+            h[0].range().start().get(),
+            text.find("h(").expect("h name"),
+            "{outcome:?}"
+        );
     }
 
     #[test]
@@ -1122,7 +1130,11 @@ mod tests {
             .filter(|diagnostic| diagnostic.code().as_str() == "6199")
             .collect();
         assert_eq!(variables.len(), 1, "{outcome:?}");
-        assert_eq!(variables[0].message(), "All variables are unused.", "{outcome:?}");
+        assert_eq!(
+            variables[0].message(),
+            "All variables are unused.",
+            "{outcome:?}"
+        );
         assert_eq!(
             variables[0].range().start().get(),
             text.find("var x = 1").expect("declaration"),
@@ -1133,7 +1145,11 @@ mod tests {
     fn rest_reports_only_rest_binding() {
         let text = "function three() { const foo = { a: 1, b: 2 }; const { a, ...bar } = foo; }";
         let outcome = check(text);
-        assert_eq!(sorted_names(&outcome.locals), ["bar", "three"], "{outcome:?}");
+        assert_eq!(
+            sorted_names(&outcome.locals),
+            ["bar", "three"],
+            "{outcome:?}"
+        );
         assert_eq!(codes(&outcome.locals), ["6133", "6133"], "{outcome:?}");
         let rest = by_name(&outcome.locals, "bar");
         assert_eq!(
@@ -1141,7 +1157,12 @@ mod tests {
             text.find("...bar").expect("rest binding") + "...".len(),
             "{outcome:?}"
         );
-        assert!(!messages(&outcome.locals).iter().any(|m| m.contains("destructured")), "{outcome:?}");
+        assert!(
+            !messages(&outcome.locals)
+                .iter()
+                .any(|m| m.contains("destructured")),
+            "{outcome:?}"
+        );
     }
 
     #[test]
@@ -1163,14 +1184,19 @@ mod tests {
 
     #[test]
     fn hash_private_used_is_clean() {
-        let outcome = check("class C { #x = 1; m() { return this.#x; } } export const c = new C();");
+        let outcome =
+            check("class C { #x = 1; m() { return this.#x; } } export const c = new C();");
         assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
         assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
     }
 
     #[test]
     fn declaration_file_locals_are_clean() {
-        let source_text = Arc::new(SourceText::new("const x = 1;\n").expect("test source fits the budget").with_declaration_file(true));
+        let source_text = Arc::new(
+            SourceText::new("const x = 1;\n")
+                .expect("test source fits the budget")
+                .with_declaration_file(true),
+        );
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             crate::source::ScriptKind::TypeScript,
@@ -1216,7 +1242,12 @@ mod tests {
             text.find("[a, b]").expect("b binding") + "[a, ".len(),
             "{outcome:?}"
         );
-        assert!(!messages(&outcome.locals).iter().any(|m| m.contains("destructured")), "{outcome:?}");
+        assert!(
+            !messages(&outcome.locals)
+                .iter()
+                .any(|m| m.contains("destructured")),
+            "{outcome:?}"
+        );
     }
 
     #[test]
@@ -1335,8 +1366,7 @@ mod tests {
         let texts = messages(&outcome.locals);
         assert_eq!(texts.len(), 1, "{outcome:?}");
         assert_eq!(
-            texts[0],
-            "'z' is declared but its value is never read.",
+            texts[0], "'z' is declared but its value is never read.",
             "{outcome:?}"
         );
         assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
@@ -1350,7 +1380,8 @@ mod tests {
     }
     #[test]
     fn for_in_target_computed_key_nested_body_reports_unused() {
-        let text = "let o: any; let obj: any; for (o[(() => { const z = 1; return \"k\"; })()] in obj) {}";
+        let text =
+            "let o: any; let obj: any; for (o[(() => { const z = 1; return \"k\"; })()] in obj) {}";
         let outcome = check(text);
         assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
         let expected = text.find("const z").expect("z declaration") + "const ".len();
@@ -1379,8 +1410,7 @@ mod tests {
         let texts = messages(&outcome.locals);
         assert_eq!(texts.len(), 1, "{outcome:?}");
         assert_eq!(
-            texts[0],
-            "'z' is declared but its value is never read.",
+            texts[0], "'z' is declared but its value is never read.",
             "{outcome:?}"
         );
         assert_eq!(codes(&outcome.locals), ["6133"], "{outcome:?}");
@@ -1440,5 +1470,4 @@ mod tests {
         assert_eq!(codes(&outcome.locals), Vec::<&str>::new(), "{outcome:?}");
         assert_eq!(codes(&outcome.params), Vec::<&str>::new(), "{outcome:?}");
     }
-
 }

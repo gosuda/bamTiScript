@@ -60,41 +60,62 @@ use crate::suite::{
     decode_case_source, read_verified_snapshot_asset,
 };
 use crate::{ErrorCode, Result, VerificationError};
-mod case_units;
 mod baselines;
-mod compile;
-mod errors_facet;
-mod types_facet;
-mod symbols_facet;
-mod js_facet;
-mod declaration_facet;
-mod source_map_facet;
 mod build_info_facet;
+mod case_units;
+mod compile;
+mod declaration_facet;
+mod errors_facet;
+mod js_facet;
+mod source_map_facet;
+mod symbols_facet;
 mod trace_facet;
-pub use case_units::{parse_case_pragmas, split_case_units, entry_virtual_path};
-pub use baselines::{baseline_groups, case_stem, baseline_area, resolve_baseline_file};
-pub use compile::{compile_case, compile_case_with_pragmas, compile_case_with_support, compile_case_frontend, compile_case_frontend_with_support};
-pub use errors_facet::{resolve_errors_baselines, parse_errors_baseline, collect_facet_diagnostics, expected_facet_diagnostics, check_diagnostics};
-pub use types_facet::{emit_types_baseline, resolve_types_baseline, check_types};
-pub use symbols_facet::{emit_symbols_baseline, resolve_symbols_baseline, check_symbols};
-pub use js_facet::{emit_javascript_baseline, output_extension, javascript_section_name, declaration_extension, declaration_section_name};
-pub use declaration_facet::{emit_declaration_baseline, extract_dts_sections};
-pub use source_map_facet::{emit_source_map_baseline};
+mod types_facet;
+pub use baselines::{baseline_area, baseline_groups, case_stem, resolve_baseline_file};
+use baselines::{
+    baseline_owner, case_inputs_with_stem, resolve_stem_baseline, split_baseline_file_name,
+    suffix_matches_options,
+};
+pub(crate) use build_info_facet::observe_build_info;
 pub use build_info_facet::{emit_build_info_baseline, extract_tsbuildinfo_sections};
-pub(crate) use case_units::{shared_lib_support_files};
+pub(crate) use case_units::shared_lib_support_files;
+pub use case_units::{entry_virtual_path, parse_case_pragmas, split_case_units};
+use case_units::{
+    is_check_cell_declaration_path, is_config_unit_name, is_declaration_input_name,
+    is_declaration_section_name, is_json_input_name, is_script_input_name,
+    is_tsbuildinfo_section_name, section_header_name, unit_basename,
+};
+use compile::{
+    build_tsconfig, cell_result, compile_failure_observation, compile_option_pairs, read_case_text,
+};
+pub use compile::{
+    compile_case, compile_case_frontend, compile_case_frontend_with_support,
+    compile_case_with_pragmas, compile_case_with_support,
+};
+pub(crate) use declaration_facet::observe_declaration;
+pub use declaration_facet::{emit_declaration_baseline, extract_dts_sections};
+pub use errors_facet::{
+    check_diagnostics, collect_facet_diagnostics, expected_facet_diagnostics,
+    parse_errors_baseline, resolve_errors_baselines,
+};
 pub(crate) use errors_facet::{execute_diagnostics_check, observe_diagnostics};
-pub(crate) use types_facet::{execute_types_check, observe_types};
-pub(crate) use symbols_facet::{execute_symbols_check, observe_symbols};
+use js_facet::{
+    bundle_output_name, declaration_code, declaration_text_for, full_emit_directory,
+    output_section_name, push_map_section, push_output_section,
+};
 pub(crate) use js_facet::{common_directory, emitted_path, observe_javascript};
-pub(crate) use declaration_facet::{observe_declaration};
-pub(crate) use source_map_facet::{observe_source_map};
-pub(crate) use build_info_facet::{observe_build_info};
+pub use js_facet::{
+    declaration_extension, declaration_section_name, emit_javascript_baseline,
+    javascript_section_name, output_extension,
+};
+pub use source_map_facet::emit_source_map_baseline;
+pub(crate) use source_map_facet::observe_source_map;
+pub use symbols_facet::{check_symbols, emit_symbols_baseline, resolve_symbols_baseline};
+pub(crate) use symbols_facet::{execute_symbols_check, observe_symbols};
 pub(crate) use trace_facet::{collect_resolution_trace, observe_trace};
-use case_units::{is_check_cell_declaration_path, unit_basename, is_config_unit_name, is_json_input_name, is_declaration_input_name, is_script_input_name, section_header_name, is_declaration_section_name, is_tsbuildinfo_section_name};
-use baselines::{split_baseline_file_name, suffix_matches_options, case_inputs_with_stem, baseline_owner, resolve_stem_baseline};
-use compile::{build_tsconfig, compile_option_pairs, read_case_text, compile_failure_observation, cell_result};
-use types_facet::{slice_source, collapse_whitespace, strip_library_root};
-use js_facet::{full_emit_directory, bundle_output_name, output_section_name, declaration_code, declaration_text_for, push_output_section, push_map_section};
+pub use types_facet::{check_types, emit_types_baseline, resolve_types_baseline};
+use types_facet::{collapse_whitespace, slice_source, strip_library_root};
+pub(crate) use types_facet::{execute_types_check, observe_types};
 
 /// Baselines are imported flat under `tests/baselines/reference/`; the runner
 /// stores every non-case blob under the snapshot's `baselines/` content store.

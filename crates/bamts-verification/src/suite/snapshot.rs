@@ -1,14 +1,6 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs, io,
-    path::{Component, Path, PathBuf},
-    process::Command,
-};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use super::ci::build_provisional_ledger;
 use super::{
-    COMPILER_CATALOG, AssetKind, CompilerSnapshot, ImportedAsset, IndexEntry, SnapshotAssets,
+    AssetKind, COMPILER_CATALOG, CompilerSnapshot, ImportedAsset, IndexEntry, SnapshotAssets,
     SuiteIndex, SuiteSnapshot, SyncOptions, VerifiedSuite,
 };
 use crate::catalog::ObservableKind;
@@ -21,6 +13,14 @@ use crate::oracle_pins::{
 use crate::schema::sha256_hex;
 use crate::ts_ledger::{Facet, Partition, TsLedgerReader, TsLedgerWriter};
 use crate::{ErrorCode, Result, VerificationError};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::{Component, Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -447,7 +447,6 @@ fn materialize_snapshot(
         ledger,
     })
 }
-
 
 pub(super) fn index_content_digest(index: &SuiteIndex) -> String {
     let mut hasher = Sha256::new();

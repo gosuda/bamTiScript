@@ -6,18 +6,18 @@ use bamts_native::{Decoded, Value};
 use std::cmp::Ordering;
 use std::mem::size_of;
 
-use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use super::property_descriptor::descriptor_from_property;
 use super::{
     allocate_array, allocate_string, argument, define_data, install_constructor_function,
-    install_function, keep_root, length_of_array_like, number, range_error,
-    to_integer_or_infinity, type_error, value_number, with_roots,
+    install_function, keep_root, length_of_array_like, number, range_error, to_integer_or_infinity,
+    type_error, value_number, with_roots,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     ArrayElementKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
     PropertyMap, RuntimeErrorKind,
 };
+use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 
 pub(super) fn install<H: Host>(
     heap: &mut Heap,
@@ -41,11 +41,7 @@ pub(super) fn install<H: Host>(
     builtins.set_constructor_prototype(heap, atoms, shapes, constructor, prototype);
     globals.insert(EcmaString::encode("Array"), constructor);
     for (name, length, handler) in [
-        (
-            "isArray",
-            1,
-            is_array_method::<H> as BuiltinHandler<H>,
-        ),
+        ("isArray", 1, is_array_method::<H> as BuiltinHandler<H>),
         ("from", 1, from::<H>),
         ("of", 0, of::<H>),
     ] {
@@ -4387,7 +4383,8 @@ mod tests {
             )
             .unwrap();
             let log = allocate_array(machine, Vec::new()).unwrap();
-            let predicate = native_with_length(machine, "mutate and match", 3, mutate_and_match::<TestHost>);
+            let predicate =
+                native_with_length(machine, "mutate and match", 3, mutate_and_match::<TestHost>);
             let found = value(find_last_index(machine, source, &[predicate, log], false).unwrap());
             assert_eq!(found, Value::int32(1));
             assert_eq!(array(machine, log), vec![Value::int32(2), Value::int32(1)]);
@@ -4410,7 +4407,8 @@ mod tests {
             machine
                 .set_data_property(source, "constructor", Value::NULL)
                 .unwrap();
-            let comparator = native_with_length(machine, "compare tens", 2, compare_tens::<TestHost>);
+            let comparator =
+                native_with_length(machine, "compare tens", 2, compare_tens::<TestHost>);
             let sorted = value(to_sorted(machine, source, &[comparator], false).unwrap());
             assert_eq!(
                 array(machine, sorted),
@@ -4428,7 +4426,8 @@ mod tests {
                 Some(machine.intrinsics.array_prototype)
             );
 
-            let abrupt = native_with_length(machine, "throwing comparator", 2, throwing::<TestHost>);
+            let abrupt =
+                native_with_length(machine, "throwing comparator", 2, throwing::<TestHost>);
             assert!(matches!(
                 to_sorted(machine, source, &[abrupt], false),
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
@@ -4450,7 +4449,8 @@ mod tests {
                     .set_data_property(receiver, &index.to_string(), Value::int32(item))
                     .unwrap();
             }
-            let length_getter = native_with_length(machine, "length getter", 0, record_length::<TestHost>);
+            let length_getter =
+                native_with_length(machine, "length getter", 0, record_length::<TestHost>);
             let length_key = PropertyKey::Named(machine.intern_str("length"));
             machine
                 .define_descriptor(
@@ -4474,7 +4474,8 @@ mod tests {
                 machine
                     .set_data_property(object, "_number", Value::int32(number))
                     .unwrap();
-                let value_of = native_with_length(machine, "valueOf", 0, record_value_of::<TestHost>);
+                let value_of =
+                    native_with_length(machine, "valueOf", 0, record_value_of::<TestHost>);
                 machine
                     .set_data_property(object, "valueOf", value_of)
                     .unwrap();
@@ -4827,7 +4828,8 @@ mod tests {
             machine
                 .set_data_property(source, "_len", Value::int32(0))
                 .unwrap();
-            let length_getter = native_with_length(machine, "length getter", 0, record_length::<TestHost>);
+            let length_getter =
+                native_with_length(machine, "length getter", 0, record_length::<TestHost>);
             let length_key = PropertyKey::Named(machine.intern_str("length"));
             machine
                 .define_descriptor(
@@ -4973,7 +4975,8 @@ mod tests {
             .unwrap();
         machine.set_data_property(iterable, "next", next).unwrap();
         let iterator = machine.intrinsics.builtins.symbol_async_iterator();
-        let self_target = native_with_length(machine, "iterator self", 0, iterator_self::<TestHost>);
+        let self_target =
+            native_with_length(machine, "iterator self", 0, iterator_self::<TestHost>);
         let key = machine.property_key_from_value(iterator).unwrap();
         machine
             .set_data_property_key(iterable, key, self_target)
@@ -5027,7 +5030,8 @@ mod tests {
             .set_data_property(iterable, "_values", backing)
             .unwrap();
         machine.set_data_property(iterable, "next", next).unwrap();
-        let self_target = native_with_length(machine, "sync iterator self", 0, iterator_self::<TestHost>);
+        let self_target =
+            native_with_length(machine, "sync iterator self", 0, iterator_self::<TestHost>);
         let key = machine
             .property_key_from_value(machine.intrinsics.builtins.symbol_iterator())
             .unwrap();

@@ -659,9 +659,8 @@ fn iterator_next<H: Host>(
                 .map_err(EvalFailure::Runtime)?
                 .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
             let item = if matches!(&machine.heap[source_index], HeapEntry::TypedArray { .. }) {
-                let bounds = crate::intrinsics::builtins::typedarray::typed_array_bounds(
-                    machine, source,
-                )?;
+                let bounds =
+                    crate::intrinsics::builtins::typedarray::typed_array_bounds(machine, source)?;
                 if bounds.out_of_bounds {
                     return Err(type_error("iterated typed array is out of bounds"));
                 }

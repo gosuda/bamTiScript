@@ -1,14 +1,14 @@
-use super::*;
 use super::native::*;
 use super::project::*;
+use super::*;
+use crate::cli::tsc_args::TscDispatchMode;
+use crate::cli::tsc_args::TscExitStatus;
 use bamts_compiler::project::canonical::slash_text;
-use bamts_compiler::project::effective::compile_project;
 use bamts_compiler::project::effective::EffectiveProject;
 use bamts_compiler::project::effective::ProjectCompileOptions;
 use bamts_compiler::project::effective::ProjectLoadRequest;
+use bamts_compiler::project::effective::compile_project;
 use bamts_compiler::service::filesystem::OsFileSystem;
-use crate::cli::tsc_args::TscDispatchMode;
-use crate::cli::tsc_args::TscExitStatus;
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -280,7 +280,9 @@ pub(super) fn compile_tsc_artifacts(
     Ok(outcome)
 }
 
-pub(super) fn initialize_tsc_config(context: &ExecutionContext) -> Result<CommandOutcome, DriverError> {
+pub(super) fn initialize_tsc_config(
+    context: &ExecutionContext,
+) -> Result<CommandOutcome, DriverError> {
     let path = context.resolve_path("tsconfig.json");
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
@@ -309,7 +311,10 @@ pub(super) fn initialize_tsc_config(context: &ExecutionContext) -> Result<Comman
 }
 
 #[cfg(test)]
-pub(super) fn execute_tsc_in(command: &ParsedTscCommand, cwd: &Path) -> Result<CommandOutcome, DriverError> {
+pub(super) fn execute_tsc_in(
+    command: &ParsedTscCommand,
+    cwd: &Path,
+) -> Result<CommandOutcome, DriverError> {
     let environment = std::env::vars_os().collect();
     let context = ExecutionContext::new(cwd, environment)?;
     execute_tsc_in_context(command, &context)

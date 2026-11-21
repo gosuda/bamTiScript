@@ -673,7 +673,12 @@ const GLOBAL_LIB_DECL_FILES: &[GlobalLibDecl] = &[
 /// the lib Decl files upstream lists in baseline order. The es2017.date.d.ts
 /// refinement has no dedicated Lib category, so it is gated on
 /// Es2017SharedMemory, which every es2017-or-later set includes.
-type IntrinsicStaticMember = (&'static str, &'static str, &'static str, &'static [GatedDeclFile]);
+type IntrinsicStaticMember = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [GatedDeclFile],
+);
 const INTRINSIC_STATIC_MEMBERS: &[IntrinsicStaticMember] = &[
     ("Math", "PI", "Math.PI", &[("lib.es5.d.ts", None)]),
     (

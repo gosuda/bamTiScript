@@ -501,10 +501,7 @@ impl<H: Host> BuiltinTable<H> {
     ) {
         self.typedarray_constructors[kind as usize] = Some(constructor);
     }
-    pub(crate) fn typed_array_constructor(
-        &self,
-        kind: builtins::typedarray::ElementKind,
-    ) -> Value {
+    pub(crate) fn typed_array_constructor(&self, kind: builtins::typedarray::ElementKind) -> Value {
         self.typedarray_constructors[kind as usize]
             .unwrap_or_else(|| panic!("TypedArray builtins install {}", kind.name()))
     }
@@ -515,10 +512,7 @@ impl<H: Host> BuiltinTable<H> {
     ) {
         self.typedarray_prototypes[kind as usize] = Some(prototype);
     }
-    pub(crate) fn typed_array_prototype(
-        &self,
-        kind: builtins::typedarray::ElementKind,
-    ) -> Value {
+    pub(crate) fn typed_array_prototype(&self, kind: builtins::typedarray::ElementKind) -> Value {
         self.typedarray_prototypes[kind as usize]
             .unwrap_or_else(|| panic!("TypedArray builtins install {}", kind.name()))
     }
