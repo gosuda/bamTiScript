@@ -1,4 +1,4 @@
-name: CI
+name: CI (Depot)
 
 on:
   push:
@@ -8,20 +8,28 @@ on:
     - cron: '17 3 * * *'
   workflow_dispatch:
 
-latchkey:
-  schema: 1
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   lint:
-    runs-on: small
+    runs-on: depot-ubuntu-24.04
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - run: rustup toolchain install
       - run: cargo fmt --all --check
       - if: always()
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    runs-on: large
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 60
     env:
       QUINT_HOME: /tmp/quint
@@ -30,6 +38,10 @@ jobs:
       LC_ALL: C
       NO_COLOR: "1"
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Install Node 24.18.0 (the version the repo pins)
         run: |
           curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
@@ -53,12 +65,16 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
 
   formal:
-    runs-on: medium
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 45
     env:
       QUINT_HOME: /tmp/quint
       V: cargo run --locked -q -p bamts-verification --bin bamts-verification --
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Install Node 24.18.0 (the version the repo pins)
         run: |
           curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
@@ -91,12 +107,18 @@ jobs:
       - run: $V formal audit --gates G1,G2,G5,G3,G4
 
   conformance:
-    runs-on: medium
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 60
     env:
       V: target/release/bamts-verification
       BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
+      LATCHKEY_CI_RUN_ID: ${{ github.run_id }}
+      LATCHKEY_CI_ATTEMPT: ${{ github.run_attempt }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Install Node 24.18.0 (the version the repo pins)
         run: |
           curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz | sudo tar -xJ -C /opt
@@ -115,17 +137,19 @@ jobs:
           $V source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
       - name: Conformance receipts (4 parallel shards), merge and check
         run: |
+          # shellcheck disable=SC2086
           seq 0 3 | xargs -P4 -I{} $V suite run --catalog typescript-7.0.2 --shard "{}/4" \
             --receipt "target/receipts/{}.jsonl" --runner compiler --platform x86_64-unknown-linux-gnu \
-            --workflow .latchkey/workflows/ci.yml --run-id "$LATCHKEY_CI_RUN_ID" \
+            --workflow .github/workflows/ci-depot.yml --run-id "$LATCHKEY_CI_RUN_ID" \
             --run-attempt "$LATCHKEY_CI_ATTEMPT" --source-sha "$(git rev-parse HEAD)" \
             --job conformance --host ubuntu-24.04-x64 \
             --runtime "node-$(node --version);rust-$(rustc --version)"
           mkdir -p target/merged
           $V suite merge --catalog typescript-7.0.2 --receipts target/receipts --out target/merged/receipt.jsonl
           $V suite merge --catalog typescript-7.0.2 --receipts target/receipts --out target/merged/receipt.jsonl --check
-      - uses: latchkey/artifact-upload@1.0.0
+      - name: Upload conformance receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: conformance-receipt
-          from: target/merged
-          path: .
+          path: target/merged
+          if-no-files-found: error
