@@ -5572,6 +5572,23 @@ fn declare_global_interface_cannot_merge_into_lib_type_alias() {
 }
 
 #[test]
+fn single_signature_union_members_combine_into_one_call_signature() {
+    let result = check_text(
+        "declare const a: ((name?: string) => number) | (() => number);\n\
+         const fromA: number = a(\"x\");\n\
+         declare const b: ((x: string) => number) | ((x: string, y?: number) => number);\n\
+         const fromB: number = b(\"x\", 1);\n\
+         const wrong: string = b(\"x\");\n\
+         export {};\n",
+    );
+    assert_eq!(
+        checker_codes(&result),
+        [TYPE_NOT_ASSIGNABLE.as_str()],
+        "union members combine like tsc; only the string annotation mismatches"
+    );
+}
+
+#[test]
 fn identifier_namespace_binding_is_unchanged() {
     let result = check_text("namespace N { export const x = 1; }\nconst y = N.x;");
     assert!(
