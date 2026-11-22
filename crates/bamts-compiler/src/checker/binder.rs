@@ -23991,8 +23991,8 @@ impl<'src> Binder<'src> {
                     .any(|element| matches!(element, ArrayElement::Spread(_))) =>
             {
                 let target = self.types.non_nullable(target);
-                let (target_shape, array_target) = self.contextual_array_target(target);
-                if target_shape.is_none() && array_target.is_none() {
+                let (target_shapes, array_target) = self.contextual_array_target(target);
+                if target_shapes.is_empty() && array_target.is_none() {
                     return self.legacy_type_of_expr(expression, scope);
                 }
                 let mut element_types = Vec::with_capacity(array.elements.len());
@@ -24000,13 +24000,14 @@ impl<'src> Binder<'src> {
                 for (index, element) in array.elements.iter().enumerate() {
                     let element_type = match element {
                         ArrayElement::Expression(inner) => {
-                            let element_target = target_shape
-                                .as_ref()
-                                .and_then(|shape| {
-                                    let elements =
-                                        shape.element_types_at_length(index, source_length);
-                                    (!elements.is_empty()).then(|| self.types.union(&elements))
+                            let shape_elements: Vec<TypeId> = target_shapes
+                                .iter()
+                                .flat_map(|shape| {
+                                    shape.element_types_at_length(index, source_length)
                                 })
+                                .collect();
+                            let element_target = (!shape_elements.is_empty())
+                                .then(|| self.types.union(&shape_elements))
                                 .or(array_target);
                             match element_target {
                                 Some(target) => {
@@ -24021,7 +24022,7 @@ impl<'src> Binder<'src> {
                     };
                     element_types.push(element_type);
                 }
-                if target_shape.is_some() {
+                if !target_shapes.is_empty() {
                     self.types.tuple(element_types)
                 } else {
                     let element = self.types.union(&element_types);
@@ -24057,36 +24058,38 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn contextual_array_target(&mut self, target: TypeId) -> (Option<TupleShape>, Option<TypeId>) {
+    fn contextual_array_target(&mut self, target: TypeId) -> (Vec<TupleShape>, Option<TypeId>) {
         let mut target = target;
         let mut aliases = HashSet::new();
         while let Type::AppliedAlias { symbol, .. } = self.types.get(target) {
             if !aliases.insert(*symbol) {
-                return (None, None);
+                return (Vec::new(), None);
             }
             let Some(view) = self.types.prepare_applied_alias_view(target) else {
-                return (None, None);
+                return (Vec::new(), None);
             };
             target = view;
         }
         match self.types.get(target).clone() {
-            Type::Tuple(shape) => (Some(shape), None),
-            Type::Array(element) => (None, Some(element)),
+            Type::Tuple(shape) => (vec![shape], None),
+            Type::Array(element) => (Vec::new(), Some(element)),
             Type::Union(members) => {
-                let elements: Vec<_> = members
-                    .into_iter()
-                    .filter_map(|member| match self.types.get(member) {
-                        Type::Array(element) => Some(*element),
-                        _ => None,
-                    })
-                    .collect();
+                let mut shapes = Vec::new();
+                let mut elements = Vec::new();
+                for member in members {
+                    match self.types.get(member) {
+                        Type::Tuple(shape) => shapes.push(shape.clone()),
+                        Type::Array(element) => elements.push(*element),
+                        _ => {}
+                    }
+                }
                 if elements.is_empty() {
-                    (None, None)
+                    (shapes, None)
                 } else {
-                    (None, Some(self.types.union(&elements)))
+                    (Vec::new(), Some(self.types.union(&elements)))
                 }
             }
-            _ => (None, None),
+            _ => (Vec::new(), None),
         }
     }
 

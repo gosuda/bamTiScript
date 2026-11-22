@@ -6074,6 +6074,22 @@ fn interfaces_referenced_while_their_base_class_is_shaped_inherit_its_members() 
     );
     assert_eq!(checker_codes(&missing), [CANNOT_FIND_TYPE.as_str()]);
 }
+
+#[test]
+fn array_literals_take_tuple_shapes_from_tuple_union_targets() {
+    let valid = check_text(
+        "declare const left: { tag: string };\
+             const tuple = <T extends [] | [{ tag: string }, ...{ tag: string }[]]>(items: T): T => items;\
+             const pair: [{ tag: string }, { tag: string }] = tuple([left, left]);\
+             const fixed: [] | [number, string] = [1, 'a'];\
+             const mixed: number[] | [string, string] = [1, 2];",
+    );
+    assert!(
+        checker_codes(&valid).is_empty(),
+        "{:?}",
+        valid.diagnostics()
+    );
+}
 #[test]
 fn imported_class_type_survives_named_alias_and_reexport() {
     let checked = linked(
