@@ -5552,6 +5552,26 @@ fn call_through_alias_of_unmodelled_conditional_is_permissive() {
 }
 
 #[test]
+fn declare_global_interface_cannot_merge_into_lib_type_alias() {
+    let result = check_text(
+        "declare global {\n\
+         \x20 interface ElementTagNameMap {\n\
+         \x20   [index: number]: unknown;\n\
+         \x20 }\n\
+         \x20 interface Console {\n\
+         \x20   extra?: number;\n\
+         \x20 }\n\
+         }\n\
+         export {};\n",
+    );
+    assert_eq!(
+        checker_codes(&result),
+        [DUPLICATE_DECLARATION.as_str()],
+        "only the lib type alias `ElementTagNameMap` rejects the interface"
+    );
+}
+
+#[test]
 fn identifier_namespace_binding_is_unchanged() {
     let result = check_text("namespace N { export const x = 1; }\nconst y = N.x;");
     assert!(
