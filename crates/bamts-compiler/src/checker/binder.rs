@@ -25085,10 +25085,12 @@ impl<'src> Binder<'src> {
                         ArrayElement::Elision | ArrayElement::Missing(_) => {}
                     }
                 }
-                let element = if element_types.is_empty() {
+                let element = if !element_types.is_empty() {
+                    self.types.union(&element_types)
+                } else if self.strict_null_checks || self.no_implicit_any {
                     self.types.never()
                 } else {
-                    self.types.union(&element_types)
+                    self.types.any()
                 };
                 self.types.array(element)
             }

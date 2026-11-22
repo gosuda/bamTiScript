@@ -10612,6 +10612,25 @@ fn rest_parameter_empty_array_default_types_as_any_array() {
 }
 
 #[test]
+fn empty_array_literal_without_strict_null_checks_accepts_any_element() {
+    let result = check_text(
+        "function f(route: string[]): string[] { \
+             const parts = []; \
+             for (const s of route) { parts.push(s); } \
+             const last: string = parts.pop()!; \
+             parts.push(`${last}/`); \
+             return parts; \
+         } \
+         [].push(1);",
+    );
+    assert!(checker_codes(&result).is_empty());
+    let never_element = check_text("declare const n: never; const a = [n]; a.push(1);");
+    assert_eq!(checker_codes(&never_element), ["BAMTS-C053"]);
+    let strict_null = check_text_strict_null("const a = []; a.push(\"x\");");
+    assert_eq!(checker_codes_of(&strict_null), ["BAMTS-C053"]);
+}
+
+#[test]
 fn negated_equality_with_non_unit_operand_keeps_the_reference_type() {
     let result = check_text(
         "function g(segments: string[], index: number): boolean { \
