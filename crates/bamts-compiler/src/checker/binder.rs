@@ -19520,6 +19520,77 @@ impl<'src> Binder<'src> {
         self.call_signature_groups_for_type_raw(type_id, type_id)
     }
 
+    fn combine_union_call_signatures(
+        &mut self,
+        groups: &[Vec<FunctionSignature>],
+    ) -> Option<FunctionSignature> {
+        if groups.len() < 2 {
+            return None;
+        }
+        let signatures = groups
+            .iter()
+            .map(|group| match group.as_slice() {
+                [signature] => Some(signature),
+                _ => None,
+            })
+            .collect::<Option<Vec<&FunctionSignature>>>()?;
+        if signatures.iter().any(|signature| {
+            !signature.type_parameters().is_empty()
+                || signature.parameters().iter().any(FunctionParameter::rest)
+        }) {
+            return None;
+        }
+        let longest = signatures
+            .iter()
+            .map(|signature| signature.parameters().len())
+            .max()?;
+        let required = signatures
+            .iter()
+            .map(|signature| {
+                signature
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| !parameter.optional())
+                    .count()
+            })
+            .max()?;
+        let mut parameters = Vec::with_capacity(longest);
+        for index in 0..longest {
+            let mut types = Vec::with_capacity(signatures.len());
+            let mut name = None;
+            for signature in &signatures {
+                if let Some(parameter) = signature.parameters().get(index) {
+                    name.get_or_insert_with(|| parameter.name().to_owned());
+                    if !types.contains(&parameter.type_id()) {
+                        types.push(parameter.type_id());
+                    }
+                }
+            }
+            let type_id = match types.as_slice() {
+                [single] => *single,
+                _ => self.types.intersection(types),
+            };
+            parameters.push(FunctionParameter::new(
+                name.unwrap_or_default(),
+                type_id,
+                index >= required,
+                false,
+            ));
+        }
+        let returns: Vec<TypeId> = signatures
+            .iter()
+            .map(|signature| signature.return_type())
+            .collect();
+        let return_type = self.types.union(&returns);
+        let combined = self
+            .types
+            .function_with_parameters(Vec::new(), parameters, return_type);
+        match self.types.get(combined) {
+            Type::Function(signature) => Some(signature.clone()),
+            _ => None,
+        }
+    }
+
     fn call_signature_groups_for_type_raw(
         &mut self,
         type_id: TypeId,
@@ -19563,7 +19634,10 @@ impl<'src> Binder<'src> {
                     }
                     groups.extend(member_groups);
                 }
-                groups
+                match self.combine_union_call_signatures(&groups) {
+                    Some(combined) => vec![vec![combined]],
+                    None => groups,
+                }
             }
             Type::Intersection(members) => {
                 let signatures: Vec<_> = members
