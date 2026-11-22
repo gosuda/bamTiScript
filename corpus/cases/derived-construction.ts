@@ -81,11 +81,13 @@ capture("super.retry", () => new class extends RetryBase {
   }
 }());
 capture("super.early-object", () => new class extends Base {
+  // @ts-expect-error Returning an object before super is valid at runtime.
   constructor() {
     return { value: "early" };
   }
 }());
 capture("super.state-u-undefined", () => new class extends Base {
+  // @ts-expect-error The missing super call must cause a runtime ReferenceError.
   constructor() {}
 }());
 

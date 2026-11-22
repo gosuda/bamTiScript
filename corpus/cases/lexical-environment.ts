@@ -80,6 +80,7 @@ class StaticClass {
 }
 const staticClassName = String(StaticClass.value === StaticClass);
 const typeResult = outcome(() => {
+  // @ts-expect-error Even typeof must throw inside a lexical binding's TDZ.
   return typeof value;
   let value;
 });
