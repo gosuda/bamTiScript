@@ -6678,6 +6678,7 @@ pub(crate) struct Binder<'src> {
     /// facts, so a reference there falls back to its declared type.
     flow_facts: FlowFacts,
     flow: FlowNodeId,
+    assignment_facts: HashMap<(FlowNodeId, SymbolId), TypeId>,
     /// Roots written through an identifier assignment or update in the
     /// statement list currently being resolved. Captured narrowing may cross
     /// a function boundary only when the root is immutable or no such write
@@ -6915,6 +6916,7 @@ impl<'src> Binder<'src> {
             label_frame: 0,
             flow_facts: FlowFacts::new(),
             flow: FlowNodeId::ROOT,
+            assignment_facts: HashMap::new(),
             ambient_stack: Vec::new(),
             strict_null_checks: options.strict_null_checks(),
             no_implicit_any: options.no_implicit_any(),
@@ -10551,6 +10553,116 @@ impl<'src> Binder<'src> {
         narrowing.type_at(flow, &key).unwrap_or(declared)
     }
 
+    /// Narrows an identifier written by a plain assignment to the members of
+    /// its declared union that the assigned value can inhabit, matching
+    /// tsc's assignment-reduced flow type.
+    fn narrow_assigned_identifier(
+        &mut self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+        assigned: TypeId,
+    ) {
+        let AssignmentTarget::Identifier(identifier) = target.data() else {
+            return;
+        };
+        let Some(symbol) = self.references.get(&identifier.id()).copied() else {
+            return;
+        };
+        if !matches!(
+            self.symbols[symbol.get() as usize].kind,
+            SymbolKind::Variable(_) | SymbolKind::Parameter
+        ) {
+            return;
+        }
+        let declared = self.symbol_types[symbol.get() as usize];
+        let reduced = self.assignment_reduced_type(declared, assigned);
+        if reduced == declared {
+            return;
+        }
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
+        narrowing.declare(symbol, declared);
+        let flow = narrowing.branch(self.flow);
+        narrowing.refine(flow, FlowKey::root(symbol), reduced);
+        self.flow = flow;
+        self.assignment_facts.insert((flow, symbol), reduced);
+    }
+
+    /// A loop head joins its entry with every back edge. The walk visits the
+    /// body once, so an assignment-narrowed fact for a root the loop writes
+    /// again falls back to the declared type at the head.
+    fn widen_loop_assignment_facts(
+        &mut self,
+        statement: &'src crate::syntax::Stmt,
+        scope: ScopeId,
+    ) {
+        if self.assignment_facts.is_empty() {
+            return;
+        }
+        let enclosing = std::mem::take(&mut self.reassigned_flow_roots);
+        let mut inventory = WriteInventory {
+            root_scope: scope,
+            shadow_frames: Vec::new(),
+        };
+        self.inventory_statement_write(statement, &mut inventory);
+        let written = std::mem::replace(&mut self.reassigned_flow_roots, enclosing);
+        let entry = self.flow;
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
+        let mut head = None;
+        for symbol in written {
+            let key = FlowKey::root(symbol);
+            if let Some((frame, fact)) = narrowing.nearest_fact(entry, &key)
+                && self.assignment_facts.get(&(frame, symbol)) == Some(&fact)
+            {
+                let flow = *head.get_or_insert_with(|| narrowing.branch(entry));
+                narrowing.refine(flow, key, self.symbol_types[symbol.get() as usize]);
+            }
+        }
+        if let Some(head) = head {
+            self.flow = head;
+        }
+    }
+
+    fn assignment_reduced_type(&mut self, declared: TypeId, assigned: TypeId) -> TypeId {
+        if declared == assigned {
+            return declared;
+        }
+        if matches!(self.types.get(assigned), Type::Never) {
+            return assigned;
+        }
+        let view = self
+            .types
+            .prepare_applied_alias_view(declared)
+            .unwrap_or(declared);
+        let Type::Union(members) = self.types.get(self.types.underlying_type(view)).clone() else {
+            return declared;
+        };
+        let sources = match self.types.get(assigned) {
+            Type::Union(parts) => parts.clone(),
+            _ => vec![assigned],
+        };
+        let kept: Vec<TypeId> = members
+            .into_iter()
+            .filter(|&member| {
+                sources
+                    .iter()
+                    .any(|&source| self.types_assignable(source, member))
+            })
+            .collect();
+        let reduced = self.types.union(&kept);
+        if self.types_assignable(assigned, reduced) {
+            reduced
+        } else {
+            declared
+        }
+    }
+
     fn assignment_flow_key(
         &self,
         target: &'src crate::syntax::AssignmentTargetNode,
@@ -14069,6 +14181,7 @@ impl<'src> Binder<'src> {
                 if let Some(initializer) = &for_statement.initializer {
                     self.resolve_for_initializer(initializer, child);
                 }
+                self.widen_loop_assignment_facts(statement, scope);
                 if let Some(test) = &for_statement.test {
                     self.resolve_expr(test, child);
                     self.legacy_type_of_expr(test, child);
@@ -14081,6 +14194,9 @@ impl<'src> Binder<'src> {
                 let body_end = self.in_branch(parent, &truthy, |binder| {
                     binder.resolve_statement(&for_statement.body, child);
                     if let Some(update) = &for_statement.update {
+                        if Self::loop_body_continues(for_statement.body.data(), 0) {
+                            binder.widen_loop_assignment_facts(statement, scope);
+                        }
                         binder.resolve_expr(update, child);
                         binder.legacy_type_of_expr(update, child);
                     }
@@ -14128,6 +14244,7 @@ impl<'src> Binder<'src> {
                 if using_diagnostic.is_none() {
                     self.assign_for_in_binding_type(&for_statement.binding, child, object_type);
                 }
+                self.widen_loop_assignment_facts(statement, scope);
                 let parent = self.flow;
                 let skipped = self.branch_guarded(parent, &[]);
                 let body_end = self.in_branch(parent, &[], |binder| {
@@ -14159,6 +14276,7 @@ impl<'src> Binder<'src> {
                         }
                     };
                 self.resolve_for_of_binding(&for_statement.binding, child, element_type);
+                self.widen_loop_assignment_facts(statement, scope);
                 let parent = self.flow;
                 let skipped = self.branch_guarded(parent, &[]);
                 let body_end = self.in_branch(parent, &[], |binder| {
@@ -14166,15 +14284,16 @@ impl<'src> Binder<'src> {
                 });
                 self.join_flow(parent, &[skipped, body_end]);
             }
-            Statement::While(statement) => {
-                self.resolve_expr(&statement.test, scope);
-                self.legacy_type_of_expr(&statement.test, scope);
+            Statement::While(while_statement) => {
+                self.widen_loop_assignment_facts(statement, scope);
+                self.resolve_expr(&while_statement.test, scope);
+                self.legacy_type_of_expr(&while_statement.test, scope);
                 let parent = self.flow;
                 let entry_super_flow = self.super_flow;
-                let truthy = self.guards_for(&statement.test, false);
-                let falsy = self.guards_for(&statement.test, true);
+                let truthy = self.guards_for(&while_statement.test, false);
+                let falsy = self.guards_for(&while_statement.test, true);
                 let body_end = self.in_branch(parent, &truthy, |binder| {
-                    binder.resolve_statement(&statement.body, scope);
+                    binder.resolve_statement(&while_statement.body, scope);
                 });
                 let skipped = self.branch_guarded(parent, &falsy);
                 let body_exit = self.branch_guarded(body_end, &falsy);
@@ -14183,14 +14302,18 @@ impl<'src> Binder<'src> {
                 // skip path, so it guarantees nothing afterwards.
                 self.super_flow = entry_super_flow;
             }
-            Statement::DoWhile(statement) => {
+            Statement::DoWhile(do_while) => {
+                self.widen_loop_assignment_facts(statement, scope);
                 let entry_super_flow = self.super_flow;
-                self.resolve_statement(&statement.body, scope);
+                self.resolve_statement(&do_while.body, scope);
                 if let SuperFlow::Tracking { .. } = self.super_flow {
                     self.super_flow = entry_super_flow;
                 }
-                self.resolve_expr(&statement.test, scope);
-                self.legacy_type_of_expr(&statement.test, scope);
+                if Self::loop_body_continues(do_while.body.data(), 0) {
+                    self.widen_loop_assignment_facts(statement, scope);
+                }
+                self.resolve_expr(&do_while.test, scope);
+                self.legacy_type_of_expr(&do_while.test, scope);
             }
             Statement::Try(statement) => {
                 let entry_super_flow = self.super_flow;
@@ -17252,6 +17375,48 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn loop_body_continues(statement: &'src Statement, depth: usize) -> bool {
+        let same = |statement: &'src Statement| Self::loop_body_continues(statement, depth);
+        let nested = |statement: &'src Statement| Self::loop_body_continues(statement, depth + 1);
+        let list = |statements: &'src [crate::syntax::Stmt]| {
+            statements.iter().any(|statement| same(statement.data()))
+        };
+        match statement {
+            Statement::Continue(jump) => jump.label.is_some() || depth == 0,
+            Statement::Block(block) => list(&block.data().statements),
+            Statement::If(if_stmt) => {
+                same(if_stmt.consequent.data())
+                    || if_stmt
+                        .alternate
+                        .as_ref()
+                        .is_some_and(|alternate| same(alternate.data()))
+            }
+            Statement::Switch(switch_stmt) => switch_stmt
+                .cases
+                .iter()
+                .any(|case| list(&case.data().consequent)),
+            Statement::For(for_stmt) => nested(for_stmt.body.data()),
+            Statement::ForIn(for_stmt) => nested(for_stmt.body.data()),
+            Statement::ForOf(for_stmt) => nested(for_stmt.body.data()),
+            Statement::While(while_stmt) => nested(while_stmt.body.data()),
+            Statement::DoWhile(do_while) => nested(do_while.body.data()),
+            Statement::Try(try_stmt) => {
+                list(&try_stmt.block.data().statements)
+                    || try_stmt
+                        .handler
+                        .as_ref()
+                        .is_some_and(|handler| list(&handler.data().body.data().statements))
+                    || try_stmt
+                        .finalizer
+                        .as_ref()
+                        .is_some_and(|finalizer| list(&finalizer.data().statements))
+            }
+            Statement::With(with_stmt) => same(with_stmt.body.data()),
+            Statement::Labeled(labeled) => same(labeled.body.data()),
+            _ => false,
+        }
+    }
+
     fn block_returns_value(block: &'src crate::syntax::Block) -> bool {
         block
             .statements
@@ -18272,6 +18437,7 @@ impl<'src> Binder<'src> {
                         scope,
                     );
                 }
+                let mut assigned = None;
                 if assignment.operator == AssignmentOperator::Assign
                     && self.is_typescript()
                     && !self
@@ -18288,8 +18454,12 @@ impl<'src> Binder<'src> {
                             NOT_ASSIGNABLE_MESSAGE,
                         );
                     }
+                    assigned = Some(source);
                 }
                 self.invalidate_assignment_flow(&assignment.left);
+                if let Some(source) = assigned {
+                    self.narrow_assigned_identifier(&assignment.left, source);
+                }
             }
             Expression::Sequence(sequence) => {
                 for inner in &sequence.expressions {

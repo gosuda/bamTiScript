@@ -1053,6 +1053,21 @@ impl<'a> NarrowingContext<'a> {
         None
     }
 
+    /// The nearest frame at or above `flow` holding a fact for `key`, with
+    /// that fact.
+    #[must_use]
+    pub fn nearest_fact(&self, flow: FlowNodeId, key: &FlowKey) -> Option<(FlowNodeId, TypeId)> {
+        let mut current = Some(flow);
+        while let Some(id) = current {
+            let frame = &self.facts.frames[id.index()];
+            if let Some(ty) = frame.facts.get(key) {
+                return Some((id, *ty));
+            }
+            current = frame.parent;
+        }
+        None
+    }
+
     /// The effective type of a reference at one program point: the nearest
     /// refinement walking up the frame chain, else the declared root type
     /// projected through the key's property path, else `None` for
