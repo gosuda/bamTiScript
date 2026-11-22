@@ -5534,6 +5534,24 @@ fn declare_global_declarations_resolve_enclosing_module_names() {
 }
 
 #[test]
+fn call_through_alias_of_unmodelled_conditional_is_permissive() {
+    let result = check_text(
+        "type Callback = (...args: any[]) => void;\n\
+         type Pick1<T, K extends keyof T> = T[K] extends Callback ? T[K] : never;\n\
+         function invoke<T extends Record<string, any>, K extends keyof T & string>(fn: Pick1<T, K>) {\n\
+         \x20 return fn(1, 2);\n\
+         }\n\
+         const n = 1;\n\
+         n();\n",
+    );
+    assert_eq!(
+        checker_codes(&result),
+        [EXPRESSION_NOT_CALLABLE.as_str()],
+        "only the genuinely non-callable `n()` reports"
+    );
+}
+
+#[test]
 fn identifier_namespace_binding_is_unchanged() {
     let result = check_text("namespace N { export const x = 1; }\nconst y = N.x;");
     assert!(

@@ -19071,13 +19071,25 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn is_permissive_callee(&mut self, callee_type: TypeId) -> bool {
+        let mut visited = HashSet::new();
+        let mut current = callee_type;
+        while visited.insert(current) {
+            let Some(view) = self.types.prepare_applied_alias_view(current) else {
+                break;
+            };
+            current = view;
+        }
+        matches!(self.types.get(current), Type::Any | Type::Error)
+    }
+
     fn evaluate_call(
         &mut self,
         call: &'src CallExpression,
         scope: ScopeId,
         callee_type: TypeId,
     ) -> CallEvaluation {
-        if matches!(self.types.get(callee_type), Type::Any | Type::Error) {
+        if self.is_permissive_callee(callee_type) {
             return CallEvaluation::success(self.types.any());
         }
 
@@ -19158,7 +19170,7 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         callee_type: TypeId,
     ) -> CallEvaluation {
-        if matches!(self.types.get(callee_type), Type::Any | Type::Error) {
+        if self.is_permissive_callee(callee_type) {
             return CallEvaluation::success(self.types.any());
         }
         let groups = self.construct_signature_groups_for_type(callee_type);
@@ -19446,7 +19458,7 @@ impl<'src> Binder<'src> {
         callee_type: TypeId,
         call_range: TextRange,
     ) -> CallEvaluation {
-        if matches!(self.types.get(callee_type), Type::Any | Type::Error) {
+        if self.is_permissive_callee(callee_type) {
             return CallEvaluation::success(self.types.any());
         }
         let arguments = self.resolve_tagged_template_arguments(tagged, scope, call_range);
