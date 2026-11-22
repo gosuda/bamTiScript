@@ -706,10 +706,7 @@ process.stdout.write(String(increment(alias)) + "\n");
 #[test]
 fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
-    let executable = directory
-        .path
-        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
-    let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+    let (compile, executable) = directory.emit(&fixture().to_string_lossy(), "hello");
     assert_success(&compile, "bamts tsc-compatible emit");
 
     let output = Command::new(&executable)
@@ -727,10 +724,7 @@ fn aot_executables_for_the_same_source_have_the_same_bytes() {
     let directory = ScratchDirectory::new();
     let mut images = Vec::new();
     for name in ["first", "second"] {
-        let executable = directory
-            .path
-            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+        let (compile, executable) = directory.emit(&fixture().to_string_lossy(), name);
         assert_success(&compile, "bamts tsc-compatible emit");
         images.push(fs::read(&executable).expect("the linked executable"));
         // The link time has a resolution of one second.
@@ -747,11 +741,7 @@ fn aot_executables_for_the_same_source_have_the_same_bytes() {
 fn a_file_in_the_project_named_like_a_system_library_is_not_linked() {
     let directory = ScratchDirectory::new();
     fs::write(directory.path.join("kernel32.lib"), b"not a library").expect("the stray file");
-    let executable = directory
-        .path
-        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
-
-    let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+    let (compile, executable) = directory.emit(&fixture().to_string_lossy(), "hello");
     assert_success(&compile, "bamts emit beside a stray kernel32.lib");
 
     let output = Command::new(&executable)
@@ -851,10 +841,7 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
 fn run_compiled_module(source: &str) -> std::process::Output {
     let project = ScratchDirectory::new();
     project.write("main.ts", source);
-    let executable = project
-        .path
-        .join(format!("module{}", std::env::consts::EXE_SUFFIX));
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "module");
     assert_success(&compile, "bamts emit of a module");
     Command::new(&executable)
         .output()
@@ -927,10 +914,7 @@ fn an_executable_runs_past_the_budget_of_the_api() {
          console.log(total, parts.join(\"\").length);\n",
     );
 
-    let executable = project
-        .path
-        .join(format!("long{}", std::env::consts::EXE_SUFFIX));
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "long");
     assert_success(&compile, "bamts emit of a long program");
     let output = Command::new(&executable)
         .output()
@@ -947,11 +931,7 @@ fn aot_runs_two_module_program_with_live_imported_mutation() {
         "main.ts",
         "import { value } from './dependency.js'; console.log(value);\n",
     );
-    let executable = project
-        .path
-        .join(format!("two-module{}", std::env::consts::EXE_SUFFIX));
-
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "two-module");
     assert_success(&compile, "bamts tsc-compatible two-module emit");
 
     let output = Command::new(&executable)
@@ -975,11 +955,7 @@ fn jit_preserves_lone_surrogates_end_to_end() {
 fn aot_preserves_lone_surrogates_end_to_end() {
     let project = ScratchDirectory::new();
     project.write("main.ts", UTF16_PROGRAM);
-    let executable = project
-        .path
-        .join(format!("utf16{}", std::env::consts::EXE_SUFFIX));
-
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "utf16");
     assert_success(&compile, "bamts tsc-compatible UTF-16 emit");
 
     let output = Command::new(&executable)
@@ -1112,11 +1088,7 @@ fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
         "main.ts",
         &NESTED_STRING_PROGRAM.replace("DEPTH", "1000000"),
     );
-    let executable = project
-        .path
-        .join(format!("nested{}", std::env::consts::EXE_SUFFIX));
-
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "nested");
     assert_success(&compile, "bamts tsc-compatible nested String AOT emit");
 
     let output = Command::new(&executable)
@@ -1130,11 +1102,7 @@ fn aot_throws_range_error_for_builtins_that_call_builtins_without_end() {
 fn aot_supports_apply_and_bound_callables() {
     let project = ScratchDirectory::new();
     project.write("main.ts", CALLABLE_PROGRAM);
-    let executable = project
-        .path
-        .join(format!("callable{}", std::env::consts::EXE_SUFFIX));
-
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "callable");
     assert_success(&compile, "bamts tsc-compatible callable AOT emit");
 
     let output = Command::new(&executable)
@@ -1148,11 +1116,7 @@ fn aot_supports_apply_and_bound_callables() {
 fn aot_runs_node_vm_in_new_context() {
     let project = ScratchDirectory::new();
     project.write("main.ts", VM_PROGRAM);
-    let executable = project
-        .path
-        .join(format!("node-vm{}", std::env::consts::EXE_SUFFIX));
-
-    let compile = project.emit("main.ts", &executable);
+    let (compile, executable) = project.emit("main.ts", "node-vm");
     assert_success(&compile, "bamts tsc-compatible node:vm AOT emit");
 
     let output = Command::new(&executable)
@@ -2252,14 +2216,22 @@ impl ScratchDirectory {
             .expect("bamts type-check starts")
     }
 
-    fn emit(&self, entrypoint: &str, output: &Path) -> Output {
-        self.command()
-            .args(["--pretty", "false", "--outFile"])
-            .arg(output)
+    fn emit(&self, entrypoint: &str, output_directory: &str) -> (Output, PathBuf) {
+        let output_directory = self.path.join(output_directory);
+        let output = self
+            .command()
+            .args(["--pretty", "false", "--outDir"])
+            .arg(&output_directory)
             .arg(entrypoint)
             .current_dir(&self.path)
             .output()
-            .expect("bamts emit starts")
+            .expect("bamts emit starts");
+        let mut executable = Path::new(entrypoint)
+            .file_stem()
+            .expect("the entrypoint names a file")
+            .to_os_string();
+        executable.push(std::env::consts::EXE_SUFFIX);
+        (output, output_directory.join(executable))
     }
 
     fn execute(&self, target: &str, entrypoint: &str, program_args: &[&str]) -> ExecutionOutput {

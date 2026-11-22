@@ -1122,7 +1122,7 @@ mod tests {
     #[cfg(feature = "node-host")]
     #[test]
     fn object_reflection_cannot_transfer_private_fields() -> Result<(), Box<dyn Error>> {
-        let source = r#"
+        let source = r#"// @ts-nocheck
             class Secret {
                 #value = {
                     value: 7,

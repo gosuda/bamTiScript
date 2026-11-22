@@ -7,17 +7,27 @@
 use std::sync::Arc;
 
 use bamts_compiler::{
-    checker::check,
+    checker::{ProgramCheckInput, ProgramCheckOptions, check_program_with_options},
+    lint::{LintProfile, LintTable},
     parser, scanner,
     source::{ScriptKind, SourceId, SourceText, TextRange},
 };
 
-/// Checker diagnostics for one TypeScript source, lint codes excluded.
+/// Checker diagnostics for one TypeScript source under `noImplicitAny`, the
+/// mode in which tsc reports a missing computed member, lint codes excluded.
 fn checker_diagnostics(source: &str) -> Vec<(String, TextRange)> {
     let source_text =
         Arc::new(SourceText::new(source).expect("test source fits the per-file budget"));
     let scanned = scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source_text);
-    let checked = check(&parser::parse(scanned));
+    let files = [parser::parse(scanned)];
+    let checked = check_program_with_options(
+        ProgramCheckInput {
+            files: &files,
+            edges: &[],
+        },
+        &LintTable::new(LintProfile::Default),
+        ProgramCheckOptions::standard().with_no_implicit_any(true),
+    );
     checked
         .diagnostics()
         .iter()
