@@ -2135,6 +2135,29 @@ fn zero_iteration_loops_do_not_leak_body_narrowing() {
 }
 
 #[test]
+fn forward_static_method_returns_infer_from_constructed_classes_and_literals() {
+    let result = check_text(
+        "class Reader {\
+           read(): void {\
+             const words: symbol = Words.create();\
+             const count: symbol = Words.count();\
+             const other: Other = Words.shadowed();\
+           }\
+         }\
+         class Words {\
+           static create() { return new Words(); }\
+           static count() { return 1; }\
+           static shadowed() { const Words = Other; return new Words(); }\
+         }\
+         class Other { tag = \"\"; }",
+    );
+    assert_eq!(
+        checker_codes(&result),
+        [TYPE_NOT_ASSIGNABLE.as_str(), TYPE_NOT_ASSIGNABLE.as_str()]
+    );
+}
+
+#[test]
 fn a_derived_class_instance_flows_into_its_base_through_the_chain() {
     let result = check_text(
         "abstract class A { abstract readonly name: string; }\n\

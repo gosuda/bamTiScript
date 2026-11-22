@@ -25519,8 +25519,12 @@ impl<'src> Binder<'src> {
                 }
             }
             Some(FunctionBody::Block(block)) => {
-                let Some(returns) = self.return_types.get(&block.id()).cloned() else {
-                    return self.types.any();
+                let returns = match self.return_types.get(&block.id()) {
+                    Some(returns) => returns.clone(),
+                    None => match self.unwalked_return_types(function, block.data(), parent) {
+                        Some(returns) => returns,
+                        None => return self.types.any(),
+                    },
                 };
                 let noncompleting_is_never =
                     !self.declaration_function_bodies.contains(&block.id());
@@ -25528,6 +25532,160 @@ impl<'src> Binder<'src> {
             }
             Some(FunctionBody::Missing(_)) => self.types.any(),
             None => self.types.void(),
+        }
+    }
+
+    /// Return-site types of a function whose body the walk has not reached
+    /// yet, available only when every returned value has a type independent
+    /// of the body's bindings and flow: a literal, or `new` of an unshadowed
+    /// non-generic class declaration.
+    fn unwalked_return_types(
+        &mut self,
+        function: &'src FunctionLike,
+        block: &'src crate::syntax::Block,
+        scope: ScopeId,
+    ) -> Option<Vec<TypeId>> {
+        if function.is_async || function.is_generator {
+            return None;
+        }
+        let mut bound = HashSet::new();
+        if let Some(name) = &function.name {
+            bound.insert(self.identifier_text(name).into_owned());
+        }
+        for parameter in &function.parameters {
+            self.collect_write_binding_names(&parameter.data().binding, &mut bound);
+        }
+        self.collect_hoisted_write_names(&block.statements, &mut bound);
+        let mut sites = Vec::new();
+        self.collect_return_sites(&block.statements, &mut sites, &mut bound);
+        if sites.is_empty() {
+            return None;
+        }
+        sites
+            .into_iter()
+            .map(|site| match site {
+                Some(argument) => self.binding_independent_type(argument, scope, &bound),
+                None => Some(self.types.undefined_type()),
+            })
+            .collect()
+    }
+
+    fn binding_independent_type(
+        &mut self,
+        expression: &'src Expr,
+        scope: ScopeId,
+        bound: &HashSet<String>,
+    ) -> Option<TypeId> {
+        match expression.data() {
+            Expression::Parenthesized(inner) => self.binding_independent_type(inner, scope, bound),
+            Expression::Literal(literal) => Some(self.type_of_literal(literal)),
+            Expression::New(new) if new.type_arguments.is_none() => {
+                let Expression::Identifier(callee) = new.callee.data() else {
+                    return None;
+                };
+                let name = self.identifier_text(callee);
+                if bound.contains(name.as_ref()) {
+                    return None;
+                }
+                let class = self.lookup_value(scope, &name)?;
+                if self.symbols[class.get() as usize].kind != SymbolKind::Class
+                    || !self.types.class_type_parameters(class).is_empty()
+                {
+                    return None;
+                }
+                self.types.declared_class(class)
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_return_sites(
+        &self,
+        statements: &'src [crate::syntax::Stmt],
+        sites: &mut Vec<Option<&'src Expr>>,
+        bound: &mut HashSet<String>,
+    ) {
+        self.collect_direct_write_lexicals(statements, bound);
+        for statement in statements {
+            self.collect_statement_return_sites(statement, sites, bound);
+        }
+    }
+
+    fn collect_statement_return_sites(
+        &self,
+        statement: &'src crate::syntax::Stmt,
+        sites: &mut Vec<Option<&'src Expr>>,
+        bound: &mut HashSet<String>,
+    ) {
+        match statement.data() {
+            Statement::Return(statement) => sites.push(statement.argument.as_deref()),
+            Statement::Block(block) => {
+                self.collect_return_sites(&block.data().statements, sites, bound);
+            }
+            Statement::If(statement) => {
+                self.collect_statement_return_sites(&statement.consequent, sites, bound);
+                if let Some(alternate) = &statement.alternate {
+                    self.collect_statement_return_sites(alternate, sites, bound);
+                }
+            }
+            Statement::Switch(statement) => {
+                for case in &statement.cases {
+                    self.collect_return_sites(&case.data().consequent, sites, bound);
+                }
+            }
+            Statement::For(statement) => {
+                if let Some(ForInitializer::Variable(variable)) = &statement.initializer {
+                    self.collect_declaration_binding_names(variable, bound);
+                }
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::ForIn(statement) => {
+                if let ForBinding::Variable(variable) = &statement.binding {
+                    self.collect_declaration_binding_names(variable, bound);
+                }
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::ForOf(statement) => {
+                if let ForBinding::Variable(variable) = &statement.binding {
+                    self.collect_declaration_binding_names(variable, bound);
+                }
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::While(statement) => {
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::DoWhile(statement) => {
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::Labeled(statement) => {
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::With(statement) => {
+                self.collect_statement_return_sites(&statement.body, sites, bound);
+            }
+            Statement::Try(statement) => {
+                self.collect_return_sites(&statement.block.data().statements, sites, bound);
+                if let Some(handler) = &statement.handler {
+                    if let Some(binding) = &handler.data().binding {
+                        self.collect_write_binding_names(binding, bound);
+                    }
+                    self.collect_return_sites(&handler.data().body.data().statements, sites, bound);
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.collect_return_sites(&finalizer.data().statements, sites, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_declaration_binding_names(
+        &self,
+        variable: &'src crate::syntax::VariableDeclaration,
+        names: &mut HashSet<String>,
+    ) {
+        for declarator in &variable.declarations {
+            self.collect_write_binding_names(&declarator.data().binding, names);
         }
     }
 
