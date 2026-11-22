@@ -12170,7 +12170,8 @@ impl<'src> Binder<'src> {
                 (symbol, export_scope)
             }
         };
-        let local_scope = self.new_scope(ScopeKind::Function, Some(export_scope));
+        let local_parent = self.declaration_lexical_scope(export_scope);
+        let local_scope = self.new_scope(ScopeKind::Function, Some(local_parent));
         self.namespace_local_scopes
             .insert(declaration_id, local_scope);
         self.namespace_local_of_symbol.insert(symbol, local_scope);
@@ -12372,6 +12373,14 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn declaration_lexical_scope(&self, scope: ScopeId) -> ScopeId {
+        if scope == self.global_scope {
+            self.module_scope
+        } else {
+            scope
+        }
+    }
+
     fn bind_interface(
         &mut self,
         interface: &'src InterfaceDeclaration,
@@ -12393,7 +12402,8 @@ impl<'src> Binder<'src> {
             declaration,
             interface.name.range(),
         );
-        let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
+        let lexical_scope = self.declaration_lexical_scope(scope);
+        let type_scope = self.new_scope(ScopeKind::Block, Some(lexical_scope));
         self.bind_type_parameter_names(interface.type_parameters.as_ref(), type_scope);
         let parameters =
             self.bound_type_parameter_symbols(interface.type_parameters.as_ref(), type_scope);
@@ -12418,7 +12428,7 @@ impl<'src> Binder<'src> {
         let member_scope = match self.interface_member_scopes.get(&id) {
             Some(existing) => *existing,
             None => {
-                let member_scope = self.new_scope(ScopeKind::Class, Some(scope));
+                let member_scope = self.new_scope(ScopeKind::Class, Some(lexical_scope));
                 self.interface_member_scopes.insert(id, member_scope);
                 member_scope
             }
@@ -12739,7 +12749,8 @@ impl<'src> Binder<'src> {
             declaration,
             alias.name.range(),
         );
-        let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
+        let lexical_scope = self.declaration_lexical_scope(scope);
+        let type_scope = self.new_scope(ScopeKind::Block, Some(lexical_scope));
         self.bind_type_parameter_names(alias.type_parameters.as_ref(), type_scope);
         let parameters =
             self.bound_type_parameter_symbols(alias.type_parameters.as_ref(), type_scope);
