@@ -6026,6 +6026,28 @@ fn discriminant_exclusion_reduces_intersection_property_types() {
         valid.diagnostics()
     );
 }
+
+#[test]
+fn discriminant_truthiness_narrows_union_results() {
+    let valid = check_text(
+        "type Ok<T> = { readonly ok: true; readonly value: T };\
+             type Err = { readonly ok: false; readonly issues: readonly string[] };\
+             type Result<T> = Ok<T> | Err;\
+             function read(result: Result<number>): number {\
+               if (!result.ok) { return result.issues.length; }\
+               return result.value;\
+             }\
+             function flag(input: { enabled: true; name: string }): string {\
+               if (!input.enabled) { return input.name; }\
+               return input.name;\
+             }",
+    );
+    assert!(
+        checker_codes(&valid).is_empty(),
+        "{:?}",
+        valid.diagnostics()
+    );
+}
 #[test]
 fn imported_class_type_survives_named_alias_and_reexport() {
     let checked = linked(
