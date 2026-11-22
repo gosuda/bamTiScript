@@ -5437,6 +5437,26 @@ fn declare_global_binds_members_into_global_scope() {
 }
 
 #[test]
+fn declare_global_declarations_resolve_enclosing_module_names() {
+    let result = check_text(
+        "type Local = { a: number };\n\
+         declare global {\n\
+         \x20 interface GlobalThing { item: Local }\n\
+         \x20 var globalThing: GlobalThing;\n\
+         \x20 function globalFn(p: Local): Local;\n\
+         }\n\
+         const n: number = globalFn(globalThing.item).a;\n\
+         const s: string = globalThing.item.a;\n\
+         export {};\n",
+    );
+    assert_eq!(
+        checker_codes(&result),
+        [TYPE_NOT_ASSIGNABLE.as_str()],
+        "module-local names must resolve inside declare global"
+    );
+}
+
+#[test]
 fn identifier_namespace_binding_is_unchanged() {
     let result = check_text("namespace N { export const x = 1; }\nconst y = N.x;");
     assert!(
