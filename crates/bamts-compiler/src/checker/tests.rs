@@ -5414,7 +5414,7 @@ fn ambient_string_module_registers_without_lexical_pollution() {
 #[test]
 fn declare_global_binds_members_into_global_scope() {
     let result = check_text(
-        "declare global { interface Window { x: number } }\nconst w: Window = 1 as any;",
+        "declare global { interface Window { x: number } }\nconst w: Window = 1 as any;\nexport {};",
     );
     let model = result.product();
     assert_eq!(
@@ -5457,6 +5457,60 @@ fn declare_global_interface_augments_intrinsic_console_members() {
         [PROPERTY_DOES_NOT_EXIST.as_str()],
         "the augmentation must merge into Console without a duplicate declaration"
     );
+}
+
+#[test]
+fn rejected_global_augmentation_does_not_merge_into_intrinsic_types() {
+    let augmentation = "interface Array<T> { extra: number } interface Console { extra: number }";
+    let read = "const n: number = console.extra;";
+    let cases = [
+        (
+            format!("declare global {{ {augmentation} }}\n{read}\n"),
+            true,
+        ),
+        (
+            format!(
+                "namespace A {{ declare global {{ {augmentation} }} }}\n{read}\nexport {{}};\n"
+            ),
+            true,
+        ),
+        (
+            format!(
+                "declare module \"m\" {{ global {{ {augmentation} }} }}\n{read}\nexport {{}};\n"
+            ),
+            true,
+        ),
+        (
+            format!("declare global {{ {augmentation} }}\n{read}\nexport {{}};\n"),
+            false,
+        ),
+        (
+            format!("declare module \"m\" {{ global {{ {augmentation} }} }}\n{read}\n"),
+            false,
+        ),
+    ];
+    for (text, rejected) in cases {
+        let result = check_text(&text);
+        let codes = checker_codes(&result);
+        assert_eq!(
+            codes.contains(&PROPERTY_DOES_NOT_EXIST.as_str()),
+            rejected,
+            "tsc 7.0.2 reports TS2339 on `console.extra` exactly when it rejects the block with TS2669:\n{text}{codes:?}"
+        );
+        let own_array = result
+            .product()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name() == "Array" && symbol.kind() == SymbolKind::Interface);
+        assert_eq!(
+            own_array, rejected,
+            "a rejected block keeps its own Array symbol, a valid one merges into the built-in:\n{text}"
+        );
+        assert!(
+            !codes.contains(&DUPLICATE_DECLARATION.as_str()),
+            "tsc reports no redeclaration:\n{text}{codes:?}"
+        );
+    }
 }
 
 #[test]
