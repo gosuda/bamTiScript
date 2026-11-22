@@ -825,54 +825,78 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn cancel_after_readiness<T>(
+        marker: &Path,
+        cancel: &CancellationToken,
+        capture: impl FnOnce() -> T,
+    ) -> (T, std::io::Result<String>) {
+        use std::io;
+
+        thread::scope(|scope| {
+            let (capture_finished, finished) = std::sync::mpsc::channel::<()>();
+            let readiness = scope.spawn(move || {
+                loop {
+                    match fs::read_to_string(marker) {
+                        Ok(message) if message.ends_with('\n') => {
+                            cancel.cancel();
+                            return Ok(message);
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            cancel.cancel();
+                            return Err(error);
+                        }
+                    }
+                    if !matches!(
+                        finished.recv_timeout(Duration::from_millis(5)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return Err(io::Error::other(
+                            "fixture exited before reporting readiness",
+                        ));
+                    }
+                }
+            });
+            let outcome = capture();
+            drop(capture_finished);
+            (
+                outcome,
+                readiness.join().expect("readiness watcher completes"),
+            )
+        })
+    }
+
+    #[cfg(unix)]
     #[test]
     fn hanging_toolchain_probe_maps_cancellation_to_driver_cancelled()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir().join(format!(
-            "bamts-cli-toolchain-probe-cancel-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory)?;
-        let compiler = directory.join("fake-cc");
+        let directory = tempfile::tempdir()?;
+        let compiler = directory.path().join("fake-cc");
         fs::write(
             &compiler,
             "#!/bin/sh
-printf started > probe-started
+printf 'started\\n' > probe-started
 /bin/sleep 30
+: > probe-returned
 ",
         )?;
         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))?;
-        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let context = ExecutionContext::new(directory.path(), BTreeMap::new())?;
         let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        let marker = directory.join("probe-started");
-        let canceller = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !marker.is_file() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
-            let started = marker.is_file();
-            trigger.cancel();
-            started
-        });
-
-        let started = Instant::now();
-        let error = probe_toolchain_in_context(compiler.into_os_string(), &context, &cancel)
-            .expect_err("cancelled compiler probe must fail as cancellation");
+        let (outcome, ready) =
+            cancel_after_readiness(&directory.path().join("probe-started"), &cancel, || {
+                probe_toolchain_in_context(compiler.into_os_string(), &context, &cancel)
+            });
+        assert_eq!(ready?, "started\n");
+        let error = outcome.expect_err("cancelled compiler probe must fail as cancellation");
         assert!(matches!(error, DriverError::Cancelled));
         assert!(
-            canceller
-                .join()
-                .expect("probe cancellation thread completes")
+            !directory.path().join("probe-returned").exists(),
+            "compiler probe reached its natural exit"
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "managed probe cancellation must be bounded"
-        );
-        fs::remove_dir_all(directory)?;
         Ok(())
     }
 
@@ -2147,45 +2171,29 @@ printf '#!/bin/sh\npwd\n' > "$output"
     #[test]
     fn managed_capture_kills_descendant_without_external_kill_before_reader_join()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = std::env::temp_dir().join(format!(
-            "bamts-cli-managed-descendant-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory)?;
-        let empty_path = directory.join("empty-path");
+        let directory = tempfile::tempdir()?;
+        let empty_path = directory.path().join("empty-path");
         std::fs::create_dir(&empty_path)?;
-        let pid_file = directory.join("descendant.pid");
+        let pid_file = directory.path().join("descendant.pid");
         let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        let cancellation_pid_file = pid_file.clone();
-        let canceller = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !cancellation_pid_file.is_file() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
-            trigger.cancel();
-        });
         let mut command = process::Command::new("/bin/sh");
         command
             .args([
                 "-c",
-                r#"/bin/sleep 30 & child=$!; printf '%s' "$child" > "$1"; wait"#,
-                "bamts-managed-child",
-                pid_file.to_str().expect("UTF-8 PID path"),
+                r#"(/bin/sleep 30; : > descendant-returned) & child=$!; printf '%s\n' "$child" > descendant.pid; wait"#,
             ])
+            .current_dir(directory.path())
             .env("PATH", empty_path);
-        let started = Instant::now();
-
-        let output = capture_process_with_cancel(&mut command, &cancel)?;
-
-        canceller.join().expect("cancellation thread completes");
+        let (output, ready) = cancel_after_readiness(&pid_file, &cancel, || {
+            capture_process_with_cancel(&mut command, &cancel)
+        });
+        let output = output?;
         assert!(output.is_none(), "cancellation has exit precedence");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "managed process-tree shutdown must be bounded"
+            !directory.path().join("descendant-returned").exists(),
+            "the descendant closed its pipes without being killed"
         );
-        let pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+        let pid = ready?.trim_end().parse::<u32>()?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let alive = process::Command::new("/bin/ps")
@@ -2203,7 +2211,6 @@ printf '#!/bin/sh\npwd\n' > "$output"
             );
             thread::sleep(Duration::from_millis(5));
         }
-        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
     #[test]
