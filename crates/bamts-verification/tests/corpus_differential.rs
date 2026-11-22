@@ -3490,12 +3490,15 @@ fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_m
     };
   }
 
+  type IterationDone = { value: undefined; done: true };
+  type IterationYield = { value: { idx: number; [Symbol.dispose](): void }; done: false };
+
   function iterable(label: string, count: number) {
     let i = 0;
     return {
       [Symbol.iterator]() {
         return {
-          next() {
+          next(): IterationYield | IterationDone {
             if (i < count) {
               const idx = i;
               i += 1;
@@ -3513,7 +3516,7 @@ fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_m
             out.push(`${label}:next:done`);
             return { value: undefined, done: true };
           },
-          return() {
+          return(): IterationDone {
             out.push(`${label}:iterator:return`);
             return { value: undefined, done: true };
           },
