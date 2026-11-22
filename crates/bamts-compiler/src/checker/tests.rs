@@ -10612,6 +10612,47 @@ fn rest_parameter_empty_array_default_types_as_any_array() {
 }
 
 #[test]
+fn negated_equality_with_non_unit_operand_keeps_the_reference_type() {
+    let result = check_text(
+        "function g(segments: string[], index: number): boolean { \
+             if (index === segments.length) { return false; } \
+             const segment = segments[index]; \
+             return segment.startsWith(\"**\"); \
+         } \
+         function h(index: number, limit: number): number { \
+             if (index !== limit) { return index.toFixed().length; } \
+             return index; \
+         }",
+    );
+    assert!(checker_codes(&result).is_empty());
+    let union_of_units = check_text(
+        "function u(y: \"a\" | \"b\" | \"c\", d: \"a\" | \"b\") { \
+             if (y !== d) { const w: \"c\" = y; } \
+         }",
+    );
+    assert_eq!(checker_codes(&union_of_units), ["BAMTS-C004"]);
+}
+
+#[test]
+fn negated_switch_case_against_template_expression_keeps_narrowing() {
+    let result = check_text_with(
+        "enum AnimalType { cat = \"cat\", dog = \"dog\" } \
+         type Animal = { type: `${AnimalType.cat}`; meow: string } \
+             | { type: `${AnimalType.dog}`; bark: string }; \
+         function check(p: never): void {} \
+         function action2(animal: Animal) { \
+             switch (animal.type) { \
+                 case `${AnimalType.cat}`: break; \
+                 case `${AnimalType.dog}`: break; \
+                 default: check(animal); \
+             } \
+         }",
+        ProgramCheckOptions::standard().with_strict(true),
+    );
+    assert!(checker_codes_of(&result).is_empty());
+}
+
+#[test]
 fn rest_parameter_default_with_non_array_type_reports_array_type() {
     let result = check_text("function foo(...bar = 0) {}");
     assert_eq!(checker_codes(&result), ["BAMTS-C107"]);

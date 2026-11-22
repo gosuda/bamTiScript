@@ -2376,7 +2376,9 @@ impl<'a> NarrowingContext<'a> {
     /// Builds an equality guard from a reference side and a literal side.
     /// The `undefined` global reads as the `undefined` type; a loose
     /// `== null` or `== undefined` widens the literal to the
-    /// `null | undefined` union.
+    /// `null | undefined` union. A non-literal side narrows the negated
+    /// branch only when its type is a unit type or the side is a template
+    /// expression, whose literal type in a literal context is not modeled.
     fn equality_guard(
         &mut self,
         reference_side: &Expr,
@@ -2394,13 +2396,16 @@ impl<'a> NarrowingContext<'a> {
                     return None;
                 }
                 let typed = resolver.expression_type(literal_side);
-                if matches!(
-                    self.table.get(typed),
-                    Type::Any | Type::Error | Type::Unknown | Type::Never | Type::Void
-                ) {
-                    None
-                } else {
-                    Some(typed)
+                match self.table.get(typed) {
+                    Type::Any | Type::Error | Type::Unknown | Type::Never | Type::Void => None,
+                    candidate
+                        if negated
+                            && !is_unit_type(candidate)
+                            && !matches!(literal_side.data(), Expression::Template(_)) =>
+                    {
+                        None
+                    }
+                    _ => Some(typed),
                 }
             })?;
         if loose_equality && matches!(self.table.get(literal), Type::Null | Type::Undefined) {
@@ -2584,6 +2589,20 @@ fn class_derives_into(table: &TypeTable, class: SymbolId, ty: TypeId) -> bool {
         Type::AppliedClass { symbol, .. } => table.class_derives_from(class, *symbol),
         _ => false,
     }
+}
+
+/// Types with exactly one value: literals, enum members, and the nullish types.
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::BooleanLiteral(_)
+            | Type::EnumMember { .. }
+            | Type::Null
+            | Type::Undefined
+    )
 }
 
 fn parameter_constraint(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
