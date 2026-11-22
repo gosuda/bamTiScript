@@ -6048,6 +6048,32 @@ fn discriminant_truthiness_narrows_union_results() {
         valid.diagnostics()
     );
 }
+
+#[test]
+fn interfaces_referenced_while_their_base_class_is_shaped_inherit_its_members() {
+    let valid = check_text(
+        "class Shape {\
+               visit(square: Square, boxed: Boxed<string>): void {}\
+               area(): number { return 1; }\
+             }\
+             interface Square extends Shape { readonly side: number; }\
+             interface Boxed<T> extends Shape { readonly item: T; }\
+             function use(square: Square, boxed: Boxed<string>): number {\
+               square.visit(square, boxed);\
+               return square.area() + boxed.area() + square.side + boxed.item.length;\
+             }",
+    );
+    assert!(
+        checker_codes(&valid).is_empty(),
+        "{:?}",
+        valid.diagnostics()
+    );
+    let missing = check_text(
+        "class Holder { hold(item: Broken): void {} }\
+             interface Broken extends Holder { missing: Missing; }",
+    );
+    assert_eq!(checker_codes(&missing), [CANNOT_FIND_TYPE.as_str()]);
+}
 #[test]
 fn imported_class_type_survives_named_alias_and_reexport() {
     let checked = linked(

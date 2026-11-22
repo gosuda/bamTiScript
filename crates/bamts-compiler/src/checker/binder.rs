@@ -22175,6 +22175,9 @@ impl<'src> Binder<'src> {
     fn resolve_named_type_symbol(&mut self, symbol: SymbolId) -> TypeId {
         match self.symbols[symbol.get() as usize].kind {
             SymbolKind::Interface => {
+                if let Some(head) = self.deferred_interface_head(symbol) {
+                    return head;
+                }
                 let head = self.resolve_type_symbol(symbol);
                 self.types.named_structural_view(head)
             }
@@ -22224,6 +22227,73 @@ impl<'src> Binder<'src> {
                 .unwrap_or_else(|| self.resolve_import_equals_type_symbol(symbol)),
             _ => self.types.error_type(),
         }
+    }
+
+    /// A type reference to an interface whose heritage reaches a class
+    /// without a published shape yields the interface's named head and
+    /// leaves the interface unresolved: resolving it now would seal it
+    /// without the class members. Its declaration statement resolves it.
+    fn deferred_interface_head(&mut self, symbol: SymbolId) -> Option<TypeId> {
+        if !matches!(
+            self.type_state[symbol.get() as usize],
+            TypeState::Unresolved
+        ) || !self.interface_base_awaits_class_shape(symbol, &mut Vec::new())
+        {
+            return None;
+        }
+        if let Some(TypeDef::Interface {
+            scope,
+            type_parameters,
+        }) = self.type_defs.get(&symbol).copied()
+            && self.types.has_class(symbol)
+            && self.types.begin_class_bounds(symbol)
+        {
+            let bounds = self.signature_type_parameters(type_parameters, scope).1;
+            self.types.finish_class_bounds(symbol, bounds);
+        }
+        Some(self.types.named(symbol))
+    }
+
+    fn interface_base_awaits_class_shape(
+        &self,
+        symbol: SymbolId,
+        visiting: &mut Vec<SymbolId>,
+    ) -> bool {
+        if visiting.contains(&symbol) {
+            return false;
+        }
+        visiting.push(symbol);
+        let Some(TypeDef::Interface { scope, .. }) = self.type_defs.get(&symbol).copied() else {
+            return false;
+        };
+        let Some(declarations) = self.interface_merges.get(&symbol) else {
+            return false;
+        };
+        declarations
+            .iter()
+            .flat_map(|interface| &interface.extends)
+            .any(|base| {
+                let EntityName::Identifier(identifier) = &base.name else {
+                    return false;
+                };
+                let Some(base_symbol) = self.lookup_type(scope, &self.identifier_text(identifier))
+                else {
+                    return false;
+                };
+                match self.symbols[base_symbol.get() as usize].kind {
+                    SymbolKind::Class => {
+                        self.types.has_class(base_symbol)
+                            && self.types.class_template_raw(base_symbol).is_none()
+                    }
+                    SymbolKind::Interface => {
+                        matches!(
+                            self.type_state[base_symbol.get() as usize],
+                            TypeState::Unresolved
+                        ) && self.interface_base_awaits_class_shape(base_symbol, visiting)
+                    }
+                    _ => false,
+                }
+            })
     }
 
     fn intrinsic_record_type(&mut self, arguments: Option<&[TypeId]>, range: TextRange) -> TypeId {
