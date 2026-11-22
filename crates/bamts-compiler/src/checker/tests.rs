@@ -2135,6 +2135,24 @@ fn zero_iteration_loops_do_not_leak_body_narrowing() {
 }
 
 #[test]
+fn assignment_narrows_a_declared_union_to_the_assigned_members() {
+    let result = check_text(
+        "class Hasher {\
+           append(data: string | Words): number {\
+             if (typeof data === \"string\") { data = Words.fromText(data); }\
+             return data.size;\
+           }\
+           rewrite(value: string | Words): number { value = \"text\"; return value.size; }\
+         }\
+         class Words {\
+           size = 0;\
+           static fromText(text: string) { return new Words(); }\
+         }",
+    );
+    assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+}
+
+#[test]
 fn forward_static_method_returns_infer_from_constructed_classes_and_literals() {
     let result = check_text(
         "class Reader {\
@@ -2155,6 +2173,48 @@ fn forward_static_method_returns_infer_from_constructed_classes_and_literals() {
         checker_codes(&result),
         [TYPE_NOT_ASSIGNABLE.as_str(), TYPE_NOT_ASSIGNABLE.as_str()]
     );
+}
+
+#[test]
+fn assignment_narrowing_widens_at_rewriting_loop_heads_and_stays_in_its_function() {
+    let codes = checker_codes_strict_null(
+        "class Link { next: Link | undefined; }\
+         function link(nodes: Link[]): void {\
+           let previous: Link | undefined;\
+           previous = undefined;\
+           for (const node of nodes) { if (previous) previous.next = node; previous = node; }\
+         }\
+         declare function len(s: string): number;\
+         function iterate(cond: boolean): void {\
+           let x: string | number | boolean;\
+           x = \"\";\
+           while (cond) { x = len(x); }\
+         }\
+         function defeat(x: number | string): number {\
+           function f() { x = 10; }\
+           if (typeof x === \"string\") { f(); return x.length; }\
+           return 0;\
+         }",
+    );
+    assert_eq!(codes, [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+}
+
+#[test]
+fn continue_edges_reach_the_for_incrementor_with_the_declared_type() {
+    let codes = checker_codes_strict_null(
+        "function continued(): void {\
+           let next: string | number = \"\";\
+           for (let i = 0; i < 10; i = next) {\
+             if (i == 5) { next = \"bad\"; continue; }\
+             next = i + 1;\
+           }\
+         }\
+         function straight(): void {\
+           let next: string | number = \"\";\
+           for (let i = 0; i < 10; i = next) { next = i + 1; }\
+         }",
+    );
+    assert_eq!(codes, [TYPE_NOT_ASSIGNABLE.as_str()]);
 }
 
 #[test]
