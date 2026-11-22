@@ -6678,6 +6678,7 @@ pub(crate) struct Binder<'src> {
     /// facts, so a reference there falls back to its declared type.
     flow_facts: FlowFacts,
     flow: FlowNodeId,
+    non_null_operand: Option<NodeId>,
     assignment_facts: HashMap<(FlowNodeId, SymbolId), TypeId>,
     /// Roots written through an identifier assignment or update in the
     /// statement list currently being resolved. Captured narrowing may cross
@@ -6916,6 +6917,7 @@ impl<'src> Binder<'src> {
             label_frame: 0,
             flow_facts: FlowFacts::new(),
             flow: FlowNodeId::ROOT,
+            non_null_operand: None,
             assignment_facts: HashMap::new(),
             ambient_stack: Vec::new(),
             strict_null_checks: options.strict_null_checks(),
@@ -24805,7 +24807,18 @@ impl<'src> Binder<'src> {
                     }
                 };
                 let declared = self.value_side_type(symbol);
-                self.narrowed_type(symbol, declared)
+                let narrowed = self.narrowed_type(symbol, declared);
+                if self.non_null_operand != Some(expression.id())
+                    || matches!(self.types.get(narrowed), Type::Never)
+                {
+                    return narrowed;
+                }
+                let non_nullable = self.types.non_nullable(narrowed);
+                if matches!(self.types.get(non_nullable), Type::Never) {
+                    declared
+                } else {
+                    narrowed
+                }
             }
             Expression::Literal(literal) => self.type_of_literal(literal),
             Expression::Unary(unary) => {
@@ -24911,7 +24924,9 @@ impl<'src> Binder<'src> {
                 .unwrap_or_else(|| self.types.undefined_type()),
             Expression::Parenthesized(inner) => self.legacy_type_of_expr(inner, scope),
             Expression::NonNull(non_null) => {
+                let outer = self.non_null_operand.replace(non_null.expression.id());
                 let operand = self.legacy_type_of_expr(&non_null.expression, scope);
+                self.non_null_operand = outer;
                 self.types.non_nullable(operand)
             }
             Expression::Assignment(assignment)

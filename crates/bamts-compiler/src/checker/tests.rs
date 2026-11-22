@@ -2153,6 +2153,20 @@ fn assignment_narrows_a_declared_union_to_the_assigned_members() {
 }
 
 #[test]
+fn non_null_assertion_of_a_nullish_flow_type_reads_the_declared_type() {
+    let codes = checker_codes_strict_null(
+        "function reset(value: string | undefined | null): void {\
+           value = undefined; value!.slice();\
+           value = null; value!.slice();\
+         }\
+         function guarded(value: string | undefined): void {\
+           if (value === undefined) { value!.slice(); }\
+         }",
+    );
+    assert!(codes.is_empty(), "{codes:?}");
+}
+
+#[test]
 fn forward_static_method_returns_infer_from_constructed_classes_and_literals() {
     let result = check_text(
         "class Reader {\
