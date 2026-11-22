@@ -1167,6 +1167,20 @@ impl<'a> NarrowingContext<'a> {
                 }
             }
         }
+        if let NarrowingGuard::Truthiness { negated, .. } = guard
+            && let [segment] = key.path()
+        {
+            let root = FlowKey::root(key.root_symbol());
+            if let Some(root_current) = self.type_at(flow, &root) {
+                let root_narrowed =
+                    self.narrow_discriminant_truthiness(root_current, segment, *negated);
+                if root_narrowed != root_current {
+                    self.facts.frames[flow.index()]
+                        .facts
+                        .insert(root, root_narrowed);
+                }
+            }
+        }
     }
 
     /// Applies a conjunction of guards in order.
@@ -1435,6 +1449,76 @@ impl<'a> NarrowingContext<'a> {
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
             | Type::ConstructorType { .. } => self.table.never(),
+        }
+    }
+
+    /// Narrows a union by the truthiness of one discriminant property
+    /// (`if (result.ok)`). The property discriminates only when its member
+    /// types differ and one of them is a literal type; a member survives
+    /// unless its property type cannot take the tested truthiness, and a
+    /// member lacking the property survives both polarities.
+    #[must_use]
+    pub fn narrow_discriminant_truthiness(
+        &mut self,
+        ty: TypeId,
+        property: &str,
+        negated: bool,
+    ) -> TypeId {
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.narrow_discriminant_truthiness(view, property, negated);
+        }
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.narrow_discriminant_truthiness(target, property, negated);
+        }
+        let Type::Union(members) = self.table.get(ty).clone() else {
+            return ty;
+        };
+        let property_types: Vec<_> = members
+            .iter()
+            .map(|member| self.property_type(*member, property))
+            .collect();
+        let present: Vec<TypeId> = property_types.iter().flatten().copied().collect();
+        if present.windows(2).all(|pair| pair[0] == pair[1])
+            || !present
+                .iter()
+                .any(|property_type| self.literal_property_type(*property_type))
+        {
+            return ty;
+        }
+        let mut kept = Vec::with_capacity(members.len());
+        for (member, property_type) in members.into_iter().zip(property_types) {
+            let survives = property_type.is_none_or(|property_type| {
+                let narrowed = self.narrow_truthiness(property_type, negated);
+                !matches!(self.table.get(narrowed), Type::Never)
+            });
+            if survives {
+                kept.push(member);
+            }
+        }
+        self.table.union(&kept)
+    }
+
+    fn literal_property_type(&mut self, ty: TypeId) -> bool {
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.literal_property_type(view);
+        }
+        match self.table.get(ty).clone() {
+            Type::Union(members) => members
+                .into_iter()
+                .all(|member| self.literal_property_type(member)),
+            Type::Boolean
+            | Type::Null
+            | Type::Undefined
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::EnumMember { .. } => true,
+            _ => false,
         }
     }
 
