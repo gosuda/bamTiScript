@@ -373,7 +373,7 @@ impl SymbolKind {
     const fn accepts_type_merge_from(self, new: Self) -> bool {
         matches!(
             (self, new),
-            (Self::Interface, Self::Interface)
+            (Self::Interface | Self::IntrinsicType, Self::Interface)
                 | (Self::Enum, Self::Enum)
                 | (Self::Namespace, Self::Namespace)
                 | (Self::Interface, Self::Namespace)
@@ -2617,6 +2617,17 @@ impl TypeTable {
 
     pub fn publish_final_class_template(&mut self, symbol: SymbolId, raw: TypeId) {
         self.publish_class_template(symbol, raw, ClassState::Final);
+    }
+
+    pub fn augment_final_class_template(&mut self, symbol: SymbolId, raw: TypeId) {
+        if let Some(template) = self
+            .classes
+            .get_mut(&symbol)
+            .and_then(|metadata| metadata.template.as_mut())
+        {
+            template.state = ClassState::Provisional;
+        }
+        self.publish_final_class_template(symbol, raw);
     }
 
     fn publish_class_template(&mut self, symbol: SymbolId, raw: TypeId, state: ClassState) {
@@ -4947,6 +4958,13 @@ enum TypeDef<'src> {
     },
 }
 
+struct IntrinsicAugmentation<'src> {
+    symbol: SymbolId,
+    scope: ScopeId,
+    parameters: Vec<SymbolId>,
+    interface: &'src InterfaceDeclaration,
+}
+
 // ---------------------------------------------------------------------------
 // Demand activation: frozen shared identities, query/context/result records,
 // and the WP-LEX source-inventory records. Shapes are frozen by
@@ -6517,6 +6535,7 @@ pub(crate) struct Binder<'src> {
     /// All interface declarations that share the same symbol through merging,
     /// in source order. The first declaration is also stored in `type_defs`.
     interface_merges: HashMap<SymbolId, Vec<&'src InterfaceDeclaration>>,
+    intrinsic_augmentations: Vec<IntrinsicAugmentation<'src>>,
     pub(crate) references: HashMap<NodeId, SymbolId>,
     reference_aliases: HashMap<NodeId, SymbolId>,
     /// Bind-once source inventory and readiness state.  This remains private
@@ -6851,6 +6870,7 @@ impl<'src> Binder<'src> {
             type_state: Vec::new(),
             type_defs: HashMap::new(),
             interface_merges: HashMap::new(),
+            intrinsic_augmentations: Vec::new(),
             references: HashMap::new(),
             reference_aliases: HashMap::new(),
             declaration_index: DeclarationIndex::default(),
@@ -10021,6 +10041,7 @@ impl<'src> Binder<'src> {
         if !self.is_module {
             self.install_sibling_script_globals(sibling_scripts)?;
         }
+        self.merge_intrinsic_interface_augmentations();
         self.resolve_statement_class_bounds(statements);
         self.check_cancel()?;
         self.build_program_flow()?;
@@ -12421,6 +12442,14 @@ impl<'src> Binder<'src> {
                     );
                 }
             }
+            None if self.symbols[id.get() as usize].kind == SymbolKind::IntrinsicType => {
+                self.intrinsic_augmentations.push(IntrinsicAugmentation {
+                    symbol: id,
+                    scope: type_scope,
+                    parameters,
+                    interface,
+                });
+            }
             None if !parameters.is_empty() => self.types.declare_class(id, parameters),
             None | Some(_) => {}
         }
@@ -12438,10 +12467,12 @@ impl<'src> Binder<'src> {
             self.bind_object_members(member, member_scope);
         }
         self.interface_merges.entry(id).or_default().push(interface);
-        self.type_defs.entry(id).or_insert(TypeDef::Interface {
-            scope: type_scope,
-            type_parameters: interface.type_parameters.as_ref(),
-        });
+        if self.symbols[id.get() as usize].kind != SymbolKind::IntrinsicType {
+            self.type_defs.entry(id).or_insert(TypeDef::Interface {
+                scope: type_scope,
+                type_parameters: interface.type_parameters.as_ref(),
+            });
+        }
     }
 
     /// Declares a container member unless the same name is already bound in the
@@ -22767,86 +22798,15 @@ impl<'src> Binder<'src> {
                     .get(&symbol)
                     .cloned()
                     .unwrap_or_default();
-                let mut merged = ObjectType {
-                    properties: Vec::new(),
-                    call_signatures: Vec::new(),
-                    call_candidate_order: Vec::new(),
-                    construct_signatures: Vec::new(),
-                    index_signatures: Vec::new(),
-                    generator_return: None,
-                    iterator_property: None,
-                    async_iterator_property: None,
-                };
-                // Per-fragment method-group signature counts per member key,
-                // in fragment iteration order — the offsets the candidate
-                // permutation is computed from.
-                let mut fragment_group_counts: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+                let mut fragments = Vec::with_capacity(declarations.len());
                 for interface in declarations {
-                    let base =
-                        self.resolve_interface_type(scope, &interface.extends, &interface.members);
-                    let base = self.types.indexed_access_view(base);
-                    if let Type::ObjectType(object) = self.types.get(base).clone() {
-                        merged.generator_return =
-                            match (merged.generator_return, object.generator_return) {
-                                (None, return_type) => return_type,
-                                (return_type, None) => return_type,
-                                (Some(left), Some(right)) => {
-                                    Some(self.types.intersection(vec![left, right]))
-                                }
-                            };
-                        merged.iterator_property =
-                            match (merged.iterator_property.take(), object.iterator_property) {
-                                (None, property) => property,
-                                (property, None) => property,
-                                (Some(left), Some(right)) => {
-                                    Some(self.merge_iterator_properties(left, right))
-                                }
-                            };
-                        merged.async_iterator_property = match (
-                            merged.async_iterator_property.take(),
-                            object.async_iterator_property,
-                        ) {
-                            (None, property) => property,
-                            (property, None) => property,
-                            (Some(left), Some(right)) => {
-                                Some(self.merge_iterator_properties(left, right))
-                            }
-                        };
-                        for property in &object.properties {
-                            if !property.is_method() {
-                                continue;
-                            }
-                            let Some(signatures) =
-                                self.types.overload_signatures(property.type_id())
-                            else {
-                                continue;
-                            };
-                            fragment_group_counts
-                                .entry(property.name().into())
-                                .or_default()
-                                .push(signatures.len() as u32);
-                        }
-                        merged.properties.extend(object.properties);
-                        for signature in object.call_signatures {
-                            if !merged.call_signatures.contains(&signature) {
-                                merged.call_signatures.push(signature);
-                            }
-                        }
-                        for signature in object.construct_signatures {
-                            if !merged.construct_signatures.contains(&signature) {
-                                merged.construct_signatures.push(signature);
-                            }
-                        }
-                        for signature in object.index_signatures {
-                            if !merged.index_signatures.contains(&signature) {
-                                merged.index_signatures.push(signature);
-                            }
-                        }
-                    }
+                    fragments.push(self.resolve_interface_type(
+                        scope,
+                        &interface.extends,
+                        &interface.members,
+                    ));
                 }
-                let structure = self.types.object_type_with_members(merged);
-                let structure =
-                    self.attach_interface_call_candidate_orders(structure, &fragment_group_counts);
+                let structure = self.merge_interface_fragments(fragments);
                 self.publish_interface_member_types(symbol, structure);
                 self.types.set_interface_structure(symbol, structure);
                 if is_generic {
@@ -23035,6 +22995,123 @@ impl<'src> Binder<'src> {
             return;
         };
         self.publish_member_types_in_scope(member_scope, structure);
+    }
+
+    fn merge_interface_fragments(&mut self, fragments: Vec<TypeId>) -> TypeId {
+        let mut merged = ObjectType {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        };
+        let mut fragment_group_counts: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+        for fragment in fragments {
+            let base = self.types.indexed_access_view(fragment);
+            let Type::ObjectType(object) = self.types.get(base).clone() else {
+                continue;
+            };
+            merged.generator_return = match (merged.generator_return, object.generator_return) {
+                (None, return_type) => return_type,
+                (return_type, None) => return_type,
+                (Some(left), Some(right)) => Some(self.types.intersection(vec![left, right])),
+            };
+            merged.iterator_property =
+                match (merged.iterator_property.take(), object.iterator_property) {
+                    (None, property) => property,
+                    (property, None) => property,
+                    (Some(left), Some(right)) => Some(self.merge_iterator_properties(left, right)),
+                };
+            merged.async_iterator_property = match (
+                merged.async_iterator_property.take(),
+                object.async_iterator_property,
+            ) {
+                (None, property) => property,
+                (property, None) => property,
+                (Some(left), Some(right)) => Some(self.merge_iterator_properties(left, right)),
+            };
+            for property in &object.properties {
+                if !property.is_method() {
+                    continue;
+                }
+                let Some(signatures) = self.types.overload_signatures(property.type_id()) else {
+                    continue;
+                };
+                fragment_group_counts
+                    .entry(property.name().into())
+                    .or_default()
+                    .push(u32::try_from(signatures.len()).expect("overload count fits in u32"));
+            }
+            merged.properties.extend(object.properties);
+            for signature in object.call_signatures {
+                if !merged.call_signatures.contains(&signature) {
+                    merged.call_signatures.push(signature);
+                }
+            }
+            for signature in object.construct_signatures {
+                if !merged.construct_signatures.contains(&signature) {
+                    merged.construct_signatures.push(signature);
+                }
+            }
+            for signature in object.index_signatures {
+                if !merged.index_signatures.contains(&signature) {
+                    merged.index_signatures.push(signature);
+                }
+            }
+        }
+        let structure = self.types.object_type_with_members(merged);
+        self.attach_interface_call_candidate_orders(structure, &fragment_group_counts)
+    }
+
+    fn merge_intrinsic_interface_augmentations(&mut self) {
+        let augmentations = std::mem::take(&mut self.intrinsic_augmentations);
+        let mut symbols: Vec<SymbolId> = Vec::new();
+        for augmentation in &augmentations {
+            if !symbols.contains(&augmentation.symbol) {
+                symbols.push(augmentation.symbol);
+            }
+        }
+        for symbol in symbols {
+            let Some(raw) = self.types.class_template_raw(symbol) else {
+                continue;
+            };
+            let class_parameters = self.types.class_type_parameters(symbol).to_vec();
+            let mut fragments = vec![raw];
+            for augmentation in &augmentations {
+                if augmentation.symbol != symbol
+                    || augmentation.parameters.len() != class_parameters.len()
+                {
+                    continue;
+                }
+                let fragment = self.resolve_interface_type(
+                    augmentation.scope,
+                    &augmentation.interface.extends,
+                    &augmentation.interface.members,
+                );
+                let substitutions = augmentation
+                    .parameters
+                    .iter()
+                    .zip(&class_parameters)
+                    .map(|(&parameter, &class_parameter)| {
+                        InferredTypeArgument::new(
+                            parameter,
+                            self.types.named(class_parameter),
+                            InferenceProvenance::Explicit,
+                        )
+                    })
+                    .collect();
+                fragments.push(
+                    InferredTypeArguments::new(substitutions)
+                        .instantiate(&mut self.types, fragment),
+                );
+            }
+            let structure = self.merge_interface_fragments(fragments);
+            self.publish_interface_member_types(symbol, structure);
+            self.types.augment_final_class_template(symbol, structure);
+        }
     }
 
     fn publish_member_types_in_scope(&mut self, member_scope: ScopeId, structure: TypeId) {

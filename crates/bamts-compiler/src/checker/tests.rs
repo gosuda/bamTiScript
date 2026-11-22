@@ -5437,6 +5437,29 @@ fn declare_global_binds_members_into_global_scope() {
 }
 
 #[test]
+fn declare_global_interface_augments_intrinsic_console_members() {
+    let result = check_text(
+        "type CreateTask = (name?: string) => void;\n\
+         declare global {\n\
+         \x20 interface Console {\n\
+         \x20   createTask?: CreateTask;\n\
+         \x20 }\n\
+         }\n\
+         if (console.createTask) {\n\
+         \x20 console.createTask(\"task\");\n\
+         }\n\
+         console.log(\"kept\");\n\
+         const missing = console.notAMember;\n\
+         export {};\n",
+    );
+    assert_eq!(
+        checker_codes(&result),
+        [PROPERTY_DOES_NOT_EXIST.as_str()],
+        "the augmentation must merge into Console without a duplicate declaration"
+    );
+}
+
+#[test]
 fn declare_global_declarations_resolve_enclosing_module_names() {
     let result = check_text(
         "type Local = { a: number };\n\
