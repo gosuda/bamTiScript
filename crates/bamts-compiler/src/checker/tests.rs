@@ -6050,6 +6050,38 @@ fn discriminant_truthiness_narrows_union_results() {
 }
 
 #[test]
+fn instanceof_narrows_by_class_derivation() {
+    let valid = check_text(
+        "class A { a = 1; }\
+             class B extends A { p = 1; }\
+             class C1 { p1 = ''; }\
+             class C2 { p2 = 1; }\
+             class D1 extends C1 { p3 = 1; }\
+             function plain(a: A): number {\
+               if (a instanceof B) { return a.p; }\
+               return a.a;\
+             }\
+             function derivedUnion(x: C2 | D1): number {\
+               if (x instanceof C1) { return x.p3; }\
+               return 0;\
+             }\
+             function baseUnion(x: C1 | C2): number {\
+               if (x instanceof D1) { return x.p3 + x.p1.length; }\
+               return 0;\
+             }\
+             function constrained<T extends A>(x: T | C2): number {\
+               if (x instanceof A) { const kept: T = x; return kept.a; }\
+               return 0;\
+             }",
+    );
+    assert!(
+        checker_codes(&valid).is_empty(),
+        "{:?}",
+        valid.diagnostics()
+    );
+}
+
+#[test]
 fn interfaces_referenced_while_their_base_class_is_shaped_inherit_its_members() {
     let valid = check_text(
         "class Shape {\
@@ -6090,6 +6122,7 @@ fn array_literals_take_tuple_shapes_from_tuple_union_targets() {
         valid.diagnostics()
     );
 }
+
 #[test]
 fn imported_class_type_survives_named_alias_and_reexport() {
     let checked = linked(

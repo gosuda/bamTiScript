@@ -1516,6 +1516,7 @@ struct ClassMetadata {
     bounds_resolving: bool,
     bounds_ready: bool,
     template: Option<ClassTemplate>,
+    base: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -2063,12 +2064,38 @@ impl TypeTable {
             bounds_resolving: false,
             bounds_ready: false,
             template: None,
+            base: None,
         });
     }
 
     #[must_use]
     pub fn has_class(&self, symbol: SymbolId) -> bool {
         self.classes.contains_key(&symbol)
+    }
+
+    pub fn set_class_base(&mut self, symbol: SymbolId, base: SymbolId) {
+        if let Some(metadata) = self.classes.get_mut(&symbol) {
+            metadata.base = Some(base);
+        }
+    }
+
+    #[must_use]
+    pub fn class_derives_from(&self, class: SymbolId, base: SymbolId) -> bool {
+        let mut current = class;
+        for _ in 0..=self.classes.len() {
+            if current == base {
+                return true;
+            }
+            match self
+                .classes
+                .get(&current)
+                .and_then(|metadata| metadata.base)
+            {
+                Some(next) => current = next,
+                None => return false,
+            }
+        }
+        false
     }
 
     #[must_use]
@@ -4730,6 +4757,10 @@ impl TypeTable {
                 if let Some(template) = metadata.template {
                     let raw = copy(target, source, template.raw, imported, next_symbol);
                     target.publish_class_template(symbol, raw, template.state);
+                }
+                if let Some(base) = metadata.base {
+                    let base = remap_symbol(target, source, base, imported, next_symbol);
+                    target.set_class_base(symbol, base);
                 }
             }
             if let Some(metadata) = source.aliases.get(&source_symbol).cloned() {
@@ -16650,6 +16681,11 @@ impl<'src> Binder<'src> {
                 base,
                 heritage.expression.range(),
             );
+            if let Some(owner) = owner
+                && let Some((base_class, _)) = self.types.class_identity(base_instance)
+            {
+                self.types.set_class_base(owner, base_class);
+            }
             if matches!(state, ClassState::Final) {
                 self.typed_expressions
                     .push((heritage.expression.range(), base_instance));

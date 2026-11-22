@@ -55,6 +55,7 @@ use super::binder::{
     DeclId, ExecutionBoundary, ExecutionPoint, FlowPointId, FunctionParameter, ScopeId, SymbolId,
     Type, TypeId, TypeTable,
 };
+use super::relations::TypeRelations;
 use crate::literal::number_value;
 use crate::source::TextRange;
 use crate::syntax::{
@@ -1271,16 +1272,107 @@ impl<'a> NarrowingContext<'a> {
         })
     }
 
-    /// Narrows to (or away from) `class_type`. Positive narrowing is the
-    /// type intersection: a member already inside the class stays itself, a
-    /// member the class fits inside narrows to the class.
+    /// Narrows to (or away from) the instances of `class_type`. A class
+    /// constructor narrows by class derivation against its instance type,
+    /// whose type parameters are `any` like the class `prototype`: the true
+    /// branch keeps each opaque member and each member derived from the
+    /// class, and takes the instance for each member the class derives
+    /// from. With no such member, a type parameter whose constraint the
+    /// class derives from intersects with the instance; otherwise the more
+    /// specific of the type and the instance remains, or their intersection.
+    /// Other constructors, and the false branch, narrow structurally by
+    /// intersecting with, or subtracting, `class_type`.
     #[must_use]
     pub fn narrow_instanceof(&mut self, ty: TypeId, class_type: TypeId, negated: bool) -> TypeId {
         if negated {
-            self.subtract(ty, class_type)
-        } else {
-            self.intersect(ty, class_type)
+            return self.subtract(ty, class_type);
         }
+        match self.constructor_instance(class_type) {
+            Some((class, instance)) => self.narrow_to_instance(ty, class, instance),
+            None => self.intersect(ty, class_type),
+        }
+    }
+
+    fn constructor_instance(&mut self, constructor: TypeId) -> Option<(SymbolId, TypeId)> {
+        if let Some(target) = self.table.type_query_target(constructor) {
+            return self.constructor_instance(target);
+        }
+        let Type::ConstructorType { symbol, .. } = *self.table.get(constructor) else {
+            return None;
+        };
+        if !self.table.has_class(symbol) {
+            return None;
+        }
+        let any = self.table.any();
+        let arguments = vec![any; self.table.class_type_parameters(symbol).len()];
+        Some((symbol, self.table.applied_class(symbol, arguments)))
+    }
+
+    fn narrow_to_instance(&mut self, ty: TypeId, class: SymbolId, instance: TypeId) -> TypeId {
+        if let Some(target) = self.table.type_query_target(ty) {
+            return self.narrow_to_instance(target, class, instance);
+        }
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.narrow_to_instance(view, class, instance);
+        }
+        let members = match self.table.get(ty) {
+            Type::Unknown => return instance,
+            Type::Error | Type::Any | Type::Never => return ty,
+            _ if ty == instance => return instance,
+            Type::Union(members) => members.clone(),
+            _ => vec![ty],
+        };
+        let mut related = Vec::with_capacity(members.len());
+        for &member in &members {
+            let view = match self.table.get(member) {
+                Type::AppliedAlias { .. } => self
+                    .table
+                    .prepare_applied_alias_view(member)
+                    .unwrap_or(member),
+                _ => member,
+            };
+            if matches!(
+                self.table.get(view),
+                Type::Error | Type::Any | Type::Unknown
+            ) || derives_from(self.table, member, class)
+            {
+                related.push(member);
+            } else if class_derives_into(self.table, class, member) {
+                related.push(instance);
+            }
+        }
+        if !related.is_empty() {
+            return self.table.union(&related);
+        }
+        let constrained: Vec<TypeId> = members
+            .into_iter()
+            .filter(|&member| {
+                parameter_constraint(self.table, member)
+                    .is_some_and(|constraint| class_derives_into(self.table, class, constraint))
+            })
+            .collect();
+        if !constrained.is_empty() {
+            let intersections: Vec<TypeId> = constrained
+                .into_iter()
+                .map(|member| self.table.intersection(vec![member, instance]))
+                .collect();
+            return self.table.union(&intersections);
+        }
+        let specific = {
+            let relations = TypeRelations::new(self.table);
+            if relations.subtype(instance, ty) {
+                Some(instance)
+            } else if relations.assignable(ty, instance) {
+                Some(ty)
+            } else if relations.assignable(instance, ty) {
+                Some(instance)
+            } else {
+                None
+            }
+        };
+        specific.unwrap_or_else(|| self.table.intersection(vec![ty, instance]))
     }
 
     /// Narrows by the `"property" in x` test: positive keeps object members
@@ -2457,6 +2549,48 @@ fn typeof_matches(table: &TypeTable, ty: &Type, name: TypeofName) -> bool {
                 | Type::AppliedClass { .. }
         ),
         TypeofName::Function => matches!(ty, Type::Function(_)),
+    }
+}
+
+fn derives_from(table: &TypeTable, ty: TypeId, class: SymbolId) -> bool {
+    let mut current = table.underlying_type(ty);
+    for _ in 0..32 {
+        match table.get(current) {
+            Type::Union(members) => {
+                return members
+                    .iter()
+                    .all(|member| derives_from(table, *member, class));
+            }
+            Type::Intersection(members) => {
+                return members
+                    .iter()
+                    .any(|member| derives_from(table, *member, class));
+            }
+            Type::AppliedClass { symbol, .. } => return table.class_derives_from(*symbol, class),
+            _ => match parameter_constraint(table, current) {
+                Some(constraint) => current = table.underlying_type(constraint),
+                None => return false,
+            },
+        }
+    }
+    false
+}
+
+fn class_derives_into(table: &TypeTable, class: SymbolId, ty: TypeId) -> bool {
+    match table.get(table.underlying_type(ty)) {
+        Type::Union(members) => members
+            .iter()
+            .any(|member| class_derives_into(table, class, *member)),
+        Type::AppliedClass { symbol, .. } => table.class_derives_from(class, *symbol),
+        _ => false,
+    }
+}
+
+fn parameter_constraint(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    match table.get(ty) {
+        Type::Named(parameter) => table.type_parameter_constraint(*parameter),
+        Type::This { constraint, .. } => Some(*constraint),
+        _ => None,
     }
 }
 
