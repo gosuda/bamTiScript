@@ -5740,6 +5740,21 @@ pub(crate) fn source_is_module(source: &SourceFile) -> bool {
         })
 }
 
+/// Returns the namespace declaration a statement introduces through any
+/// `export` and `declare` wrappers, with the node id the binder keys it by.
+fn namespace_statement(
+    statement: &crate::syntax::Stmt,
+) -> Option<(&crate::syntax::NamespaceDeclaration, NodeId)> {
+    match statement.data() {
+        Statement::Namespace(namespace) => Some((namespace, statement.id())),
+        Statement::Declare(inner)
+        | Statement::Export(crate::syntax::ExportDeclaration::Named(
+            crate::syntax::ExportNamedDeclaration::Declaration(inner),
+        )) => namespace_statement(inner),
+        _ => None,
+    }
+}
+
 /// Returns whether the source text calls `import(` anywhere outside a member
 /// access. Such files check as strict modules upstream even without a
 /// top-level `import` or `export` declaration.
@@ -12186,7 +12201,11 @@ impl<'src> Binder<'src> {
                     declaration_id,
                     *range,
                 );
-                let export_scope = self.global_scope;
+                let export_scope = if self.augments_global_scope(declaration_id) {
+                    self.global_scope
+                } else {
+                    self.new_scope(ScopeKind::Namespace, Some(scope_parent))
+                };
                 self.namespace_export_scopes.insert(symbol, export_scope);
                 (symbol, export_scope)
             }
@@ -12400,6 +12419,34 @@ impl<'src> Binder<'src> {
         } else {
             scope
         }
+    }
+
+    /// Whether a `declare global` block augments the global scope, as tsc's
+    /// `isModuleAugmentationExternal` decides: the block is a top-level
+    /// statement of an external module, or sits directly in the body of a
+    /// top-level string-named ambient module of a script. tsc rejects every
+    /// other placement with TS2669 and binds the block as a plain ambient
+    /// module named `global`, so its declarations stay local to it and never
+    /// merge into the global declarations or the built-in types.
+    fn augments_global_scope(&self, declaration: NodeId) -> bool {
+        self.source
+            .statements()
+            .iter()
+            .filter_map(namespace_statement)
+            .any(|(namespace, id)| {
+                if self.is_module {
+                    id == declaration
+                } else {
+                    matches!(namespace.name, NamespaceName::StringLiteral(_))
+                        && namespace
+                            .body
+                            .data()
+                            .statements
+                            .iter()
+                            .filter_map(namespace_statement)
+                            .any(|(_, nested)| nested == declaration)
+                }
+            })
     }
 
     fn bind_interface(
