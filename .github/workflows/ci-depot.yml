@@ -54,10 +54,10 @@ jobs:
           cargo fetch --locked
           npm ci --prefix formal/quint
           v=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
-          test "$v" = v0.7.1
+          test "$v" = v0.6.0
           d="$QUINT_HOME/rust-evaluator-$v"; mkdir -p "$d"
           curl -fsSL --retry 3 -o /tmp/q.tgz "https://github.com/quint-co/quint/releases/download/evaluator/$v/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz"
-          echo "ce0502bdef65dc26c242a9e56379a9bb26de6f3db38f0e3989339d46a542f5eb  /tmp/q.tgz" | sha256sum --check --strict
+          echo "61755a09d5052d93a4e75e840059edfd0d3674aeda164b9d2464be3d6e21b1c2  /tmp/q.tgz" | sha256sum --check --strict
           tar -xzf /tmp/q.tgz -C "$d" quint_evaluator && chmod +x "$d/quint_evaluator"
       - name: Fetch pinned TypeScript test fixtures
         run: cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
@@ -86,10 +86,10 @@ jobs:
           (cargo fetch --locked -q && cargo build --locked -q -p bamts-verification --bin bamts-verification) & b=$!
           npm ci --prefix formal/quint
           v=$(node -p 'require("./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js").QUINT_EVALUATOR_VERSION')
-          test "$v" = v0.7.1
+          test "$v" = v0.6.0
           d="$QUINT_HOME/rust-evaluator-$v"; mkdir -p "$d"
           curl -fsSL --retry 3 -o /tmp/q.tgz "https://github.com/quint-co/quint/releases/download/evaluator/$v/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz"
-          echo "ce0502bdef65dc26c242a9e56379a9bb26de6f3db38f0e3989339d46a542f5eb  /tmp/q.tgz" | sha256sum --check --strict
+          echo "61755a09d5052d93a4e75e840059edfd0d3674aeda164b9d2464be3d6e21b1c2  /tmp/q.tgz" | sha256sum --check --strict
           tar -xzf /tmp/q.tgz -C "$d" quint_evaluator && chmod +x "$d/quint_evaluator"
           curl -fsSLo /tmp/racket.sh https://download.racket-lang.org/installers/9.2/racket-9.2-x86_64-linux-cs.sh
           sudo sh /tmp/racket.sh --create-dir --unix-style --dest /usr/local
