@@ -2566,18 +2566,27 @@ mod tests {
         }
     }
 
-    /// Tests that open a peak-memory window run one at a time: on Linux a
-    /// window resets a mark shared by the whole process, so overlapping windows
-    /// would lower each other's result.
-    static PEAK_WINDOW_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn the_peak_window_reports_a_touched_allocation() {
         const BYTES: usize = 64 * 1024 * 1024;
         const BEFORE_BYTES: usize = 256 * 1024 * 1024;
-        let _serial = PEAK_WINDOW_TESTS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        const TEST_NAME: &str = "perf::tests::the_peak_window_reports_a_touched_allocation";
+        const CHILD: &str = "BAMTS_PEAK_WINDOW_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST_NAME, "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("start isolated peak-window test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "isolated {TEST_NAME} did not pass: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         if peak_window_available() {
             // Reset property: a large allocation made and dropped before the
             // window opens must not raise the window's peak.
@@ -2615,9 +2624,6 @@ mod tests {
 
     #[test]
     fn a_failed_measurement_returns_the_work_error() {
-        let _serial = PEAK_WINDOW_TESTS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         if peak_window_available() {
             let error = measure_peak(|| -> Result<()> { Err(PerfError::harness("work failed")) })
                 .unwrap_err();
