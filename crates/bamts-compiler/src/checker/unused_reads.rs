@@ -562,10 +562,9 @@ fn scan_jsx_attribute(
         crate::syntax::JsxAttributeItem::Attribute(attribute) => {
             if let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
                 attribute.data().initializer.as_ref()
+                && let Some(expression) = container.data().expression.as_deref()
             {
-                if let Some(expression) = container.data().expression.as_deref() {
-                    scan_expr_writes(expression, writes);
-                }
+                scan_expr_writes(expression, writes);
             }
         }
         crate::syntax::JsxAttributeItem::Spread(spread) => {

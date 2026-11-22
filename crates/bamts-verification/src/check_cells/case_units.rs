@@ -378,7 +378,7 @@ fn directive_attributes(line: &str) -> Vec<(&str, &str)> {
 
 /// The next quoted attribute value, advancing past it.
 fn quoted_value<'a>(rest: &mut &'a str) -> Option<&'a str> {
-    let source: &'a str = *rest;
+    let source = *rest;
     let quote = source.trim_start().chars().next().unwrap_or('\0');
     if quote != '"' && quote != '\'' {
         return None;

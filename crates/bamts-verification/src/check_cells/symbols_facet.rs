@@ -91,8 +91,7 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     for (unit, output) in units {
         let section = unit_basename(&unit.virtual_path);
         emit_unit_symbols(
-            output.semantic_model(),
-            output.source_file(),
+            output,
             &unit.display_name,
             &section,
             &declaration_anchors,
@@ -121,8 +120,7 @@ struct SymbolRecord {
 }
 
 fn emit_unit_symbols(
-    model: &SemanticModel,
-    source_file: &bamts_compiler::syntax::SourceFile,
+    output: &FrontendOutput,
     heading: &str,
     section: &str,
     declaration_anchors: &HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>>,
@@ -130,6 +128,8 @@ fn emit_unit_symbols(
     libs: &[Arc<str>],
     out: &mut String,
 ) {
+    let model = output.semantic_model();
+    let source_file = output.source_file();
     let source = source_file.source_text();
     let tokens = source_file.tokens();
     let local_decl_positions: Vec<Option<(usize, usize)>> = model
@@ -476,10 +476,8 @@ fn symbol_decl_position(
             _ => break,
         }
     }
-    if !found_at {
-        if let Some(start) = undecorated_start {
-            node_index = start;
-        }
+    if !found_at && let Some(start) = undecorated_start {
+        node_index = start;
     }
     // The declaration's full start is the end of the significant token that
     // precedes it (TypeScript's `node.pos`, which counts leading trivia).
