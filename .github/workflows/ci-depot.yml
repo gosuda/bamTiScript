@@ -23,9 +23,10 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - run: rustup toolchain install
+      - id: toolchain
+        run: rustup toolchain install
       - run: cargo fmt --all --check
-      - if: always()
+      - if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -98,13 +99,15 @@ jobs:
           (cd formal/lean && lake build)
           wait $b
       - name: Fetch catalog authority
+        id: authority
         run: |
           $V source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
           $V source fetch typescript-6.0-tests --dest target/authority/typescript-6.0.2-tests
           $V source fetch typescript-compat-tests --dest target/authority/typescript-5.9.3-tests
           $V source fetch test262 --dest target/authority/test262
       - run: $V catalog regenerate --release typescript-7.0.2 --check
-      - run: $V formal audit --gates G1,G2,G5,G3,G4
+      - if: ${{ !cancelled() && steps.authority.outcome == 'success' }}
+        run: $V formal audit --gates G1,G2,G5,G3,G4
 
   conformance:
     runs-on: depot-ubuntu-24.04-4
@@ -127,8 +130,10 @@ jobs:
         run: |
           npm ci
           cargo build --locked --release -p bamts-verification --bin bamts-verification --bin ts_lane_worker --bin ts_conformance
-          target/release/ts_conformance sync --verify-pin --write-snapshot
-          target/release/ts_conformance audit-ledger --require-complete
+          status=0
+          target/release/ts_conformance sync --verify-pin --write-snapshot || status=1
+          target/release/ts_conformance audit-ledger --require-complete || status=1
+          exit "$status"
       - name: Fetch pinned TypeScript authority
         run: |
           $V source fetch typescript-7-compiler --dest target/authority/typescript-7.0.2

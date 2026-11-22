@@ -37,29 +37,39 @@ jobs:
           node-version: 24.18.0
           package-manager-cache: false
       - name: Install pinned Rust toolchain
+        id: toolchain
+        if: ${{ !cancelled() }}
         run: |
           $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           rustup toolchain install $toolchain --profile minimal --component clippy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
       - name: Cache Rust dependencies
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         uses: ./.github/actions/rust-cache
       - name: Test Windows cache ownership and publication
-        run: cargo test --locked -p bamts-native --features cache-guard
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-native --features cache-guard --no-fail-fast
       # Every other job runs on Linux, where the Win32 backend, the Microsoft
       # linker driver and the stack size of a linked image are not compiled.
       - name: Lint the Windows platform backend and linker driver
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo clippy --locked -p bamts-platform -p bamts-cli --all-targets -- -D warnings
       - name: Test the Windows platform backend
-        run: cargo test --locked -p bamts-platform
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-platform --no-fail-fast
       - name: Test the Microsoft linker driver and the Windows cache root
-        run: cargo test --locked -p bamts-cli --lib -- windows_link fallback_cache_root
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-cli --lib --no-fail-fast -- windows_link fallback_cache_root
       - name: Test linked native executables
-        run: cargo test --locked -p bamts-cli --test cli -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-cli --test cli --no-fail-fast -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
       - name: Test the lane workers
-        run: cargo test --locked -p bamts-verification --test lane_serving
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-verification --test lane_serving --no-fail-fast
       - name: Test the serving lane executor
-        run: cargo test --locked -p bamts-verification --lib serving
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-verification --lib --no-fail-fast serving
 
   quality:
     name: Quality
@@ -76,6 +86,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
 
       - name: Install Rust toolchain
+        id: toolchain
         run: |
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
@@ -86,12 +97,15 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Cache Rust dependencies
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         uses: ./.github/actions/rust-cache
 
       - name: Check workspace
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo check --workspace --locked
 
       - name: Clippy
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # The workspace guard shells out to `cargo metadata --offline`,
@@ -99,9 +113,12 @@ jobs:
       # this host build never downloads. `cargo fetch` without `--target`
       # gets all of them, matching the Formal job's workspace audit.
       - name: Fetch dependencies for all targets
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo fetch --locked
 
       - name: Fetch pinned TypeScript test fixtures
+        id: fixtures
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: >-
           cargo run --locked -p bamts-verification -- source fetch
           typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
@@ -111,19 +128,26 @@ jobs:
       # drive a local Quint. Without these the step fails on a missing
       # toolchain rather than on a real defect.
       - name: Setup Node
+        id: node
+        if: ${{ !cancelled() }}
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
           package-manager-cache: false
 
       - name: Install npm dependencies
+        id: npm
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
         run: npm ci
 
       - name: Install Quint
+        id: quint
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
         uses: ./.github/actions/setup-quint
 
       - name: Test workspace
-        run: cargo test --workspace --locked
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.fixtures.outcome == 'success' && steps.npm.outcome == 'success' && steps.quint.outcome == 'success' }}
+        run: cargo test --workspace --locked --no-fail-fast
 
   preflight:
     name: Preflight
@@ -224,7 +248,7 @@ jobs:
 
       - name: Corpus differential
         run: |
-          cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
+          cargo test -p bamts-verification --test corpus_differential --locked --no-fail-fast -- --nocapture
 
   formal:
     name: Formal
@@ -289,6 +313,7 @@ jobs:
       # the source-derived authority lock instead; strict ledger closure stays
       # a completion/release gate.
       - name: Fetch catalog authority
+        id: authority
         run: |
           cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
           cargo run --locked -p bamts-verification -- source fetch typescript-6.0-tests --dest target/authority/typescript-6.0.2-tests
@@ -299,6 +324,7 @@ jobs:
         run: cargo run --locked -p bamts-verification --bin bamts-verification -- catalog regenerate --release typescript-7.0.2 --check
 
       - name: Formal gates G1,G2,G5,G3,G4
+        if: ${{ !cancelled() && steps.authority.outcome == 'success' }}
         run: cargo run --locked -p bamts-verification --bin bamts-verification -- formal audit --gates G1,G2,G5,G3,G4
 
   conformance:
