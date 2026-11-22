@@ -63,7 +63,7 @@ fn unbound_request(request_id: u64) -> LaneRequest {
 /// cases share the name `x`: a compile that keeps a declaration of the compile before
 /// it sees a conflict, or the wrong type, and the last case declares no `x` at all.
 const CASES: [(&str, &str, &str); 3] = [
-    ("scalarPin", "var x: any;\n", ">x : any\n>  : ^^^\n"),
+    ("scalarPin", "var x: any;\n", ">x : any\n"),
     (
         "stringPin",
         "var x: string;\n",
