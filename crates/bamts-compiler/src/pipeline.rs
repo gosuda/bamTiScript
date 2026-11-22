@@ -3689,7 +3689,10 @@ mod tests {
             }
         }
         let bytes = payload.as_bytes();
-        assert!(bytes.len() % 4 == 0, "inline map payload pads to a quartet");
+        assert!(
+            bytes.len().is_multiple_of(4),
+            "inline map payload pads to a quartet"
+        );
         let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
         for quartet in bytes.chunks_exact(4) {
             let pad = quartet

@@ -2329,7 +2329,7 @@ impl TypeTable {
                         object
                             .call_signatures
                             .iter()
-                            .flat_map(|signature| Self::signature_member_types(signature)),
+                            .flat_map(Self::signature_member_types),
                     )
                     .chain(
                         object
@@ -2437,10 +2437,10 @@ impl TypeTable {
         })
     }
     pub fn set_applied_alias_view(&mut self, head: TypeId, view: TypeId) {
-        if head == view {
-            if let Type::AppliedAlias { symbol, .. } = self.get(head).clone() {
-                self.circular_aliases.insert(symbol);
-            }
+        if head == view
+            && let Type::AppliedAlias { symbol, .. } = self.get(head).clone()
+        {
+            self.circular_aliases.insert(symbol);
         }
         self.applied_alias_views.insert(head, view);
     }
@@ -23927,10 +23927,8 @@ impl<'src> Binder<'src> {
             Some(key) => key,
             None => match name {
                 PropertyName::Computed(expression) => {
-                    match self.object_member_source_slice(expression.range()) {
-                        Some(inner) => format!("[{inner}]"),
-                        None => return None,
-                    }
+                    let inner = self.object_member_source_slice(expression.range())?;
+                    format!("[{inner}]")
                 }
                 _ => return None,
             },
@@ -23940,10 +23938,8 @@ impl<'src> Binder<'src> {
             PropertyName::String(literal) => self.text(literal.data().token()).to_owned(),
             PropertyName::Number(literal) => self.text(literal.data().token()).to_owned(),
             PropertyName::Computed(expression) => {
-                match self.object_member_source_slice(expression.range()) {
-                    Some(inner) => format!("[{inner}]"),
-                    None => return None,
-                }
+                let inner = self.object_member_source_slice(expression.range())?;
+                format!("[{inner}]")
             }
             PropertyName::Private(_) | PropertyName::Missing(_) => return None,
         };
@@ -24428,7 +24424,6 @@ impl<'src> Binder<'src> {
     /// the whole path only, matching upstream, which emits no bare `>#p` row.
     /// Members declared on a base class are looked up through the heritage
     /// chain, so `d.foo` with `foo` on `C` records `Symbol(C.foo, ...)`.
-
     fn record_symbol_member_reference_rows(
         &mut self,
         owner: SymbolId,
@@ -27676,16 +27671,6 @@ impl<'src> Binder<'src> {
                     }));
                 };
                 let parameters = demand_ready!(self.function_parameters(&inventory));
-                let parameters = parameters
-                    .into_iter()
-                    .map(|(name, type_id, optional, rest, declared)| {
-                        if declared {
-                            FunctionParameter::new_declared(name, type_id, optional, rest)
-                        } else {
-                            FunctionParameter::new(name, type_id, optional, rest)
-                        }
-                    })
-                    .collect();
                 let (type_parameters, type_parameter_bounds) =
                     self.callable_type_parameters(&inventory);
                 let declared_return = demand_ready!(self.callable_declared_return(&inventory));
@@ -27773,7 +27758,7 @@ impl<'src> Binder<'src> {
     fn function_parameters(
         &mut self,
         inventory: &CallableInventory<'src>,
-    ) -> DemandResult<Vec<(String, TypeId, bool, bool, bool)>> {
+    ) -> DemandResult<Vec<FunctionParameter>> {
         self.check_cancel()?;
         enum SourceParameters<'a> {
             Syntax(&'a [crate::syntax::ParameterNode]),
@@ -27838,7 +27823,11 @@ impl<'src> Binder<'src> {
                     };
                     let optional = data.optional || data.initializer.is_some();
                     let declared = data.type_annotation.is_some();
-                    parameters.push((name, type_id, optional, rest, declared));
+                    parameters.push(if declared {
+                        FunctionParameter::new_declared(name, type_id, optional, rest)
+                    } else {
+                        FunctionParameter::new(name, type_id, optional, rest)
+                    });
                 }
             }
             SourceParameters::Type(type_parameters) => {
@@ -27848,7 +27837,12 @@ impl<'src> Binder<'src> {
                     let type_id = demand_ready!(
                         self.resolve_type_demand(&parameter.type_annotation.data().type_node)
                     );
-                    parameters.push((name, type_id, parameter.optional, parameter.rest, true));
+                    parameters.push(FunctionParameter::new_declared(
+                        name,
+                        type_id,
+                        parameter.optional,
+                        parameter.rest,
+                    ));
                 }
             }
         }
