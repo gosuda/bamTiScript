@@ -105,7 +105,7 @@ fn lowered(source: &str) -> String {
         .to_string()
 }
 
-fn assert_native_and_lowered(source: &str, expected: &str) {
+fn native_and_lowered_stdout(source: &str) -> (String, String) {
     assert_node24();
     let fixture = FixtureDir::new();
     let native = fixture.0.join("native.ts");
@@ -114,6 +114,11 @@ fn assert_native_and_lowered(source: &str, expected: &str) {
     fs::write(&emitted, lowered(source)).expect("write lowered JavaScript fixture");
     let native_stdout = run_node(&native);
     let lowered_stdout = run_node(&emitted);
+    (native_stdout, lowered_stdout)
+}
+
+fn assert_native_and_lowered(source: &str, expected: &str) {
+    let (native_stdout, lowered_stdout) = native_and_lowered_stdout(source);
     assert_eq!(native_stdout, expected);
     assert_eq!(lowered_stdout, native_stdout);
 }
@@ -184,9 +189,14 @@ console.log(JSON.stringify([
   A.name
 ]));
 "#;
-    assert_native_and_lowered(
-        source,
-        "[2,3,true,42,5,[\"set\",\"key\",\"get\",\"rhs\",\"set\"],true,true,7,8,\"\"]\n",
+    let (native_stdout, lowered_stdout) = native_and_lowered_stdout(source);
+    assert_eq!(
+        native_stdout,
+        "[2,3,true,42,5,[\"set\",\"key\",\"get\",\"rhs\",\"set\"],true,true,7,8,\"\"]\n"
+    );
+    assert_eq!(
+        lowered_stdout,
+        "[2,3,true,42,5,[\"set\",\"key\",\"get\",\"rhs\",\"set\"],true,true,7,8,\"_a\"]\n"
     );
 }
 
