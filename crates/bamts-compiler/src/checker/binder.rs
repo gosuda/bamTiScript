@@ -7202,10 +7202,7 @@ impl<'src> Binder<'src> {
                     .get(name)
                     .copied()
                     .filter(|existing| {
-                        kind.occupies_type()
-                            && self.symbols[existing.get() as usize]
-                                .kind
-                                .accepts_type_merge_from(kind)
+                        kind.occupies_type() && self.accepts_type_merge(*existing, kind)
                     })
             });
         if let Some(existing) = merge {
@@ -11402,10 +11399,7 @@ impl<'src> Binder<'src> {
                     .get(name)
                     .copied()
                     .filter(|existing| {
-                        kind.occupies_type()
-                            && self.symbols[existing.get() as usize]
-                                .kind
-                                .accepts_type_merge_from(kind)
+                        kind.occupies_type() && self.accepts_type_merge(*existing, kind)
                     })
             });
         // TS2397: A global declaration in a script whose name collides with a
@@ -11547,6 +11541,13 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn accepts_type_merge(&self, existing: SymbolId, kind: SymbolKind) -> bool {
+        let symbol = &self.symbols[existing.get() as usize];
+        symbol.kind.accepts_type_merge_from(kind)
+            && !(symbol.kind == SymbolKind::IntrinsicType
+                && self.intrinsics.is_type_alias(&symbol.name))
+    }
+
     fn insert_type(
         &mut self,
         scope: ScopeId,
@@ -11554,7 +11555,7 @@ impl<'src> Binder<'src> {
         id: SymbolId,
         kind: SymbolKind,
     ) -> Option<SymbolId> {
-        match self.scopes[scope.0 as usize].types.get(name) {
+        match self.scopes[scope.0 as usize].types.get(name).copied() {
             None => {
                 self.scopes[scope.0 as usize]
                     .types
@@ -11562,11 +11563,10 @@ impl<'src> Binder<'src> {
                 None
             }
             Some(existing) => {
-                let existing_kind = self.symbols[existing.get() as usize].kind;
-                if existing_kind.accepts_type_merge_from(kind) {
+                if self.accepts_type_merge(existing, kind) {
                     None
                 } else {
-                    Some(*existing)
+                    Some(existing)
                 }
             }
         }

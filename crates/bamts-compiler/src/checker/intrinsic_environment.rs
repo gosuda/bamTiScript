@@ -483,6 +483,11 @@ impl GlobalEnvironment {
     }
 
     #[must_use]
+    pub(crate) fn is_type_alias(self, name: &str) -> bool {
+        LIB_TYPE_ALIASES.binary_search(&name).is_ok()
+    }
+
+    #[must_use]
     pub fn module_values(self) -> Vec<&'static str> {
         match self.module {
             ModuleEnvironment::Standard => Vec::new(),
@@ -738,6 +743,39 @@ pub fn lib_decl_files_for_global(
 
 const COMMONJS_WRAPPER_VALUES: &[&str] =
     &["module", "exports", "require", "__filename", "__dirname"];
+
+const LIB_TYPE_ALIASES: &[&str] = &[
+    "ArrayBufferLike",
+    "Awaited",
+    "Capitalize",
+    "ClassDecorator",
+    "ConstructorParameters",
+    "ElementTagNameMap",
+    "Exclude",
+    "Extract",
+    "FlatArray",
+    "InstanceType",
+    "IteratorResult",
+    "Lowercase",
+    "MethodDecorator",
+    "NoInfer",
+    "NonNullable",
+    "Omit",
+    "OmitThisParameter",
+    "ParameterDecorator",
+    "Parameters",
+    "Partial",
+    "Pick",
+    "PropertyDecorator",
+    "PropertyKey",
+    "Readonly",
+    "Record",
+    "Required",
+    "ReturnType",
+    "ThisParameterType",
+    "Uncapitalize",
+    "Uppercase",
+];
 
 // `Function` is the sole declaration-only value. It permits library source
 // checking without claiming that the runtime installs the constructor.
