@@ -2035,6 +2035,16 @@ impl TypeTable {
         self.object_symbol == Some(symbol)
     }
 
+    pub(super) fn concat_array_element(&self, type_id: TypeId) -> Option<TypeId> {
+        let Type::AppliedClass { symbol, arguments } = self.get(type_id) else {
+            return None;
+        };
+        match arguments.as_slice() {
+            [element] if self.concat_array_symbol == Some(*symbol) => Some(*element),
+            _ => None,
+        }
+    }
+
     fn intrinsic_collection_index(&self, symbol: SymbolId) -> Option<usize> {
         self.collection_symbols
             .iter()
@@ -6740,6 +6750,7 @@ pub(crate) struct Binder<'src> {
     /// Suppress BAMTS-C038 for identifiers in unreachable conditional branches.
     /// Resolution still proceeds so cannot-find-name errors in dead code are not lost.
     suppress_used_before_assigned: bool,
+    in_type_member_name: bool,
     /// Accumulated return expression types per function body node, used to
     /// infer function and getter return types when no annotation is present.
     return_types: HashMap<NodeId, Vec<TypeId>>,
@@ -6912,6 +6923,7 @@ impl<'src> Binder<'src> {
             uninitialized_variables: HashSet::new(),
             declarator_symbols: HashMap::new(),
             suppress_used_before_assigned: false,
+            in_type_member_name: false,
             diagnostic_suppressions,
             expected_diagnostics,
             return_types: HashMap::new(),
@@ -9465,6 +9477,9 @@ impl<'src> Binder<'src> {
         }
         if let (Some(type_symbol), Some(value_symbol)) = (console_type, console_value) {
             self.bind_intrinsic_console(type_symbol, value_symbol);
+        }
+        if let Some(symbol) = self.types.concat_array_symbol {
+            self.bind_intrinsic_concat_array(symbol);
         }
         if let (
             Some(set_value),
@@ -17806,6 +17821,15 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn resolve_type_member_name(&mut self, name: &'src PropertyName, scope: ScopeId) {
+        let PropertyName::Computed(expression) = name else {
+            return;
+        };
+        let enclosing = std::mem::replace(&mut self.in_type_member_name, true);
+        self.resolve_expr(expression, scope);
+        self.in_type_member_name = enclosing;
+    }
+
     pub(crate) fn resolve_expr(&mut self, expression: &'src Expr, scope: ScopeId) {
         match expression.data() {
             Expression::Identifier(identifier) => {
@@ -20827,6 +20851,9 @@ impl<'src> Binder<'src> {
                 self.namespace_reference_blocks
                     .insert(reference, declaration);
             }
+            if self.in_type_member_name {
+                return;
+            }
             if self.strict_null_checks
                 && !self.suppress_used_before_assigned
                 && self.uninitialized_variables.contains(&symbol)
@@ -22003,11 +22030,12 @@ impl<'src> Binder<'src> {
                 self.types.union(&[string, number, symbol])
             }
             SymbolKind::IntrinsicType
-                if self.types.intrinsic_collection_index(symbol).is_some() =>
+                if self.types.intrinsic_collection_index(symbol).is_some()
+                    || self.types.concat_array_symbol == Some(symbol) =>
             {
                 self.types
                     .declared_class(symbol)
-                    .expect("intrinsic collection class registered")
+                    .expect("intrinsic generic interface registered")
             }
             SymbolKind::IntrinsicType if self.class_instance_types.contains_key(&symbol) => {
                 self.class_instance_types[&symbol]
@@ -22908,7 +22936,7 @@ impl<'src> Binder<'src> {
         for member in members {
             match member.data() {
                 TypeMember::Property(property) => {
-                    self.resolve_property_name(&property.name, scope);
+                    self.resolve_type_member_name(&property.name, scope);
                     if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&property.name)
                     {
                         let method = match &property.type_annotation {
@@ -22947,7 +22975,7 @@ impl<'src> Binder<'src> {
                     }
                 }
                 TypeMember::Method(method) => {
-                    self.resolve_property_name(&method.name, scope);
+                    self.resolve_type_member_name(&method.name, scope);
                     if let Some(protocol) = self.intrinsic_symbol_iterator_protocol(&method.name) {
                         if self.no_implicit_any && method.function.return_type_missing {
                             self.emit(

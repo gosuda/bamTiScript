@@ -8,7 +8,10 @@
 //! lib is not in the active set does not resolve, so a missing member
 //! reports the same diagnostic as a missing object member.
 
-use super::{Binder, FunctionParameter, ObjectType, Type, TypeId};
+use super::{
+    Binder, FunctionParameter, IndexSignature, ObjectType, PropertyType, ScopeKind, SymbolId, Type,
+    TypeId,
+};
 use crate::checker::intrinsic_environment::Lib;
 use crate::source::TextRange;
 
@@ -314,6 +317,46 @@ impl Binder<'_> {
         }
     }
 
+    pub(super) fn bind_intrinsic_concat_array(&mut self, symbol: SymbolId) {
+        let scope = self.new_scope(ScopeKind::Block, None);
+        let parameter = self.declare_intrinsic_type_parameter(scope, "T");
+        self.types.declare_class(symbol, vec![parameter]);
+        let element = self.types.named(parameter);
+        let number = self.types.number();
+        let properties = [
+            PropertyType::new("length", false, number).with_readonly(true),
+            PropertyType::new("join", false, self.array_join_method()).with_method(true),
+            PropertyType::new("slice", false, self.array_slice_method(element)).with_method(true),
+        ];
+        let template = self.types.object_type_with_members(ObjectType {
+            properties: Vec::from(properties),
+            index_signatures: vec![IndexSignature {
+                readonly: true,
+                parameters: vec![req("n", number)],
+                value_type: element,
+                declaring_types: Vec::new(),
+            }],
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        self.types.publish_final_class_template(symbol, template);
+    }
+
+    fn array_join_method(&mut self) -> TypeId {
+        let string = self.types.string();
+        self.method_type(vec![opt("separator", string)], string)
+    }
+
+    fn array_slice_method(&mut self, element: TypeId) -> TypeId {
+        let number = self.types.number();
+        let result = self.types.array(element);
+        self.method_type(vec![opt("start", number), opt("end", number)], result)
+    }
+
     fn array_member(&mut self, element: TypeId, name: &str) -> Option<TypeId> {
         let number = self.types.number();
         let string = self.types.string();
@@ -333,10 +376,7 @@ impl Binder<'_> {
                 let items = self.types.array(element);
                 Some(self.method_type(vec![rest("items", items)], number))
             }
-            "slice" => {
-                let result = self.types.array(element);
-                Some(self.method_type(vec![opt("start", number), opt("end", number)], result))
-            }
+            "slice" => Some(self.array_slice_method(element)),
             "splice" => {
                 let items = self.types.array(element);
                 let result = self.types.array(element);
@@ -353,7 +393,7 @@ impl Binder<'_> {
                 vec![req("searchElement", element), opt("fromIndex", number)],
                 number,
             )),
-            "join" => Some(self.method_type(vec![opt("separator", string)], string)),
+            "join" => Some(self.array_join_method()),
             "reverse" => {
                 let result = self.types.array(element);
                 Some(self.nullary(result))

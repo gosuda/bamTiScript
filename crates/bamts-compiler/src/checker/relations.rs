@@ -495,6 +495,10 @@ impl<'table> TypeRelations<'table> {
         }
         let result = if !alias_relation_inserted || identical_application {
             true
+        } else if target_class
+            && let Some(compatible) = self.array_relates_to_concat_array(source, target, strictness)
+        {
+            compatible
         } else if source_applied || target_applied {
             let source_view = if source_class {
                 self.table.applied_class_view(source)
@@ -2110,6 +2114,31 @@ impl<'table> TypeRelations<'table> {
                     .unwrap_or_else(|| source.index_signatures.is_empty());
                 properties_relate && signatures_relate
             })
+    }
+
+    fn array_relates_to_concat_array(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        strictness: Strictness,
+    ) -> Option<bool> {
+        let element = self.table.concat_array_element(target)?;
+        let relates_element = |source| self.relates(source, element, strictness);
+        match self.table.get(source) {
+            Type::Array(source) => Some(relates_element(*source)),
+            Type::Tuple(shape) => Some(
+                (shape.required as usize >= shape.prefix.len()
+                    || relates_element(self.table.undefined_type()))
+                    && shape
+                        .prefix
+                        .iter()
+                        .chain(shape.rest.iter())
+                        .chain(&shape.suffix)
+                        .copied()
+                        .all(relates_element),
+            ),
+            _ => None,
+        }
     }
 
     /// An array or tuple flows into an object type carrying numeric index

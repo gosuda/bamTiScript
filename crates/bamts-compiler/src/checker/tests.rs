@@ -4529,6 +4529,45 @@ fn block_scoped_used_before_declaration_matrix() {
     assert_eq!(codes("let a = 1; a; const b = a; b;"), Vec::<&str>::new());
 }
 
+#[test]
+fn computed_type_members_do_not_read_later_values_at_runtime() {
+    let text = "type Events = { [key]: number };
+                interface Handler { [key](): void; }
+                const object = { [key]: 1 };
+                const key = Symbol();";
+    let checked = check_text(text);
+    let diagnostics = checked.diagnostics();
+    assert_eq!(
+        checker_codes(&checked),
+        [BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()]
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code() == BLOCK_SCOPED_USED_BEFORE_DECLARATION)
+            .map(|diagnostic| diagnostic.range().start().get()),
+        text.find("{ [key]: 1 }").map(|start| start + "{ [".len())
+    );
+}
+
+#[test]
+fn array_concat_accepts_compatible_arrays_tuples_and_array_like_values() {
+    let checked = check_text(
+        "function concat(left: string[], array: string[], tuple: [string, string],
+                         wrong: number[],
+                         arrayLike: {
+                             readonly length: number;
+                             readonly [index: number]: string;
+                             join(separator?: string): string;
+                             slice(start?: number, end?: number): string[];
+                         }) {
+             left.concat(array, tuple, arrayLike);
+             left.concat(wrong);
+         }",
+    );
+    assert_eq!(checker_codes(&checked), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+}
+
 /// TS2576: super.S1 where S1 is a base static member. Also pins the
 /// superAccess oracle shape: static fires TS2576, instance fields fire
 /// TS2855, and a base instance method stays silent.
