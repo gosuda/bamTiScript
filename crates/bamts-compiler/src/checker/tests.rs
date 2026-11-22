@@ -1905,6 +1905,21 @@ fn numeric_keys_use_string_index_signatures() {
 }
 
 #[test]
+fn alias_named_literal_union_keys_use_string_index_signatures() {
+    let result = check_text(
+        "type Key = 'a' | 'b';\n\
+             declare const key: Key;\n\
+             declare const dictionary: { [name: string]: number };\n\
+             declare const record: Record<string, number>;\n\
+             const fromDictionary: number = dictionary[key];\n\
+             const fromRecord: number = record[key];\n\
+             type Value = { [name: string]: number }[Key];\n\
+             const typed: Value = 1;",
+    );
+    assert!(checker_codes(&result).is_empty());
+}
+
+#[test]
 fn dynamic_index_access_rejects_partially_indexable_unions() {
     let result = check_text(
         "declare const key: string;\n\

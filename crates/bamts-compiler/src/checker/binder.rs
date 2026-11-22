@@ -3343,6 +3343,11 @@ impl TypeTable {
     }
 
     fn try_reduce_indexed_access(&mut self, object: TypeId, index: TypeId) -> Option<TypeId> {
+        if let Some(view) = self.prepare_applied_alias_view(index)
+            && view != index
+        {
+            return self.try_reduce_indexed_access(object, view);
+        }
         match self.get(index).clone() {
             Type::Union(members) => {
                 let mut found = Vec::with_capacity(members.len());
