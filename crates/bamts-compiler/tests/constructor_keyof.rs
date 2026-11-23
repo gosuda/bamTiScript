@@ -441,3 +441,45 @@ const reverseString: keyof typeof E = "1";
         2,
     );
 }
+
+#[test]
+fn numeric_constructor_keys_accept_equivalent_literal_spellings() {
+    assert_checks(
+        r#"
+class C { static 2.5 = true; static 16 = true; static 1000 = true; }
+type K = keyof typeof C;
+const fractional: K = 2.50;
+const exponent: K = 25e-1;
+const hexadecimal: K = 0x10;
+const decimal: K = 16;
+const separated: K = 1_000;
+const plain: K = 1000;
+"#,
+    );
+}
+
+#[test]
+fn numeric_literal_aliases_compare_values_in_both_directions() {
+    assert_checks(
+        r#"
+type Short = 2.5;
+type Long = 2.50;
+const short: Short = 2.50;
+const long: Long = 2.5;
+"#,
+    );
+}
+
+#[test]
+fn numeric_key_value_comparison_rejects_other_values_and_string_keys() {
+    assert_assignment_errors(
+        r#"
+class Numeric { static 2.5 = true; }
+class Quoted { static "2.5" = true; }
+const different: keyof typeof Numeric = 2.51;
+const wrongString: keyof typeof Numeric = "2.5";
+const wrongNumber: keyof typeof Quoted = 2.50;
+"#,
+        3,
+    );
+}
