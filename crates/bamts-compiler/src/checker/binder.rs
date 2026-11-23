@@ -1743,6 +1743,12 @@ impl TypeTable {
         ty
     }
 
+    #[must_use]
+    #[inline]
+    pub(crate) fn constructor_identity(&self, id: TypeId) -> TypeId {
+        self.constructor_revisions.get(&id).copied().unwrap_or(id)
+    }
+
     pub(crate) fn iterable_view(&self, source: TypeId) -> Option<TypeId> {
         self.iterable_views.get(&source).copied()
     }
