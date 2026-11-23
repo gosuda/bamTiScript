@@ -2872,6 +2872,10 @@ impl TypeTable {
 
     fn keyof_view(&mut self, view: TypeId) -> Option<TypeId> {
         match self.get(view).clone() {
+            Type::ConstructorType {
+                structural: target, ..
+            }
+            | Type::TypeQuery { target, .. } => self.try_reduce_keyof(target),
             Type::ObjectType(object) => {
                 let mut keys =
                     Vec::with_capacity(object.properties.len() + object.index_signatures.len());

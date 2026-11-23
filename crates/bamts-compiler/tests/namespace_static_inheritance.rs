@@ -139,16 +139,32 @@ fn a_type_alias_captured_before_merge_sees_later_exports() {
     );
 }
 
-// Pre-existing gap, not stale-alias specific: `keyof typeof D` fails even
-// without an alias, so `keyof` on constructors needs its own fix.
 #[test]
-#[ignore = "keyof on constructors is unreduced even direct; tracks separately"]
 fn an_early_constructor_alias_keyof_includes_later_namespace_exports() {
     assert_reads_clean(
         "class C {}\nclass D extends C {}\nconst alias = D;\n\
          namespace C { export const x: 1 = 1; }\ntype K = keyof typeof alias;\nconst k: K = \"x\";\n",
         "an alias's keyof includes the constructor's later namespace exports",
     );
+}
+
+#[test]
+fn a_constructor_type_query_keyof_includes_own_and_inherited_statics() {
+    assert_reads_clean(
+        "class C { static base: 1 = 1; }\nclass D extends C { static own: 2 = 2; }\n\
+         type K = keyof typeof D;\nconst inherited: K = \"base\";\n\
+         const own: K = \"own\";\nconst prototype: K = \"prototype\";\n",
+        "a constructor type query exposes its structural keys",
+    );
+}
+
+#[test]
+fn a_constructor_keyof_rejects_absent_properties() {
+    let codes = checker_codes(
+        "class C { static present: 1 = 1; }\n\
+         const key: keyof typeof C = \"missing\";\n",
+    );
+    assert!(codes.iter().any(|code| code == "BAMTS-C004"), "{codes:?}");
 }
 
 // Pre-existing gap, not stale-alias specific: `new D<number>(1)` fails even
