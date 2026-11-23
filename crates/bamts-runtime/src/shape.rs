@@ -123,29 +123,31 @@ pub(crate) enum Which {
 /// One inline cache site for named property get or set.
 #[derive(Clone, Debug)]
 pub(crate) struct PropertySite {
-    pub(crate) entries: [(ShapeId, PropertyKey); 4],
+    entries: [(ShapeId, PropertyKey, u32); 4],
     pub(crate) len: u8,
 }
 impl PropertySite {
     const fn new() -> Self {
         Self {
             entries: [
-                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
-                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
-                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
-                (ShapeId::ROOT, PropertyKey::Private(u32::MAX)),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX), 0),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX), 0),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX), 0),
+                (ShapeId::ROOT, PropertyKey::Private(u32::MAX), 0),
             ],
             len: 0,
         }
     }
-    pub(crate) fn matches(&self, shape: ShapeId, key: &PropertyKey) -> bool {
+    pub(crate) fn slot(&self, shape: ShapeId, key: &PropertyKey) -> Option<u32> {
         self.entries[..usize::from(self.len)]
             .iter()
-            .any(|(cached_shape, cached_key)| *cached_shape == shape && cached_key == key)
+            .find_map(|(cached_shape, cached_key, slot)| {
+                (*cached_shape == shape && cached_key == key).then_some(*slot)
+            })
     }
-    pub(crate) fn record(&mut self, shape: ShapeId, key: PropertyKey) {
+    pub(crate) fn record(&mut self, shape: ShapeId, key: PropertyKey, slot: u32) {
         if usize::from(self.len) < self.entries.len() {
-            self.entries[usize::from(self.len)] = (shape, key);
+            self.entries[usize::from(self.len)] = (shape, key, slot);
             self.len += 1;
         } else {
             self.len = u8::MAX;
