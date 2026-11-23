@@ -2787,11 +2787,12 @@ fn definite_initialization(
     let mut entry = RegisterSet::empty(register_count);
     entry.insert_prefix(function.entry_initialized());
     facts[0] = entry;
+    let mut after = RegisterSet::empty(register_count);
 
     loop {
         let mut changed = false;
         for (pc, instruction) in function.code.iter().copied().enumerate() {
-            let mut after = facts[pc].clone();
+            after.words.copy_from_slice(&facts[pc].words);
             instruction.visit_writes(|write| after.insert(write));
             instruction.visit_successors(pc as u32, |successor| {
                 changed |= facts[successor.get() as usize].intersect(&after);
@@ -2800,12 +2801,12 @@ fn definite_initialization(
         for handler in function.handlers.iter().copied() {
             let start = handler.start.get() as usize;
             let end = handler.end.get() as usize;
-            let mut contribution = RegisterSet::full(register_count);
-            for protected in &facts[start..end] {
-                contribution.intersect(protected);
+            after.words.copy_from_slice(&facts[start].words);
+            for protected in &facts[start + 1..end] {
+                after.intersect(protected);
             }
-            contribution.insert(handler.catch_register);
-            changed |= facts[handler.handler.get() as usize].intersect(&contribution);
+            after.insert(handler.catch_register);
+            changed |= facts[handler.handler.get() as usize].intersect(&after);
         }
         if !changed {
             break;
