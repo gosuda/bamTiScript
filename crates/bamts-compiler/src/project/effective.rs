@@ -1502,7 +1502,16 @@ fn rewrite_layer_paths(
             rewrite_references(root, directory, value)?,
         );
     }
-    if let Some(compiler) = raw.get("compilerOptions").and_then(JsonValue::as_object) {
+    if let Some(value) = raw.get("compilerOptions") {
+        let compiler = value.as_object().ok_or_else(|| {
+            ProjectCompileError::Config(
+                super::ConfigError::InvalidField {
+                    field: Arc::from("compilerOptions"),
+                    expected: "an object",
+                }
+                .into(),
+            )
+        })?;
         let rewritten = rewrite_compiler_paths(root, directory, compiler)?;
         set_named_entry(
             &mut entries,
@@ -2479,6 +2488,55 @@ mod tests {
                 fixture.0.join("app/tsconfig.json"),
             ]
         );
+    }
+
+    #[test]
+    fn malformed_compiler_options_are_rejected_before_merging_or_overrides() {
+        for invalid in ["[]", "null", "false", "42", r#""invalid""#] {
+            for inherited in [false, true] {
+                let fixture = Fixture::new();
+                fixture.write("main.ts", "export const value = 1;\n");
+                let malformed = format!(r#"{{"compilerOptions":{invalid}}}"#);
+                if inherited {
+                    fixture.write("base.json", &malformed);
+                    fixture.write(
+                        "tsconfig.json",
+                        r#"{"extends":"./base.json","files":["main.ts"],"compilerOptions":{}}"#,
+                    );
+                } else {
+                    fixture.write("tsconfig.json", &malformed);
+                }
+                let filesystem = fixture.filesystem();
+                let mut request = fixture.request("tsconfig.json");
+                request.overrides.strict = Some(true);
+                let root = ProjectRoot::new(&fixture.0).unwrap();
+                let errors = [
+                    EffectiveProject::load(&request, &filesystem).unwrap_err(),
+                    load_reference_closure(
+                        &root,
+                        &[fixture.0.join("tsconfig.json")],
+                        &filesystem,
+                    )
+                    .unwrap_err(),
+                ];
+                for error in errors {
+                    assert!(
+                        matches!(
+                            error,
+                            ProjectCompileError::Config(ref diagnostics)
+                                if diagnostics.iter().any(|diagnostic| matches!(
+                                    diagnostic,
+                                    super::super::tsconfig::TsConfigDiagnostic::InvalidField {
+                                        field,
+                                        expected: "an object",
+                                    } if field.as_ref() == "compilerOptions"
+                                ))
+                        ),
+                        "invalid={invalid}, inherited={inherited}: {error}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
