@@ -9,6 +9,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
+#[cfg(not(target_env = "msvc"))]
 use std::process::Output;
 use std::sync::atomic::Ordering;
 
