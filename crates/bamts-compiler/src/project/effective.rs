@@ -2512,12 +2512,8 @@ mod tests {
                 let root = ProjectRoot::new(&fixture.0).unwrap();
                 let errors = [
                     EffectiveProject::load(&request, &filesystem).unwrap_err(),
-                    load_reference_closure(
-                        &root,
-                        &[fixture.0.join("tsconfig.json")],
-                        &filesystem,
-                    )
-                    .unwrap_err(),
+                    load_reference_closure(&root, &[fixture.0.join("tsconfig.json")], &filesystem)
+                        .unwrap_err(),
                 ];
                 for error in errors {
                     assert!(
