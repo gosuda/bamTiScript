@@ -671,7 +671,11 @@ impl Serialize for ProjectShowConfig<'_> {
         let mut state = serializer.serialize_map(None)?;
         let empty_object = JsonValue::Object(JsonObject::from_entries(Vec::new()));
         let compiler_options = raw.get("compilerOptions").unwrap_or(&empty_object);
-        let canonical = canonicalize_compiler_options(compiler_options, config_directory);
+        let canonical = canonicalize_compiler_options(
+            compiler_options,
+            config_directory,
+            self.project.paths_base_directory(),
+        );
         // TypeScript 7.0.2 nests the implied options it reports for the
         // supported target/module surface inside `compilerOptions`, appended
         // after the explicit entries. Each implication applies only when the
@@ -746,6 +750,7 @@ impl Serialize for ProjectShowConfig<'_> {
 pub(super) fn canonicalize_compiler_options(
     options: &JsonValue,
     config_directory: &Path,
+    paths_base_directory: Option<&Path>,
 ) -> JsonValue {
     const ENUM_OPTIONS: &[&str] = &[
         "target",
@@ -766,11 +771,7 @@ pub(super) fn canonicalize_compiler_options(
     let Some(object) = options.as_object() else {
         return options.clone();
     };
-    let base_url = object
-        .get("baseUrl")
-        .and_then(JsonValue::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config_directory.to_path_buf());
+    let paths_base = paths_base_directory.unwrap_or(config_directory);
     let entries = object
         .entries()
         .iter()
@@ -828,7 +829,7 @@ pub(super) fn canonicalize_compiler_options(
                                                     .expect("paths target is a string");
                                                 JsonValue::String(Arc::from(
                                                     ProjectShowConfig::relative_path(
-                                                        &base_url,
+                                                        paths_base,
                                                         Path::new(text),
                                                     )
                                                     .as_str(),
@@ -851,6 +852,7 @@ pub(super) fn canonicalize_compiler_options(
                     JsonValue::Object(nested) => canonicalize_compiler_options(
                         &JsonValue::Object(nested.clone()),
                         config_directory,
+                        paths_base_directory,
                     ),
                     other => other.clone(),
                 }

@@ -2302,6 +2302,205 @@ fn tsc_project_base_url_null_clears_inherited_and_command_line_values() {
 }
 
 #[test]
+fn tsc_base_url_null_preserves_the_paths_declaration_origin() {
+    for (config, clear, expected_file, expected_value) in [
+        (
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            true,
+            "util.ts",
+            "root",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","files":["main.ts"]}"#,
+            true,
+            "configs/util.ts",
+            "base",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","compilerOptions":{"paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            true,
+            "util.ts",
+            "root",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","compilerOptions":{"baseUrl":null},"files":["main.ts"]}"#,
+            false,
+            "configs/util.ts",
+            "base",
+        ),
+        (
+            r#"{"extends":"./configs/middle.json","files":["main.ts"]}"#,
+            true,
+            "configs/util.ts",
+            "base",
+        ),
+        (
+            r#"{"compilerOptions":{"baseUrl":"../outside","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            true,
+            "util.ts",
+            "root",
+        ),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("tsconfig.json", config);
+        project.write(
+            "configs/base.json",
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}}}"#,
+        );
+        project.write(
+            "configs/middle.json",
+            r#"{"extends":"./base.json","compilerOptions":{"baseUrl":"elsewhere"}}"#,
+        );
+        project.write("util.ts", "export const selected: 'root' = 'root';\n");
+        project.write(
+            "configs/util.ts",
+            "export const selected: 'base' = 'base';\n",
+        );
+        for file in [
+            "vendor/util.ts",
+            "configs/vendor/util.ts",
+            "configs/elsewhere/util.ts",
+        ] {
+            project.write(file, "export const selected: 'stale' = 'stale';\n");
+        }
+        project.write(
+            "main.ts",
+            &format!("import {{ selected }} from '@util';\nexport const result: '{expected_value}' = selected;\n"),
+        );
+        let overrides = if clear {
+            &["--baseUrl", "null"][..]
+        } else {
+            &[][..]
+        };
+        let checked = project
+            .command()
+            .args(["-p", "tsconfig.json", "--noEmit", "--listFiles"])
+            .args(overrides)
+            .current_dir(&project.path)
+            .output()
+            .expect("path mapping check starts");
+        assert_success(
+            &checked,
+            "cleared baseUrl preserves paths declaration origin",
+        );
+        let expected = project
+            .path
+            .join(expected_file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            stdout(&checked).lines().any(|line| line == expected),
+            "{}",
+            stdout(&checked)
+        );
+        assert!(
+            !stdout(&checked).contains("/vendor/"),
+            "{}",
+            stdout(&checked)
+        );
+
+        let shown = project
+            .command()
+            .args(["-p", "tsconfig.json", "--showConfig"])
+            .args(overrides)
+            .current_dir(&project.path)
+            .output()
+            .expect("path mapping showConfig starts");
+        assert_success(&shown, "showConfig retains the paths substitution spelling");
+        let shown: serde_json::Value =
+            serde_json::from_slice(&shown.stdout).expect("config is JSON");
+        assert_eq!(shown["compilerOptions"]["paths"]["@util"][0], "./util.ts");
+        assert!(shown["compilerOptions"].get("baseUrl").is_none());
+    }
+}
+
+#[test]
+fn tsc_removed_base_url_never_rebases_path_mappings() {
+    for (config, overrides, expected_file) in [
+        (
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            &[][..],
+            "util.ts",
+        ),
+        (
+            r#"{"compilerOptions":{"baseUrl":"../outside","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            &[][..],
+            "util.ts",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","files":["main.ts"]}"#,
+            &["--baseUrl", "./new"][..],
+            "configs/util.ts",
+        ),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("tsconfig.json", config);
+        project.write(
+            "configs/base.json",
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}}}"#,
+        );
+        project.write(
+            "main.ts",
+            "import { value } from '@util';\nexport { value };\n",
+        );
+        for file in [
+            "util.ts",
+            "configs/util.ts",
+            "vendor/util.ts",
+            "configs/vendor/util.ts",
+            "new/util.ts",
+        ] {
+            project.write(file, "export const value = 42;\n");
+        }
+        let output = project
+            .command()
+            .args(["-p", "tsconfig.json", "--noEmit", "--listFiles"])
+            .args(overrides)
+            .current_dir(&project.path)
+            .output()
+            .expect("removed baseUrl path mapping check starts");
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stdout(&output).contains("error TS5102"),
+            "{}",
+            stdout(&output)
+        );
+        let expected = project
+            .path
+            .join(expected_file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            stdout(&output).lines().any(|line| line == expected),
+            "{}",
+            stdout(&output)
+        );
+        assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    }
+}
+
+#[test]
+fn check_resolves_paths_from_the_config_directory() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":"../outside","paths":{"@util":["./util.ts"]}}}"#,
+    );
+    project.write("util.ts", "export const value: number = 42;\n");
+    project.write(
+        "main.ts",
+        "import { value } from '@util';\nexport const result: number = value;\n",
+    );
+    let output = project
+        .command()
+        .args(["check", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("native config check starts");
+    assert_success(&output, "shared config parsing ignores baseUrl for paths");
+}
+
+#[test]
 fn tsc_direct_emits_declaration_for_single_root() {
     let project = ScratchDirectory::new();
     project.write("hello.ts", "export const value: number = 1;\n");

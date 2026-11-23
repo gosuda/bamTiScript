@@ -1305,7 +1305,7 @@ impl ProjectConfig {
         // only actual source and path-mapping targets require confinement.
         let base_url = optional_output_path(root, directory, compiler, "baseUrl")?
             .unwrap_or_else(|| directory.to_path_buf());
-        let paths = parse_path_mappings(root, &base_url, compiler)?;
+        let paths = parse_path_mappings(root, directory, compiler)?;
         let strict = optional_bool(compiler, "strict")?.unwrap_or(false);
         let options = CompilerOptions {
             target: optional_nested_string(compiler, "target")?,

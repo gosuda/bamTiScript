@@ -97,6 +97,7 @@ pub struct EffectiveProject {
     /// The tsconfig text this project was loaded from, when one exists.
     /// Diagnostics that must anchor inside the configuration read it.
     config_source: Option<Arc<str>>,
+    paths_base_directory: Option<PathBuf>,
 }
 
 impl EffectiveProject {
@@ -117,10 +118,10 @@ impl EffectiveProject {
             .map_err(ProjectCompileError::Path)?;
         // Direct CLI compilation supplies its own roots and no configuration
         // document: the effective options come only from the overrides.
-        let (raw, diagnostic_patterns, config_source) = match &request.source_files {
+        let (raw, path_origins, config_source) = match &request.source_files {
             Some(_) => (
                 JsonObject::from_entries(Vec::new()),
-                DiagnosticPatterns::default(),
+                ConfigPathOrigins::default(),
                 None,
             ),
             None => {
@@ -147,7 +148,7 @@ impl EffectiveProject {
             TsConfig::parse_value(&root, &config_path, raw).map_err(ProjectCompileError::Config)?;
         let source_files = match &request.source_files {
             Some(paths) => materialize_explicit_sources(&root, paths)?,
-            None => materialize_sources(&root, &config, &diagnostic_patterns, fs)?,
+            None => materialize_sources(&root, &config, &path_origins, fs)?,
         };
         let build_info_path = effective_build_info_path(&root, &config)?;
 
@@ -160,6 +161,7 @@ impl EffectiveProject {
             build_info_path,
             config,
             config_source,
+            paths_base_directory: path_origins.paths,
         })
     }
 
@@ -201,6 +203,13 @@ impl EffectiveProject {
     #[must_use]
     pub const fn config(&self) -> &TsConfig {
         &self.config
+    }
+
+    /// The declaring directory of the effective `paths` option. TypeScript 7
+    /// resolves substitutions there independently of the removed `baseUrl`.
+    #[must_use]
+    pub fn paths_base_directory(&self) -> Option<&Path> {
+        self.paths_base_directory.as_deref()
     }
 
     /// Reports removed compiler options without reading source files. The
@@ -1348,9 +1357,10 @@ impl From<MaterializeError> for ProjectCompileError {
 }
 
 #[derive(Default)]
-struct DiagnosticPatterns {
+struct ConfigPathOrigins {
     include: Option<PatternSource>,
     exclude: Option<PatternSource>,
+    paths: Option<PathBuf>,
 }
 
 struct PatternSource {
@@ -1358,7 +1368,7 @@ struct PatternSource {
     values: Arc<[Arc<str>]>,
 }
 
-impl DiagnosticPatterns {
+impl ConfigPathOrigins {
     fn capture(&mut self, raw: &JsonObject, config_path: &Path) {
         let Some(directory) = config_path.parent() else {
             return;
@@ -1374,6 +1384,13 @@ impl DiagnosticPatterns {
                 directory: directory.to_path_buf(),
                 values,
             });
+        }
+        if raw
+            .get("compilerOptions")
+            .and_then(JsonValue::as_object)
+            .is_some_and(|options| options.get("paths").is_some())
+        {
+            self.paths = Some(directory.to_path_buf());
         }
     }
 }
@@ -1395,7 +1412,7 @@ fn load_merged_raw(
     config_path: &Path,
     source: &str,
     fs: &dyn FileSystem,
-) -> Result<(JsonObject, DiagnosticPatterns, Arc<str>), ProjectCompileError> {
+) -> Result<(JsonObject, ConfigPathOrigins, Arc<str>), ProjectCompileError> {
     let chain = resolve_extends(
         root,
         config_path,
@@ -1422,17 +1439,17 @@ fn merge_config_layers(
     chain: &[ResolvedExtends],
     derived_path: &Path,
     derived_raw: &JsonObject,
-) -> Result<(JsonObject, DiagnosticPatterns), ProjectCompileError> {
+) -> Result<(JsonObject, ConfigPathOrigins), ProjectCompileError> {
     let mut merged = JsonObject::from_entries(Vec::new());
-    let mut patterns = DiagnosticPatterns::default();
+    let mut patterns = ConfigPathOrigins::default();
     for layer in chain.iter().rev() {
         let raw = parse_object(layer.source()).map_err(ProjectCompileError::Config)?;
         patterns.capture(&raw, layer.path());
-        let rewritten = rewrite_layer_paths(root, layer.path(), &raw, &merged)?;
+        let rewritten = rewrite_layer_paths(root, layer.path(), &raw)?;
         merged = merge_objects(&merged, &rewritten);
     }
     patterns.capture(derived_raw, derived_path);
-    let rewritten = rewrite_layer_paths(root, derived_path, derived_raw, &merged)?;
+    let rewritten = rewrite_layer_paths(root, derived_path, derived_raw)?;
     Ok((merge_objects(&merged, &rewritten), patterns))
 }
 
@@ -1462,7 +1479,6 @@ fn rewrite_layer_paths(
     root: &ProjectRoot,
     config_path: &Path,
     raw: &JsonObject,
-    inherited: &JsonObject,
 ) -> Result<JsonObject, ProjectCompileError> {
     let directory = config_path.parent().ok_or_else(|| {
         ProjectCompileError::Path(PathError::PathHasNoParent {
@@ -1487,10 +1503,7 @@ fn rewrite_layer_paths(
         );
     }
     if let Some(compiler) = raw.get("compilerOptions").and_then(JsonValue::as_object) {
-        let inherited_compiler = inherited
-            .get("compilerOptions")
-            .and_then(JsonValue::as_object);
-        let rewritten = rewrite_compiler_paths(root, directory, compiler, inherited_compiler)?;
+        let rewritten = rewrite_compiler_paths(root, directory, compiler)?;
         set_named_entry(
             &mut entries,
             "compilerOptions",
@@ -1504,29 +1517,21 @@ fn rewrite_compiler_paths(
     root: &ProjectRoot,
     directory: &Path,
     compiler: &JsonObject,
-    inherited: Option<&JsonObject>,
 ) -> Result<JsonObject, ProjectCompileError> {
     let mut entries = compiler.entries().to_vec();
-    let inherited_base = inherited
-        .and_then(|object| object.get("baseUrl"))
-        .and_then(JsonValue::as_str)
-        .map(PathBuf::from);
-    let base_url = match compiler.get("baseUrl") {
-        Some(JsonValue::Null) => directory.to_path_buf(),
-        Some(value) => {
-            let value = value
-                .as_str()
-                .ok_or_else(|| invalid_config_field("baseUrl"))?;
-            let path = root.resolve_output_from(directory, value);
-            set_named_entry(
-                &mut entries,
-                "baseUrl",
-                JsonValue::String(path_to_arc(&path)),
-            );
-            path
-        }
-        None => inherited_base.unwrap_or_else(|| directory.to_path_buf()),
-    };
+    if let Some(value) = compiler.get("baseUrl")
+        && !matches!(value, JsonValue::Null)
+    {
+        let value = value
+            .as_str()
+            .ok_or_else(|| invalid_config_field("baseUrl"))?;
+        let path = root.resolve_output_from(directory, value);
+        set_named_entry(
+            &mut entries,
+            "baseUrl",
+            JsonValue::String(path_to_arc(&path)),
+        );
+    }
     for field in [
         "rootDir",
         "outDir",
@@ -1563,7 +1568,7 @@ fn rewrite_compiler_paths(
         for (pattern, targets) in mappings.entries() {
             rewritten.push((
                 Arc::clone(pattern),
-                rewrite_string_array(root, &base_url, targets)?,
+                rewrite_string_array(root, directory, targets)?,
             ));
         }
         set_named_entry(
@@ -1804,7 +1809,7 @@ fn materialize_explicit_sources(
 fn materialize_sources(
     root: &ProjectRoot,
     config: &TsConfig,
-    diagnostic_patterns: &DiagnosticPatterns,
+    diagnostic_patterns: &ConfigPathOrigins,
     fs: &dyn FileSystem,
 ) -> Result<Arc<[PathBuf]>, MaterializeError> {
     let project = config.config();
@@ -2134,6 +2139,7 @@ pub fn load_reference_closure(
             }
         })?;
         let (raw, ..) = load_merged_raw(root, &path, &source, fs)?;
+        let raw = apply_overrides(root, root.path(), raw, &ProjectOptionOverrides::default())?;
         let config =
             TsConfig::parse_value(root, &path, raw).map_err(ProjectCompileError::Config)?;
         let mut referenced = BTreeSet::new();
