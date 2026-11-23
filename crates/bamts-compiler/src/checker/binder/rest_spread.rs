@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::{Binder, ObjectType, PropertyType, Type, TypeId};
 use crate::syntax::Accessibility;
 
@@ -63,33 +65,27 @@ impl<'src> Binder<'src> {
             Type::ConstructorType { structural, .. } => (structural, true),
             _ => (view, false),
         };
-        let Type::ObjectType(object) = self.types.get(structural).clone() else {
+        let Some(object) = self.types.current_object_view(structural) else {
             return source;
         };
-        if excluded.is_empty()
+        if matches!(&object, Cow::Borrowed(_))
+            && excluded.is_empty()
             && !object.properties.iter().any(Self::is_spread_excluded)
             && !statics
         {
             return source;
         }
-        let mut properties = Vec::with_capacity(object.properties.len());
-        for property in &object.properties {
+        let mut object = object.into_owned();
+        object.properties.retain(|property| {
             if excluded.iter().any(|name| name.as_str() == property.name()) {
-                continue;
+                return false;
             }
-            if property.access() != Accessibility::Public {
-                continue;
+            if statics {
+                property.access() == Accessibility::Public
+            } else {
+                !Self::is_spread_excluded(property)
             }
-            if !statics
-                && property.declaring_class().is_some()
-                && (property.is_method() || property.accessor())
-            {
-                continue;
-            }
-            properties.push(property.clone());
-        }
-        let mut filtered = object.clone();
-        filtered.properties = properties;
-        self.types.object_type_with_members(filtered)
+        });
+        self.types.object_type_with_members(object)
     }
 }

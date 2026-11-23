@@ -1262,11 +1262,19 @@ impl<'a> NarrowingContext<'a> {
             };
         }
         self.filter(ty, &|table, candidate| match candidate {
-            Type::Named(_)
-            | Type::Object
-            | Type::Keyof(_)
-            | Type::IndexedAccess { .. }
-            | Type::Record { .. } => Narrow::Keep,
+            Type::Named(_) | Type::Object | Type::Keyof(_) | Type::IndexedAccess { .. } => {
+                Narrow::Keep
+            }
+            Type::Record {
+                key,
+                value,
+                optional_value,
+            } if table
+                .record_structural_view(*key, *value, *optional_value)
+                .is_none() =>
+            {
+                Narrow::Keep
+            }
             _ if typeof_matches(table, candidate, name) != negated => Narrow::Keep,
             _ => Narrow::Drop,
         })
@@ -1381,25 +1389,38 @@ impl<'a> NarrowingContext<'a> {
     /// both polarities; primitives can only take the negative branch.
     #[must_use]
     pub fn narrow_in(&mut self, ty: TypeId, property: &str, negated: bool) -> TypeId {
-        self.filter(ty, &|_, candidate| match candidate {
-            Type::ObjectType(object) => {
-                let declares = object
-                    .properties
+        self.filter(ty, &|table, candidate| {
+            let declares = match candidate {
+                Type::ObjectType(object) => object
+                    .properties()
                     .iter()
-                    .any(|member| member.name() == property);
-                if declares != negated {
-                    Narrow::Keep
-                } else {
-                    Narrow::Drop
+                    .any(|member| member.name() == property),
+                Type::Record {
+                    key,
+                    value,
+                    optional_value,
+                } => {
+                    let Some(object) = table.record_structural_view(*key, *value, *optional_value)
+                    else {
+                        return Narrow::Keep;
+                    };
+                    object
+                        .properties()
+                        .iter()
+                        .any(|member| member.name() == property)
                 }
+                Type::Object
+                | Type::Function(_)
+                | Type::Array(_)
+                | Type::Named(_)
+                | Type::AppliedClass { .. } => return Narrow::Keep,
+                _ => false,
+            };
+            if declares != negated {
+                Narrow::Keep
+            } else {
+                Narrow::Drop
             }
-            Type::Object
-            | Type::Function(_)
-            | Type::Array(_)
-            | Type::Named(_)
-            | Type::AppliedClass { .. } => Narrow::Keep,
-            _ if negated => Narrow::Keep,
-            _ => Narrow::Drop,
         })
     }
 
@@ -2548,6 +2569,7 @@ fn typeof_matches(table: &TypeTable, ty: &Type, name: TypeofName) -> bool {
         TypeofName::Object => matches!(
             ty,
             Type::ObjectType(_)
+                | Type::Record { .. }
                 | Type::Array(_)
                 | Type::Tuple(_)
                 | Type::Null

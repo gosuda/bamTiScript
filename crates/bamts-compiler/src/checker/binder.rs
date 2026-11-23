@@ -1520,11 +1520,14 @@ pub enum Type {
         object: TypeId,
         index: TypeId,
     },
-    /// A deferred `Record<K, V>` mapped type. Concrete keys reduce to an
-    /// ordinary object type at construction or generic instantiation.
+    /// A retained `Record<K, V>` mapped type. Generic and live constructor
+    /// keys keep their identity; consumers read their current object shape.
     Record {
         key: TypeId,
         value: TypeId,
+        /// Present for mapped optional members, containing `V | undefined`.
+        /// The declared value stays separate from the optional read type.
+        optional_value: Option<TypeId>,
     },
     /// A receiver-bound `this` type. The owner isolates markers from nested
     /// foreign types; the constraint names its declaring class or interface.
@@ -1871,20 +1874,18 @@ impl TypeTable {
             _ => ty,
         };
         match self.get(ty) {
-            Type::ObjectType(object) => {
+            Type::ObjectType(_) | Type::Record { .. } => {
+                let object = self.current_object_view(ty)?;
                 if let Some(property) = object.property(name) {
                     return Some(property.type_id());
                 }
 
-                let numeric = name.parse::<usize>().is_ok();
                 object
                     .index_signatures
                     .iter()
                     .find(|signature| {
                         signature.parameters.first().is_some_and(|parameter| {
-                            matches!(self.get(parameter.type_id()), Type::String)
-                                || (numeric
-                                    && matches!(self.get(parameter.type_id()), Type::Number))
+                            self.property_name_assignable_to_key(name, parameter.type_id())
                         })
                     })
                     .map(|signature| signature.value_type)
@@ -2055,28 +2056,25 @@ impl TypeTable {
     pub fn read_property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
         let ty = self.named_structural_view(ty);
         match self.get(ty) {
-            Type::ObjectType(object) => {
-                if let Some(property) = object.property(name) {
-                    let type_id = property.type_id();
-                    if property.optional() {
-                        let undefined = self.undefined_type();
-                        return Some(self.union(&[type_id, undefined]));
+            Type::ObjectType(_) | Type::Record { .. } => {
+                let (type_id, optional) = {
+                    let object = self.current_object_view(ty)?;
+                    if let Some(property) = object.property(name) {
+                        (property.type_id(), property.optional())
+                    } else {
+                        let signature = object.index_signatures.iter().find(|signature| {
+                            signature.parameters.first().is_some_and(|parameter| {
+                                self.property_name_assignable_to_key(name, parameter.type_id())
+                            })
+                        })?;
+                        (signature.value_type, false)
                     }
-                    return Some(type_id);
-                }
-
-                let numeric = name.parse::<usize>().is_ok();
-                object
-                    .index_signatures
-                    .iter()
-                    .find(|signature| {
-                        signature.parameters.first().is_some_and(|parameter| {
-                            matches!(self.get(parameter.type_id()), Type::String)
-                                || (numeric
-                                    && matches!(self.get(parameter.type_id()), Type::Number))
-                        })
-                    })
-                    .map(|signature| signature.value_type)
+                };
+                Some(if optional {
+                    self.union(&[type_id, self.undefined_type()])
+                } else {
+                    type_id
+                })
             }
             Type::Tuple(shape) => {
                 if name == "length" {
@@ -2589,7 +2587,7 @@ impl TypeTable {
                 self.template_mentions_parameter(*object, parameters, visiting)
                     || self.template_mentions_parameter(*index, parameters, visiting)
             }
-            Type::Record { key, value } => {
+            Type::Record { key, value, .. } => {
                 self.template_mentions_parameter(*key, parameters, visiting)
                     || self.template_mentions_parameter(*value, parameters, visiting)
             }
@@ -3380,34 +3378,78 @@ impl TypeTable {
     /// Reduces `Record<K, V>` for concrete keys and preserves a mapped type
     /// while `K` still depends on a type parameter.
     pub fn record(&mut self, key: TypeId, value: TypeId) -> TypeId {
+        self.record_with_optional(key, value, false)
+    }
+
+    pub(crate) fn record_with_optional(
+        &mut self,
+        key: TypeId,
+        value: TypeId,
+        optional: bool,
+    ) -> TypeId {
+        let optional_value = optional.then(|| self.union(&[value, self.undefined_type()]));
         let mut properties = Vec::new();
         let mut index_keys = Vec::new();
         match self.collect_record_members(key, value, &mut properties, &mut index_keys, true) {
             RecordKeyState::Concrete => self.intern(Type::ObjectType(Self::record_object(
-                properties, index_keys, value,
+                properties,
+                index_keys,
+                value,
+                optional_value,
             ))),
-            RecordKeyState::Deferred => self.intern(Type::Record { key, value }),
+            RecordKeyState::Deferred => self.intern(Type::Record {
+                key,
+                value,
+                optional_value,
+            }),
             RecordKeyState::Invalid => self.error_type(),
         }
     }
 
-    /// Relations read a concrete record's current shape without changing its
-    /// retained key domain or interning a snapshot.
-    pub(super) fn record_structural_view(&self, key: TypeId, value: TypeId) -> Option<ObjectType> {
+    /// Reads an object's current shape without replacing a retained Record
+    /// identity. Existing object types stay borrowed.
+    pub(crate) fn current_object_view(&self, ty: TypeId) -> Option<Cow<'_, ObjectType>> {
+        match self.get(ty) {
+            Type::ObjectType(object) => Some(Cow::Borrowed(object)),
+            Type::Record {
+                key,
+                value,
+                optional_value,
+            } => self
+                .record_structural_view(*key, *value, *optional_value)
+                .map(Cow::Owned),
+            _ => None,
+        }
+    }
+
+    /// Reads a concrete record's current shape without changing its retained
+    /// key domain or interning a snapshot.
+    pub(super) fn record_structural_view(
+        &self,
+        key: TypeId,
+        value: TypeId,
+        optional_value: Option<TypeId>,
+    ) -> Option<ObjectType> {
         let mut properties = Vec::new();
         let mut index_keys = Vec::new();
         let state =
             self.collect_record_members(key, value, &mut properties, &mut index_keys, false);
         (state == RecordKeyState::Concrete)
-            .then(|| Self::record_object(properties, index_keys, value))
+            .then(|| Self::record_object(properties, index_keys, value, optional_value))
     }
 
     fn record_object(
         mut properties: Vec<PropertyType>,
         mut index_keys: Vec<TypeId>,
         value: TypeId,
+        optional_value: Option<TypeId>,
     ) -> ObjectType {
         Self::normalize_record_properties(&mut properties);
+        if optional_value.is_some() {
+            for property in &mut properties {
+                property.optional = true;
+            }
+        }
         index_keys.sort_by_key(|type_id| type_id.get());
         index_keys.dedup();
         let index_signatures = index_keys
@@ -3421,7 +3463,7 @@ impl TypeTable {
                     false,
                     false,
                 )],
-                value_type: value,
+                value_type: optional_value.unwrap_or(value),
                 declaring_types: Vec::new(),
             })
             .collect();
@@ -3769,12 +3811,17 @@ impl TypeTable {
                     .map_or(self.string(), |_| self.number());
                 self.named_index_constraint(object, &name, key)
             }
-            Type::NumberLiteral(name) => match self.get(object) {
-                Type::String => {
-                    IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.string()))
+            Type::NumberLiteral(name) => {
+                let Some(number) = number_value(name) else {
+                    return IndexedAccessConstraint::Invalid;
+                };
+                match self.get(object) {
+                    Type::String => {
+                        IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.string()))
+                    }
+                    _ => self.named_index_constraint(object, &format_number(number), self.number()),
                 }
-                _ => self.named_index_constraint(object, name, self.number()),
-            },
+            }
             Type::String => self.index_signature_constraint(object, self.string()),
             Type::Number => self.number_index_constraint(object),
             Type::Symbol => self.index_signature_constraint(object, self.symbol_type()),
@@ -3797,8 +3844,17 @@ impl TypeTable {
         key: TypeId,
     ) -> IndexedAccessConstraint {
         match self.get(object) {
-            Type::ObjectType(object_type) => {
+            Type::ObjectType(_) | Type::Record { .. } => {
+                let Some(object_type) = self.current_object_view(object) else {
+                    return IndexedAccessConstraint::Invalid;
+                };
                 if let Some(property) = object_type.property(name) {
+                    if property.optional() {
+                        return self.constraint_union(vec![
+                            self.constraint_type_expr(property.type_id()),
+                            self.constraint_type_expr(self.undefined_type()),
+                        ]);
+                    }
                     return IndexedAccessConstraint::Reduced(
                         self.constraint_type_expr(property.type_id()),
                     );
@@ -3854,7 +3910,9 @@ impl TypeTable {
                     .map(|element| self.constraint_type_expr(element))
                     .collect(),
             ),
-            Type::ObjectType(_) => self.index_signature_constraint(object, self.number()),
+            Type::ObjectType(_) | Type::Record { .. } => {
+                self.index_signature_constraint(object, self.number())
+            }
             Type::String => {
                 IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.string()))
             }
@@ -3875,7 +3933,7 @@ impl TypeTable {
     }
 
     fn index_signature_constraint(&self, object: TypeId, key: TypeId) -> IndexedAccessConstraint {
-        let Type::ObjectType(object) = self.get(object) else {
+        let Some(object) = self.current_object_view(object) else {
             return IndexedAccessConstraint::Invalid;
         };
         let find = |wanted| {
@@ -3959,12 +4017,19 @@ impl TypeTable {
             Type::Never => Some(self.never()),
             Type::Error => Some(self.error_type()),
             Type::Null | Type::Undefined => Some(self.error_type()),
-            Type::Record { key, value } => {
+            Type::Record {
+                key,
+                value,
+                optional_value,
+            } => {
+                if self.current_object_view(view).is_some() {
+                    return self.try_resolve_concrete_indexed_access(view, index);
+                }
                 let constraint = self.type_parameter_constraint_view(index).unwrap_or(index);
                 if self.assignable(index, key)
                     || (constraint != index && self.assignable(constraint, key))
                 {
-                    Some(value)
+                    Some(optional_value.unwrap_or(value))
                 } else {
                     Some(self.error_type())
                 }
@@ -4014,13 +4079,14 @@ impl TypeTable {
                 let Ok(key) = name.to_utf8_strict() else {
                     return Some(self.error_type());
                 };
-                self.property_type(view, &key).or(Some(self.error_type()))
+                self.read_property_type(view, &key)
+                    .or(Some(self.error_type()))
             }
             Type::NumberLiteral(name) => number_value(&name)
-                .and_then(|number| self.property_type(view, &format_number(number)))
+                .and_then(|number| self.read_property_type(view, &format_number(number)))
                 .or(Some(self.error_type())),
             Type::String => {
-                if let Type::ObjectType(object) = self.get(view).clone()
+                if let Some(object) = self.current_object_view(view)
                     && let Some(signature) = object.index_signatures.iter().find(|signature| {
                         signature.parameters.first().is_some_and(|parameter| {
                             matches!(self.get(parameter.type_id()), Type::String)
@@ -4034,29 +4100,31 @@ impl TypeTable {
             Type::Number => match self.get(view).clone() {
                 Type::Array(element) => Some(element),
                 Type::Tuple(shape) => Some(self.union(&shape.all_element_types())),
-                Type::ObjectType(object) => object
-                    .index_signatures
-                    .iter()
-                    .find(|signature| {
-                        signature.parameters.first().is_some_and(|parameter| {
-                            matches!(self.get(parameter.type_id()), Type::Number)
+                _ => Some(
+                    self.current_object_view(view)
+                        .and_then(|object| {
+                            object
+                                .index_signatures
+                                .iter()
+                                .find(|signature| {
+                                    signature.parameters.first().is_some_and(|parameter| {
+                                        matches!(self.get(parameter.type_id()), Type::Number)
+                                    })
+                                })
+                                .or_else(|| {
+                                    object.index_signatures.iter().find(|signature| {
+                                        signature.parameters.first().is_some_and(|parameter| {
+                                            matches!(self.get(parameter.type_id()), Type::String)
+                                        })
+                                    })
+                                })
+                                .map(|signature| signature.value_type)
                         })
-                    })
-                    .or_else(|| {
-                        object.index_signatures.iter().find(|signature| {
-                            signature.parameters.first().is_some_and(|parameter| {
-                                matches!(self.get(parameter.type_id()), Type::String)
-                            })
-                        })
-                    })
-                    .map_or_else(
-                        || Some(self.error_type()),
-                        |signature| Some(signature.value_type),
-                    ),
-                _ => Some(self.error_type()),
+                        .unwrap_or(self.error_type()),
+                ),
             },
             Type::Symbol => {
-                if let Type::ObjectType(object) = self.get(view).clone()
+                if let Some(object) = self.current_object_view(view)
                     && let Some(signature) = object.index_signatures.iter().find(|signature| {
                         signature.parameters.first().is_some_and(|parameter| {
                             matches!(self.get(parameter.type_id()), Type::Symbol)
@@ -4133,7 +4201,9 @@ impl TypeTable {
             | Type::StringLiteral(_)
             | Type::Array(_)
             | Type::Tuple(_) => true,
-            Type::Record { .. } => true,
+            Type::Record { .. } => self
+                .current_object_view(view)
+                .is_none_or(|object| !object.index_signatures.is_empty()),
             Type::ObjectType(object) => !object.index_signatures.is_empty(),
             Type::Union(members) => members
                 .into_iter()
@@ -4146,18 +4216,29 @@ impl TypeTable {
     }
 
     fn indexed_access_keyof_view(&mut self, view: TypeId) -> Option<TypeId> {
-        match self.get(view).clone() {
-            Type::ObjectType(object) => {
-                let mut members =
-                    Vec::with_capacity(object.properties.len() + object.index_signatures.len());
-                for property in &object.properties {
-                    members.push(property.type_id());
-                }
-                for signature in &object.index_signatures {
-                    members.push(signature.value_type);
-                }
-                Some(self.union_or_single(members))
+        if let Some(object) = self.current_object_view(view) {
+            let mut members =
+                Vec::with_capacity(object.properties.len() + object.index_signatures.len() + 1);
+            let mut optional = false;
+            for property in &object.properties {
+                members.push(property.type_id());
+                optional |= property.optional();
             }
+            for signature in &object.index_signatures {
+                members.push(signature.value_type);
+            }
+            drop(object);
+            if optional {
+                members.push(self.undefined_type());
+            }
+            return Some(self.union_or_single(members));
+        }
+        match self.get(view).clone() {
+            Type::Record {
+                value,
+                optional_value,
+                ..
+            } => Some(optional_value.unwrap_or(value)),
             Type::Tuple(shape) => Some(self.union_or_single(shape.all_element_types())),
             Type::Array(element) => Some(element),
             _ => None,
@@ -5229,10 +5310,14 @@ impl TypeTable {
                     let index = copy(target, source, index, imported, next_symbol);
                     target.indexed_access(object, index)
                 }
-                Type::Record { key, value } => {
+                Type::Record {
+                    key,
+                    value,
+                    optional_value,
+                } => {
                     let key = copy(target, source, key, imported, next_symbol);
                     let value = copy(target, source, value, imported, next_symbol);
-                    target.record(key, value)
+                    target.record_with_optional(key, value, optional_value.is_some())
                 }
                 Type::This { owner, constraint } => {
                     let owner = remap_symbol(target, source, owner, imported, next_symbol);
@@ -21277,9 +21362,22 @@ impl<'src> Binder<'src> {
                 read,
             );
         }
-        match self.types.get(object_type) {
-            Type::Record { key, value } => {
-                let property = self.deferred_record_property_type(*key, *value, name);
+        let record_view = matches!(self.types.get(object_type), Type::Record { .. })
+            .then(|| self.types.current_object_view(object_type))
+            .flatten()
+            .map(|object| Type::ObjectType(object.into_owned()));
+        match record_view.as_ref().unwrap_or(self.types.get(object_type)) {
+            Type::Record {
+                key,
+                value,
+                optional_value,
+            } => {
+                let value = if read && self.strict_null_checks {
+                    optional_value.unwrap_or(*value)
+                } else {
+                    *value
+                };
+                let property = self.deferred_record_property_type(*key, value, name);
                 if property == self.types.error_type() && self.is_typescript() {
                     self.emit(
                         PROPERTY_DOES_NOT_EXIST,
@@ -21308,12 +21406,10 @@ impl<'src> Binder<'src> {
                     }
                     return Some(type_id);
                 }
-                let numeric = name.parse::<usize>().is_ok();
                 if let Some(signature) = object.index_signatures.iter().find(|signature| {
                     signature.parameters.first().is_some_and(|parameter| {
-                        matches!(self.types.get(parameter.type_id()), Type::String)
-                            || (numeric
-                                && matches!(self.types.get(parameter.type_id()), Type::Number))
+                        self.types
+                            .property_name_assignable_to_key(name, parameter.type_id())
                     })
                 }) {
                     let signature = signature.clone();
@@ -22873,7 +22969,7 @@ impl<'src> Binder<'src> {
                 self.references_free_type_parameter(*object, visiting, bound)
                     || self.references_free_type_parameter(*index, visiting, bound)
             }
-            Type::Record { key, value } => {
+            Type::Record { key, value, .. } => {
                 self.references_free_type_parameter(*key, visiting, bound)
                     || self.references_free_type_parameter(*value, visiting, bound)
             }
@@ -23172,10 +23268,7 @@ impl<'src> Binder<'src> {
             .unwrap_or_else(|| self.types.any());
         let view = self.types.indexed_access_view(input);
         match self.types.get(view).clone() {
-            Type::Record { key, value } => {
-                let value = self.types.union(&[value, self.types.undefined_type()]);
-                self.types.record(key, value)
-            }
+            Type::Record { key, value, .. } => self.types.record_with_optional(key, value, true),
             Type::ObjectType(mut object) => {
                 for property in &mut object.properties {
                     property.optional = true;
@@ -23980,7 +24073,11 @@ impl<'src> Binder<'src> {
                     });
             }
             let base_view = self.types.indexed_access_view(base_type);
-            if let Type::ObjectType(base_object) = self.types.get(base_view).clone() {
+            if let Some(base_object) = self
+                .types
+                .current_object_view(base_view)
+                .map(Cow::into_owned)
+            {
                 for base_property in &base_object.properties {
                     let declared = object.properties[..declared_properties]
                         .iter()
@@ -24496,6 +24593,7 @@ impl<'src> Binder<'src> {
         }
         match self.types.get(target).clone() {
             Type::ObjectType(object) => Some(object),
+            Type::Record { .. } => self.types.current_object_view(target).map(Cow::into_owned),
             Type::Intersection(members) => {
                 let mut combined = ObjectType {
                     properties: Vec::new(),
@@ -25438,7 +25536,12 @@ impl<'src> Binder<'src> {
                         .type_parameter_constraint_view(spread_type)
                         .unwrap_or(spread_type);
                     let spread_type = self.types.indexed_access_view(spread_type);
-                    match self.types.get(spread_type).clone() {
+                    let spread = self
+                        .types
+                        .current_object_view(spread_type)
+                        .map(|object| Type::ObjectType(object.into_owned()))
+                        .unwrap_or_else(|| self.types.get(spread_type).clone());
+                    match spread {
                         Type::ObjectType(object) => {
                             if let Some(source_iterator) = object
                                 .iterator_property
@@ -25467,7 +25570,11 @@ impl<'src> Binder<'src> {
                             }
                             index_signatures.extend(object.index_signatures);
                         }
-                        Type::Record { key, value } => {
+                        Type::Record {
+                            key,
+                            value,
+                            optional_value,
+                        } => {
                             index_signatures.push(IndexSignature {
                                 readonly: false,
                                 enum_reverse: false,
@@ -25477,7 +25584,7 @@ impl<'src> Binder<'src> {
                                     false,
                                     false,
                                 )],
-                                value_type: value,
+                                value_type: optional_value.unwrap_or(value),
                                 declaring_types: Vec::new(),
                             });
                         }
@@ -35068,7 +35175,7 @@ namespace undefined { export var x = 42; }",
 
         assert!(table.keyof_projection_view(keys).is_none());
         assert!(matches!(table.get(keys), Type::Keyof(_)));
-        assert!(table.record_structural_view(keys, number).is_none());
+        assert!(table.record_structural_view(keys, number, None).is_none());
         let record = table.record(keys, number);
         let unrelated = table.string_literal("unrelated");
         assert!(!table.assignable(unrelated, keys));
@@ -35081,7 +35188,7 @@ namespace undefined { export var x = 42; }",
         let fixed = table.string_literal("fixed");
         assert!(table.assignable(fixed, keys));
         assert!(!table.assignable(unrelated, keys));
-        assert!(table.record_structural_view(keys, number).is_some());
+        assert!(table.record_structural_view(keys, number, None).is_some());
         assert!(table.assignable(record, fixed_shape));
         assert!(table.assignable(fixed_shape, record));
     }
@@ -35136,6 +35243,74 @@ namespace undefined { export var x = 42; }",
         assert!(target.assignable(extra, imported));
         assert!(target.assignable(prototype, imported));
         assert!(!target.assignable(extra, prototype));
+    }
+
+    #[test]
+    fn imported_optional_records_keep_declared_values_and_live_keys() {
+        let mut source = TypeTable::new();
+        let initial =
+            source.object_type(vec![PropertyType::new("prototype", false, source.object())]);
+        let constructor = source.constructor_type(SymbolId::new(1), Vec::new(), initial);
+        let keys = source.keyof(constructor);
+        let record = source.record_with_optional(keys, source.number(), true);
+
+        let mut target = TypeTable::new();
+        let mut next_symbol = 1_000;
+        let (imported, _) = target.import_type(
+            &source,
+            record,
+            &[],
+            &mut ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let Type::Record {
+            key,
+            value,
+            optional_value,
+        } = target.get(imported).clone()
+        else {
+            panic!("the imported optional record retains its live key recipe");
+        };
+        assert_eq!(value, target.number());
+        let optional_value = optional_value.expect("optional read type is preserved");
+        assert_eq!(
+            target.read_property_type(imported, "prototype"),
+            Some(optional_value)
+        );
+        assert_eq!(
+            target.property_type(imported, "prototype"),
+            Some(target.number())
+        );
+        {
+            let shape = target
+                .current_object_view(imported)
+                .expect("current record shape");
+            let property = shape.property("prototype").expect("prototype property");
+            assert!(property.optional());
+            assert_eq!(property.type_id(), target.number());
+        }
+        let Type::Keyof(constructor) = *target.instantiation_type(key) else {
+            panic!("the key query retains its constructor operand");
+        };
+        let Type::ConstructorType { symbol, .. } = *target.get(constructor) else {
+            panic!("constructor operand");
+        };
+        let updated = target.object_type(vec![
+            PropertyType::new("prototype", false, target.object()),
+            PropertyType::new("extra", false, target.number()),
+        ]);
+        let updated = target.constructor_type(symbol, Vec::new(), updated);
+        target.publish_constructor_revision(constructor, updated);
+        assert_eq!(
+            target.read_property_type(imported, "extra"),
+            Some(optional_value)
+        );
+        let shape = target
+            .current_object_view(imported)
+            .expect("updated record shape");
+        let property = shape.property("extra").expect("later namespace property");
+        assert!(property.optional());
+        assert_eq!(property.type_id(), target.number());
     }
 
     #[test]

@@ -231,10 +231,8 @@ impl<'table> ConditionalTypeEvaluator<'table> {
         }
         let source_properties = mapped
             .source
-            .and_then(|source| match self.types.get(source) {
-                Type::ObjectType(object) => Some(object.properties().to_vec()),
-                _ => None,
-            })
+            .and_then(|source| self.types.current_object_view(source))
+            .map(|object| object.properties().to_vec())
             .unwrap_or_default();
 
         let mut properties = Vec::new();
@@ -308,12 +306,14 @@ impl<'table> ConditionalTypeEvaluator<'table> {
         depth: usize,
     ) -> Result<BTreeSet<Box<str>>, ConditionalTypeError> {
         self.check_depth(depth)?;
-        match self.types.get(object) {
-            Type::ObjectType(object) => Ok(object
+        if let Some(object) = self.types.current_object_view(object) {
+            return Ok(object
                 .properties()
                 .iter()
                 .map(|property| Box::<str>::from(property.name()))
-                .collect()),
+                .collect());
+        }
+        match self.types.get(object) {
             Type::Union(members) => {
                 let Some((first, rest)) = members.split_first() else {
                     return Ok(BTreeSet::new());
@@ -357,7 +357,10 @@ impl<'table> ConditionalTypeEvaluator<'table> {
                 self.match_pattern(element, element_pattern, position, captures, depth + 1)
             }
             InferPattern::Object(pattern_properties) => {
-                let Type::ObjectType(candidate_properties) = self.types.get(candidate).clone()
+                let Some(candidate_properties) = self
+                    .types
+                    .current_object_view(candidate)
+                    .map(|object| object.into_owned())
                 else {
                     return Ok(false);
                 };
@@ -582,7 +585,7 @@ impl<'table> ConditionalTypeEvaluator<'table> {
             Type::IndexedAccess { object, index } => self
                 .check_type_depth(object, child_depth, visiting)
                 .and_then(|()| self.check_type_depth(index, child_depth, visiting)),
-            Type::Record { key, value } => self
+            Type::Record { key, value, .. } => self
                 .check_type_depth(key, child_depth, visiting)
                 .and_then(|()| self.check_type_depth(value, child_depth, visiting)),
             Type::This { constraint, .. } => {
@@ -758,6 +761,76 @@ fn match_template<'text>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retained_record(types: &mut TypeTable, optional: bool) -> TypeId {
+        let structure = types.object_type(vec![PropertyType::new("x", false, types.boolean())]);
+        let constructor = types.constructor_type(SymbolId::new(1), Vec::new(), structure);
+        let keys = types.keyof(constructor);
+        types.record_with_optional(keys, types.number(), optional)
+    }
+
+    #[test]
+    fn conditional_object_inference_reads_retained_record_properties() {
+        let mut types = TypeTable::new();
+        let record = retained_record(&mut types, false);
+        let capture = SymbolId::new(2);
+        let inferred = types.named(capture);
+        let number = types.number();
+        let never = types.never();
+        let mut evaluator = ConditionalTypeEvaluator::new(&mut types);
+        for (name, expected) in [("x", number), ("absent", never)] {
+            let conditional = ConditionalType {
+                check_type: record,
+                extends_pattern: InferPattern::Object(
+                    vec![(name.into(), InferPattern::Capture(capture))].into(),
+                ),
+                true_type: inferred,
+                false_type: never,
+                distributive: false,
+            };
+            assert_eq!(evaluator.evaluate_conditional(&conditional), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn mapped_types_read_retained_record_keys_and_preserve_optional_properties() {
+        let mut types = TypeTable::new();
+        let record = retained_record(&mut types, true);
+        let number = types.number();
+        let x = types.string_literal("x");
+        let mut evaluator = ConditionalTypeEvaluator::new(&mut types);
+        let keys = evaluator.keyof(record).expect("finite record keys");
+        assert_eq!(keys, x);
+        for (modifier, optional) in [
+            (MappedModifier::Preserve, true),
+            (MappedModifier::Remove, false),
+        ] {
+            let mapped = MappedType {
+                source: Some(record),
+                keys,
+                parameter: SymbolId::new(2),
+                name_type: None,
+                value_type: number,
+                optional_modifier: modifier,
+                readonly_modifier: MappedModifier::Preserve,
+                source_readonly: BTreeSet::new(),
+            };
+            let result = evaluator
+                .evaluate_mapped_type(&mapped)
+                .expect("mapped record");
+            let expected = evaluator
+                .types
+                .object_type(vec![PropertyType::new("x", optional, number)]);
+            assert_eq!(result.type_id, expected);
+        }
+        assert!(matches!(
+            evaluator.types.get(record),
+            Type::Record {
+                optional_value: Some(_),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn naked_conditional_distributes_and_infers_independently() {

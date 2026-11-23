@@ -3,24 +3,58 @@
 use std::sync::Arc;
 
 use bamts_compiler::{
-    checker::check,
+    checker::{SemanticModel, TypeId, check, relations::TypeRelations},
+    diagnostic::Diagnostic,
     parser, scanner,
     source::{ScriptKind, SourceId, SourceText},
 };
 
-fn checker_codes(source: &str) -> Vec<String> {
+fn analyze_source(source: &str) -> (SemanticModel, Vec<Diagnostic>) {
     let scanned = scanner::scan(
         SourceId::new(0),
         ScriptKind::TypeScript,
         Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
     );
-    let checked = check(&parser::parse(scanned));
-    checked
-        .diagnostics()
+    check(&parser::parse(scanned)).into_parts()
+}
+
+fn checker_codes(source: &str) -> Vec<String> {
+    analyze_source(source)
+        .1
         .iter()
         .map(|diagnostic| diagnostic.code().as_str().to_owned())
         .filter(|code| code.starts_with("BAMTS-C"))
         .collect()
+}
+
+fn checked_model(source: &str) -> SemanticModel {
+    let (model, diagnostics) = analyze_source(source);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.code().as_str().starts_with("BAMTS-C")),
+        "{diagnostics:?}\n{source}"
+    );
+    model
+}
+
+fn value_type(model: &SemanticModel, name: &str) -> TypeId {
+    let symbol = model
+        .scopes()
+        .iter()
+        .find_map(|scope| scope.value(name))
+        .unwrap_or_else(|| panic!("value {name} is bound"));
+    model.symbol_type(symbol)
+}
+
+fn assert_value_type(model: &SemanticModel, name: &str, expected: TypeId) {
+    let actual = value_type(model, name);
+    assert!(
+        TypeRelations::new(model.types()).equivalent(actual, expected),
+        "{name}: {:?}, expected {:?}",
+        model.types().get(actual),
+        model.types().get(expected),
+    );
 }
 
 fn assert_checks(source: &str) {
@@ -598,11 +632,10 @@ const hexadecimal: keyof Quoted = 16;
     );
     let codes = checker_codes(
         r#"
-declare const record: Record<2.50, boolean>;
-const wrongSpelling: boolean = record["2.50"];
+type WrongSpelling = Record<2.50, boolean>["2.50"];
 "#,
     );
-    assert!(!codes.is_empty(), "quoted keys keep their spelling");
+    assert_eq!(codes, ["BAMTS-C064"], "quoted keys keep their spelling");
 }
 
 #[test]
@@ -629,4 +662,247 @@ const empty: keyof Empty = 1;
 "#,
         3,
     );
+}
+
+#[test]
+fn destructuring_live_records_infers_exact_current_property_types() {
+    let model = checked_model(
+        r#"
+class C {}
+declare const fields: Record<keyof typeof C, number>;
+const { prototype } = fields;
+namespace C { export const extra = 1; }
+const { extra } = fields;
+"#,
+    );
+    for name in ["prototype", "extra"] {
+        assert_value_type(&model, name, model.types().number());
+    }
+    assert_eq!(
+        checker_codes(
+            "class C {} declare const fields: Record<keyof typeof C, number>; const { absent } = fields;"
+        ),
+        ["BAMTS-C057"],
+    );
+}
+
+#[test]
+fn partial_live_records_keep_optional_members_through_instantiation_and_updates() {
+    let model = checked_model(
+        r#"
+class C {}
+type Fields<T> = Partial<Record<keyof typeof C, T>>;
+const before: Fields<number> = {};
+declare const fields: Fields<number>;
+declare const expected: number | undefined;
+const { prototype } = fields;
+namespace C { export const extra = 1; }
+const after: Fields<number> = {};
+const { extra } = fields;
+type Indexed = Fields<number>["extra"];
+declare const indexed: Indexed;
+type BroadFields<T> = Partial<Record<keyof typeof C | number, T>>;
+type Broad = BroadFields<number>[number];
+declare const broad: Broad;
+"#,
+    );
+    let expected = value_type(&model, "expected");
+    for name in ["prototype", "extra", "indexed", "broad"] {
+        assert_value_type(&model, name, expected);
+    }
+    assert_assignment_errors(
+        r#"
+class C {}
+declare const partial: Partial<Record<keyof typeof C, number>>;
+const required: Record<keyof typeof C, number> = partial;
+const wrongValue: Partial<Record<keyof typeof C, number>> = { prototype: "wrong" };
+"#,
+        2,
+    );
+}
+
+#[test]
+fn optional_record_relations_allow_missing_keys_without_losing_value_checks() {
+    assert_checks(
+        r#"
+class Narrow {}
+class Wide { static extra = 1; }
+declare const source: Record<keyof typeof Narrow, number>;
+const target: Partial<Record<keyof typeof Wide, number>> = source;
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+class Narrow {}
+class Wide { static extra = 1; }
+declare const source: Record<keyof typeof Narrow, string>;
+const target: Partial<Record<keyof typeof Wide, number>> = source;
+"#,
+        1,
+    );
+}
+
+#[test]
+fn concrete_record_relations_keep_the_generic_key_subset_rule() {
+    assert_checks(
+        r#"
+class C {}
+declare const all: Record<keyof typeof C, number>;
+function select<K extends keyof typeof C>(key: K) {
+    const selected: Record<K, number> = all;
+}
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+class C {}
+declare const all: Record<keyof typeof C, string>;
+function select<K extends keyof typeof C>(key: K) {
+    const selected: Record<K, number> = all;
+}
+"#,
+        1,
+    );
+}
+
+#[test]
+fn indexed_access_constraints_read_live_record_properties_and_index_domains() {
+    assert_checks(
+        r#"
+class C { static x = 1; static 2.5 = 1; }
+type R = Record<keyof typeof C, number>;
+function named<T extends R>(value: T["x"]): number { return value; }
+function numeric<T extends R>(value: T[2.50]): number { return value; }
+type Indexed = Record<keyof typeof C | number, number>;
+function broad<T extends Indexed>(value: T[number]): number { return value; }
+type Optional = Partial<R>;
+function optional<T extends Optional>(value: T["x"]): number | undefined { return value; }
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+class C { static x = 1; }
+type R = Record<keyof typeof C, number>;
+function wrong<T extends R>(value: T["x"]) {
+    const result: string = value;
+}
+type Indexed = Record<keyof typeof C | number, number>;
+function wrongIndex<T extends Indexed>(value: T[number]) {
+    const result: string = value;
+}
+"#,
+        2,
+    );
+}
+
+#[test]
+fn live_numeric_record_indexes_accept_cooked_names_and_keep_exact_value_types() {
+    let model = checked_model(
+        r#"
+class C { static 1 = true; }
+type R = Record<keyof typeof C, boolean>;
+declare const record: R;
+type Numeric = R[1];
+type StringForm = R["1"];
+declare const numeric: Numeric;
+declare const stringForm: StringForm;
+const expression = record["1"];
+"#,
+    );
+    for name in ["numeric", "stringForm", "expression"] {
+        assert_value_type(&model, name, model.types().boolean());
+    }
+    assert_eq!(
+        checker_codes(
+            "class C { static 1 = true; } type Wrong = Record<keyof typeof C, boolean>[\"01\"];"
+        ),
+        ["BAMTS-C064"],
+    );
+}
+
+#[test]
+fn disjoint_symbol_indexes_do_not_block_numeric_live_record_assignments() {
+    assert_checks(
+        r#"
+class C {}
+declare const source: { prototype: boolean; [key: symbol]: boolean };
+const target: Record<keyof typeof C | number, boolean> = source;
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+class C {}
+declare const overlapping: { prototype: boolean; [key: number]: string };
+const target: Record<keyof typeof C | number, boolean> = overlapping;
+declare const missing: { [key: symbol]: boolean };
+const required: Record<keyof typeof C | number, boolean> = missing;
+"#,
+        2,
+    );
+}
+
+#[test]
+fn live_records_participate_in_structural_inference_without_erasing_naked_identity() {
+    let model = checked_model(
+        r#"
+class C { static x = 1; }
+declare function fromObject<T>(value: { x: T }): T;
+declare function fromRecord<T>(value: Record<keyof typeof C, T>): T;
+declare function identity<T>(value: T): T;
+declare const fields: Record<keyof typeof C, number>;
+declare const object: { x: number; prototype: number };
+const first = fromObject(fields);
+const second = fromRecord(object);
+const preserved = identity(fields);
+namespace C { export const extra = 1; }
+const { extra } = preserved;
+"#,
+    );
+    for name in ["first", "second", "extra"] {
+        assert_value_type(&model, name, model.types().number());
+    }
+    assert_eq!(
+        value_type(&model, "preserved"),
+        value_type(&model, "fields")
+    );
+}
+
+#[test]
+fn live_record_intersections_aggregate_members_and_keep_excess_property_checks() {
+    assert_checks(
+        r#"
+class C { static x = 1; }
+declare const parts: { x: number } & { prototype: number };
+const combined: Record<keyof typeof C, number> = parts;
+declare const fields: Record<keyof typeof C, number> & { extra: string };
+const shape: { x: number; prototype: number; extra: string } = fields;
+"#,
+    );
+    assert_eq!(
+        checker_codes(
+            "class C {} const fields: Record<keyof typeof C, number> = { prototype: 1, extra: 2 };"
+        ),
+        ["BAMTS-C067"],
+    );
+}
+
+#[test]
+fn live_record_spread_and_interface_heritage_use_current_object_members() {
+    let model = checked_model(
+        r#"
+class C { static x = 1; }
+interface Fields extends Record<keyof typeof C, number> {}
+declare const inherited: Fields;
+const inheritedValue = inherited.x;
+declare const fields: Record<keyof typeof C, number>;
+const copied = { ...fields };
+const copyValue = copied.x;
+namespace C { export const extra = 1; }
+const later = { ...fields };
+const laterValue = later.extra;
+"#,
+    );
+    for name in ["inheritedValue", "copyValue", "laterValue"] {
+        assert_value_type(&model, name, model.types().number());
+    }
 }
