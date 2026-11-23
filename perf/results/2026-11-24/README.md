@@ -1,11 +1,19 @@
-# Local optimization evidence: 2026-11-24
+# Optimization evidence: 2026-11-24
 
-## Scope and provenance
+## Final CI results
 
-This directory preserves local bytecode-verifier evidence for the optimization
-integration. Compiler and runtime changes are integrated; their tests and
-performance results remain pending. These measurements do not establish product
-completion.
+[CI_COMPARISON.md](CI_COMPARISON.md) records the completed compiler, runtime,
+and corrected end-to-end comparisons, their raw reports, exact source revisions,
+and correctness results. The implementation and timing-controller PRs are merged.
+The measured optimization revision passed its ordinary correctness jobs; BH1
+qualification remains pending, and later main failures are documented separately.
+
+## Historical local scope and provenance
+
+The remainder of this document preserves the earlier local bytecode-verifier
+checkpoint. Compiler, runtime, and workspace validation were pending at that
+checkpoint; those historical statuses are superseded where the final CI report
+provides later evidence. Neither report establishes product completion.
 
 | Source | Commit |
 | --- | --- |
@@ -96,7 +104,7 @@ For nested handlers, protected-fact intersections fall from 32,506,848 to 31,744
 These counts identify redundant global fixed-point transfers as the removed
 work. They are separate evidence from the elapsed-time samples.
 
-## Validation status
+## Historical local validation status
 
 | Area | Status and evidence |
 | --- | --- |
@@ -121,11 +129,12 @@ The candidate `cargo check --locked --workspace -j 1` attempt, with
 checking the unchanged dependency `cranelift-assembler-x64 0.134.4`. It emitted
 no candidate Rust diagnostic; see the [workspace check log](cargo-workspace-check.log).
 Baseline runtime release-library tests also ended in SIGKILL. Compiler, runtime,
-and full-workspace validation remain pending despite the passing bytecode suite.
+and full-workspace validation were pending at this local checkpoint despite the
+passing bytecode suite.
 
-Append later validation with its exact revision, commands, host identity, and raw
-results. Preserve the distinction between these imported source-branch checks
-and checks run on the final integration revision.
+Subsequent validation is recorded in [CI_COMPARISON.md](CI_COMPARISON.md) with
+exact revisions, host identities, CI links, and raw results. It distinguishes
+these source-branch checks from the measured integration revision and later main.
 
 ## Reproduce the verifier comparison
 
