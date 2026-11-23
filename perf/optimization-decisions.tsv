@@ -1,0 +1,10 @@
+ts	phase	decision	why	evidence	result
+2026-11-24T01:47:00Z	frame	Use base 37f76d4f and isolate compiler/runtime/bytecode worktrees	Preserve concurrent repository work and keep mechanisms separately reviewable	AGENTS.md	open
+2026-11-24T01:48:00Z	measurement	Keep local comparisons separate from BH1 release evidence	This executor does not match the pinned host	perf/hosts/bh1.toml	BH1 unchanged
+2026-11-24T01:51:00Z	compiler	Transfer owned tokens and semantic models rather than copy them	Both source objects are consumed by the receiving stage	crates/bamts-compiler/src/pipeline.rs;crates/bamts-compiler/src/parser.rs	awaiting tests
+2026-11-24T01:51:00Z	runtime	Cache shape/key slots while checking live descriptors on every hit	Shape fixes slot placement but attributes can change	crates/bamts-runtime/src/shape.rs	awaiting tests
+2026-11-24T01:52:00Z	build	Use one build job and a workspace-local pinned toolchain	Dependency compilation was killed and the transient toolchain disappeared	rust-toolchain.toml	baseline build running
+2026-11-24T02:01:00Z	compiler	Extend object lookup borrowing to the Binder read path	Ordinary source reads otherwise retain a whole-object clone	crates/bamts-compiler/src/checker/binder.rs	awaiting tests
+2026-11-24T02:04:00Z	fixtures	Split the wide-property workload across functions	The TypeScript oracle rejected one oversized function with TS2563	perf/generate_local.py	oracle rerun required
+2026-11-23T17:04:31Z	audit	Correct the timestamp labels in the preceding seven rows	Those rows use Seoul local clock readings but were labeled Z; their actual offset is +09:00	clock.curr_time	preceding timestamps superseded
+2026-11-23T17:27:36Z	build	Retry the SIGKILLed release build with codegen-units=256 and retain every gate	Both the first release build and the lower-memory retry ended in SIGKILL without a Rust diagnostic; check-only validation is now running	root build sessions; cargo check --locked -p bamts-compiler --examples -j 1	compiler/runtime/end-to-end performance PENDING; no gate weakened
