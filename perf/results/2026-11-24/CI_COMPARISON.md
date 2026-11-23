@@ -138,8 +138,8 @@ and the [CPython 3.12.3 implementation](https://github.com/python/cpython/blob/v
 The corrected controller waits for Linux process-descriptor readiness with
 `os.pidfd_open` and `select.poll`, then reaps the already-exited process with
 an untimed `wait()`. Absolute deadlines retain the timeout budget. Every
-failure path closes an opened descriptor and kills and reaps an unreaped child
-process group. There is no fallback to the polling implementation.
+setup, polling, or timeout failure closes an opened descriptor, kills the
+child process group, and reaps the direct child. There is no fallback to the polling implementation.
 The prerequisites are Linux 5.3 or newer, normal SIGCHLD handling, and exclusive
 ownership of child reaping.
 
@@ -195,7 +195,7 @@ later main revision.
 | Bytecode semantics | **138 tests**, including **280,893 exhaustive differential cases** that compare complete public certificates or the exact first error against the original solver. |
 | Windows cancellation and linked-native execution | [Windows job 137921775258](https://github.com/gosuda/bamTiScript/actions/runs/45240005716/job/137921775258): **18 linked-native tests passed**, including cancellation after native image publication and process cleanup. This does not separately prove entry into guest code. |
 | Corpus | [Corpus job 137921775919](https://github.com/gosuda/bamTiScript/actions/runs/45240005716/job/137921775919): **46 passed, zero failed, one ignored**. |
-| BH1 performance qualification | No passing qualified result was available when this report was prepared. The [BH1 job 137942253503](https://github.com/gosuda/bamTiScript/actions/runs/45240005716/job/137942253503) was waiting for its matching self-hosted runner at the last inspection. Host fingerprints and gate requirements remain unchanged. |
+| BH1 performance qualification | No passing qualified result was available when this report was prepared. The [BH1 job 137942253503](https://github.com/gosuda/bamTiScript/actions/runs/45240005716/job/137942253503) was still queued without an assigned runner at 2026-11-23 20:00 UTC. Host fingerprints and gate requirements remain unchanged. |
 
 The verifier's separate local stress evidence is retained in
 [README.md](README.md) and [COUNTERBALANCED.md](COUNTERBALANCED.md).
