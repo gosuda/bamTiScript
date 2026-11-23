@@ -360,7 +360,7 @@ impl Binder<'_> {
         self.method_type(vec![opt("start", number), opt("end", number)], result)
     }
 
-    fn array_member(&mut self, element: TypeId, name: &str) -> Option<TypeId> {
+    pub(super) fn array_member(&mut self, element: TypeId, name: &str) -> Option<TypeId> {
         let number = self.types.number();
         let string = self.types.string();
         let boolean = self.types.boolean();

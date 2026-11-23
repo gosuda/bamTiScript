@@ -1579,6 +1579,12 @@ enum IndexedAccessConstraintMode {
     Write,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ValueRefinement {
+    NonNullable,
+    Truthy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassState {
     Provisional,
@@ -2060,12 +2066,7 @@ impl TypeTable {
             }
             Type::Tuple(shape) => {
                 if name == "length" {
-                    return Some(match shape.max_arity() {
-                        Some(max) if max == shape.min_arity() => {
-                            self.number_literal(max.to_string().as_str())
-                        }
-                        _ => self.number(),
-                    });
+                    return Some(self.tuple_length_type(shape.min_arity(), shape.max_arity()));
                 }
                 let index = name.parse::<usize>().ok()?;
                 let shape = shape.clone();
@@ -2324,12 +2325,7 @@ impl TypeTable {
             }
             Type::Tuple(shape) => {
                 if name == "length" {
-                    return Some(match shape.max_arity() {
-                        Some(max) if max == shape.min_arity() => {
-                            self.number_literal(max.to_string().as_str())
-                        }
-                        _ => self.number(),
-                    });
+                    return Some(self.tuple_length_type(shape.min_arity(), shape.max_arity()));
                 }
                 let index = name.parse::<usize>().ok()?;
                 let shape = shape.clone();
@@ -2386,6 +2382,16 @@ impl TypeTable {
             elements.push(self.undefined_type());
         }
         Some(self.union(&elements))
+    }
+
+    fn tuple_length_type(&mut self, minimum: usize, maximum: Option<usize>) -> TypeId {
+        let Some(maximum) = maximum else {
+            return self.number();
+        };
+        let lengths = (minimum..=maximum)
+            .map(|length| self.number_literal(&length.to_string()))
+            .collect();
+        self.union_or_single(lengths)
     }
 
     #[must_use]
@@ -3948,6 +3954,38 @@ impl TypeTable {
         )
     }
 
+    fn indexed_access_read_type(&mut self, source: TypeId) -> Option<TypeId> {
+        let IndexedAccessConstraint::Reduced(expression) =
+            self.indexed_access_constraint_view(source)
+        else {
+            return None;
+        };
+        Some(self.constraint_expression_type(expression))
+    }
+
+    fn constraint_expression_type(&mut self, expression: ConstraintTypeExpr) -> TypeId {
+        match expression {
+            ConstraintTypeExpr::Id(type_id) => type_id,
+            ConstraintTypeExpr::Opaque => self.unknown(),
+            ConstraintTypeExpr::Union(members) => {
+                let members: Vec<_> = members
+                    .into_vec()
+                    .into_iter()
+                    .map(|member| self.constraint_expression_type(member))
+                    .collect();
+                self.union(&members)
+            }
+            ConstraintTypeExpr::Intersection(members) => {
+                let members = members
+                    .into_vec()
+                    .into_iter()
+                    .map(|member| self.constraint_expression_type(member))
+                    .collect();
+                self.intersection(members)
+            }
+        }
+    }
+
     pub(super) fn indexed_access_target_constraint_view(
         &self,
         target: TypeId,
@@ -4042,6 +4080,23 @@ impl TypeTable {
             return match mode {
                 IndexedAccessConstraintMode::Read => self.constraint_union(members),
                 IndexedAccessConstraintMode::Write => self.constraint_intersection(members),
+            };
+        }
+        if let Type::Intersection(indexes) = self.get(index) {
+            let mut members = Vec::with_capacity(indexes.len());
+            for &index in indexes {
+                match self.indexed_access_constraint(object, index, mode, active) {
+                    IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque)
+                    | IndexedAccessConstraint::Invalid => {}
+                    IndexedAccessConstraint::Reduced(member) => members.push(member),
+                }
+            }
+            if members.is_empty() {
+                return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
+            }
+            return match mode {
+                IndexedAccessConstraintMode::Read => self.constraint_intersection(members),
+                IndexedAccessConstraintMode::Write => self.constraint_union(members),
             };
         }
 
@@ -4178,6 +4233,25 @@ impl TypeTable {
                 self.index_signature_constraint(object, key)
             }
             Type::Tuple(shape) => {
+                if name == "length" {
+                    let Some(maximum) = shape.max_arity() else {
+                        return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Id(
+                            self.number(),
+                        ));
+                    };
+                    return self.constraint_union(
+                        (shape.min_arity()..=maximum)
+                            .map(|length| {
+                                let literal = Type::NumberLiteral(length.to_string().into());
+                                let type_id = *self
+                                    .index
+                                    .get(&literal)
+                                    .expect("tuple lengths are interned with their shape");
+                                ConstraintTypeExpr::Id(type_id)
+                            })
+                            .collect(),
+                    );
+                }
                 let Ok(index) = name.parse::<usize>() else {
                     return IndexedAccessConstraint::Invalid;
                 };
@@ -4728,6 +4802,7 @@ impl TypeTable {
         {
             return self.array(rest);
         }
+        self.tuple_length_type(shape.min_arity(), shape.max_arity());
         let tuple = self.intern(Type::Tuple(shape));
         self.ensure_iterable_view(tuple);
         tuple
@@ -5143,17 +5218,7 @@ impl TypeTable {
 
     /// Removes `null` and `undefined` while preserving every other constituent.
     pub fn non_nullable(&mut self, type_id: TypeId) -> TypeId {
-        match self.instantiation_type(type_id).clone() {
-            Type::Null | Type::Undefined => self.never,
-            Type::Union(members) => {
-                let members: Vec<_> = members
-                    .into_iter()
-                    .filter(|member| !matches!(self.get(*member), Type::Null | Type::Undefined))
-                    .collect();
-                self.union(&members)
-            }
-            _ => type_id,
-        }
+        self.refine_value_type(type_id, ValueRefinement::NonNullable, &mut HashSet::new())
     }
 
     /// Whether the type is exactly `null` or exactly `undefined`, rather than a
@@ -5201,23 +5266,67 @@ impl TypeTable {
     /// Removes constituents that can never be the result of the left operand
     /// of `||`.
     pub fn truthy_type(&mut self, type_id: TypeId) -> TypeId {
-        match self.get(type_id).clone() {
-            Type::Null | Type::Undefined | Type::Void | Type::BooleanLiteral(false) => self.never,
-            Type::NumberLiteral(text) if number_value(&text) == Some(0.0) => self.never,
-            Type::StringLiteral(text) if text.is_empty() => self.never,
+        self.refine_value_type(type_id, ValueRefinement::Truthy, &mut HashSet::new())
+    }
+
+    fn refine_value_type(
+        &mut self,
+        type_id: TypeId,
+        refinement: ValueRefinement,
+        active: &mut HashSet<TypeId>,
+    ) -> TypeId {
+        if active.len() >= MAX_TYPE_DEPTH as usize || !active.insert(type_id) {
+            return type_id;
+        }
+        let ty = match refinement {
+            ValueRefinement::NonNullable => self.instantiation_type(type_id),
+            ValueRefinement::Truthy => self.get(type_id),
+        }
+        .clone();
+        let refined = match ty {
+            Type::Null | Type::Undefined => self.never,
+            Type::Void | Type::BooleanLiteral(false) if refinement == ValueRefinement::Truthy => {
+                self.never
+            }
+            Type::NumberLiteral(text)
+                if refinement == ValueRefinement::Truthy && number_value(&text) == Some(0.0) =>
+            {
+                self.never
+            }
+            Type::StringLiteral(text)
+                if refinement == ValueRefinement::Truthy && text.is_empty() =>
+            {
+                self.never
+            }
             Type::EnumMember {
                 string_value: Some(value),
                 ..
-            } if value.is_empty() => self.never,
+            } if refinement == ValueRefinement::Truthy && value.is_empty() => self.never,
             Type::Union(members) => {
                 let members: Vec<_> = members
                     .into_iter()
-                    .filter(|member| self.truthy_type(*member) != self.never)
+                    .map(|member| self.refine_value_type(member, refinement, active))
                     .collect();
                 self.union(&members)
             }
+            Type::IndexedAccess { .. } => {
+                if let Some(read) = self.indexed_access_read_type(type_id) {
+                    let narrowed = self.refine_value_type(read, refinement, active);
+                    if narrowed == read {
+                        type_id
+                    } else if narrowed == self.never {
+                        self.never
+                    } else {
+                        self.intersection(vec![type_id, narrowed])
+                    }
+                } else {
+                    type_id
+                }
+            }
             _ => type_id,
-        }
+        };
+        active.remove(&type_id);
+        refined
     }
 
     /// Returns whether a value of `source` may be assigned where `target` is
@@ -21149,7 +21258,7 @@ impl<'src> Binder<'src> {
     }
 
     fn iteration_element_type(&mut self, iterable: TypeId, mode: ForOfMode) -> Option<TypeId> {
-        self.iteration_element_type_inner(iterable, mode, iterable)
+        self.iteration_element_type_inner(iterable, mode, iterable, &mut HashSet::new())
     }
 
     fn iteration_element_type_inner(
@@ -21157,6 +21266,22 @@ impl<'src> Binder<'src> {
         iterable: TypeId,
         mode: ForOfMode,
         receiver: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Option<TypeId> {
+        if active.len() >= MAX_TYPE_DEPTH as usize || !active.insert(iterable) {
+            return None;
+        }
+        let element = self.iteration_element_type_view(iterable, mode, receiver, active);
+        active.remove(&iterable);
+        element
+    }
+
+    fn iteration_element_type_view(
+        &mut self,
+        iterable: TypeId,
+        mode: ForOfMode,
+        receiver: TypeId,
+        active: &mut HashSet<TypeId>,
     ) -> Option<TypeId> {
         match self.types.get(iterable).clone() {
             Type::Array(_) | Type::Tuple(_) => {
@@ -21208,7 +21333,8 @@ impl<'src> Binder<'src> {
                 let mut has_error = false;
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let element = self.iteration_element_type_inner(member, mode, receiver)?;
+                    let element =
+                        self.iteration_element_type_inner(member, mode, receiver, active)?;
                     has_error |= element == error;
                     elements.push(element);
                 }
@@ -21256,7 +21382,8 @@ impl<'src> Binder<'src> {
                 let error = self.types.error_type();
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let Some(element) = self.iteration_element_type_inner(member, mode, receiver)
+                    let Some(element) =
+                        self.iteration_element_type_inner(member, mode, receiver, active)
                     else {
                         continue;
                     };
@@ -21271,16 +21398,20 @@ impl<'src> Binder<'src> {
                     _ => Some(self.types.intersection(elements)),
                 }
             }
+            Type::IndexedAccess { .. } => {
+                let read = self.types.indexed_access_read_type(iterable)?;
+                self.iteration_element_type_inner(read, mode, receiver, active)
+            }
             Type::Named(symbol) => {
                 if let Some(constraint) = self.type_parameter_effective_constraint(iterable) {
-                    return self.iteration_element_type_inner(constraint, mode, receiver);
+                    return self.iteration_element_type_inner(constraint, mode, receiver, active);
                 }
                 let resolved = self.resolve_named_type_symbol(symbol);
                 let view = self.types.named_structural_view(resolved);
                 if view != resolved {
-                    self.iteration_element_type_inner(view, mode, receiver)
+                    self.iteration_element_type_inner(view, mode, receiver, active)
                 } else if resolved != iterable {
-                    self.iteration_element_type_inner(resolved, mode, receiver)
+                    self.iteration_element_type_inner(resolved, mode, receiver, active)
                 } else {
                     None
                 }
@@ -21288,17 +21419,17 @@ impl<'src> Binder<'src> {
             Type::AppliedClass { .. } => {
                 let view = self.types.prepare_applied_class_view(iterable)?;
                 (view != iterable)
-                    .then(|| self.iteration_element_type_inner(view, mode, receiver))
+                    .then(|| self.iteration_element_type_inner(view, mode, receiver, active))
                     .flatten()
             }
             Type::AppliedAlias { .. } => {
                 let view = self.types.prepare_applied_alias_view(iterable)?;
                 (view != iterable)
-                    .then(|| self.iteration_element_type_inner(view, mode, receiver))
+                    .then(|| self.iteration_element_type_inner(view, mode, receiver, active))
                     .flatten()
             }
             Type::ConstructorType { structural, .. } => {
-                self.iteration_element_type_inner(structural, mode, receiver)
+                self.iteration_element_type_inner(structural, mode, receiver, active)
             }
             _ => None,
         }
@@ -22035,6 +22166,10 @@ impl<'src> Binder<'src> {
                         }
                         _ => self.types.property_type(view, name),
                     };
+                    let property = property.or_else(|| match self.types.get(view) {
+                        Type::Array(element) => self.array_member(*element, name),
+                        _ => None,
+                    });
                     if let Some(property) = property {
                         found.push(self.project_this_type(property, member_owner, receiver));
                     }

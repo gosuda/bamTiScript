@@ -1150,6 +1150,40 @@ impl<'table> TypeRelations<'table> {
                     _ => false,
                 }
             }
+            (
+                Type::IndexedAccess {
+                    object: source_object,
+                    index: source_index,
+                },
+                Type::IndexedAccess {
+                    object: target_object,
+                    index: target_index,
+                },
+            ) if self.equivalent(*source_object, *target_object)
+                && self.equivalent(*source_index, *target_index) =>
+            {
+                true
+            }
+            (Type::Union(sources), Type::IndexedAccess { .. }) => {
+                let relates = |member: &TypeId| self.relates(*member, target, strictness);
+                if strictness == Strictness::Comparable {
+                    sources.iter().any(relates)
+                } else {
+                    sources.iter().all(relates)
+                }
+            }
+            (Type::Intersection(sources), Type::IndexedAccess { .. })
+                if sources
+                    .iter()
+                    .any(|member| self.relates(*member, target, strictness)) =>
+            {
+                true
+            }
+            (Type::Named(symbol), Type::IndexedAccess { .. })
+                if let Some(constraint) = self.table.type_parameter_constraint(*symbol) =>
+            {
+                constraint != source && self.relates(constraint, target, strictness)
+            }
             (_, Type::IndexedAccess { .. }) => {
                 if matches!(from, Type::Never)
                     || (strictness == Strictness::Assignable
@@ -1181,6 +1215,13 @@ impl<'table> TypeRelations<'table> {
             // constraints. Keep the indexed-access identity intact: deriving this view
             // must not mutate the interned table or erase generic correlations.
             (Type::IndexedAccess { .. }, _) => {
+                if let Type::Union(targets) = to
+                    && targets
+                        .iter()
+                        .any(|member| self.relates(source, *member, strictness))
+                {
+                    return true;
+                }
                 match self.table.indexed_access_constraint_view(source) {
                     IndexedAccessConstraint::Reduced(expression) => {
                         self.constraint_source_relates(&expression, target, strictness)
