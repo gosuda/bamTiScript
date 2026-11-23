@@ -362,6 +362,118 @@ mod tests {
         }
     }
 
+    fn serve_archive_responses(
+        responses: Vec<(u16, &'static [u8])>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<usize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::io::{BufRead, BufReader, ErrorKind, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind archive fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("bound archive fixture wait");
+        let url = format!("http://{}/archive.tar.gz", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            for (status, body) in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            if stopping.load(std::sync::atomic::Ordering::Relaxed)
+                                || Instant::now() >= deadline
+                            {
+                                return served;
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("accept archive request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound request read");
+                {
+                    let mut request = BufReader::new(&mut stream);
+                    let mut line = String::new();
+                    let mut header_bytes = 0;
+                    loop {
+                        line.clear();
+                        let count = request.read_line(&mut line).expect("read request header");
+                        assert_ne!(count, 0, "request header must terminate");
+                        header_bytes += count;
+                        assert!(header_bytes <= 8192, "fixture request header is bounded");
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write response header");
+                stream.write_all(body).expect("write archive body");
+                served += 1;
+            }
+            served
+        });
+        (url, server, stop)
+    }
+
+    #[test]
+    fn archive_fetch_retries_transient_failures_and_reuses_verified_bytes() {
+        let cache = TestDir::new("archive-retry");
+        let payload = b"verified archive";
+        let expected = sha256_hex(payload);
+        let (url, server, stop) = serve_archive_responses(vec![(504, b""), (200, payload)]);
+        let result = fetch_archive(&url, &expected, cache.path());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(server.join().expect("archive server"), 2);
+        let archive = result.expect("transient failure retried");
+        assert_eq!(fs::read(&archive).unwrap(), payload);
+        assert_eq!(
+            fetch_archive(&url, &expected, cache.path()).expect("verified cache hit"),
+            archive
+        );
+    }
+
+    #[test]
+    fn archive_fetch_still_rejects_a_wrong_digest_after_retry() {
+        let cache = TestDir::new("archive-retry-digest");
+        let expected = sha256_hex(b"expected archive");
+        let (url, server, stop) =
+            serve_archive_responses(vec![(504, b""), (200, b"incorrect archive")]);
+        let result = fetch_archive(&url, &expected, cache.path());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(server.join().expect("archive server"), 2);
+        assert_eq!(result.unwrap_err().code(), ErrorCode::Digest);
+        assert!(!cache.path().join(format!("{expected}.tar.gz")).exists());
+    }
+
+    #[test]
+    fn archive_fetch_does_not_retry_permanent_http_errors() {
+        let cache = TestDir::new("archive-permanent-failure");
+        let expected = sha256_hex(b"missing archive");
+        let (url, server, stop) =
+            serve_archive_responses(vec![(404, b""), (200, b"missing archive")]);
+        let result = fetch_archive(&url, &expected, cache.path());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(server.join().expect("archive server"), 1);
+        assert_eq!(result.unwrap_err().code(), ErrorCode::ToolFailed);
+        assert!(!cache.path().join(format!("{expected}.tar.gz")).exists());
+    }
+
     fn write_fixture_tree(root: &Path) {
         let case = root.join("tests/cases/compiler/a.ts");
         fs::create_dir_all(case.parent().unwrap()).unwrap();
