@@ -1541,6 +1541,8 @@ pub enum Type {
         symbol: SymbolId,
         arguments: Vec<TypeId>,
         structural: TypeId,
+        /// Distinguishes substituted cycles from their immutable source snapshot.
+        projection: Option<ConstructorProjection>,
     },
     /// A `typeof X` query with its written spelling. The target is the
     /// resolved meaning for checking; display renders `typeof <spelling>`.
@@ -1611,6 +1613,14 @@ struct ImportedTypeMap {
     pending_constructor_revisions: Vec<(TypeId, TypeId)>,
 }
 
+/// The source and substitution that distinguish a recursive constructor view.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ConstructorProjection {
+    pub(crate) source: TypeId,
+    pub(crate) substitutions: Box<[(SymbolId, TypeId)]>,
+    pub(crate) this_receiver: Option<(SymbolId, TypeId)>,
+}
+
 /// An interning table for structural types plus the assignability relation.
 ///
 /// The table is append-only while checking and frozen into the immutable
@@ -1623,6 +1633,7 @@ pub struct TypeTable {
     /// Captured constructor identities map directly to their current raw
     /// namespace-augmented representation. Interned nodes and keys stay fixed.
     constructor_revisions: HashMap<TypeId, TypeId>,
+    constructor_projections: HashMap<ConstructorProjection, TypeId>,
     /// Materialized key sets live outside the immutable interned nodes.
     keyof_views: HashMap<TypeId, TypeId>,
     constructor_keyof_dependents: HashMap<SymbolId, HashSet<TypeId>>,
@@ -1694,6 +1705,7 @@ impl TypeTable {
             types: Vec::new(),
             index: HashMap::new(),
             constructor_revisions: HashMap::new(),
+            constructor_projections: HashMap::new(),
             keyof_views: HashMap::new(),
             constructor_keyof_dependents: HashMap::new(),
             error: TypeId(0),
@@ -2831,7 +2843,108 @@ impl TypeTable {
             symbol,
             arguments,
             structural,
+            projection: None,
         })
+    }
+
+    pub(crate) fn constructor_projection(
+        &self,
+        projection: &ConstructorProjection,
+    ) -> Option<TypeId> {
+        self.constructor_projections.get(projection).copied()
+    }
+
+    pub(crate) fn begin_constructor_projection(
+        &mut self,
+        projection: ConstructorProjection,
+    ) -> TypeId {
+        let Type::ConstructorType {
+            symbol,
+            arguments,
+            structural,
+            ..
+        } = self.types[projection.source.0 as usize].clone()
+        else {
+            panic!("constructor projection requires a constructor source");
+        };
+        let identity = self.intern(Type::ConstructorType {
+            symbol,
+            arguments,
+            structural,
+            projection: Some(projection.clone()),
+        });
+        assert!(self.constructor_projections.insert(projection, identity).is_none());
+        identity
+    }
+
+    pub(crate) fn finish_constructor_projection(
+        &mut self,
+        identity: TypeId,
+        arguments: Vec<TypeId>,
+        structural: TypeId,
+    ) -> TypeId {
+        let Type::ConstructorType {
+            symbol,
+            projection: Some(projection),
+            ..
+        } = self.types[identity.0 as usize].clone()
+        else {
+            panic!("constructor projection requires a registered identity");
+        };
+        let current = self.intern(Type::ConstructorType {
+            symbol,
+            arguments,
+            structural,
+            projection: Some(projection.clone()),
+        });
+        self.constructor_projections.insert(projection, current);
+        self.publish_constructor_revision(identity, current);
+        current
+    }
+
+    /// Projection sources predate their raw projections. Walk the immutable
+    /// sources so import replay order does not affect identity.
+    fn same_constructor_application(&self, mut previous: TypeId, mut current: TypeId) -> bool {
+        loop {
+            let (
+                Type::ConstructorType {
+                    symbol: previous_symbol,
+                    arguments: previous_arguments,
+                    projection: previous_projection,
+                    ..
+                },
+                Type::ConstructorType {
+                    symbol: current_symbol,
+                    arguments: current_arguments,
+                    projection: current_projection,
+                    ..
+                },
+            ) = (
+                &self.types[previous.0 as usize],
+                &self.types[current.0 as usize],
+            )
+            else {
+                return false;
+            };
+            if previous_symbol != current_symbol {
+                return false;
+            }
+            if previous_arguments == current_arguments {
+                return true;
+            }
+            let (Some(previous_projection), Some(current_projection)) =
+                (previous_projection, current_projection)
+            else {
+                return false;
+            };
+            if previous_projection.substitutions != current_projection.substitutions
+                || previous_projection.this_receiver != current_projection.this_receiver
+            {
+                return false;
+            }
+            previous = previous_projection.source;
+            current = current_projection.source;
+        }
     }
 
     /// Publishes a new static view for the same constructor application.
@@ -2846,27 +2959,13 @@ impl TypeTable {
         if previous == current {
             return;
         }
-        let (
-            Type::ConstructorType {
-                symbol: previous_symbol,
-                arguments: previous_arguments,
-                ..
-            },
-            Type::ConstructorType {
-                symbol: current_symbol,
-                arguments: current_arguments,
-                ..
-            },
-        ) = (
-            &self.types[previous.0 as usize],
-            &self.types[current.0 as usize],
-        )
-        else {
+        let Type::ConstructorType { symbol, .. } = self.types[current.0 as usize] else {
             panic!("constructor revisions require constructor identities");
         };
-        assert_eq!(previous_symbol, current_symbol);
-        assert_eq!(previous_arguments, current_arguments);
-        let symbol = *current_symbol;
+        assert!(
+            self.same_constructor_application(previous, current),
+            "constructor revisions preserve the constructor application"
+        );
         for view in self.constructor_revisions.values_mut() {
             if *view == previous {
                 *view = current;
@@ -2874,6 +2973,18 @@ impl TypeTable {
         }
         self.constructor_revisions.remove(&current);
         self.constructor_revisions.insert(previous, current);
+        let mut projections: Vec<_> = self
+            .constructor_projections
+            .iter()
+            .filter(|(projection, _)| projection.source == previous)
+            .map(|(projection, &identity)| (projection.clone(), identity))
+            .collect();
+        projections.sort_by_key(|(_, identity)| *identity);
+        for (projection, identity) in projections {
+            let substitution = InferredTypeArguments::for_constructor_projection(&projection);
+            let projected = substitution.instantiate_constructor_projection(self, current);
+            self.publish_constructor_revision(identity, projected);
+        }
         self.refresh_constructor_keyof(symbol);
     }
 
@@ -5007,6 +5118,7 @@ impl TypeTable {
                     symbol,
                     arguments,
                     structural,
+                    projection,
                 } => {
                     let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
                     let arguments = arguments
@@ -5014,7 +5126,41 @@ impl TypeTable {
                         .map(|&arg| copy(target, source, arg, imported, next_symbol))
                         .collect();
                     let structural = copy(target, source, structural, imported, next_symbol);
-                    target.constructor_type(symbol, arguments, structural)
+                    let projection = projection.map(|projection| {
+                        let source_id =
+                            copy(target, source, projection.source, imported, next_symbol);
+                        let mut substitutions: Vec<_> = projection
+                            .substitutions
+                            .iter()
+                            .map(|&(symbol, type_id)| {
+                                (
+                                    remap_symbol(target, source, symbol, imported, next_symbol),
+                                    copy(target, source, type_id, imported, next_symbol),
+                                )
+                            })
+                            .collect();
+                        substitutions.sort_by_key(|&(symbol, _)| symbol);
+                        ConstructorProjection {
+                            source: source_id,
+                            substitutions: substitutions.into_boxed_slice(),
+                            this_receiver: projection.this_receiver.map(|(owner, receiver)| {
+                                (
+                                    remap_symbol(target, source, owner, imported, next_symbol),
+                                    copy(target, source, receiver, imported, next_symbol),
+                                )
+                            }),
+                        }
+                    });
+                    let type_id = target.intern(Type::ConstructorType {
+                        symbol,
+                        arguments,
+                        structural,
+                        projection: projection.clone(),
+                    });
+                    if let Some(projection) = projection {
+                        target.constructor_projections.insert(projection, type_id);
+                    }
+                    type_id
                 }
             };
             imported.types.insert(source_id, type_id);
@@ -30574,6 +30720,456 @@ mod tests {
     }
 
     #[test]
+    fn generic_factory_preserves_return_types_through_recursive_static_methods() {
+        let (model, diagnostics) = bound(
+            r#"
+            function make<T>(value: T) {
+                class C {
+                    static read(): T { return value; }
+                    static self() { return C; }
+                }
+                return C;
+            }
+            const direct = make<number>(1).read();
+            const recursive = make<number>(1).self().read();
+            const repeated = make<number>(1).self().self().read();
+            const text = make<string>("value").self().read();
+            "#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for name in ["direct", "recursive", "repeated"] {
+            let result = model.symbol_type(value_symbol(&model, name));
+            assert_eq!(model.types().get(result), &Type::Number, "{name}");
+        }
+        let text = model.symbol_type(value_symbol(&model, "text"));
+        assert_eq!(model.types().get(text), &Type::String);
+    }
+
+    fn constructor_member(
+        table: &mut TypeTable,
+        constructor: TypeId,
+        name: &str,
+    ) -> Option<TypeId> {
+        let Type::ConstructorType { structural, .. } = *table.get(constructor) else {
+            panic!("constructor type");
+        };
+        table.property_type(structural, name)
+    }
+
+    #[test]
+    fn recursive_constructor_projection_retains_substitution_and_interning() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let parameter = SymbolId::new(2);
+        let variable = table.named(parameter);
+        let empty = table.object_type(Vec::new());
+        let captured = table.constructor_type(owner, Vec::new(), empty);
+        let captured_raw = table.types[captured.get() as usize].clone();
+        let shape = table.object_type(vec![
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let current = table.constructor_type(owner, Vec::new(), shape);
+        table.publish_constructor_revision(captured, current);
+        let number = table.number();
+        let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter,
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let projected = substitution.instantiate(&mut table, captured);
+        assert_ne!(projected, current);
+        let mut cursor = projected;
+        for _ in 0..64 {
+            assert_eq!(constructor_member(&mut table, cursor, "value"), Some(number));
+            cursor = constructor_member(&mut table, cursor, "self").expect("recursive self");
+            assert_eq!(table.constructor_identity(cursor), projected);
+        }
+        assert_eq!(constructor_member(&mut table, captured, "value"), Some(variable));
+        assert_eq!(table.types[captured.get() as usize], captured_raw);
+        let count = table.types.len();
+        for _ in 0..16 {
+            assert_eq!(substitution.instantiate(&mut table, captured), projected);
+            assert_eq!(substitution.instantiate(&mut table, projected), projected);
+        }
+        assert_eq!(table.types.len(), count);
+        for (index, raw) in table.types.iter().enumerate() {
+            let identity = TypeId(u32::try_from(index).expect("type count fits in u32"));
+            assert_eq!(table.index.get(raw), Some(&identity));
+        }
+    }
+
+    #[test]
+    fn unchanged_recursive_constructor_substitution_keeps_live_capture_identity() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let parameter = SymbolId::new(2);
+        let unrelated = SymbolId::new(3);
+        let variable = table.named(parameter);
+        let number = table.number();
+        let empty = table.object_type(Vec::new());
+        let captured = table.constructor_type(owner, Vec::new(), empty);
+        let shape = table.object_type(vec![
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let current = table.constructor_type(owner, Vec::new(), shape);
+        table.publish_constructor_revision(captured, current);
+        let substitutions = [
+            InferredTypeArguments::new(Vec::new()),
+            InferredTypeArguments::new(vec![InferredTypeArgument::new(
+                parameter,
+                variable,
+                InferenceProvenance::Explicit,
+            )]),
+            InferredTypeArguments::new(vec![InferredTypeArgument::new(
+                unrelated,
+                number,
+                InferenceProvenance::Explicit,
+            )]),
+        ];
+        let count = table.types.len();
+        for substitution in substitutions {
+            assert_eq!(substitution.instantiate(&mut table, captured), captured);
+        }
+        assert_eq!(table.types.len(), count);
+        let augmented = table.object_type(vec![
+            PropertyType::new("added", false, number),
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let augmented = table.constructor_type(owner, Vec::new(), augmented);
+        table.publish_constructor_revision(current, augmented);
+        assert_eq!(constructor_member(&mut table, captured, "added"), Some(number));
+    }
+
+    #[test]
+    fn mutually_recursive_constructor_projection_retains_both_cycles() {
+        let mut table = TypeTable::new();
+        let parameter = SymbolId::new(3);
+        let variable = table.named(parameter);
+        let number = table.number();
+        let empty = table.object_type(Vec::new());
+        let left = table.constructor_type(SymbolId::new(1), Vec::new(), empty);
+        let right = table.constructor_type(SymbolId::new(2), Vec::new(), empty);
+        let left_shape = table.object_type(vec![
+            PropertyType::new("peer", false, right),
+            PropertyType::new("value", false, variable),
+        ]);
+        let left_current = table.constructor_type(SymbolId::new(1), Vec::new(), left_shape);
+        table.publish_constructor_revision(left, left_current);
+        let right_shape = table.object_type(vec![
+            PropertyType::new("peer", false, left),
+            PropertyType::new("value", false, variable),
+        ]);
+        let right_current = table.constructor_type(SymbolId::new(2), Vec::new(), right_shape);
+        table.publish_constructor_revision(right, right_current);
+        let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter,
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let projected = substitution.instantiate(&mut table, left);
+        let peer = constructor_member(&mut table, projected, "peer").expect("right peer");
+        assert_eq!(constructor_member(&mut table, peer, "value"), Some(number));
+        let returned = constructor_member(&mut table, peer, "peer").expect("left peer");
+        assert_eq!(table.constructor_identity(returned), projected);
+        assert_eq!(constructor_member(&mut table, returned, "value"), Some(number));
+    }
+
+    #[test]
+    fn constructor_projection_follows_later_static_revisions() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let parameter = SymbolId::new(2);
+        let variable = table.named(parameter);
+        let number = table.number();
+        let empty = table.object_type(Vec::new());
+        let captured = table.constructor_type(owner, Vec::new(), empty);
+        let shape = table.object_type(vec![
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let current = table.constructor_type(owner, Vec::new(), shape);
+        table.publish_constructor_revision(captured, current);
+        let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter,
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let projected = substitution.instantiate(&mut table, captured);
+        let keys = table.keyof(projected);
+        let added = table.string_literal("added");
+        assert!(!table.assignable(added, keys));
+        let augmented = table.object_type(vec![
+            PropertyType::new("added", false, variable),
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let augmented = table.constructor_type(owner, Vec::new(), augmented);
+        table.publish_constructor_revision(current, augmented);
+        assert_eq!(constructor_member(&mut table, projected, "added"), Some(number));
+        assert!(table.assignable(added, keys));
+        let returned = constructor_member(&mut table, projected, "self").expect("self");
+        assert_eq!(constructor_member(&mut table, returned, "added"), Some(number));
+        assert_eq!(
+            table.constructor_identity(projected),
+            substitution.instantiate(&mut table, captured)
+        );
+        table.publish_constructor_revision(augmented, current);
+        assert_eq!(constructor_member(&mut table, projected, "added"), None);
+        assert!(!table.assignable(added, keys));
+        assert_eq!(constructor_member(&mut table, projected, "value"), Some(number));
+        let returned = constructor_member(&mut table, projected, "self").expect("restored self");
+        assert_eq!(constructor_member(&mut table, returned, "added"), None);
+        assert_eq!(constructor_member(&mut table, returned, "value"), Some(number));
+    }
+
+    #[test]
+    fn constructor_revision_preserves_an_argument_with_a_revised_projection() {
+        let mut table = TypeTable::new();
+        let child_owner = SymbolId::new(1);
+        let parent_owner = SymbolId::new(2);
+        let parameter = SymbolId::new(3);
+        let variable = table.named(parameter);
+        let number = table.number();
+        let child_shape = table.object_type(vec![PropertyType::new("value", false, variable)]);
+        let child = table.constructor_type(child_owner, Vec::new(), child_shape);
+        let parent_shape = table.object_type(Vec::new());
+        let parent = table.constructor_type(parent_owner, vec![child], parent_shape);
+        let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter,
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let projected = substitution.instantiate(&mut table, parent);
+        let Type::ConstructorType { arguments, .. } = table.get(projected) else {
+            panic!("constructor type");
+        };
+        let original_projected_child = arguments[0];
+
+        let revised_child_shape = table.object_type(vec![
+            PropertyType::new("added", false, variable),
+            PropertyType::new("value", false, variable),
+        ]);
+        let revised_child = table.constructor_type(child_owner, Vec::new(), revised_child_shape);
+        table.publish_constructor_revision(child, revised_child);
+        let revised_shape = table.object_type(vec![PropertyType::new("fresh", false, number)]);
+        let revised_parent = table.constructor_type(parent_owner, vec![child], revised_shape);
+        table.publish_constructor_revision(parent, revised_parent);
+
+        assert_eq!(constructor_member(&mut table, projected, "fresh"), Some(number));
+        let Type::ConstructorType { arguments, .. } = table.get(projected) else {
+            panic!("constructor type");
+        };
+        let projected_child = arguments[0];
+        assert_ne!(original_projected_child, projected_child);
+        assert_eq!(
+            table.constructor_identity(original_projected_child),
+            projected_child
+        );
+        assert_eq!(
+            constructor_member(&mut table, projected_child, "added"),
+            Some(number)
+        );
+        assert_eq!(constructor_member(&mut table, child, "added"), Some(variable));
+
+        let mut target = TypeTable::new();
+        let mut imported = ImportedTypeMap::default();
+        let mut next_symbol = 100;
+        let (imported_projection, _) =
+            target.import_type(&table, projected, &[], &mut imported, &mut next_symbol);
+        let imported_number = target.number();
+        assert_eq!(
+            constructor_member(&mut target, imported_projection, "fresh"),
+            Some(imported_number)
+        );
+
+        table.publish_constructor_revision(revised_parent, parent);
+        assert_eq!(constructor_member(&mut table, projected, "fresh"), None);
+        let Type::ConstructorType { arguments, .. } = table.get(projected) else {
+            panic!("constructor type");
+        };
+        assert_eq!(table.constructor_identity(arguments[0]), projected_child);
+    }
+
+    #[test]
+    fn constructor_projection_keeps_its_recipe_across_unchanged_revisions() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let parameter = SymbolId::new(2);
+        let variable = table.named(parameter);
+        let number = table.number();
+        let string = table.string();
+        let empty = table.object_type(Vec::new());
+        let captured = table.constructor_type(owner, Vec::new(), empty);
+        let generic_shape = table.object_type(vec![
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let generic = table.constructor_type(owner, Vec::new(), generic_shape);
+        table.publish_constructor_revision(captured, generic);
+        let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter,
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+        let projected = substitution.instantiate(&mut table, captured);
+        let fixed_shape = table.object_type(vec![
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, string),
+        ]);
+        let fixed = table.constructor_type(owner, Vec::new(), fixed_shape);
+        table.publish_constructor_revision(generic, fixed);
+        assert_eq!(constructor_member(&mut table, projected, "value"), Some(string));
+        assert_eq!(substitution.instantiate(&mut table, captured), captured);
+        assert_ne!(
+            table.constructor_identity(projected),
+            table.constructor_identity(captured)
+        );
+        let mut imported_table = TypeTable::new();
+        let mut imported = ImportedTypeMap::default();
+        let mut next_symbol = 100;
+        let (imported_projection, _) = imported_table.import_type(
+            &table,
+            projected,
+            &[],
+            &mut imported,
+            &mut next_symbol,
+        );
+        let imported_fixed = imported.types[&fixed];
+        let imported_generic = imported.types[&generic];
+        imported_table.publish_constructor_revision(imported_fixed, imported_generic);
+        let imported_number = imported_table.number();
+        assert_eq!(
+            constructor_member(&mut imported_table, imported_projection, "value"),
+            Some(imported_number)
+        );
+        let imported_base = constructor_member(&mut imported_table, imported_generic, "value");
+        assert_eq!(imported_base, Some(imported.types[&variable]));
+
+        table.publish_constructor_revision(fixed, generic);
+        assert_eq!(constructor_member(&mut table, captured, "value"), Some(variable));
+        assert_eq!(constructor_member(&mut table, projected, "value"), Some(number));
+        let returned = constructor_member(&mut table, projected, "self").expect("self");
+        assert_eq!(constructor_member(&mut table, returned, "value"), Some(number));
+        assert_eq!(
+            table.constructor_identity(returned),
+            table.constructor_identity(projected)
+        );
+    }
+
+    #[test]
+    fn importing_recursive_constructor_projections_keeps_specializations_distinct() {
+        let mut source = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let parameter = SymbolId::new(2);
+        let variable = source.named(parameter);
+        let empty = source.object_type(Vec::new());
+        let captured = source.constructor_type(owner, Vec::new(), empty);
+        let shape = source.object_type(vec![
+            PropertyType::new("self", false, captured),
+            PropertyType::new("value", false, variable),
+        ]);
+        let current = source.constructor_type(owner, Vec::new(), shape);
+        source.publish_constructor_revision(captured, current);
+        let mut projected = Vec::new();
+        for value in [source.number(), source.string()] {
+            let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+                parameter,
+                value,
+                InferenceProvenance::Explicit,
+            )]);
+            projected.push(substitution.instantiate(&mut source, captured));
+        }
+        let root = source.object_type(vec![
+            PropertyType::new("base", false, captured),
+            PropertyType::new("number", false, projected[0]),
+            PropertyType::new("string", false, projected[1]),
+        ]);
+        let mut target = TypeTable::new();
+        let mut imported = ImportedTypeMap::default();
+        let mut next_symbol = 100;
+        let (root, _) = target.import_type(
+            &source,
+            root,
+            &[],
+            &mut imported,
+            &mut next_symbol,
+        );
+        let base = target.property_type(root, "base").expect("base");
+        let imported_parameter = imported.symbols[&parameter];
+        for (name, expected) in [
+            ("number", target.number()),
+            ("string", target.string()),
+        ] {
+            let specialized = target.property_type(root, name).expect("specialization");
+            let mut cursor = specialized;
+            for _ in 0..16 {
+                assert_eq!(constructor_member(&mut target, cursor, "value"), Some(expected));
+                cursor = constructor_member(&mut target, cursor, "self").expect("self");
+                assert_eq!(
+                    target.constructor_identity(cursor),
+                    target.constructor_identity(specialized)
+                );
+            }
+            let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+                imported_parameter,
+                expected,
+                InferenceProvenance::Explicit,
+            )]);
+            let count = target.types.len();
+            assert_eq!(
+                substitution.instantiate(&mut target, base),
+                target.constructor_identity(specialized)
+            );
+            assert_eq!(target.types.len(), count);
+        }
+        let original_value = constructor_member(&mut target, base, "value").expect("value");
+        assert_eq!(target.get(original_value), &Type::Named(imported_parameter));
+    }
+
+    #[test]
+    fn imported_factory_constructor_preserves_recursive_method_returns() {
+        let (model, diagnostics) = bound(
+            r#"
+            function make<T>(value: T) {
+                class C {
+                    static read(): T { return value; }
+                    static self() { return C; }
+                }
+                return C;
+            }
+            const result = make<number>(1);
+            "#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let result = model.symbol_type(value_symbol(&model, "result"));
+        let mut target = TypeTable::new();
+        let mut imported = ImportedTypeMap::default();
+        let mut next_symbol = 100;
+        let (mut constructor, _) = target.import_type(
+            model.types(),
+            result,
+            &[],
+            &mut imported,
+            &mut next_symbol,
+        );
+        for _ in 0..16 {
+            let read = constructor_member(&mut target, constructor, "read").expect("read");
+            let Type::Function(read) = target.get(read) else {
+                panic!("read method");
+            };
+            assert_eq!(target.get(read.return_type()), &Type::Number);
+            let self_method = constructor_member(&mut target, constructor, "self").expect("self");
+            let Type::Function(self_method) = target.get(self_method) else {
+                panic!("self method");
+            };
+            constructor = self_method.return_type();
+        }
+    }
+
+    #[test]
     fn constructor_revisions_preserve_interning_and_captured_aliases() {
         let mut table = TypeTable::new();
         let owner = SymbolId::new(1);
@@ -30605,6 +31201,7 @@ mod tests {
                 symbol: SymbolId::new(2),
                 arguments: Vec::new(),
                 structural: empty,
+                projection: None,
             }
         );
         assert_eq!(table.get(empty), &empty_node);
