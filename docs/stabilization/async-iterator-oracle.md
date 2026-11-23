@@ -5,6 +5,9 @@ structural async iterator. It awaits that payload when the returned iterator
 retains the builtin `AsyncIterator` identity. Awaiting every `for await` value
 therefore disagrees with the pinned compiler.
 
+The [verification guide](../explanation/verification.md) explains how these
+checks relate to the separate product completion gates.
+
 ## Reference executable
 
 Observed on 2026-11-23:
