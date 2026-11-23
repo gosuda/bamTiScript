@@ -17577,7 +17577,7 @@ fn site_hit_get_caches_shaped_own_data() {
         None
     );
     machine.property_site_record_get(module, function, 0, object, &key);
-    assert_eq!(machine.function_sites(module, function).gets[0].len, 1);
+    assert_eq!(machine.function_sites(module, function).sites[0].len, 1);
     assert_eq!(
         machine.property_site_hit_get(module, function, 0, object, &key),
         Some(Value::int32(1))
@@ -17598,7 +17598,7 @@ fn site_cache_distinguishes_keys_on_one_shape() {
     let key_b = PropertyKey::Named(machine.intern_str("b"));
     machine.property_site_record_get(module, function, 0, object, &key_a);
     machine.property_site_record_get(module, function, 0, object, &key_b);
-    assert_eq!(machine.function_sites(module, function).gets[0].len, 2);
+    assert_eq!(machine.function_sites(module, function).sites[0].len, 2);
     assert_eq!(
         machine.property_site_hit_get(module, function, 0, object, &key_a),
         Some(Value::int32(1))
@@ -17803,6 +17803,64 @@ fn profile_property_cache_hits() {
 }
 
 #[test]
+#[ignore = "development-host performance measurement"]
+fn profile_function_site_initialization() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let instructions = 100_000;
+    let iterations = 100;
+    let mut code = vec![
+        Instruction::LoadConst {
+            dst: reg(0),
+            constant: cid(0),
+        };
+        instructions
+    ];
+    code[10_000] = Instruction::GetProperty {
+        dst: reg(0),
+        object: reg(0),
+        key: reg(0),
+    };
+    code[20_000] = Instruction::SetProperty {
+        object: reg(0),
+        key: reg(0),
+        value: reg(0),
+    };
+    code[instructions - 1] = Instruction::Halt;
+    let program = verified(
+        vec![Constant::Int32(1)],
+        vec![function(0, 1, code, Vec::new())],
+    );
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let module = ModuleId::new(0);
+    let function = FunctionId::new(0);
+    let mut found = 0;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        found += usize::from(
+            black_box(&mut machine)
+                .get_cache_slot(module, function, 10_000, Which::Get)
+                .is_some(),
+        );
+        found += usize::from(
+            black_box(&mut machine)
+                .get_cache_slot(module, function, 20_000, Which::Set)
+                .is_some(),
+        );
+        machine.property_sites.clear();
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(found, iterations * 2);
+    eprintln!(
+        "function_sites instructions={instructions} iterations={iterations} elapsed_ns={} sites_found={found} site_bytes={}",
+        elapsed.as_nanos(),
+        std::mem::size_of::<crate::shape::PropertySite>()
+    );
+}
+
+#[test]
 fn site_cache_ignores_prototype_values() {
     let program = site_program();
     let mut host = TestHost;
@@ -17824,7 +17882,7 @@ fn site_cache_ignores_prototype_values() {
     );
     let key = PropertyKey::Named(machine.intern_str("a"));
     machine.property_site_record_get(module, function, 0, child, &key);
-    assert_eq!(machine.function_sites(module, function).gets[0].len, 0);
+    assert_eq!(machine.function_sites(module, function).sites[0].len, 0);
     assert_eq!(
         machine.property_site_hit_get(module, function, 0, child, &key),
         None
@@ -17870,7 +17928,7 @@ fn site_cache_ignores_accessors_and_uninitialized() {
         .unwrap();
     machine.property_site_record_get(module, function, 0, object, &key_acc);
     machine.property_site_record_get(module, function, 0, object, &key_uninit);
-    assert_eq!(machine.function_sites(module, function).gets[0].len, 0);
+    assert_eq!(machine.function_sites(module, function).sites[0].len, 0);
     assert_eq!(
         machine.property_site_hit_get(module, function, 0, object, &key_acc),
         None
@@ -17894,7 +17952,7 @@ fn site_cache_goes_megamorphic_on_fifth_shape() {
         machine.property_site_record_get(module, function, 0, object, &key);
     }
     assert_eq!(
-        machine.function_sites(module, function).gets[0].len,
+        machine.function_sites(module, function).sites[0].len,
         u8::MAX
     );
     let extra = site_object(&mut machine, &[("extra", Value::int32(9))]);
@@ -17919,7 +17977,7 @@ fn site_hit_set_updates_writable_data() {
         None
     );
     machine.property_site_record_set(module, function, 1, object, &key);
-    assert_eq!(machine.function_sites(module, function).sets[1].len, 1);
+    assert_eq!(machine.function_sites(module, function).sites[1].len, 1);
     assert_eq!(
         machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(2)),
         Some(())
@@ -17959,7 +18017,7 @@ fn site_set_ignores_readonly_and_absent_keys() {
     machine.property_site_record_set(module, function, 1, object, &key);
     let absent = PropertyKey::Named(machine.intern_str("absent"));
     machine.property_site_record_set(module, function, 1, object, &absent);
-    assert_eq!(machine.function_sites(module, function).sets[1].len, 0);
+    assert_eq!(machine.function_sites(module, function).sites[1].len, 0);
     assert_eq!(
         machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(2)),
         None
@@ -17997,8 +18055,8 @@ fn site_cache_ignores_dictionary_maps() {
     let key = PropertyKey::Named(machine.intern_str("w0"));
     machine.property_site_record_get(module, function, 0, object, &key);
     machine.property_site_record_set(module, function, 1, object, &key);
-    assert_eq!(machine.function_sites(module, function).gets[0].len, 0);
-    assert_eq!(machine.function_sites(module, function).sets[1].len, 0);
+    assert_eq!(machine.function_sites(module, function).sites[0].len, 0);
+    assert_eq!(machine.function_sites(module, function).sites[1].len, 0);
     assert_eq!(
         machine.property_site_hit_get(module, function, 0, object, &key),
         None

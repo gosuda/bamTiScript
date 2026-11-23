@@ -10586,15 +10586,9 @@ impl<'a, H: Host> Machine<'a, H> {
             self.property_sites
                 .insert((module, function), FunctionSites::build(code));
         }
-        let sites = self.property_sites.get_mut(&(module, function))?;
-        let index = match which {
-            Which::Get => sites.gets.get_mut(pc)?,
-            Which::Set => sites.sets.get_mut(pc)?,
-        };
-        if !index.usable() {
-            return None;
-        }
-        Some(pc)
+        self.property_sites
+            .get(&(module, function))?
+            .site_index(pc, which)
     }
 
     #[cfg(test)]
@@ -10639,7 +10633,7 @@ impl<'a, H: Host> Machine<'a, H> {
             let PropertyMap::Shaped { shape, slots } = properties else {
                 return None;
             };
-            let site_state = &self.property_sites[&(module, function)].gets[site_index];
+            let site_state = &self.property_sites[&(module, function)].sites[site_index];
             let slot = site_state.slot(*shape, key)?;
             match slots.get(slot as usize) {
                 Some(Property::Data { value, .. }) if *value != Value::UNINITIALIZED => {
@@ -10688,7 +10682,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .property_sites
             .get_mut(&(module, function))
             .expect("site table was built above");
-        sites.gets[site_index].record(shape, key.clone(), slot);
+        sites.sites[site_index].record(shape, key.clone(), slot);
     }
 
     /// Writes `value` through the cache at `site` when the receiver matches
@@ -10717,7 +10711,7 @@ impl<'a, H: Host> Machine<'a, H> {
             let PropertyMap::Shaped { shape, slots } = properties else {
                 return None;
             };
-            let site_state = &self.property_sites[&(module, function)].sets[site_index];
+            let site_state = &self.property_sites[&(module, function)].sites[site_index];
             let slot = site_state.slot(*shape, key)?;
             match slots.get(slot as usize)? {
                 Property::Data {
@@ -10788,7 +10782,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .property_sites
             .get_mut(&(module, function))
             .expect("site table was built above");
-        sites.sets[site_index].record(shape, key.clone(), slot);
+        sites.sites[site_index].record(shape, key.clone(), slot);
     }
 
     pub(crate) fn set_super(
