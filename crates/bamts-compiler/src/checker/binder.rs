@@ -11798,10 +11798,8 @@ impl<'src> Binder<'src> {
                     source: self.source,
                 };
                 let key = flow_key_of(&member.object, &resolver)?;
-                let MemberProperty::Named(property) = &member.property else {
-                    return None;
-                };
-                Some(key.child(self.identifier_text(property).as_ref()))
+                let name = enum_plan::cook_member_property_name(self.source, &member.property)?;
+                Some(key.child(&Self::semantic_property_key(&name)))
             }
             _ => None,
         }
@@ -19573,7 +19571,36 @@ impl<'src> Binder<'src> {
             Expression::Update(update) => {
                 self.inventory_assignment_target_writes_in_scope(&update.argument, scope);
                 self.resolve_assignment_target(&update.argument, scope);
+                let operand = self.assignment_target_type(&update.argument, scope, true);
+                let (result, nullable) = self.numeric_update_type(operand);
+                if self.strict_null_checks && nullable {
+                    self.emit(
+                        STRICT_NULL_MEMBER_ACCESS,
+                        update.argument.range(),
+                        "Update operand is possibly 'null' or 'undefined'.",
+                    );
+                }
+                if self.node_types.insert(expression.id(), result).is_none() {
+                    self.typed_expressions.push((expression.range(), result));
+                }
                 self.invalidate_assignment_flow(&update.argument);
+                if !nullable && let Some(key) = self.assignment_flow_key(&update.argument) {
+                    let symbol = key.root_symbol();
+                    let root = key.path().is_empty();
+                    let written = self.types.widen(operand, false);
+                    let mut narrowing = NarrowingContext::new_with_cancel(
+                        &mut self.types,
+                        &mut self.flow_facts,
+                        self.cancel.clone(),
+                    );
+                    narrowing.declare(symbol, self.symbol_types[symbol.get() as usize]);
+                    let flow = narrowing.branch(self.flow);
+                    narrowing.refine(flow, key, written);
+                    self.flow = flow;
+                    if root {
+                        self.assignment_facts.insert((flow, symbol), written);
+                    }
+                }
             }
             Expression::Binary(binary) => {
                 self.resolve_expr(&binary.left, scope);
@@ -21282,15 +21309,32 @@ impl<'src> Binder<'src> {
         target: &'src crate::syntax::AssignmentTargetNode,
         scope: ScopeId,
     ) -> TypeId {
+        self.assignment_target_type(target, scope, false)
+    }
+
+    fn assignment_target_type(
+        &mut self,
+        target: &'src crate::syntax::AssignmentTargetNode,
+        scope: ScopeId,
+        read: bool,
+    ) -> TypeId {
         match target.data() {
-            AssignmentTarget::Identifier(identifier) => self
-                .references
-                .get(&identifier.id())
-                .or_else(|| self.reference_aliases.get(&target.id()))
-                .map_or_else(
-                    || self.types.any(),
-                    |symbol| self.symbol_types[symbol.get() as usize],
-                ),
+            AssignmentTarget::Identifier(identifier) => {
+                let Some(symbol) = self
+                    .references
+                    .get(&identifier.id())
+                    .or_else(|| self.reference_aliases.get(&target.id()))
+                    .copied()
+                else {
+                    return self.types.any();
+                };
+                let declared = self.symbol_types[symbol.get() as usize];
+                if read {
+                    self.narrowed_type(symbol, declared)
+                } else {
+                    declared
+                }
+            }
             AssignmentTarget::Member(member) => {
                 let object_type = self.legacy_type_of_expr(&member.object, scope);
                 self.record_member_reference_rows(
@@ -21301,7 +21345,7 @@ impl<'src> Binder<'src> {
                     target.range(),
                     target.id(),
                 );
-                self.type_of_member(&member.object, &member.property, false, false, scope)
+                self.type_of_member(&member.object, &member.property, false, read, scope)
                     .0
             }
             _ => self.types.any(),
@@ -26418,15 +26462,8 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Update(update) => {
-                let operand = self.type_of_assignment_target(&update.argument, scope);
-                if matches!(
-                    self.types.get(operand),
-                    Type::BigInt | Type::BigIntLiteral(_)
-                ) {
-                    self.types.bigint()
-                } else {
-                    self.types.number()
-                }
+                let operand = self.assignment_target_type(&update.argument, scope, true);
+                self.numeric_update_type(operand).0
             }
             Expression::Binary(binary) => {
                 let left = self.legacy_type_of_expr(&binary.left, scope);
@@ -26855,6 +26892,62 @@ impl<'src> Binder<'src> {
             Expression::Identifier(identifier) => self.identifier_text(identifier) == "undefined",
             _ => false,
         }
+    }
+
+    /// Updates read the current numeric value before invalidating the target.
+    /// Cached aliases and constraints expose nullability without materializing
+    /// new types. Constraints do not change a generic update result's numeric
+    /// category, and each existing type is visited at most once per purpose.
+    fn numeric_update_type(&mut self, operand: TypeId) -> (TypeId, bool) {
+        match self.types.get(operand) {
+            Type::BigInt | Type::BigIntLiteral(_) => return (self.types.bigint(), false),
+            Type::Null | Type::Undefined => return (self.types.number(), true),
+            Type::AppliedAlias { .. }
+            | Type::TypeQuery { .. }
+            | Type::Union(_)
+            | Type::Named(_) => {}
+            _ => return (self.types.number(), false),
+        }
+        let mut pending = vec![(operand, true)];
+        let mut visited = HashSet::new();
+        let mut bigint = false;
+        let mut number = false;
+        let mut nullable = false;
+        while let Some((member, classify_numeric)) = pending.pop() {
+            if !visited.insert((member, classify_numeric)) {
+                continue;
+            }
+            match self.types.get(member) {
+                Type::BigInt | Type::BigIntLiteral(_) => bigint |= classify_numeric,
+                Type::Null | Type::Undefined => nullable = true,
+                Type::Union(members) => {
+                    pending.extend(members.iter().map(|member| (*member, classify_numeric)));
+                }
+                Type::AppliedAlias { .. } => {
+                    if let Some(view) = self.types.applied_alias_view(member) {
+                        pending.push((view, classify_numeric));
+                    } else {
+                        number |= classify_numeric;
+                    }
+                }
+                Type::TypeQuery { target, .. } => pending.push((*target, classify_numeric)),
+                Type::Named(symbol) => {
+                    number |= classify_numeric;
+                    if let Some(constraint) = self.types.type_parameter_constraint(*symbol) {
+                        pending.push((constraint, false));
+                    }
+                }
+                _ => number |= classify_numeric,
+            }
+        }
+        let result = match (bigint, number) {
+            (true, false) => self.types.bigint(),
+            (true, true) => self
+                .types
+                .union(&[self.types.number(), self.types.bigint()]),
+            _ => self.types.number(),
+        };
+        (result, nullable)
     }
 
     fn is_bigint_like(&self, type_id: TypeId) -> bool {
