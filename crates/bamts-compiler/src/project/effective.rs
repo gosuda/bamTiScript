@@ -1505,11 +1505,11 @@ fn rewrite_layer_paths(
     if let Some(value) = raw.get("compilerOptions") {
         let compiler = value.as_object().ok_or_else(|| {
             ProjectCompileError::Config(
-                super::ConfigError::InvalidField {
+                TsConfigError::from(super::ConfigError::InvalidField {
                     field: Arc::from("compilerOptions"),
                     expected: "an object",
-                }
-                .into(),
+                })
+                .with_config_path(config_path),
             )
         })?;
         let rewritten = rewrite_compiler_paths(root, directory, compiler)?;
@@ -2516,6 +2516,17 @@ mod tests {
                         .unwrap_err(),
                 ];
                 for error in errors {
+                    let offending = if inherited {
+                        "base.json"
+                    } else {
+                        "tsconfig.json"
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&fixture.0.join(offending).display().to_string()),
+                        "{error}"
+                    );
                     assert!(
                         matches!(
                             error,

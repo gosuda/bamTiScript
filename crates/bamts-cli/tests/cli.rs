@@ -1540,22 +1540,40 @@ fn build_and_clean_reject_malformed_reference_compiler_options() {
         let project = ScratchDirectory::new();
         project.write(
             "tsconfig.json",
-            r#"{"files":[],"references":[{"path":"./lib"}]}"#,
+            r#"{"files":[],"references":[{"path":"./good"},{"path":"./lib"}]}"#,
         );
-        project.write("lib/main.ts", "export const value = 1;\n");
-        project.write("lib/main.js", "existing output\n");
-        if inherited {
+        project.write(
+            "good/tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"composite":true}}"#,
+        );
+        project.write("good/main.ts", "export const value = 1;\n");
+        let built = project
+            .command()
+            .args(["--build", "good/tsconfig.json"])
+            .current_dir(&project.path)
+            .output()
+            .expect("valid reference output is recorded");
+        assert_success(&built, "valid reference build");
+        let output_path = project.path.join("good/main.js");
+        let build_info_path = project.path.join("good/tsconfig.tsbuildinfo");
+        let recorded_output = fs::read(&output_path).expect("JavaScript output was emitted");
+        let recorded_build_info = fs::read(&build_info_path).expect("build outputs were recorded");
+
+        project.write("lib/main.ts", "export const value = 2;\n");
+        let offending_config = if inherited {
             project.write("lib/base.json", r#"{"compilerOptions":[]}"#);
             project.write(
                 "lib/tsconfig.json",
                 r#"{"extends":"./base.json","files":["main.ts"],"compilerOptions":{}}"#,
             );
+            "lib/base.json"
         } else {
             project.write(
                 "lib/tsconfig.json",
                 r#"{"files":["main.ts"],"compilerOptions":[]}"#,
             );
-        }
+            "lib/tsconfig.json"
+        };
         for flags in [&[][..], &["--clean"][..]] {
             let output = project
                 .command()
@@ -1567,13 +1585,24 @@ fn build_and_clean_reject_malformed_reference_compiler_options() {
             let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
             assert!(!output.status.success(), "{diagnostic}");
             assert!(diagnostic.contains("compilerOptions"), "{diagnostic}");
-            assert_eq!(
-                fs::read_to_string(project.path.join("lib/main.js")).unwrap(),
-                "existing output\n",
-                "invalid reference configurations must not modify outputs"
+            assert!(
+                diagnostic.contains(&project.path.join(offending_config).display().to_string()),
+                "{diagnostic}"
             );
-            assert!(!project.path.join("lib/main.d.ts").exists());
+            assert_eq!(fs::read(&output_path).unwrap(), recorded_output);
+            assert_eq!(fs::read(&build_info_path).unwrap(), recorded_build_info);
+            assert!(!project.path.join("lib/main.js").exists());
         }
+
+        let cleaned = project
+            .command()
+            .args(["--build", "--clean", "good/tsconfig.json"])
+            .current_dir(&project.path)
+            .output()
+            .expect("valid reference cleanup starts");
+        assert_success(&cleaned, "valid reference cleanup");
+        assert!(!output_path.exists());
+        assert!(!build_info_path.exists());
     }
 }
 
