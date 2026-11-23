@@ -17486,6 +17486,200 @@ fn site_cache_distinguishes_keys_on_one_shape() {
     );
 }
 #[test]
+fn site_cache_distinguishes_slots_for_one_key_on_different_shapes() {
+    let program = site_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let module = ModuleId::new(0);
+    let function = FunctionId::new(0);
+    let objects = [
+        site_object(&mut machine, &[("a", Value::int32(1))]),
+        site_object(
+            &mut machine,
+            &[("b", Value::int32(99)), ("a", Value::int32(2))],
+        ),
+    ];
+    let key = PropertyKey::Named(machine.intern_str("a"));
+    for object in objects {
+        machine.property_site_record_get(module, function, 0, object, &key);
+        machine.property_site_record_set(module, function, 1, object, &key);
+    }
+    for (index, object) in objects.into_iter().enumerate() {
+        assert_eq!(
+            machine.property_site_hit_get(module, function, 0, object, &key),
+            Some(Value::int32(index as u32 + 1))
+        );
+        assert_eq!(
+            machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(7)),
+            Some(())
+        );
+        assert_eq!(
+            machine.get_named_property(object, "a").unwrap(),
+            Value::int32(7)
+        );
+    }
+    assert_eq!(
+        machine.get_named_property(objects[1], "b").unwrap(),
+        Value::int32(99)
+    );
+}
+
+#[test]
+fn site_cache_rechecks_changed_descriptors() {
+    let program = site_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let module = ModuleId::new(0);
+    let function = FunctionId::new(0);
+    let object = site_object(&mut machine, &[("a", Value::int32(1))]);
+    let key = PropertyKey::Named(machine.intern_str("a"));
+    machine.property_site_record_get(module, function, 0, object, &key);
+    machine.property_site_record_set(module, function, 1, object, &key);
+    machine
+        .define_descriptor(
+            object,
+            key.clone(),
+            Property::Data {
+                value: Value::int32(3),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(4)),
+        None
+    );
+    assert_eq!(
+        machine.property_site_hit_get(module, function, 0, object, &key),
+        Some(Value::int32(3))
+    );
+    machine
+        .define_descriptor(
+            object,
+            key.clone(),
+            Property::Accessor {
+                getter: None,
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        machine.property_site_hit_get(module, function, 0, object, &key),
+        None
+    );
+    assert_eq!(
+        machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(4)),
+        None
+    );
+    machine
+        .define_descriptor(
+            object,
+            key.clone(),
+            Property::Data {
+                value: Value::UNINITIALIZED,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        machine.property_site_hit_get(module, function, 0, object, &key),
+        None
+    );
+}
+
+#[test]
+fn site_cache_misses_after_delete_and_reinsert() {
+    let program = site_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let module = ModuleId::new(0);
+    let function = FunctionId::new(0);
+    let object = site_object(&mut machine, &[("a", Value::int32(1))]);
+    let key = PropertyKey::Named(machine.intern_str("a"));
+    machine.property_site_record_get(module, function, 0, object, &key);
+    machine.property_site_record_set(module, function, 1, object, &key);
+    assert!(machine.internal_delete(object, &key).unwrap());
+    machine
+        .set_data_property_key(object, key.clone(), Value::int32(8))
+        .unwrap();
+    assert_eq!(
+        machine.property_site_hit_get(module, function, 0, object, &key),
+        None
+    );
+    assert_eq!(
+        machine.property_site_hit_set(module, function, 1, object, &key, Value::int32(9)),
+        None
+    );
+    assert_eq!(
+        machine.get_named_property(object, "a").unwrap(),
+        Value::int32(8)
+    );
+}
+
+#[test]
+#[ignore = "development-host performance measurement"]
+fn profile_property_cache_hits() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let program = site_program();
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    let module = ModuleId::new(0);
+    let function = FunctionId::new(0);
+    let object = site_object(&mut machine, &[("a", Value::int32(1))]);
+    let key = PropertyKey::Named(machine.intern_str("a"));
+    machine.property_site_record_get(module, function, 0, object, &key);
+    machine.property_site_record_set(module, function, 1, object, &key);
+    let iterations = 2_000_000_u64;
+    let mut checksum = 0_u64;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        checksum = checksum.wrapping_add(
+            black_box(&mut machine)
+                .property_site_hit_get(module, function, 0, object, black_box(&key))
+                .expect("populated cache hits")
+                .to_bits(),
+        );
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(checksum, iterations.wrapping_mul(Value::int32(1).to_bits()));
+    eprintln!(
+        "property_cache_get iterations={iterations} elapsed_ns={} checksum={checksum}",
+        elapsed.as_nanos()
+    );
+    let started = Instant::now();
+    for value in 0..iterations {
+        black_box(&mut machine)
+            .property_site_hit_set(
+                module,
+                function,
+                1,
+                object,
+                black_box(&key),
+                Value::int32(value as u32),
+            )
+            .expect("populated cache handles stores");
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(
+        machine.get_named_property(object, "a").unwrap(),
+        Value::int32(iterations as u32 - 1)
+    );
+    eprintln!(
+        "property_cache_set iterations={iterations} elapsed_ns={} final_value={}",
+        elapsed.as_nanos(),
+        iterations - 1
+    );
+}
+
+#[test]
 fn site_cache_ignores_prototype_values() {
     let program = site_program();
     let mut host = TestHost;

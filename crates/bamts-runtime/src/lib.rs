@@ -10622,10 +10622,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 return None;
             };
             let site_state = &self.property_sites[&(module, function)].gets[site_index];
-            if !site_state.matches(*shape, key) {
-                return None;
-            }
-            let slot = self.shapes.slot_of(*shape, key)?;
+            let slot = site_state.slot(*shape, key)?;
             match slots.get(slot as usize) {
                 Some(Property::Data { value, .. }) if *value != Value::UNINITIALIZED => {
                     Some(*value)
@@ -10635,7 +10632,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    /// Records `(shape, key)` at `site` when the generic read found the key
+    /// Records `(shape, key, slot)` at `site` when the generic read found the key
     /// as an own data property of a plain shaped object.
     pub(crate) fn property_site_record_get(
         &mut self,
@@ -10651,26 +10648,29 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(receiver).ok().flatten() else {
             return;
         };
-        let Some(shape) = (match &self.heap[index] {
+        let Some((shape, slot)) = (match &self.heap[index] {
             HeapEntry::Object {
-                properties: PropertyMap::Shaped { shape, .. },
+                properties: PropertyMap::Shaped { shape, slots },
                 boxed_primitive: None,
                 ..
-            } => Some(*shape),
+            } => self
+                .shapes
+                .slot_of(*shape, key)
+                .and_then(|slot| match slots.get(slot as usize) {
+                    Some(Property::Data { value, .. }) if *value != Value::UNINITIALIZED => {
+                        Some((*shape, slot))
+                    }
+                    _ => None,
+                }),
             _ => None,
         }) else {
             return;
         };
-        match self.own_get(index, key) {
-            Some(Found::Value(value)) if value != Value::UNINITIALIZED => {}
-            Some(Found::Text(_)) => {}
-            _ => return,
-        }
         let sites = self
             .property_sites
             .get_mut(&(module, function))
             .expect("site table was built above");
-        sites.gets[site_index].record(shape, key.clone());
+        sites.gets[site_index].record(shape, key.clone(), slot);
     }
 
     /// Writes `value` through the cache at `site` when the receiver matches
@@ -10700,10 +10700,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 return None;
             };
             let site_state = &self.property_sites[&(module, function)].sets[site_index];
-            if !site_state.matches(*shape, key) {
-                return None;
-            }
-            let slot = self.shapes.slot_of(*shape, key)?;
+            let slot = site_state.slot(*shape, key)?;
             match slots.get(slot as usize)? {
                 Property::Data {
                     writable: true,
@@ -10738,7 +10735,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Some(())
     }
 
-    /// Records `(shape, key)` at `site` when the key is already an own
+    /// Records `(shape, key, slot)` at `site` when the key is already an own
     /// writable data property of a plain shaped object, so a later store
     /// keeps its attributes and never adds a property.
     pub(crate) fn property_site_record_set(
@@ -10766,14 +10763,14 @@ impl<'a, H: Host> Machine<'a, H> {
         {
             cacheable = Some((*shape, slot));
         }
-        let Some((shape, _slot)) = cacheable else {
+        let Some((shape, slot)) = cacheable else {
             return;
         };
         let sites = self
             .property_sites
             .get_mut(&(module, function))
             .expect("site table was built above");
-        sites.sets[site_index].record(shape, key.clone());
+        sites.sets[site_index].record(shape, key.clone(), slot);
     }
 
     pub(crate) fn set_super(
