@@ -20584,7 +20584,7 @@ impl<'src> Binder<'src> {
                     _ => Some(self.types.intersection(elements)),
                 }
             }
-            Type::ObjectType(_) => {
+            Type::ObjectType(_) | Type::Record { .. } => {
                 let next = self.types.read_property_type(iterator, "next")?;
                 let result = self.zero_argument_return_type(next)?;
                 let result = match protocol {
@@ -20612,8 +20612,9 @@ impl<'src> Binder<'src> {
                 }
                 Some(self.types.union(&yields))
             }
-            Type::ObjectType(object) => {
+            Type::ObjectType(_) | Type::Record { .. } => {
                 let value = self.types.property_type(result, "value")?;
+                let object = self.types.current_object_view(result)?;
                 let returns_only = object.properties.iter().any(|property| {
                     property.name() == "done"
                         && !property.optional()

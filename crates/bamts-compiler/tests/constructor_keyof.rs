@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use bamts_compiler::{
-    checker::{SemanticModel, TypeId, check, relations::TypeRelations},
-    diagnostic::Diagnostic,
+    checker::{SemanticModel, TypeId, check},
+    diagnostic::{Diagnostic, DiagnosticSeverity},
     parser, scanner,
     source::{ScriptKind, SourceId, SourceText},
 };
@@ -15,15 +15,18 @@ fn analyze_source(source: &str) -> (SemanticModel, Vec<Diagnostic>) {
         ScriptKind::TypeScript,
         Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
     );
-    check(&parser::parse(scanned)).into_parts()
+    let parsed = parser::parse(scanned);
+    let (model, mut diagnostics) = check(&parsed).into_parts();
+    diagnostics.extend_from_slice(parsed.diagnostics());
+    (model, diagnostics)
 }
 
 fn checker_codes(source: &str) -> Vec<String> {
     analyze_source(source)
         .1
         .iter()
+        .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
         .map(|diagnostic| diagnostic.code().as_str().to_owned())
-        .filter(|code| code.starts_with("BAMTS-C"))
         .collect()
 }
 
@@ -32,7 +35,7 @@ fn checked_model(source: &str) -> SemanticModel {
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.code().as_str().starts_with("BAMTS-C")),
+            .all(|diagnostic| diagnostic.severity() != DiagnosticSeverity::Error),
         "{diagnostics:?}\n{source}"
     );
     model
@@ -49,8 +52,9 @@ fn value_type(model: &SemanticModel, name: &str) -> TypeId {
 
 fn assert_value_type(model: &SemanticModel, name: &str, expected: TypeId) {
     let actual = value_type(model, name);
-    assert!(
-        TypeRelations::new(model.types()).equivalent(actual, expected),
+    assert_eq!(
+        actual,
+        expected,
         "{name}: {:?}, expected {:?}",
         model.types().get(actual),
         model.types().get(expected),
