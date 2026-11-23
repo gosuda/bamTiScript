@@ -781,8 +781,8 @@ fn compare_array_elements<H: Host>(
             Ordering::Greater
         });
     }
-    let left = machine.to_string(left)?;
-    let right = machine.to_string(right)?;
+    let left = machine.coerce_string_observable(left)?;
+    let right = machine.coerce_string_observable(right)?;
     Ok(left.as_units().cmp(right.as_units()))
 }
 
@@ -5001,6 +5001,68 @@ mod tests {
 
             assert_eq!(array(machine, sorted), vec![one, ten, two]);
             assert_eq!(array(machine, source), vec![ten, two, one]);
+        });
+    }
+
+    #[test]
+    fn to_sorted_observes_object_string_conversions() {
+        fn stringify(
+            machine: &mut Machine<'_, TestHost>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let rank = machine.get_named_property(this, "rank")?;
+            log_event(machine.string_value(rank).unwrap().to_string_lossy());
+            Ok(BuiltinOutcome::Value(rank))
+        }
+
+        with_machine(|machine| {
+            let first = ordinary_object(machine);
+            let second = ordinary_object(machine);
+            let stringify = native(machine, "sort string conversion", stringify);
+            for (object, rank) in [(first, "z"), (second, "a")] {
+                let rank = allocate_string(machine, EcmaString::encode(rank)).unwrap();
+                machine.set_data_property(object, "rank", rank).unwrap();
+                machine
+                    .set_data_property(object, "toString", stringify)
+                    .unwrap();
+            }
+            let source = allocate_array(machine, vec![first, second]).unwrap();
+            clear_log();
+
+            let sorted = call_prototype(machine, "toSorted", source, &[]).unwrap();
+
+            assert_eq!(array(machine, sorted), [second, first]);
+            assert_eq!(array(machine, source), [first, second]);
+            assert_eq!(get_log(), ["a", "z"]);
+        });
+    }
+
+    #[test]
+    fn to_sorted_propagates_object_string_conversion_failure() {
+        fn stringify(
+            _machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::int32(99)))
+        }
+
+        with_machine(|machine| {
+            let object = ordinary_object(machine);
+            let stringify = native(machine, "throwing sort string conversion", stringify);
+            machine
+                .set_data_property(object, "toString", stringify)
+                .unwrap();
+            let source = allocate_array(machine, vec![object, Value::int32(0)]).unwrap();
+
+            assert!(matches!(
+                call_prototype(machine, "toSorted", source, &[]),
+                Err(EvalFailure::ThrowValue(value)) if value == Value::int32(99)
+            ));
+            assert_eq!(array(machine, source), [object, Value::int32(0)]);
         });
     }
 
