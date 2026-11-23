@@ -2138,6 +2138,111 @@ fn tsc_removed_base_url_preserves_native_emission_policy() {
 }
 
 #[test]
+fn tsc_removed_option_cannot_emit_native_code_with_unresolved_static_imports() {
+    for source in [
+        "import './missing';\nconsole.log('must not execute');\n",
+        "import { value } from './missing';\nconsole.log(value);\n",
+        "import './dependency';\nconsole.log('must not execute');\n",
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        project.write("dependency.ts", "import './missing';\n");
+        let executable = project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+
+        for flag in ["--noEmit", "--noEmitOnError"] {
+            let checked = project
+                .command()
+                .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps", flag])
+                .current_dir(&project.path)
+                .output()
+                .expect("removed-option check starts");
+            assert_eq!(checked.status.code(), Some(1), "{}", stderr(&checked));
+            assert_eq!(stdout(&checked), REMOVED_BASE_URL_DIAGNOSTIC);
+            assert!(stderr(&checked).is_empty(), "{}", stderr(&checked));
+            assert!(!executable.exists());
+        }
+
+        let compiled = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps"])
+            .current_dir(&project.path)
+            .output()
+            .expect("native compilation with an unresolved dependency starts");
+        assert_eq!(compiled.status.code(), Some(1), "{}", stderr(&compiled));
+        assert!(
+            stderr(&compiled).contains("unresolved static dependency \"./missing\""),
+            "{}",
+            stderr(&compiled)
+        );
+        assert!(!executable.exists(), "invalid native output was published");
+        let launch = Command::new(&executable)
+            .output()
+            .expect_err("an unresolved static dependency must leave no executable to run");
+        assert_eq!(launch.kind(), std::io::ErrorKind::NotFound);
+        assert!(!project.path.join("main.js").exists());
+    }
+}
+
+#[test]
+fn tsc_native_emission_keeps_erased_and_lazy_unresolved_imports() {
+    for source in [
+        "import type { Missing } from './missing';\nconsole.log('ok');\n",
+        "const load = () => import('./missing');\nconsole.log('ok');\n",
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        let compiled = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps"])
+            .current_dir(&project.path)
+            .output()
+            .expect("native compilation with an erased or lazy import starts");
+        assert_eq!(compiled.status.code(), Some(2), "{}", stderr(&compiled));
+        assert_eq!(stdout(&compiled), REMOVED_BASE_URL_DIAGNOSTIC);
+        let executable = project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+        let executed = Command::new(executable)
+            .output()
+            .expect("native executable starts");
+        assert_success(&executed, "erased and lazy imports do not block execution");
+        assert_eq!(executed.stdout, b"ok\n");
+    }
+}
+
+#[test]
+fn tsc_artifact_emission_preserves_unresolved_static_imports() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "import './missing';\nconsole.log('ok');\n");
+    let compiled = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "main.ts",
+            "--baseUrl",
+            "./deps",
+            "--declaration",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("JavaScript artifact compilation starts");
+    assert_eq!(compiled.status.code(), Some(2), "{}", stderr(&compiled));
+    assert_eq!(stdout(&compiled), REMOVED_BASE_URL_DIAGNOSTIC);
+    let javascript =
+        fs::read_to_string(project.path.join("main.js")).expect("JavaScript output is preserved");
+    assert!(javascript.contains("import "), "{javascript}");
+    assert!(javascript.contains("./missing"), "{javascript}");
+    assert!(
+        !project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX))
+            .exists()
+    );
+}
+
+#[test]
 fn tsc_removed_base_url_preserves_artifact_emission_policy() {
     for (flags, status, emits) in [
         (&[][..], 2, true),

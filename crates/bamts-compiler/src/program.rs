@@ -3012,6 +3012,9 @@ pub enum ProgramLowerErrorKind {
     UnsupportedJsxMode {
         mode: JsxEmit,
     },
+    UnresolvedStaticDependency {
+        specifier: String,
+    },
 }
 
 /// A whole-program lowering failure anchored to a canonical module path and phase.
@@ -3026,11 +3029,16 @@ impl fmt::Display for ProgramLowerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "program lowering failed in {} during {:?}: {:?}",
+            "program lowering failed in {} during {:?}: ",
             self.module.display(),
             self.phase,
-            self.kind
-        )
+        )?;
+        match &self.kind {
+            ProgramLowerErrorKind::UnresolvedStaticDependency { specifier } => {
+                write!(formatter, "unresolved static dependency {specifier:?}")
+            }
+            kind => write!(formatter, "{kind:?}"),
+        }
     }
 }
 
@@ -3174,6 +3182,15 @@ pub fn lower_program_with_cancel(
             for dep in current.dependencies() {
                 if dep.kind() != ModuleEdgeKind::StaticRuntime {
                     continue;
+                }
+                if dep.is_unresolved() {
+                    return Err(program_lower_error(
+                        current.path(),
+                        ProgramLowerPhase::Frontend,
+                        ProgramLowerErrorKind::UnresolvedStaticDependency {
+                            specifier: dep.specifier().to_owned(),
+                        },
+                    ));
                 }
                 if let ModuleTarget::Local(target) = dep.target()
                     && static_reachable.insert(*target)
