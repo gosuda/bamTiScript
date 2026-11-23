@@ -1,4 +1,4 @@
-"""Build and compare two clean checkouts on one host; this is not BH1 evidence.
+"""Build and compare two clean checkouts on one Linux host; not BH1 evidence.
 
 Run with Python 3.11+ through uv:
   uv run --no-project python perf/compare_optimization.py \
@@ -640,6 +640,8 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--rounds", type=int, default=6)
     args = parser.parse_args()
+    if sys.platform != "linux":
+        parser.error("this runner requires Linux process groups and CPU affinity APIs")
     baseline: Path = args.baseline.resolve(strict=True)
     candidate: Path = args.candidate.resolve(strict=True)
     output: Path = args.output.resolve()
@@ -695,7 +697,9 @@ def main() -> None:
             )
             if mapping(pin.get("toolchain")).get("channel") != RUST_VERSION:
                 raise ComparisonError(f"both revisions must pin Rust {RUST_VERSION}")
-        with tempfile.TemporaryDirectory(prefix="bamts-optimization-") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="bamts-optimization-", dir=output.parent
+        ) as temporary:
             work = Path(temporary)
             environment["CARGO_TARGET_DIR"] = str(work / "target")
             disposable_baseline = work / "baseline"
