@@ -3,7 +3,7 @@
 use std::{fs, sync::Arc};
 
 use bamts_compiler::{
-    checker::{PropertyType, SymbolId, TypeTable, check},
+    checker::{PropertyType, SemanticModel, SymbolId, TypeId, TypeTable, check},
     diagnostic::DiagnosticSeverity,
     parser,
     pipeline::{FrontendMode, compile_program_frontend},
@@ -13,7 +13,7 @@ use bamts_compiler::{
     source::{ScriptKind, SourceId, SourceText},
 };
 
-fn checker_errors(source: &str) -> Vec<&'static str> {
+fn checker_output(source: &str) -> (Vec<&'static str>, SemanticModel) {
     let scanned = scanner::scan(
         SourceId::new(0),
         ScriptKind::TypeScript,
@@ -21,13 +21,33 @@ fn checker_errors(source: &str) -> Vec<&'static str> {
     );
     let parsed = parser::parse(scanned);
     let checked = check(&parsed);
-    parsed
+    let errors = parsed
         .diagnostics()
         .iter()
         .chain(checked.diagnostics())
         .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
         .map(|diagnostic| diagnostic.code().as_str())
-        .collect()
+        .collect();
+    (errors, checked.into_product())
+}
+
+fn checker_errors(source: &str) -> Vec<&'static str> {
+    checker_output(source).0
+}
+
+fn binding_type(model: &SemanticModel, name: &str) -> TypeId {
+    let symbol = model
+        .scopes()
+        .iter()
+        .find_map(|scope| scope.value(name))
+        .unwrap_or_else(|| panic!("binding {name} exists"));
+    let mut value = model.symbol_type(symbol);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(view) = model.types().applied_alias_view(value) {
+        assert!(seen.insert(value), "cyclic fixture alias for {name}");
+        value = view;
+    }
+    value
 }
 
 #[test]
@@ -55,6 +75,148 @@ function heterogeneous<K extends "x" | "y">(value: { x: number; y: string }[K]) 
     const rejected: number = value;
 }
 declare function invalid<K extends "x" | "absent">(value: Row[K]): void;
+"#;
+    assert_eq!(
+        checker_errors(source),
+        ["BAMTS-C004", "BAMTS-C004", "BAMTS-C064"]
+    );
+}
+
+#[test]
+fn generic_indexed_calls_keep_each_keys_argument_and_return_type() {
+    let source = r#"
+type Row = { x: number; y: string };
+declare function select<K extends "x" | "y">(key: K, value: Row[K]): Row[K];
+const inferredX = select("x", 1);
+const inferredY = select("y", "accepted");
+const explicitX = select<"x">("x", 1);
+const explicitY = select<"y">("y", "accepted");
+const acceptedX: number = inferredX;
+const acceptedY: string = inferredY;
+select("x", "wrong");
+select("y", 1);
+select<"x">("x", "wrong");
+select<"y">("y", 1);
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C053"; 4]);
+    for name in ["inferredX", "explicitX"] {
+        assert_eq!(binding_type(&model, name), model.types().number(), "{name}");
+    }
+    for name in ["inferredY", "explicitY"] {
+        assert_eq!(binding_type(&model, name), model.types().string(), "{name}");
+    }
+}
+
+#[test]
+fn generic_indexed_aliases_keep_each_substituted_keys_value_type() {
+    let source = r#"
+type Row = { x: number; y: string };
+type Value<K extends "x" | "y"> = Row[K];
+declare const valueX: Value<"x">;
+declare const valueY: Value<"y">;
+const acceptedX: number = valueX;
+const acceptedY: string = valueY;
+const rejectedX: Value<"x"> = "wrong";
+const rejectedY: Value<"y"> = 1;
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"; 2]);
+    assert_eq!(binding_type(&model, "valueX"), model.types().number());
+    assert_eq!(binding_type(&model, "valueY"), model.types().string());
+}
+
+#[test]
+fn generic_indexed_targets_require_a_value_accepted_by_every_possible_key() {
+    let source = r#"
+type Uniform = { x: boolean; y: boolean };
+function uniform<K extends "x" | "y">(key: K): Uniform[K] {
+    const value: Uniform[K] = true;
+    return value;
+}
+type Overlap = { x: number | string; y: string | boolean };
+function overlap<K extends "x" | "y">(key: K): Overlap[K] {
+    const value: Overlap[K] = "common";
+    return value;
+}
+type Heterogeneous = { x: number; y: string };
+function rejected<K extends "x" | "y">(key: K): Heterogeneous[K] {
+    const value: Heterogeneous[K] = 1;
+    return value;
+}
+"#;
+    assert_eq!(checker_errors(source), ["BAMTS-C004"]);
+}
+
+#[test]
+fn generic_indexed_targets_keep_fixed_object_union_values_together() {
+    let source = r#"
+type Row = { x: number; y: string } | { x: string; y: number };
+function numberValue<K extends "x" | "y">(): Row[K] { return 1; }
+function stringValue<K extends "x" | "y">(): Row[K] { return "accepted"; }
+declare const expected: number | string;
+const resultX = numberValue<"x">();
+const resultY = stringValue<"y">();
+function rejected<K extends "x" | "y">() {
+    const value: Row[K] = true;
+}
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"]);
+    let expected = binding_type(&model, "expected");
+    assert_eq!(binding_type(&model, "resultX"), expected);
+    assert_eq!(binding_type(&model, "resultY"), expected);
+}
+
+#[test]
+fn generic_indexed_targets_preserve_never_unknown_and_nullish_rules() {
+    let source = r#"
+type Opaque = { x: unknown; y: unknown };
+function opaque<K extends "x" | "y">(source: unknown): Opaque[K] {
+    return source;
+}
+function bottom<T, K extends keyof T>(source: never): T[K] {
+    return source;
+}
+function nullish<T, K extends keyof T>(): T[K] { return undefined; }
+type Numeric = { x: number; y: number };
+function uninhabited<K extends never>(): Numeric[K] { return undefined; }
+const rejected: Numeric[never] = undefined;
+"#;
+    assert_eq!(checker_errors(source), ["BAMTS-C004"]);
+}
+
+#[test]
+fn generic_object_bounds_do_not_prove_an_indexed_target_accepts_the_bound() {
+    let source = r#"
+function fixedKey<T extends { x: number }, K extends "x">(value: T[K]): T[K] {
+    const accepted: T[K] = value;
+    return accepted;
+}
+function objectKeys<T extends { x: number }, K extends keyof T>(value: T[K]): T[K] {
+    const accepted: T[K] = value;
+    const rejected: T[K] = 1;
+    return accepted;
+}
+"#;
+    assert_eq!(checker_errors(source), ["BAMTS-C004"]);
+}
+
+#[test]
+fn indexed_key_alias_bounds_keep_relation_evidence_and_never_stays_uninhabited() {
+    let source = r#"
+type Keys = "x" | "y";
+type Row = { x: number; y: string };
+type WrappedRow = Row;
+function read<K extends Keys>(value: WrappedRow[K]) {
+    const accepted: number | string = value;
+    const rejected: boolean = value;
+}
+function impossible<K extends never>(value: Row[K]) {
+    const accepted: Row[K] = value;
+    const rejected: Row[K] = 1;
+}
+declare function invalid<K extends "x" | "absent" | never>(value: Row[K]): void;
 "#;
     assert_eq!(
         checker_errors(source),
