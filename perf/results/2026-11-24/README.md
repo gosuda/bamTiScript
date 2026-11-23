@@ -101,6 +101,7 @@ work. They are separate evidence from the elapsed-time samples.
 | Area | Status and evidence |
 | --- | --- |
 | Source bytecode tests | **138 passed** through pinned direct `rustc --test`, including a differential test over **280,893 exhaustive cases** comparing complete certificates or exact first errors with the original solver. |
+| Integrated bytecode Cargo tests | **PASS: 138 passed, 0 failed**, including the same exhaustive differential test, with `cargo test --locked -p bamts-bytecode --lib -j 1`, pinned Rust 1.97.1, `CARGO_INCREMENTAL=0`, and `CARGO_PROFILE_TEST_DEBUG=0`. Production bytecode source is unchanged from integration `602530a3bde07e47fd290e783133c48b095b0aea`. See [Cargo test log](cargo-bytecode-tests.log). |
 | Benchmark output agreement | **Checked:** zero failures and matching wire/certificate digests across the 72 counterbalanced samples. Their binary hashes and workload digests match the historical run. Exact encoded bytes and complete certificates are checked by each runner outside timing. |
 | Integration formatting and whitespace | **PASS** at `602530a3bde07e47fd290e783133c48b095b0aea`: `cargo fmt --all --check` and `git diff --check`. |
 | Full workspace checks and root gates | **PENDING.** Leaf bytecode tests do not satisfy workspace or product gates. |
@@ -114,6 +115,13 @@ including the retry with 256 codegen units. The subsequent baseline
 `cargo check --locked -p bamts-compiler --examples -j 1` also ended in SIGKILL
 without a diagnostic. These attempts did not validate compiler or runtime
 changes. They do not relax any gate, and no CI result is claimed here.
+
+The candidate `cargo check --locked --workspace -j 1` attempt, with
+`CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=0`, was also SIGKILLed while
+checking the unchanged dependency `cranelift-assembler-x64 0.134.4`. It emitted
+no candidate Rust diagnostic; see the [workspace check log](cargo-workspace-check.log).
+Baseline runtime release-library tests also ended in SIGKILL. Compiler, runtime,
+and full-workspace validation remain pending despite the passing bytecode suite.
 
 Append later validation with its exact revision, commands, host identity, and raw
 results. Preserve the distinction between these imported source-branch checks
