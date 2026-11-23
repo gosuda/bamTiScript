@@ -1,4 +1,4 @@
-"""Build and compare two clean checkouts on one Linux host; not BH1 evidence.
+"""Build and compare two clean checkouts on one Linux 5.3+ host; not BH1 evidence.
 
 Run with Python 3.11+ through uv:
   uv run --no-project python perf/compare_optimization.py \
@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
+import select
 import shutil
 import signal
 import statistics
@@ -227,8 +229,14 @@ def logged(
     deadline: float,
     maximum_seconds: float,
 ) -> int:
-    remaining = min(maximum_seconds, deadline - time.monotonic())
-    if remaining <= 0:
+    """Capture a child group and reap it before returning or propagating failure.
+
+    Requires Linux pidfds, normal SIGCHLD handling, and exclusive child reaping.
+    """
+    now = time.monotonic()
+    expires_at = min(deadline, now + maximum_seconds)
+    timeout = expires_at - now
+    if timeout <= 0:
         raise ComparisonError("comparison exceeded its overall time budget")
     prefix.parent.mkdir(parents=True, exist_ok=True)
     prefix.with_suffix(".command.json").write_text(
@@ -250,21 +258,33 @@ def logged(
         ) as process,
     ):
         try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
+            pidfd = os.pidfd_open(process.pid)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                # The process can exit between the timeout and the signal.
-                if process.poll() is None:
+                poller = select.poll()
+                poller.register(pidfd, select.POLLIN)
+                remaining = expires_at - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                events = poller.poll(math.ceil(remaining * 1000))
+                if not events:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if not (events[0][1] & select.POLLIN):
+                    raise ComparisonError("unexpected process-exit notification")
+                returncode = process.wait()
+            finally:
+                os.close(pidfd)
+        finally:
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
                     process.kill()
-            process.wait()
-            raise
+                finally:
+                    process.wait()
     elapsed = time.perf_counter_ns() - started
     if returncode != 0:
         raise ComparisonError(f"command exited {returncode}; see {prefix}.stderr.log")
     return elapsed
-
 
 def artifact(
     stdout: Path, name: str, is_test: bool, target_root: Path, manifest: Path
@@ -653,7 +673,9 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=6)
     args = parser.parse_args()
     if sys.platform != "linux":
-        parser.error("this runner requires Linux process groups and CPU affinity APIs")
+        parser.error(
+            "this runner requires Linux 5.3+ process descriptors and CPU affinity APIs"
+        )
     baseline: Path = args.baseline.resolve(strict=True)
     candidate: Path = args.candidate.resolve(strict=True)
     output: Path = args.output.resolve()
@@ -681,7 +703,10 @@ def main() -> None:
     environment.update({"NO_COLOR": "1", "RUST_BACKTRACE": "1", "TZ": "UTC"})
     report = Report(
         "bamts.optimization-comparison/v1",
-        "Same-host development comparison; not BH1 or product-completion evidence.",
+        (
+            "Same-host development comparison; not BH1 or product-completion "
+            "evidence. Process wall time uses Linux pidfd readiness."
+        ),
         "incomplete",
         {},
         {
