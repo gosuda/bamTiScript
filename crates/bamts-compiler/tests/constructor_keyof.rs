@@ -51,7 +51,12 @@ fn value_type(model: &SemanticModel, name: &str) -> TypeId {
 }
 
 fn assert_value_type(model: &SemanticModel, name: &str, expected: TypeId) {
-    let actual = value_type(model, name);
+    let mut actual = value_type(model, name);
+    let mut visited = std::collections::HashSet::new();
+    while let Some(view) = model.types().applied_alias_view(actual) {
+        assert!(visited.insert(actual), "cyclic alias for {name}");
+        actual = view;
+    }
     assert_eq!(
         actual,
         expected,
