@@ -1056,6 +1056,49 @@ fn export_assignment_combined_with_default_export_is_rejected_during_link() {
 }
 
 #[test]
+fn imported_recursive_constructors_keep_completed_namespace_views() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "dep.ts",
+        "export class Self { method() { return Self; } }\n\
+         export namespace Self { export const tag: 1 = 1; }\n",
+    );
+    fixture.write("barrel.ts", "export { Self } from './dep.js';\n");
+    for module in ["./dep.js", "./barrel.js"] {
+        for (annotation, expected_errors) in [("1", 0), ("2", 1)] {
+            fixture.write(
+                "main.ts",
+                &format!(
+                    "import {{ Self }} from '{module}';\n\
+                     const Constructor = new Self().method();\n\
+                     const instance = new Constructor();\n\
+                     const tag: {annotation} = instance.method().tag;\n"
+                ),
+            );
+            let resolved = fixture.loader().load("main.ts").unwrap();
+            let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+            let errors: Vec<_> = frontend
+                .modules()
+                .iter()
+                .flat_map(|module| module.diagnostics().iter())
+                .filter(|diagnostic| diagnostic.code().as_str().starts_with("BAMTS-C"))
+                .collect();
+            assert_eq!(
+                errors.len(),
+                expected_errors,
+                "module={module}, annotation={annotation}: {errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .all(|diagnostic| diagnostic.code().as_str() == "BAMTS-C004"),
+                "{errors:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn program_lowering_initializes_default_named_class_binding() {
     let fixture = Fixture::new();
     fixture.write("main.ts", "export default class Foo {}; Foo;");

@@ -1576,6 +1576,7 @@ struct ImportedTypeMap {
     types: HashMap<TypeId, TypeId>,
     symbols: HashMap<SymbolId, SymbolId>,
     synthesized: Vec<(SymbolId, SymbolId)>,
+    pending_constructor_revisions: Vec<(TypeId, TypeId)>,
 }
 
 /// An interning table for structural types plus the assignability relation.
@@ -4545,7 +4546,9 @@ impl TypeTable {
             if let Some(&type_id) = imported.types.get(&source_id) {
                 return type_id;
             }
-            let source_type = source.get(source_id).clone();
+            // Revision views can close cycles; copy immutable nodes before
+            // publishing the remapped constructor revisions.
+            let source_type = source.types[source_id.0 as usize].clone();
             let type_id = match source_type {
                 Type::Error => target.error_type(),
                 Type::Any => target.any(),
@@ -4831,6 +4834,9 @@ impl TypeTable {
                 }
             };
             imported.types.insert(source_id, type_id);
+            if let Some(&current) = source.constructor_revisions.get(&source_id) {
+                imported.pending_constructor_revisions.push((source_id, current));
+            }
             type_id
         }
 
@@ -5011,6 +5017,15 @@ impl TypeTable {
             .iter()
             .map(|parameter| remap_symbol(self, source, *parameter, imported, next_symbol))
             .collect();
+        let mut revisions = Vec::new();
+        while let Some((previous, current)) = imported.pending_constructor_revisions.pop() {
+            let current = copy(self, source, current, imported, next_symbol);
+            let previous = imported.types[&previous];
+            revisions.push((previous, current));
+        }
+        for (previous, current) in revisions {
+            self.publish_constructor_revision(previous, current);
+        }
         (root, parameters)
     }
 }
