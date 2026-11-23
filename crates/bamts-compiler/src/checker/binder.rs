@@ -933,6 +933,13 @@ impl FunctionParameter {
     pub const fn declared(&self) -> bool {
         self.declared
     }
+
+    #[must_use]
+    pub(crate) fn with_type_id(&self, type_id: TypeId) -> Self {
+        let mut parameter = self.clone();
+        parameter.type_id = type_id;
+        parameter
+    }
 }
 
 /// One interned function signature.
@@ -30256,6 +30263,48 @@ mod tests {
             source(text),
         ));
         bind_source(parsed.product())
+    }
+
+    #[test]
+    fn constructor_substitution_keeps_recursive_static_views_finite() {
+        let (model, diagnostics) = bound("class Self { method() { return Self; } }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let owner = value_symbol(&model, "Self");
+        let constructor = model.constructor_type(owner);
+        let mut table = model.types().clone();
+        let substitution =
+            super::InferredTypeArguments::for_this(owner, model.symbol_type(owner));
+        let instantiated = substitution.instantiate(&mut table, constructor);
+        let Type::ConstructorType {
+            symbol, structural, ..
+        } = table.get(instantiated)
+        else {
+            panic!("constructor type");
+        };
+        assert_eq!(*symbol, owner);
+        let Type::ObjectType(object) = table.get(*structural) else {
+            panic!("constructor structure");
+        };
+        let prototype = object.property("prototype").expect("prototype").type_id();
+        let method = table.property_type(prototype, "method").expect("method");
+        let Type::Function(signature) = table.get(method).clone() else {
+            panic!("method signature");
+        };
+        substitution.instantiate_signature(&mut table, &signature);
+        let type_count = table.types.len();
+        for _ in 0..8 {
+            let next = substitution.instantiate(&mut table, constructor);
+            assert_eq!(next, instantiated);
+            let method = substitution.instantiate_signature(&mut table, &signature);
+            let Type::Function(signature) = table.get(method) else {
+                panic!("substituted method signature");
+            };
+            assert!(
+                matches!(table.get(signature.return_type()), Type::ConstructorType { symbol, .. }
+                    if *symbol == owner)
+            );
+        }
+        assert_eq!(table.types.len(), type_count);
     }
 
     #[test]
