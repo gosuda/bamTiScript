@@ -9,6 +9,8 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
+#[cfg(not(target_env = "msvc"))]
+use std::process::Output;
 use std::sync::atomic::Ordering;
 
 pub(super) fn check(
@@ -385,6 +387,7 @@ impl Linker {
             .current_dir(context.cwd())
             .env_clear()
             .envs(context.envs())
+            .stdin(std::process::Stdio::null())
             .arg(object)
             .arg(archive)
             .arg("-o")
@@ -395,7 +398,7 @@ impl Linker {
         command
     }
 
-    pub(super) fn diagnostics(&self, output: &std::process::Output) -> String {
+    pub(super) fn diagnostics(&self, output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 }
@@ -433,6 +436,7 @@ pub(super) fn probe_toolchain_in_context(
         .current_dir(context.cwd())
         .env_clear()
         .envs(context.envs())
+        .stdin(std::process::Stdio::null())
         .arg("--version");
     match capture_process_with_cancel(&mut command, cancel) {
         Ok(Some(output)) if output.status.success() => Ok(program),

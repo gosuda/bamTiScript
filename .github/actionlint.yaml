@@ -1,6 +1,7 @@
-# Depot-hosted runner labels are not in actionlint's built-in runner list.
+# Custom runner labels used by the hosted and performance jobs.
 self-hosted-runner:
   labels:
+    - bh1
     - depot-ubuntu-24.04
     - depot-ubuntu-24.04-4
     - depot-ubuntu-24.04-8

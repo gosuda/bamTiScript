@@ -802,6 +802,8 @@ pub(crate) struct PropertyId(usize);
 pub(crate) enum PropertyAnchorKind {
     Plain,
     Shorthand,
+    ClassMember { name_range: TextRange },
+    TypeMember { name_range: TextRange },
 }
 
 /// One property occurrence recorded for rename support.
@@ -839,6 +841,7 @@ pub struct IndexSignature {
 /// The members retained by an interned structural object type.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ObjectType {
+    /// Sorted by name, with duplicate names merged before interning.
     pub(crate) properties: Vec<PropertyType>,
     pub(crate) call_signatures: Vec<FunctionSignature>,
     /// Candidate selection order over `call_signatures`: a complete
@@ -857,6 +860,14 @@ impl ObjectType {
     #[must_use]
     pub fn properties(&self) -> &[PropertyType] {
         &self.properties
+    }
+
+    #[must_use]
+    fn property(&self, name: &str) -> Option<&PropertyType> {
+        self.properties
+            .binary_search_by(|property| property.name().cmp(name))
+            .ok()
+            .map(|index| &self.properties[index])
     }
 }
 
@@ -1550,6 +1561,9 @@ struct ImportedTypeMap {
 pub struct TypeTable {
     types: Vec<Type>,
     index: HashMap<Type, TypeId>,
+    /// Captured constructor identities map directly to their current raw
+    /// namespace-augmented representation. Interned nodes and keys stay fixed.
+    constructor_revisions: HashMap<TypeId, TypeId>,
     error: TypeId,
     any: TypeId,
     unknown: TypeId,
@@ -1617,6 +1631,7 @@ impl TypeTable {
         let mut table = Self {
             types: Vec::new(),
             index: HashMap::new(),
+            constructor_revisions: HashMap::new(),
             error: TypeId(0),
             any: TypeId(0),
             unknown: TypeId(0),
@@ -1669,6 +1684,15 @@ impl TypeTable {
     }
 
     fn intern(&mut self, ty: Type) -> TypeId {
+        if let Type::ObjectType(object) = &ty {
+            debug_assert!(
+                object
+                    .properties
+                    .windows(2)
+                    .all(|pair| pair[0].name() < pair[1].name()),
+                "interned object properties must have unique, sorted names"
+            );
+        }
         if let Some(existing) = self.index.get(&ty) {
             return *existing;
         }
@@ -1678,10 +1702,18 @@ impl TypeTable {
         id
     }
 
-    /// Returns the interned representation of a type identity.
+    /// Returns a type's semantic representation. Captured constructor identities
+    /// observe their latest namespace augmentation without rewriting interned nodes.
     #[must_use]
+    #[inline]
     pub fn get(&self, id: TypeId) -> &Type {
-        &self.types[id.0 as usize]
+        let ty = &self.types[id.0 as usize];
+        if matches!(ty, Type::ConstructorType { .. })
+            && let Some(current) = self.constructor_revisions.get(&id)
+        {
+            return &self.types[current.0 as usize];
+        }
+        ty
     }
 
     pub(crate) fn iterable_view(&self, source: TypeId) -> Option<TypeId> {
@@ -1699,13 +1731,9 @@ impl TypeTable {
                 .map_or(ty, |template| template.raw),
             _ => ty,
         };
-        match self.get(ty).clone() {
+        match self.get(ty) {
             Type::ObjectType(object) => {
-                if let Some(property) = object
-                    .properties
-                    .iter()
-                    .find(|property| property.name() == name)
-                {
+                if let Some(property) = object.property(name) {
                     return Some(property.type_id());
                 }
 
@@ -1732,10 +1760,12 @@ impl TypeTable {
                     });
                 }
                 let index = name.parse::<usize>().ok()?;
+                let shape = shape.clone();
                 self.tuple_index_type(&shape, index)
             }
-            Type::Array(element) => name.parse::<usize>().is_ok().then_some(element),
+            Type::Array(element) => name.parse::<usize>().is_ok().then_some(*element),
             Type::Union(members) => {
+                let members = members.clone();
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     found.push(self.property_type(member, name)?);
@@ -1743,6 +1773,7 @@ impl TypeTable {
                 Some(self.union(&found))
             }
             Type::Intersection(members) => {
+                let members = members.clone();
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     if let Some(property) = self.property_type(member, name) {
@@ -1884,18 +1915,15 @@ impl TypeTable {
     #[must_use]
     pub fn read_property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
         let ty = self.named_structural_view(ty);
-        match self.get(ty).clone() {
+        match self.get(ty) {
             Type::ObjectType(object) => {
-                if let Some(property) = object
-                    .properties
-                    .iter()
-                    .find(|property| property.name() == name)
-                {
+                if let Some(property) = object.property(name) {
+                    let type_id = property.type_id();
                     if property.optional() {
                         let undefined = self.undefined_type();
-                        return Some(self.union(&[property.type_id(), undefined]));
+                        return Some(self.union(&[type_id, undefined]));
                     }
-                    return Some(property.type_id());
+                    return Some(type_id);
                 }
 
                 let numeric = name.parse::<usize>().is_ok();
@@ -1921,9 +1949,11 @@ impl TypeTable {
                     });
                 }
                 let index = name.parse::<usize>().ok()?;
+                let shape = shape.clone();
                 self.tuple_index_type(&shape, index)
             }
             Type::Array(element) => {
+                let element = *element;
                 if name.parse::<usize>().is_ok() {
                     return Some(element);
                 }
@@ -1933,6 +1963,7 @@ impl TypeTable {
                 None
             }
             Type::Union(members) => {
+                let members = members.clone();
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     found.push(self.read_property_type(member, name)?);
@@ -1940,6 +1971,7 @@ impl TypeTable {
                 Some(self.union(&found))
             }
             Type::Intersection(members) => {
+                let members = members.clone();
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     if let Some(property) = self.read_property_type(member, name) {
@@ -2520,9 +2552,11 @@ impl TypeTable {
     }
 
     fn materialize_one_applied_alias_view(&mut self, type_id: TypeId) {
-        let Type::AppliedAlias { symbol, arguments } = self.get(type_id).clone() else {
+        let Type::AppliedAlias { symbol, arguments } = self.get(type_id) else {
             return;
         };
+        let symbol = *symbol;
+        let arguments = arguments.clone();
         let Some(metadata) = self.aliases.get(&symbol).cloned() else {
             return;
         };
@@ -2704,6 +2738,47 @@ impl TypeTable {
         })
     }
 
+    /// Publishes a new static view for the same constructor application.
+    /// Every captured revision points directly to the current raw node, even
+    /// when interning reuses an older shape. No lookup follows a revision chain.
+    fn publish_constructor_revision(&mut self, previous: TypeId, current: TypeId) {
+        let previous = self
+            .constructor_revisions
+            .get(&previous)
+            .copied()
+            .unwrap_or(previous);
+        if previous == current {
+            return;
+        }
+        let (
+            Type::ConstructorType {
+                symbol: previous_symbol,
+                arguments: previous_arguments,
+                ..
+            },
+            Type::ConstructorType {
+                symbol: current_symbol,
+                arguments: current_arguments,
+                ..
+            },
+        ) = (
+            &self.types[previous.0 as usize],
+            &self.types[current.0 as usize],
+        )
+        else {
+            panic!("constructor revisions require constructor identities");
+        };
+        assert_eq!(previous_symbol, current_symbol);
+        assert_eq!(previous_arguments, current_arguments);
+        for view in self.constructor_revisions.values_mut() {
+            if *view == previous {
+                *view = current;
+            }
+        }
+        self.constructor_revisions.remove(&current);
+        self.constructor_revisions.insert(previous, current);
+    }
+
     /// Returns the parameter-relative self head used inside a class declaration.
     pub fn declared_class(&mut self, symbol: SymbolId) -> Option<TypeId> {
         let parameters = self.classes.get(&symbol)?.parameters.clone();
@@ -2774,9 +2849,11 @@ impl TypeTable {
     }
 
     fn materialize_one_applied_class_view(&mut self, type_id: TypeId) {
-        let Type::AppliedClass { symbol, arguments } = self.get(type_id).clone() else {
+        let Type::AppliedClass { symbol, arguments } = self.get(type_id) else {
             return;
         };
+        let symbol = *symbol;
+        let arguments = arguments.clone();
         let Some(metadata) = self.classes.get(&symbol).cloned() else {
             return;
         };
@@ -2870,6 +2947,10 @@ impl TypeTable {
 
     fn keyof_view(&mut self, view: TypeId) -> Option<TypeId> {
         match self.get(view).clone() {
+            Type::ConstructorType {
+                structural: target, ..
+            }
+            | Type::TypeQuery { target, .. } => self.try_reduce_keyof(target),
             Type::ObjectType(object) => {
                 let mut keys =
                     Vec::with_capacity(object.properties.len() + object.index_signatures.len());
@@ -3257,11 +3338,7 @@ impl TypeTable {
     ) -> IndexedAccessConstraint {
         match self.get(object) {
             Type::ObjectType(object_type) => {
-                if let Some(property) = object_type
-                    .properties
-                    .iter()
-                    .find(|property| property.name() == name)
-                {
+                if let Some(property) = object_type.property(name) {
                     return IndexedAccessConstraint::Reduced(
                         self.constraint_type_expr(property.type_id()),
                     );
@@ -12564,7 +12641,9 @@ impl<'src> Binder<'src> {
                             owner,
                             &name,
                             bare,
-                            PropertyAnchorKind::Plain,
+                            PropertyAnchorKind::TypeMember {
+                                name_range: Self::property_name_range(&property.name),
+                            },
                             true,
                         );
                     }
@@ -12586,7 +12665,9 @@ impl<'src> Binder<'src> {
                             owner,
                             &name,
                             bare,
-                            PropertyAnchorKind::Plain,
+                            PropertyAnchorKind::TypeMember {
+                                name_range: Self::property_name_range(&method.name),
+                            },
                             true,
                         );
                     }
@@ -13968,19 +14049,16 @@ impl<'src> Binder<'src> {
         }
         let structural = self.types.object_type_with_members(object);
         let constructor = self.types.constructor_type(owner, arguments, structural);
-        self.class_constructor_types.insert(owner, constructor);
-        self.refresh_captured_constructor_views(existing, constructor);
+        self.publish_class_constructor(owner, constructor);
     }
 
-    /// Refresh views captured before a namespace augmentation.
-    /// `const alias = D` stores the pre-merge constructor id, so a later
-    /// export would stay invisible through the alias while `D` sees it.
-    /// Only top-level exact id matches move forward; reassigned variables
-    /// hold a different id and stay untouched. The baseline record advances
-    /// with the semantic slots so `.types` renders the same constructor.
-    /// Captures nested inside interned types need a representation fix
-    /// tracked separately.
-    fn refresh_captured_constructor_views(&mut self, existing: TypeId, current: TypeId) {
+    /// Publishes a class's static view and refreshes direct and nested captures.
+    /// Explicitly structural annotations retain their own interned shape.
+    fn publish_class_constructor(&mut self, owner: SymbolId, current: TypeId) {
+        let Some(existing) = self.class_constructor_types.insert(owner, current) else {
+            return;
+        };
+        self.types.publish_constructor_revision(existing, current);
         self.symbol_types
             .iter_mut()
             .chain(self.node_types.values_mut())
@@ -16123,7 +16201,7 @@ impl<'src> Binder<'src> {
             self.class_instance_types
                 .insert(owner, preliminary_instance);
             let static_type = self.class_static_type(class, scope, preliminary_instance);
-            self.class_constructor_types.insert(owner, static_type);
+            self.publish_class_constructor(owner, static_type);
             self.symbol_types[owner.get() as usize] = preliminary_instance;
         }
     }
@@ -16257,7 +16335,7 @@ impl<'src> Binder<'src> {
         let static_type = self.class_static_type(class, scope, instance_type);
         if let Some(owner) = owner {
             self.class_instance_types.insert(owner, instance_type);
-            self.class_constructor_types.insert(owner, static_type);
+            self.publish_class_constructor(owner, static_type);
             // Class declarations: the symbol's declared type is the instance
             // type (`>C : C` in .types baselines). Class expressions: the
             // symbol's type is the constructor type (`>C : typeof C`).
@@ -16958,6 +17036,8 @@ impl<'src> Binder<'src> {
         if let Some(base_static) = base_static
             && !base_static.construct_signatures.is_empty()
         {
+            let (type_parameters, type_parameter_bounds) =
+                self.signature_type_parameters(class.type_parameters.as_ref(), scope);
             let mut inherited = Vec::with_capacity(base_static.construct_signatures.len());
             for entry in &base_static.construct_signatures {
                 let javascript = entry.signature.javascript;
@@ -16987,6 +17067,10 @@ impl<'src> Binder<'src> {
                         signature.clone()
                     };
                 signature.javascript = javascript;
+                signature.type_parameters.clone_from(&type_parameters);
+                signature
+                    .type_parameter_bounds
+                    .clone_from(&type_parameter_bounds);
                 signature.return_type = instance_type;
                 // The overwritten return is synthesized, not a written
                 // annotation, so no provenance survives the substitution.
@@ -17637,7 +17721,15 @@ impl<'src> Binder<'src> {
             .map(PropertyOwner::Member);
         let anchor = |binder: &mut Self, name: &str, property_name: &PropertyName| {
             if let (Some(owner), Some(bare)) = (owner, Self::property_bare_range(property_name)) {
-                binder.record_property_anchor(owner, name, bare, PropertyAnchorKind::Plain, true);
+                binder.record_property_anchor(
+                    owner,
+                    name,
+                    bare,
+                    PropertyAnchorKind::ClassMember {
+                        name_range: Self::property_name_range(property_name),
+                    },
+                    true,
+                );
             }
         };
         match member.data() {
@@ -20322,13 +20414,9 @@ impl<'src> Binder<'src> {
                 // A same-named class static is the runtime value; the
                 // namespace type binding must not mask it.
                 if let Some(&constructor) = self.class_constructor_types.get(&object_symbol)
-                    && let Type::ConstructorType { structural, .. } =
-                        self.types.get(constructor).clone()
-                    && let Type::ObjectType(object) = self.types.get(structural).clone()
-                    && let Some(property) = object
-                        .properties
-                        .iter()
-                        .find(|property| property.name() == name_str.as_str())
+                    && let Type::ConstructorType { structural, .. } = self.types.get(constructor)
+                    && let Type::ObjectType(object) = self.types.get(*structural)
+                    && let Some(property) = object.property(name_str.as_str())
                     && self.is_member_accessible(property)
                 {
                     return (property.type_id(), false);
@@ -20669,9 +20757,9 @@ impl<'src> Binder<'src> {
                 read,
             );
         }
-        match self.types.get(object_type).clone() {
+        match self.types.get(object_type) {
             Type::Record { key, value } => {
-                let property = self.deferred_record_property_type(key, value, name);
+                let property = self.deferred_record_property_type(*key, *value, name);
                 if property == self.types.error_type() && self.is_typescript() {
                     self.emit(
                         PROPERTY_DOES_NOT_EXIST,
@@ -20682,15 +20770,12 @@ impl<'src> Binder<'src> {
                 Some(property)
             }
             Type::ObjectType(object) => {
-                if let Some(property) = object
-                    .properties
-                    .iter()
-                    .find(|property| property.name() == name)
-                {
+                if let Some(property) = object.property(name) {
                     if !self.is_member_accessible(property) {
                         self.emit(MEMBER_NOT_ACCESSIBLE, range, MEMBER_NOT_ACCESSIBLE_MESSAGE);
                         return Some(self.types.error_type());
                     }
+                    let property = property.clone();
                     let mut type_id = self.project_this_type_for_owners(
                         property.type_id(),
                         property.declaring_types(),
@@ -20711,6 +20796,7 @@ impl<'src> Binder<'src> {
                                 && matches!(self.types.get(parameter.type_id()), Type::Number))
                     })
                 }) {
+                    let signature = signature.clone();
                     let type_id = self.project_this_type_for_owners(
                         signature.value_type,
                         &signature.declaring_types,
@@ -20739,6 +20825,7 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::Named(symbol) => {
+                let symbol = *symbol;
                 let resolved = self.resolve_named_type_symbol(symbol);
                 let view = self.types.named_structural_view(resolved);
                 if view == object_type {
@@ -20770,6 +20857,7 @@ impl<'src> Binder<'src> {
                     );
                     return Some(self.types.error_type());
                 }
+                let members = members.clone();
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     let member_property = self.property_type_for_member_raw(
@@ -20795,26 +20883,29 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::Intersection(members) => {
+                let members = members.clone();
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
                     let member = self
                         .types
                         .prepare_applied_alias_view(member)
                         .unwrap_or(member);
-                    let (resolved, member_owner) = match self.types.get(member).clone() {
+                    let (resolved, member_owner) = match self.types.get(member) {
                         Type::Named(symbol) => {
+                            let symbol = *symbol;
                             (self.resolve_named_type_symbol(symbol), Some(symbol))
                         }
-                        Type::AppliedClass { symbol, .. } => (member, Some(symbol)),
+                        Type::AppliedClass { symbol, .. } => (member, Some(*symbol)),
                         _ => (member, owner_hint),
                     };
                     let view = self.types.named_structural_view(resolved);
-                    let property = match self.types.get(view).clone() {
+                    let property = match self.types.get(view) {
                         Type::Function(signature) if name == "call" => {
+                            let signature = signature.clone();
                             Some(self.function_call_member_type(&signature))
                         }
                         Type::ObjectType(object)
-                            if name == "call" && TypeTable::is_pure_callable_object(&object) =>
+                            if name == "call" && TypeTable::is_pure_callable_object(object) =>
                         {
                             self.call_member_type_for_callable(view)
                         }
@@ -20882,6 +20973,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_) => self.primitive_wrapper_member(object_type, name, range),
             Type::AppliedClass { symbol, .. } => {
+                let symbol = *symbol;
                 if let Some(view) = self.types.prepare_applied_class_view(object_type) {
                     return self.property_type_for_member_raw(
                         MemberRequest {
@@ -20916,7 +21008,7 @@ impl<'src> Binder<'src> {
             }
             Type::ConstructorType { structural, .. } => self.property_type_for_member_raw(
                 MemberRequest {
-                    object_type: structural,
+                    object_type: *structural,
                     name,
                     range,
                     receiver,
@@ -20929,16 +21021,17 @@ impl<'src> Binder<'src> {
                 owner, constraint, ..
             } => self.property_type_for_member_raw(
                 MemberRequest {
-                    object_type: constraint,
+                    object_type: *constraint,
                     name,
                     range,
                     receiver,
-                    owner_hint: Some(owner),
+                    owner_hint: Some(*owner),
                     lookup,
                 },
                 read,
             ),
             Type::Function(signature) if name == "call" => {
+                let signature = signature.clone();
                 let property = self.function_call_member_type(&signature);
                 Some(self.project_this_type(property, owner_hint, receiver))
             }
@@ -20971,13 +21064,9 @@ impl<'src> Binder<'src> {
     }
 
     fn property_is_readonly(&mut self, object_type: TypeId, name: &str) -> bool {
-        match self.types.get(object_type).clone() {
+        match self.types.get(object_type) {
             Type::ObjectType(object) => {
-                if let Some(property) = object
-                    .properties
-                    .iter()
-                    .find(|property| property.name() == name)
-                {
+                if let Some(property) = object.property(name) {
                     return property.readonly();
                 }
                 let numeric = name.parse::<usize>().is_ok();
@@ -20991,27 +21080,32 @@ impl<'src> Binder<'src> {
                 })
             }
             Type::Named(symbol) => {
-                let resolved = self.resolve_named_type_symbol(symbol);
+                let resolved = self.resolve_named_type_symbol(*symbol);
                 let view = self.types.named_structural_view(resolved);
                 view != object_type && self.property_is_readonly(view, name)
             }
-            Type::Union(members) | Type::Intersection(members) => members
-                .into_iter()
-                .any(|member| self.property_is_readonly(member, name)),
+            Type::Union(members) | Type::Intersection(members) => {
+                let members = members.clone();
+                members
+                    .into_iter()
+                    .any(|member| self.property_is_readonly(member, name))
+            }
             Type::AppliedClass { .. } => {
                 if let Some(view) = self.types.prepare_applied_class_view(object_type) {
                     return self.property_is_readonly(view, name);
                 }
                 false
             }
-            Type::ConstructorType { structural, .. } => self.property_is_readonly(structural, name),
+            Type::ConstructorType { structural, .. } => {
+                self.property_is_readonly(*structural, name)
+            }
             Type::AppliedAlias { .. } => {
                 if let Some(view) = self.types.prepare_applied_alias_view(object_type) {
                     return self.property_is_readonly(view, name);
                 }
                 false
             }
-            Type::This { constraint, .. } => self.property_is_readonly(constraint, name),
+            Type::This { constraint, .. } => self.property_is_readonly(*constraint, name),
             _ => false,
         }
     }
@@ -30165,6 +30259,68 @@ mod tests {
     }
 
     #[test]
+    fn constructor_revisions_preserve_interning_and_captured_aliases() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let empty = table.object_type(Vec::new());
+        let empty_node = table.get(empty).clone();
+        let original = table.constructor_type(owner, Vec::new(), empty);
+        let original_node = table.get(original).clone();
+        let unrelated = table.constructor_type(SymbolId::new(2), Vec::new(), empty);
+        let query = table.type_query("C".into(), Vec::new(), original);
+        let alias_symbol = SymbolId::new(3);
+        table.declare_alias(alias_symbol, Vec::new());
+        table.publish_alias_template(alias_symbol, query);
+        let alias = table.applied_alias(alias_symbol, Vec::new());
+        let alias_view = table.applied_alias_view(alias).expect("cached alias view");
+        let captured = table
+            .type_query_target(alias_view)
+            .expect("constructor query");
+        assert_eq!(captured, original);
+
+        let number = table.number();
+        let with_x = table.object_type(vec![PropertyType::new("x", false, number)]);
+        let first = table.constructor_type(owner, Vec::new(), with_x);
+        table.publish_constructor_revision(original, first);
+        assert_eq!(table.get(captured), table.get(first));
+        assert_eq!(table.applied_alias_view(alias), Some(alias_view));
+        assert_eq!(
+            table.get(unrelated),
+            &Type::ConstructorType {
+                symbol: SymbolId::new(2),
+                arguments: Vec::new(),
+                structural: empty,
+            }
+        );
+        assert_eq!(table.get(empty), &empty_node);
+        assert_eq!(table.types[original.get() as usize], original_node);
+        assert_eq!(table.index.get(&original_node), Some(&original));
+        assert_eq!(table.constructor_type(owner, Vec::new(), empty), original);
+
+        let with_xy = table.object_type(vec![
+            PropertyType::new("x", false, number),
+            PropertyType::new("y", false, number),
+        ]);
+        let second = table.constructor_type(owner, Vec::new(), with_xy);
+        table.publish_constructor_revision(original, second);
+        for captured in [original, first] {
+            assert_eq!(table.get(captured), table.get(second));
+        }
+        table.publish_constructor_revision(second, original);
+        for captured in [original, first, second] {
+            assert_eq!(table.get(captured), &original_node);
+        }
+        assert!(!table.constructor_revisions.contains_key(&original));
+        assert!(
+            table
+                .constructor_revisions
+                .values()
+                .all(|view| *view == original)
+        );
+        assert_eq!(table.index.get(&original_node), Some(&original));
+    }
+
+    #[test]
     fn transforming_recursive_class_view_is_demand_bounded() {
         let mut table = TypeTable::new();
         let class = SymbolId::new(1);
@@ -32138,6 +32294,113 @@ mod tests {
         ]);
 
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn property_lookup_preserves_optional_types_and_name_boundaries() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let undefined = table.undefined_type();
+        let object = table.object_type(vec![
+            PropertyType::new("\u{1f642}", false, string),
+            PropertyType::new("z", false, number),
+            PropertyType::new("a0", true, string),
+            PropertyType::new("a", false, number),
+            PropertyType::new("", false, string),
+        ]);
+        for (name, expected) in [
+            ("", string),
+            ("a", number),
+            ("z", number),
+            ("\u{1f642}", string),
+        ] {
+            assert_eq!(table.property_type(object, name), Some(expected));
+            assert_eq!(table.read_property_type(object, name), Some(expected));
+        }
+        assert_eq!(table.property_type(object, "a0"), Some(string));
+        let optional = table.union(&[string, undefined]);
+        assert_eq!(table.read_property_type(object, "a0"), Some(optional));
+        for missing in ["0", "a00", "zz", "\u{1f643}"] {
+            assert_eq!(table.property_type(object, missing), None);
+            assert_eq!(table.read_property_type(object, missing), None);
+        }
+        let empty = table.object_type(Vec::new());
+        assert_eq!(table.property_type(empty, "a"), None);
+        assert_eq!(table.read_property_type(empty, "a"), None);
+    }
+
+    #[test]
+    fn property_lookup_keeps_index_signature_precedence() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let boolean = table.boolean();
+        let object = table.object_type(vec![PropertyType::new("0", false, boolean)]);
+        let Type::ObjectType(mut members) = table.get(object).clone() else {
+            unreachable!();
+        };
+        members.index_signatures = vec![
+            super::IndexSignature {
+                readonly: false,
+                parameters: vec![FunctionParameter::new(
+                    "key".to_owned(),
+                    number,
+                    false,
+                    false,
+                )],
+                value_type: number,
+                declaring_types: Vec::new(),
+            },
+            super::IndexSignature {
+                readonly: false,
+                parameters: vec![FunctionParameter::new(
+                    "key".to_owned(),
+                    string,
+                    false,
+                    false,
+                )],
+                value_type: string,
+                declaring_types: Vec::new(),
+            },
+        ];
+        let object = table.object_type_with_members(members);
+        for (name, expected) in [("0", boolean), ("1", number), ("name", string)] {
+            assert_eq!(table.property_type(object, name), Some(expected));
+            assert_eq!(table.read_property_type(object, name), Some(expected));
+        }
+    }
+
+    #[test]
+    fn property_lookup_distributes_over_unions_and_intersections() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let undefined = table.undefined_type();
+        let left = table.object_type(vec![PropertyType::new("value", false, number)]);
+        let right = table.object_type(vec![
+            PropertyType::new("value", true, string),
+            PropertyType::new("extra", false, string),
+        ]);
+        let union = table.union(&[left, right]);
+        let raw = table.union(&[number, string]);
+        let read = table.union(&[number, string, undefined]);
+        assert_eq!(table.property_type(union, "value"), Some(raw));
+        assert_eq!(table.read_property_type(union, "value"), Some(read));
+        assert_eq!(table.property_type(union, "extra"), None);
+        assert_eq!(table.read_property_type(union, "extra"), None);
+
+        let intersection = table.intersection(vec![left, right]);
+        let raw = table.intersection(vec![number, string]);
+        let optional = table.union(&[string, undefined]);
+        let read = table.intersection(vec![number, optional]);
+        assert_eq!(table.property_type(intersection, "value"), Some(raw));
+        assert_eq!(table.read_property_type(intersection, "value"), Some(read));
+        assert_eq!(table.property_type(intersection, "extra"), Some(string));
+        assert_eq!(
+            table.read_property_type(intersection, "extra"),
+            Some(string)
+        );
     }
 
     #[test]

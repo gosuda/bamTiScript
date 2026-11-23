@@ -24,3 +24,7 @@ bamts-cancel.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "run_perf"
+required-features = ["node-host"]
