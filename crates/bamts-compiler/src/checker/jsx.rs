@@ -783,6 +783,7 @@ impl<'src> Binder<'src> {
                 properties: Vec::new(),
                 index_signatures: vec![IndexSignature {
                     readonly: false,
+                    enum_reverse: false,
                     parameters: vec![FunctionParameter::new("key".to_owned(), key, false, false)],
                     value_type: value,
                     declaring_types: Vec::new(),

@@ -454,6 +454,9 @@ struct HoistedDeclarationIdentity {
 #[derive(Clone, Debug)]
 pub struct PropertyType {
     name: Box<str>,
+    /// Whether the declaration used a numeric property name. The cooked
+    /// spelling alone cannot distinguish `1` from `"1"`.
+    numeric_name: bool,
     optional: bool,
     readonly: bool,
     getter_only: bool,
@@ -490,6 +493,7 @@ impl PropertyType {
     pub fn new(name: impl Into<Box<str>>, optional: bool, type_id: TypeId) -> Self {
         Self {
             name: name.into(),
+            numeric_name: false,
             optional,
             readonly: false,
             getter_only: false,
@@ -502,6 +506,17 @@ impl PropertyType {
             accessor: false,
             declared: false,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_numeric_name(mut self, numeric_name: bool) -> Self {
+        self.numeric_name = numeric_name;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn numeric_name(&self) -> bool {
+        self.numeric_name
     }
 
     #[must_use]
@@ -646,6 +661,7 @@ impl PropertyType {
 impl PartialEq for PropertyType {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+            && self.numeric_name == other.numeric_name
             && self.optional == other.optional
             && self.readonly == other.readonly
             && self.getter_only == other.getter_only
@@ -665,6 +681,7 @@ impl Eq for PropertyType {}
 impl std::hash::Hash for PropertyType {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
+        self.numeric_name.hash(state);
         self.optional.hash(state);
         self.readonly.hash(state);
         self.getter_only.hash(state);
@@ -833,6 +850,8 @@ pub(crate) struct PropertySite {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IndexSignature {
     pub(crate) readonly: bool,
+    /// A numeric enum's reverse lookup is readable but is not a declared key.
+    pub(crate) enum_reverse: bool,
     pub(crate) parameters: Vec<FunctionParameter>,
     pub(crate) value_type: TypeId,
     pub(crate) declaring_types: Vec<SymbolId>,
@@ -2962,8 +2981,11 @@ impl TypeTable {
                 let mut keys =
                     Vec::with_capacity(object.properties.len() + object.index_signatures.len());
                 for property in &object.properties {
+                    if property.access() != Accessibility::Public {
+                        continue;
+                    }
                     let name = property.name.as_ref();
-                    let key = if name.parse::<usize>().is_ok() {
+                    let key = if property.numeric_name() {
                         self.number_literal(name)
                     } else {
                         self.string_literal(name)
@@ -2971,7 +2993,9 @@ impl TypeTable {
                     keys.push(key);
                 }
                 for signature in &object.index_signatures {
-                    if let Some(parameter) = signature.parameters.first() {
+                    if !signature.enum_reverse
+                        && let Some(parameter) = signature.parameters.first()
+                    {
                         keys.push(parameter.type_id());
                     }
                 }
@@ -3025,6 +3049,7 @@ impl TypeTable {
                     .into_iter()
                     .map(|key_type| IndexSignature {
                         readonly: false,
+                        enum_reverse: false,
                         parameters: vec![FunctionParameter::new(
                             "key".to_owned(),
                             key_type,
@@ -3069,7 +3094,9 @@ impl TypeTable {
                 properties.push(PropertyType::new(name, false, value));
             }
             Type::NumberLiteral(name) => {
-                properties.push(PropertyType::new(name.clone(), false, value));
+                properties.push(
+                    PropertyType::new(name.clone(), false, value).with_numeric_name(true),
+                );
             }
             Type::Any => index_keys.extend([self.string(), self.number(), self.symbol_type()]),
             Type::Never => {}
@@ -4126,6 +4153,7 @@ impl TypeTable {
                     };
                     property =
                         PropertyType::new(first.name().to_owned(), first.optional(), type_id)
+                            .with_numeric_name(first.numeric_name())
                             .with_readonly(first.readonly())
                             .with_getter_only(first.getter_only())
                             .with_accessibility(first.access(), first.declaring_class())
@@ -4595,6 +4623,7 @@ impl TypeTable {
                                 property.optional,
                                 copy(target, source, property.type_id, imported, next_symbol),
                             )
+                            .with_numeric_name(property.numeric_name)
                             .with_readonly(property.readonly)
                             .with_getter_only(property.getter_only)
                             .with_accessibility(property.access(), declaring_class)
@@ -4630,6 +4659,7 @@ impl TypeTable {
                         .into_iter()
                         .map(|signature| IndexSignature {
                             readonly: signature.readonly,
+                            enum_reverse: signature.enum_reverse,
                             parameters: signature
                                 .parameters
                                 .into_iter()
@@ -6089,6 +6119,7 @@ fn constructor_with_members_in(
     if numeric_index {
         object.index_signatures.push(IndexSignature {
             readonly: false,
+            enum_reverse: true,
             parameters: vec![FunctionParameter::new(
                 "index".to_owned(),
                 types.number(),
@@ -16730,9 +16761,16 @@ impl<'src> Binder<'src> {
                     }
                     _ => continue,
                 };
+            let numeric_name = match member.data() {
+                ClassMember::Property(property) => Self::is_numeric_name(&property.name),
+                ClassMember::AutoAccessor(accessor) => Self::is_numeric_name(&accessor.name),
+                ClassMember::Method(method) => Self::is_numeric_name(&method.name),
+                _ => unreachable!("only named members contribute class properties"),
+            };
             let _ = seen.insert(name.clone());
             properties.push(
                 PropertyType::new(name, optional, type_id)
+                    .with_numeric_name(numeric_name)
                     .with_readonly(readonly)
                     .with_getter_only(getter_only)
                     .with_accessibility(access, declaring_class)
@@ -23570,6 +23608,7 @@ impl<'src> Binder<'src> {
                             None => self.types.any(),
                         };
                         let member = PropertyType::new(name, property.optional, type_id)
+                            .with_numeric_name(Self::is_numeric_name(&property.name))
                             .with_readonly(property.readonly);
                         let member = if declared {
                             member.with_declared()
@@ -23612,7 +23651,9 @@ impl<'src> Binder<'src> {
                         }
                         let type_id = self.resolve_function_type(&method.function, scope);
                         object.properties.push(
-                            PropertyType::new(name, method.optional, type_id).with_method(true),
+                            PropertyType::new(name, method.optional, type_id)
+                                .with_numeric_name(Self::is_numeric_name(&method.name))
+                                .with_method(true),
                         );
                     }
                 }
@@ -23667,6 +23708,7 @@ impl<'src> Binder<'src> {
                         self.resolve_type(&index.type_annotation.data().type_node, scope);
                     object.index_signatures.push(IndexSignature {
                         readonly: index.readonly,
+                        enum_reverse: false,
                         parameters,
                         value_type,
                         declaring_types: Vec::new(),
@@ -23796,6 +23838,16 @@ impl<'src> Binder<'src> {
             _ => None,
         }
     }
+    fn is_numeric_name(name: &PropertyName) -> bool {
+        match name {
+            PropertyName::Number(_) => true,
+            PropertyName::Computed(expression) => {
+                matches!(expression.data(), Expression::Literal(Literal::Number(_)))
+            }
+            _ => false,
+        }
+    }
+
     fn property_key(&self, name: &PropertyName) -> Option<String> {
         match name {
             PropertyName::Identifier(identifier) => {
@@ -24805,7 +24857,8 @@ impl<'src> Binder<'src> {
                         }
                         upsert_property(
                             &mut properties,
-                            PropertyType::new(name, false, value_type),
+                            PropertyType::new(name, false, value_type)
+                                .with_numeric_name(Self::is_numeric_name(&property.name)),
                         );
                     }
                 }
@@ -24845,6 +24898,7 @@ impl<'src> Binder<'src> {
                                 upsert_property(
                                     &mut properties,
                                     PropertyType::new(name, false, type_id)
+                                        .with_numeric_name(Self::is_numeric_name(&method.name))
                                         .with_readonly(getter_only)
                                         .with_getter_only(getter_only),
                                 );
@@ -24874,6 +24928,7 @@ impl<'src> Binder<'src> {
                                 upsert_property(
                                     &mut properties,
                                     PropertyType::new(name, false, type_id)
+                                        .with_numeric_name(Self::is_numeric_name(&method.name))
                                         .with_readonly(false)
                                         .with_getter_only(false),
                                 );
@@ -24889,7 +24944,8 @@ impl<'src> Binder<'src> {
                                 });
                                 upsert_property(
                                     &mut properties,
-                                    PropertyType::new(name, false, method_type),
+                                    PropertyType::new(name, false, method_type)
+                                        .with_numeric_name(Self::is_numeric_name(&method.name)),
                                 );
                             }
                         }
@@ -24925,6 +24981,7 @@ impl<'src> Binder<'src> {
                                     source_property.optional(),
                                     source_property.type_id(),
                                 )
+                                .with_numeric_name(source_property.numeric_name())
                                 .with_spreadable(source_property.spreadable());
                                 upsert_property(&mut properties, fresh);
                             }
@@ -24933,6 +24990,7 @@ impl<'src> Binder<'src> {
                         Type::Record { key, value } => {
                             index_signatures.push(IndexSignature {
                                 readonly: false,
+                                enum_reverse: false,
                                 parameters: vec![FunctionParameter::new(
                                     "key".to_owned(),
                                     key,
@@ -32392,6 +32450,7 @@ mod tests {
         members.index_signatures = vec![
             super::IndexSignature {
                 readonly: false,
+                enum_reverse: false,
                 parameters: vec![FunctionParameter::new(
                     "key".to_owned(),
                     number,
@@ -32403,6 +32462,7 @@ mod tests {
             },
             super::IndexSignature {
                 readonly: false,
+                enum_reverse: false,
                 parameters: vec![FunctionParameter::new(
                     "key".to_owned(),
                     string,

@@ -332,6 +332,7 @@ impl Binder<'_> {
             properties: Vec::from(properties),
             index_signatures: vec![IndexSignature {
                 readonly: true,
+                enum_reverse: false,
                 parameters: vec![req("n", number)],
                 value_type: element,
                 declaring_types: Vec::new(),

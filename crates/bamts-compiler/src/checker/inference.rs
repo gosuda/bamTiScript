@@ -506,6 +506,7 @@ impl TypeInstantiation<'_> {
                     .iter()
                     .map(|signature| IndexSignature {
                         readonly: signature.readonly,
+                        enum_reverse: signature.enum_reverse,
                         parameters: signature
                             .parameters
                             .iter()
