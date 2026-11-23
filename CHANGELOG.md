@@ -23,6 +23,11 @@ version has shipped, and no tag or stable package exists while any gate in
 - API startup now duplicates inherited standard input instead of reopening
   `/dev/stdin`. Node-spawned socket input works with the existing reader
   cancellation and shutdown path.
+- Child processes that bamts runs (the C toolchain probe, the linker, an AOT
+  image, and `taskkill` on Windows) get no standard input, and `taskkill`
+  output no longer reaches standard output. Under `--api` on Windows, AOT
+  execution and its cancellation no longer hang while the client keeps the
+  protocol stream open.
 
 - `bamts-verification completion verify` takes exactly one of `--leaf`,
   `--cluster`, or `--root` and reads measured rows from
