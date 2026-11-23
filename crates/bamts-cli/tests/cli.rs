@@ -1934,7 +1934,7 @@ fn tsc_direct_no_emit_applies_explicit_strict_null_checks() {
             .output()
             .expect("direct strict-null check starts");
         assert_eq!(output.status.code(), Some(status), "{}", stdout(&output));
-        assert_eq!(stdout(&output).contains("error TS"), status != 0);
+        assert_eq!(stdout(&output).contains(": error "), status != 0);
         assert!(!project.path.join("main.js").exists());
     }
 }
