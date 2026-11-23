@@ -161,6 +161,93 @@ fn api_execution_reports_bounded_resource_exhaustion() {
 }
 
 #[test]
+fn api_aot_tools_do_not_read_the_protocol_stream() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "export const value = 1;\n");
+    project.write("tool-stdin.rs", include_str!("fixtures/tool-stdin.rs"));
+    let tool = project
+        .path
+        .join(format!("tool-stdin{}", std::env::consts::EXE_SUFFIX));
+    let compiled = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg(project.path.join("tool-stdin.rs"))
+        .arg("-o")
+        .arg(&tool)
+        .output()
+        .expect("stand-in tool compiler starts");
+    assert_success(&compiled, "stand-in tool compiler");
+
+    let marker = project.path.join("tool-stdin-eof");
+    let mut child = project
+        .command()
+        .arg("--api")
+        .env(
+            if cfg!(target_env = "msvc") {
+                "BAMTS_LINKER"
+            } else {
+                "CC"
+            },
+            &tool,
+        )
+        .env("BAMTS_STDIN_MARKER", &marker)
+        .current_dir(&project.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bamts API child starts");
+    let mut stdin = child.stdin.take().expect("API child stdin is piped");
+    for request in [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "root": project.path },
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "compiler/execute",
+            "params": { "args": ["run", "--target", "aot", "main.ts"] },
+        }),
+    ] {
+        let payload = serde_json::to_vec(&request).expect("API request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("API request is written");
+    }
+    stdin.flush().expect("API requests are flushed");
+
+    let (reached_eof, output) = thread::scope(|scope| {
+        let output = scope.spawn(move || wait_for_output(child, "bamts --api"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !marker.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let reached_eof = marker.is_file();
+        drop(stdin);
+        (reached_eof, output.join().expect("API child is reaped"))
+    });
+
+    assert_success(&output, "bamts --api");
+    assert!(
+        reached_eof,
+        "tool waited for protocol EOF\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = decode_frames(&output.stdout);
+    assert_eq!(responses.len(), 2, "initialize and execute both respond");
+    let message = responses[1]["error"]["message"]
+        .as_str()
+        .expect("the stand-in linker deliberately fails");
+    assert!(
+        message.contains("tool stdin reached EOF before linking"),
+        "{message}"
+    );
+}
+
+#[test]
 fn api_aot_execution_is_bounded_by_request_cancellation() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "for (;;) {}\n");

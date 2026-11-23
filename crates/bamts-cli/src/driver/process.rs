@@ -135,6 +135,9 @@ pub(super) fn terminate_managed_process(child: &mut std::process::Child) -> io::
     let pid = child.id().to_string();
     let terminated = Command::new("taskkill")
         .args(["/PID", &pid, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .and_then(|status| {
             if status.success() {
