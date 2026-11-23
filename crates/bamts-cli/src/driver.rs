@@ -489,6 +489,11 @@ struct LoadedProgramFrontend {
     pub(super) output: ProgramFrontendOutput,
 }
 
+enum FrontendConfig<'a> {
+    Discovered,
+    CommandLine(&'a ParsedTscCommand),
+}
+
 fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, DriverError> {
     let context = ExecutionContext::ambient()?;
     load_program_frontend_in_context_with_cancel(args, &context, &CancellationToken::new())
@@ -498,6 +503,15 @@ fn load_program_frontend_in_context_with_cancel(
     args: &CliArgs,
     context: &ExecutionContext,
     cancel: &CancellationToken,
+) -> Result<LoadedProgramFrontend, DriverError> {
+    load_program_frontend_in_context(args, context, cancel, FrontendConfig::Discovered)
+}
+
+fn load_program_frontend_in_context(
+    args: &CliArgs,
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+    configuration: FrontendConfig<'_>,
 ) -> Result<LoadedProgramFrontend, DriverError> {
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
@@ -531,22 +545,30 @@ fn load_program_frontend_in_context_with_cancel(
             error,
         )))
     })?;
-    let config_path = project.config().to_owned();
-    let config_source = if config_path.is_file() {
-        fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
-            path: config_path.clone(),
-            source,
-        })?
-    } else {
-        "{}".to_owned()
-    };
-    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
-        DriverError::ProjectConfig {
-            path: config_path,
-            message: error.to_string(),
+    let options = match configuration {
+        FrontendConfig::Discovered => {
+            let config_path = project.config().to_owned();
+            let config_source = if config_path.is_file() {
+                fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
+                    path: config_path.clone(),
+                    source,
+                })?
+            } else {
+                "{}".to_owned()
+            };
+            ProjectConfig::parse(&root, &config_path, &config_source)
+                .map_err(|error| DriverError::ProjectConfig {
+                    path: config_path,
+                    message: error.to_string(),
+                })?
+                .options()
+                .clone()
         }
-    })?;
-    let loader = ProgramLoader::new(&root, config.options()).map_err(DriverError::ProgramLoad)?;
+        FrontendConfig::CommandLine(command) => {
+            tsc::native_frontend_options(command, context, &root, &absolute_entrypoint)?
+        }
+    };
+    let loader = ProgramLoader::new(&root, &options).map_err(DriverError::ProgramLoad)?;
     let program = loader
         .load_with_cancel(&absolute_entrypoint, cancel)
         .map_err(DriverError::ProgramLoad)?;

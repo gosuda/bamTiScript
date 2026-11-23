@@ -1877,6 +1877,97 @@ fn direct_mode_preserves_its_option_surface() {
 }
 
 #[test]
+fn tsc_direct_ignores_malformed_config_for_checking_and_native_emission() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", include_str!("fixtures/hello.ts"));
+    project.write("tsconfig.json", "{ invalid configuration");
+
+    let checked = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--noEmit"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct check starts");
+    assert_success(&checked, "direct check ignores malformed configuration");
+
+    let compiled = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--outDir", "out"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct native compile starts");
+    assert_success(
+        &compiled,
+        "direct native compile ignores malformed configuration",
+    );
+    let executable = project
+        .path
+        .join("out")
+        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+    let output = Command::new(executable)
+        .output()
+        .expect("native executable starts");
+    assert_success(&output, "direct native output executes");
+    assert_eq!(output.stdout, b"hello from bamts\n");
+    assert!(!project.path.join("hello.js").exists());
+}
+
+#[test]
+fn tsc_direct_no_emit_applies_explicit_strict_null_checks() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "declare const value: string | null;\nconst text: string = value;\n",
+    );
+
+    for (strict, status) in [("false", 0), ("true", 1)] {
+        let output = project
+            .command()
+            .args([
+                "--ignoreConfig",
+                "main.ts",
+                "--noEmit",
+                "--strictNullChecks",
+                strict,
+            ])
+            .current_dir(&project.path)
+            .output()
+            .expect("direct strict-null check starts");
+        assert_eq!(output.status.code(), Some(status), "{}", stdout(&output));
+        assert_eq!(stdout(&output).contains("error TS"), status != 0);
+        assert!(!project.path.join("main.js").exists());
+    }
+}
+
+#[test]
+fn tsc_direct_native_output_can_stay_outside_the_source_root() {
+    let project = ScratchDirectory::new();
+    project.write("source/bamts.toml", "");
+    project.write("source/hello.ts", include_str!("fixtures/hello.ts"));
+    fs::create_dir(project.path.join("caller")).expect("caller directory is created");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "--outDir", "../out"])
+        .arg(project.path.join("source/hello.ts"))
+        .current_dir(project.path.join("caller"))
+        .output()
+        .expect("direct native compile starts outside the source root");
+
+    assert_success(
+        &output,
+        "native output keeps command-relative path semantics",
+    );
+    assert!(
+        project
+            .path
+            .join("out")
+            .join(format!("hello{}", std::env::consts::EXE_SUFFIX))
+            .is_file()
+    );
+}
+
+#[test]
 fn tsc_direct_emits_declaration_for_single_root() {
     let project = ScratchDirectory::new();
     project.write("hello.ts", "export const value: number = 1;\n");
