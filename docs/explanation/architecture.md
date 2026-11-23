@@ -73,7 +73,7 @@ flowchart TD
 - The host surface is a subset. It is not full Node.js or Node-API compatibility.
 - Exposes two distinct npm distribution surfaces:
   - `bamti-cli`: The standalone CLI transport package that resolves and executes the `bamts` binary executable on disk.
-  - `bamti`: The Node.js 24 or later interface. `runNative()` uses the native Node-API addon (`bamts-napi`); `run()` starts the CLI through `bamti-cli`. `createSession()` and the unstable service/AST exports share a persistent `bamts --api` child process.
+  - `bamti`: The Node.js 24 or later interface. `runNative()` uses the native Node-API addon (`bamts-napi`); `run()` starts the CLI through `bamti-cli`. Each default `createSession()` call owns a persistent `bamts --api` child process. Service and AST operations reuse the child belonging to the supplied session.
 - Target design and fail-closed loading:
   - `bamti` specifies five optional native platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`).
   - `native-loader.js` resolves the optional platform package matching the host OS and architecture, validating package manifests, binary SHA-256 digests, and release metadata.
