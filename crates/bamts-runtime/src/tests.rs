@@ -653,6 +653,9 @@ fn gc_traces_shaped_and_dictionary_property_edges() {
                     configurable: true,
                 },
             );
+            if dictionary {
+                properties.remove(&machine.shapes, &removed);
+            }
             properties.insert(
                 &mut machine.shapes,
                 symbol_key.clone(),
@@ -665,7 +668,7 @@ fn gc_traces_shaped_and_dictionary_property_edges() {
             );
             properties.insert(
                 &mut machine.shapes,
-                private_key,
+                private_key.clone(),
                 Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -674,7 +677,12 @@ fn gc_traces_shaped_and_dictionary_property_edges() {
                 },
             );
             if dictionary {
-                properties.remove(&machine.shapes, &removed);
+                assert!(
+                    !machine
+                        .shapes
+                        .live_keys()
+                        .any(|key| { key == &symbol_key || key == &private_key })
+                );
             }
             let object = machine
                 .allocate(HeapEntry::Object {
