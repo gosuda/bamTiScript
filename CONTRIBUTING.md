@@ -8,7 +8,7 @@ bamTiScript is in pre-release state (`0.2.0`).
 
 - `bamti` and `bamti-cli` 0.1.0 are published, but their referenced platform binary packages are unavailable.
 - TypeScript 7.0.2 serves as the primary compatibility oracle, not a completed compatibility claim.
-- No repository-local GitHub Actions workflow is present. Run the verification gates locally before committing or pushing.
+- Hosted GitHub Actions workflows in [`.github/workflows`](.github/workflows) check pull requests and `main`. Run the local verification gates before committing or pushing.
 
 ---
 
@@ -36,9 +36,11 @@ unsafe_code = "forbid"
 
 The root policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. `bamts-codegen`, `bamts-napi`, `bamts-node`, `bamts-platform`, and `bamts-verification` use `deny` with narrowly scoped exceptions. `bamts-native` contains documented unsafe FFI and native-bridge code. This policy and encapsulation are not an end-to-end memory-safety proof.
 
-### Host C toolchain
+### Native linker
 
-AOT steps require a working C compiler driver selected by `$CC`, defaulting to `cc`. For example, use `CC=gcc` or `CC=clang` when that compiler is not installed as `cc`. AOT targets the host architecture and does not cross-compile.
+AOT targets the host architecture and does not cross-compile. On Linux and macOS, it uses the C compiler driver selected by `$CC`, defaulting to `cc`. Use `CC=gcc` or `CC=clang` when that compiler is not installed as `cc`.
+
+On Windows MSVC, install the Visual Studio C++ tools. The driver uses `BAMTS_LINKER` when set, then searches `PATH` for Microsoft's `link.exe`, then queries the Visual Studio installer. It derives the library search path from the toolchain or the supplied `LIB` environment variable.
 
 ---
 
@@ -89,7 +91,8 @@ cargo build --release -p bamts-cli
 ### Conventions for tests and examples
 
 - Use `process.stdout.write` for program output in TypeScript examples and fixtures. Do not use `console.log`, `console.debug`, `console.trace`, `console.table`, or `debugger` statements.
-- Single entrypoint source files are supported for compilation. Generation of declaration files (`.d.ts`) and source maps is rejected in version `0.2.0`.
+- The TypeScript-compatible CLI emits declarations with `--declaration` and JavaScript source maps with `--sourceMap`. These options use the project emission pipeline, including for a single input file.
+- Native AOT compilation accepts one entrypoint and rejects declaration and source-map output options. Its output is a linked executable.
 
 ---
 

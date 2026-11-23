@@ -7,6 +7,7 @@ use bamts_compiler::project::canonical::slash_text;
 use bamts_compiler::project::effective::EffectiveProject;
 use bamts_compiler::project::effective::ProjectCompileOptions;
 use bamts_compiler::project::effective::ProjectLoadRequest;
+use bamts_compiler::project::effective::ProjectOptionOverrides;
 use bamts_compiler::project::effective::compile_project;
 use bamts_compiler::service::filesystem::OsFileSystem;
 use std::fs::OpenOptions;
@@ -189,10 +190,11 @@ pub(super) fn compile_tsc_native_roots(
         let mut args = command.to_cli_args();
         args.entrypoint = Some(file_name.clone());
         args.extra_inputs.clear();
-        let frontend = load_program_frontend_in_context_with_cancel(
+        let frontend = load_program_frontend_in_context(
             &args,
             context,
             &CancellationToken::new(),
+            FrontendConfig::CommandLine(command),
         )?;
         let (rendered, file_has_errors) = render_tsc_program_diagnostics(command, &frontend);
         stdout.extend_from_slice(rendered.as_bytes());
@@ -212,6 +214,42 @@ pub(super) fn compile_tsc_native_roots(
         stdout,
         exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated).code(),
         ..CommandOutcome::default()
+    })
+}
+
+pub(super) fn native_frontend_project(
+    command: &ParsedTscCommand,
+    context: &ExecutionContext,
+    root: &ProjectRoot,
+    entrypoint: &Path,
+) -> Result<EffectiveProject, DriverError> {
+    let overrides = project_overrides(command);
+    let resolve = |path: Option<PathBuf>| path.map(|path| context.resolve_path(path));
+    let overrides = ProjectOptionOverrides {
+        out_dir: None,
+        root_dir: None,
+        out_file: resolve(overrides.out_file),
+        ts_build_info_file: resolve(overrides.ts_build_info_file),
+        declaration_dir: resolve(overrides.declaration_dir),
+        base_url: overrides.base_url.map(resolve),
+        ..overrides
+    };
+    let filesystem = OsFileSystem::new(root.path()).map_err(|error| {
+        DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(io::Error::new(
+            error.kind(),
+            error.to_string(),
+        )))
+    })?;
+    let request = ProjectLoadRequest {
+        config_path: None,
+        cwd: root.path().to_path_buf(),
+        overrides,
+        allow_missing_config: true,
+        source_files: Some(vec![entrypoint.to_path_buf()]),
+    };
+    EffectiveProject::load(&request, &filesystem).map_err(|error| DriverError::ProjectConfig {
+        path: root.path().join("tsconfig.json"),
+        message: error.to_string(),
     })
 }
 

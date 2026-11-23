@@ -149,6 +149,18 @@ jobs:
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.fixtures.outcome == 'success' && steps.npm.outcome == 'success' && steps.quint.outcome == 'success' }}
         run: cargo test --workspace --locked --no-fail-fast
 
+      - name: Test pinned Node oracle contracts
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.npm.outcome == 'success' }}
+        run: >-
+          cargo test --locked -p bamts-verification --lib -- --ignored --exact
+          corpus::tests::verify_node_version_accepts_pinned_and_rejects_missing
+          corpus::tests::oracle_runs_a_real_corpus_case
+          facets::tests::forged_unpinned_js_outcomes_are_not_a_public_proof_path
+
+      - name: Test npm interfaces
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.npm.outcome == 'success' }}
+        run: node --test --test-skip-pattern='staged cli-|clean consumer' npm/test/*.test.mjs
+
   preflight:
     name: Preflight
     runs-on: ubuntu-24.04

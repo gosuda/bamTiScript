@@ -161,6 +161,93 @@ fn api_execution_reports_bounded_resource_exhaustion() {
 }
 
 #[test]
+fn api_aot_tools_do_not_read_the_protocol_stream() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "export const value = 1;\n");
+    project.write("tool-stdin.rs", include_str!("fixtures/tool-stdin.rs"));
+    let tool = project
+        .path
+        .join(format!("tool-stdin{}", std::env::consts::EXE_SUFFIX));
+    let compiled = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg(project.path.join("tool-stdin.rs"))
+        .arg("-o")
+        .arg(&tool)
+        .output()
+        .expect("stand-in tool compiler starts");
+    assert_success(&compiled, "stand-in tool compiler");
+
+    let marker = project.path.join("tool-stdin-eof");
+    let mut child = project
+        .command()
+        .arg("--api")
+        .env(
+            if cfg!(target_env = "msvc") {
+                "BAMTS_LINKER"
+            } else {
+                "CC"
+            },
+            &tool,
+        )
+        .env("BAMTS_STDIN_MARKER", &marker)
+        .current_dir(&project.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bamts API child starts");
+    let mut stdin = child.stdin.take().expect("API child stdin is piped");
+    for request in [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "root": project.path },
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "compiler/execute",
+            "params": { "args": ["run", "--target", "aot", "main.ts"] },
+        }),
+    ] {
+        let payload = serde_json::to_vec(&request).expect("API request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("API request is written");
+    }
+    stdin.flush().expect("API requests are flushed");
+
+    let (reached_eof, output) = thread::scope(|scope| {
+        let output = scope.spawn(move || wait_for_output(child, "bamts --api"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !marker.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let reached_eof = marker.is_file();
+        drop(stdin);
+        (reached_eof, output.join().expect("API child is reaped"))
+    });
+
+    assert_success(&output, "bamts --api");
+    assert!(
+        reached_eof,
+        "tool waited for protocol EOF\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = decode_frames(&output.stdout);
+    assert_eq!(responses.len(), 2, "initialize and execute both respond");
+    let message = responses[1]["error"]["message"]
+        .as_str()
+        .expect("the stand-in linker deliberately fails");
+    assert!(
+        message.contains("tool stdin reached EOF before linking"),
+        "{message}"
+    );
+}
+
+#[test]
 fn api_aot_execution_is_bounded_by_request_cancellation() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "for (;;) {}\n");
@@ -213,25 +300,42 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
             Ok(found || is_file)
         })
     };
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !image_published().expect("AOT publication directory is readable") {
-        assert!(
-            Instant::now() < deadline,
-            "the AOT image was never published"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    let cancel = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "$/cancelRequest",
-        "params": { "id": 2 },
+    let (publication, output) = thread::scope(|scope| {
+        let stdout = child.stdout.take().expect("API child stdout is piped");
+        let stderr = child.stderr.take().expect("API child stderr is piped");
+        let stdout = scope.spawn(move || read_output(stdout));
+        let stderr = scope.spawn(move || read_output(stderr));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let publication = loop {
+            match image_published() {
+                Ok(false) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                result => break result,
+            }
+        };
+        let cancel = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": 2 },
+        });
+        let payload = serde_json::to_vec(&cancel).expect("cancel request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("cancel request is written");
+        drop(stdin);
+        let mut output =
+            wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+        output.stdout = stdout.join().expect("stdout reader");
+        output.stderr = stderr.join().expect("stderr reader");
+        (publication, output)
     });
-    let payload = serde_json::to_vec(&cancel).expect("cancel request serializes");
-    stdin
-        .write_all(&framed(&payload))
-        .expect("cancel request is written");
-    drop(stdin);
-    let output = wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+    assert!(
+        matches!(publication, Ok(true)),
+        "the AOT image was never published: {publication:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_success(&output, "bamts --api");
     let responses = decode_frames(&output.stdout);
     assert_eq!(responses.len(), 2, "initialize and execute both respond");
@@ -1786,6 +1890,777 @@ fn direct_mode_preserves_its_option_surface() {
         .output()
         .expect("direct null watch starts");
     assert_not_implemented(&unset_watch, "watch");
+}
+
+#[test]
+fn tsc_direct_ignores_malformed_config_for_checking_and_native_emission() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", include_str!("fixtures/hello.ts"));
+    project.write("tsconfig.json", "{ invalid configuration");
+
+    let checked = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--noEmit"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct check starts");
+    assert_success(&checked, "direct check ignores malformed configuration");
+
+    let compiled = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--outDir", "out"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct native compile starts");
+    assert_success(
+        &compiled,
+        "direct native compile ignores malformed configuration",
+    );
+    let executable = project
+        .path
+        .join("out")
+        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+    let output = Command::new(executable)
+        .output()
+        .expect("native executable starts");
+    assert_success(&output, "direct native output executes");
+    assert_eq!(output.stdout, b"hello from bamts\n");
+    assert!(!project.path.join("hello.js").exists());
+}
+
+#[test]
+fn tsc_direct_no_emit_applies_explicit_strict_null_checks() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "declare const value: string | null;\nconst text: string = value;\n",
+    );
+
+    for (strict, status) in [("false", 0), ("true", 1)] {
+        let output = project
+            .command()
+            .args([
+                "--ignoreConfig",
+                "main.ts",
+                "--noEmit",
+                "--strictNullChecks",
+                strict,
+            ])
+            .current_dir(&project.path)
+            .output()
+            .expect("direct strict-null check starts");
+        assert_eq!(output.status.code(), Some(status), "{}", stdout(&output));
+        assert_eq!(stdout(&output).contains(": error "), status != 0);
+        assert!(!project.path.join("main.js").exists());
+    }
+}
+
+#[test]
+fn tsc_direct_native_output_can_stay_outside_the_source_root() {
+    let project = ScratchDirectory::new();
+    project.write("source/bamts.toml", "");
+    project.write("source/hello.ts", include_str!("fixtures/hello.ts"));
+    fs::create_dir(project.path.join("caller")).expect("caller directory is created");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "--outDir", "../out"])
+        .arg(project.path.join("source/hello.ts"))
+        .current_dir(project.path.join("caller"))
+        .output()
+        .expect("direct native compile starts outside the source root");
+
+    assert_success(
+        &output,
+        "native output keeps command-relative path semantics",
+    );
+    assert!(
+        project
+            .path
+            .join("out")
+            .join(format!("hello{}", std::env::consts::EXE_SUFFIX))
+            .is_file()
+    );
+}
+
+#[test]
+fn tsc_native_root_dir_does_not_change_the_source_boundary() {
+    let project = ScratchDirectory::new();
+    project.write("src/bamts.toml", "");
+    project.write("src/main.ts", include_str!("fixtures/hello.ts"));
+
+    let checked = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "src/main.ts",
+            "--rootDir",
+            ".",
+            "--noEmit",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("nested native check starts");
+    assert_success(&checked, "rootDir may include the discovered source root");
+
+    let compiled = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "src/main.ts",
+            "--rootDir",
+            ".",
+            "--outDir",
+            "out",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("nested native compilation starts");
+    assert_success(&compiled, "native emission ignores artifact layout rootDir");
+    let executable = project
+        .path
+        .join("out")
+        .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+    let executed = Command::new(executable)
+        .output()
+        .expect("nested native executable starts");
+    assert_success(&executed, "nested native executable runs");
+    assert_eq!(executed.stdout, b"hello from bamts\n");
+
+    project.write("outside.ts", "export const value = 42;\n");
+    project.write(
+        "src/main.ts",
+        "import { value } from '../outside';\nconsole.log(value);\n",
+    );
+    let escaped = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "src/main.ts",
+            "--rootDir",
+            ".",
+            "--noEmit",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("confined native check starts");
+    assert!(
+        !escaped.status.success(),
+        "rootDir must not widen source access"
+    );
+}
+
+const REMOVED_BASE_URL_DIAGNOSTIC: &str = concat!(
+    "error TS5102: Option 'baseUrl' has been removed. ",
+    "Please remove it from your configuration.\n",
+);
+
+#[test]
+fn tsc_removed_base_url_precedes_semantic_and_resolution_errors() {
+    for source in [
+        "export const value = 1;\n",
+        "const wrong: number = 'text';\n",
+        "import { value } from 'missing-package';\nexport const result = value;\n",
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        project.write("extra.ts", "export const other = 2;\n");
+
+        for roots in [&["main.ts"][..], &["main.ts", "extra.ts"][..]] {
+            for base_url in ["./deps", "../outside"] {
+                let output = project
+                    .command()
+                    .args(["--ignoreConfig", "--noEmit", "--baseUrl", base_url])
+                    .args(roots)
+                    .current_dir(&project.path)
+                    .output()
+                    .expect("removed baseUrl check starts");
+
+                assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+                assert_eq!(stdout(&output), REMOVED_BASE_URL_DIAGNOSTIC);
+                assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+                assert!(!project.path.join("main.js").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn tsc_source_syntax_errors_precede_removed_base_url() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "import { value } from 'missing-package';\nconst broken = ;\nconst wrong: number = 'text';\n",
+    );
+    project.write("extra.ts", "export const other = 2;\n");
+
+    for roots in [&["main.ts"][..], &["main.ts", "extra.ts"][..]] {
+        let output = project
+            .command()
+            .args(["--ignoreConfig", "--noEmit", "--baseUrl", "./deps"])
+            .args(roots)
+            .current_dir(&project.path)
+            .output()
+            .expect("syntax-first direct check starts");
+
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        let text = stdout(&output);
+        assert!(
+            text.contains("error TS1109: Expression expected."),
+            "{text}"
+        );
+        assert_eq!(text.matches(": error ").count(), 1, "{text}");
+        assert!(!text.contains("TS5102"), "{text}");
+        assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    }
+}
+
+#[test]
+fn tsc_removed_base_url_preserves_native_emission_policy() {
+    for (flags, status, emits) in [
+        (&[][..], 2, true),
+        (&["--noEmit"][..], 1, false),
+        (&["--noEmitOnError"][..], 1, false),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("hello.ts", include_str!("fixtures/hello.ts"));
+        let output = project
+            .command()
+            .args(["--ignoreConfig", "hello.ts", "--baseUrl", "./deps"])
+            .args(flags)
+            .current_dir(&project.path)
+            .output()
+            .expect("removed baseUrl native compilation starts");
+
+        assert_eq!(output.status.code(), Some(status), "{}", stderr(&output));
+        assert_eq!(stdout(&output), REMOVED_BASE_URL_DIAGNOSTIC);
+        assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+        let executable = project
+            .path
+            .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+        assert_eq!(executable.is_file(), emits);
+        assert!(!project.path.join("hello.js").exists());
+        if emits {
+            let executed = Command::new(executable)
+                .output()
+                .expect("native executable starts");
+            assert_success(
+                &executed,
+                "native output executes despite the option diagnostic",
+            );
+            assert_eq!(executed.stdout, b"hello from bamts\n");
+        }
+    }
+}
+
+#[test]
+fn tsc_removed_option_cannot_emit_native_code_with_unresolved_static_imports() {
+    for source in [
+        "import './missing';\nconsole.log('must not execute');\n",
+        "import { value } from './missing';\nconsole.log(value);\n",
+        "import './dependency';\nconsole.log('must not execute');\n",
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        project.write("dependency.ts", "import './missing';\n");
+        let executable = project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+
+        for flag in ["--noEmit", "--noEmitOnError"] {
+            let checked = project
+                .command()
+                .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps", flag])
+                .current_dir(&project.path)
+                .output()
+                .expect("removed-option check starts");
+            assert_eq!(checked.status.code(), Some(1), "{}", stderr(&checked));
+            assert_eq!(stdout(&checked), REMOVED_BASE_URL_DIAGNOSTIC);
+            assert!(stderr(&checked).is_empty(), "{}", stderr(&checked));
+            assert!(!executable.exists());
+        }
+
+        let compiled = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps"])
+            .current_dir(&project.path)
+            .output()
+            .expect("native compilation with an unresolved dependency starts");
+        assert_eq!(compiled.status.code(), Some(1), "{}", stderr(&compiled));
+        assert!(
+            stderr(&compiled).contains("unresolved static dependency \"./missing\""),
+            "{}",
+            stderr(&compiled)
+        );
+        assert!(!executable.exists(), "invalid native output was published");
+        let launch = Command::new(&executable)
+            .output()
+            .expect_err("an unresolved static dependency must leave no executable to run");
+        assert_eq!(launch.kind(), std::io::ErrorKind::NotFound);
+        assert!(!project.path.join("main.js").exists());
+    }
+}
+
+#[test]
+fn tsc_native_emission_keeps_erased_and_lazy_unresolved_imports() {
+    for source in [
+        "import type { Missing } from './missing';\nconsole.log('ok');\n",
+        "const load = () => import('./missing');\nconsole.log('ok');\n",
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        let compiled = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps"])
+            .current_dir(&project.path)
+            .output()
+            .expect("native compilation with an erased or lazy import starts");
+        assert_eq!(compiled.status.code(), Some(2), "{}", stderr(&compiled));
+        assert_eq!(stdout(&compiled), REMOVED_BASE_URL_DIAGNOSTIC);
+        let executable = project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+        let executed = Command::new(executable)
+            .output()
+            .expect("native executable starts");
+        assert_success(&executed, "erased and lazy imports do not block execution");
+        assert_eq!(executed.stdout, b"ok\n");
+    }
+}
+
+#[test]
+fn tsc_native_emission_quarantines_unresolved_static_imports_in_lazy_modules() {
+    for (source, expected) in [
+        (
+            "const load = () => import('./lazy.js');\nconsole.log('ok');\n",
+            "ok\n",
+        ),
+        (
+            "import('./lazy.js').then(\n\
+                 () => console.log('unexpected fulfillment'),\n\
+                 () => console.log('rejected'),\n\
+             );\n",
+            "rejected\n",
+        ),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        project.write(
+            "lazy.ts",
+            "import './missing.js';\nconsole.log('lazy body must not execute');\n",
+        );
+        let compiled = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps"])
+            .current_dir(&project.path)
+            .output()
+            .expect("native compilation with an invalid lazy module starts");
+        assert_eq!(compiled.status.code(), Some(2), "{}", stderr(&compiled));
+        assert_eq!(stdout(&compiled), REMOVED_BASE_URL_DIAGNOSTIC);
+        assert!(stderr(&compiled).is_empty(), "{}", stderr(&compiled));
+        let executable = project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+        let executed = Command::new(executable)
+            .output()
+            .expect("native executable with a quarantined lazy module starts");
+        assert_success(&executed, "invalid lazy modules reject only when imported");
+        assert_eq!(executed.stdout, expected.as_bytes());
+        assert!(executed.stderr.is_empty(), "{}", stderr(&executed));
+    }
+}
+
+#[test]
+fn tsc_artifact_emission_preserves_unresolved_static_imports() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "import './missing';\nconsole.log('ok');\n");
+    let compiled = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "main.ts",
+            "--baseUrl",
+            "./deps",
+            "--declaration",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("JavaScript artifact compilation starts");
+    assert_eq!(compiled.status.code(), Some(2), "{}", stderr(&compiled));
+    assert_eq!(stdout(&compiled), REMOVED_BASE_URL_DIAGNOSTIC);
+    let javascript =
+        fs::read_to_string(project.path.join("main.js")).expect("JavaScript output is preserved");
+    assert!(javascript.contains("import "), "{javascript}");
+    assert!(javascript.contains("./missing"), "{javascript}");
+    assert!(
+        !project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX))
+            .exists()
+    );
+}
+
+#[test]
+fn tsc_removed_base_url_preserves_artifact_emission_policy() {
+    for (flags, status, emits) in [
+        (&[][..], 2, true),
+        (&["--noEmit"][..], 1, false),
+        (&["--noEmitOnError"][..], 1, false),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", "export const value = 1;\n");
+        project.write("extra.ts", "export const other = 2;\n");
+        let output = project
+            .command()
+            .args([
+                "--ignoreConfig",
+                "main.ts",
+                "extra.ts",
+                "--baseUrl",
+                "./deps",
+                "--declaration",
+            ])
+            .args(flags)
+            .current_dir(&project.path)
+            .output()
+            .expect("removed baseUrl artifact compilation starts");
+
+        assert_eq!(output.status.code(), Some(status), "{}", stderr(&output));
+        assert_eq!(stdout(&output), REMOVED_BASE_URL_DIAGNOSTIC);
+        assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+        for file in ["main.js", "extra.js", "main.d.ts", "extra.d.ts"] {
+            assert_eq!(project.path.join(file).is_file(), emits, "{file}");
+        }
+    }
+}
+
+#[test]
+fn tsc_removed_base_url_allows_direct_show_config_and_null() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "export const value = 1;\n");
+    project.write("tsconfig.json", "{ invalid configuration");
+    let shown = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "main.ts",
+            "--baseUrl",
+            "./deps",
+            "--showConfig",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct showConfig starts");
+    assert_success(&shown, "showConfig bypasses removed-option validation");
+    let config: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("config is JSON");
+    assert_eq!(config["compilerOptions"]["baseUrl"], "./deps");
+
+    for (source, status) in [
+        ("export const value = 1;\n", 0),
+        ("const wrong: number = 'text';\n", 1),
+    ] {
+        project.write("main.ts", source);
+        let output = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "null", "--noEmit"])
+            .current_dir(&project.path)
+            .output()
+            .expect("direct null override starts");
+        assert_eq!(output.status.code(), Some(status), "{}", stderr(&output));
+        assert_eq!(stdout(&output).contains(": error "), status != 0);
+        assert!(!stdout(&output).contains("TS5102"), "{}", stdout(&output));
+    }
+}
+
+#[test]
+fn tsc_project_removed_base_url_is_positioned_with_utf16_and_precedes_semantics() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "tsconfig.json",
+        "{\"label\":\"\u{1f600}\",\"compilerOptions\":{\"baseUrl\":\"deps\"},\"files\":[\"main.ts\"]}",
+    );
+    for source in [
+        "export const value = 1;\n",
+        "const wrong: number = 'text';\n",
+        "import { value } from 'missing-package';\nexport const result = value;\n",
+    ] {
+        project.write("main.ts", source);
+        let output = project
+            .command()
+            .args(["-p", "tsconfig.json", "--noEmit"])
+            .current_dir(&project.path)
+            .output()
+            .expect("removed baseUrl project check starts");
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        let text = stdout(&output);
+        assert!(
+            text.contains("tsconfig.json(1,34): error TS5102:"),
+            "{text}"
+        );
+        assert_eq!(text.matches(": error ").count(), 1, "{text}");
+        assert!(
+            text.ends_with("  Use '\"paths\": {\"*\": [\"./deps/*\"]}' instead.\n"),
+            "{text}"
+        );
+    }
+
+    project.write("main.ts", "const broken = ;\n");
+    let syntax = project
+        .command()
+        .args(["-p", "tsconfig.json", "--noEmit"])
+        .current_dir(&project.path)
+        .output()
+        .expect("syntax-first project check starts");
+    assert_eq!(syntax.status.code(), Some(1));
+    assert!(stdout(&syntax).contains("TS1109"), "{}", stdout(&syntax));
+    assert!(!stdout(&syntax).contains("TS5102"), "{}", stdout(&syntax));
+}
+
+#[test]
+fn tsc_project_base_url_null_clears_inherited_and_command_line_values() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "export const value = 1;\n");
+    project.write("base.json", r#"{"compilerOptions":{"baseUrl":"deps"}}"#);
+    project.write(
+        "tsconfig.json",
+        r#"{"extends":"./base.json","files":["main.ts"]}"#,
+    );
+
+    let shown = project
+        .command()
+        .args(["-p", "tsconfig.json", "--showConfig"])
+        .current_dir(&project.path)
+        .output()
+        .expect("project showConfig starts");
+    assert_success(&shown, "project showConfig preserves removed options");
+    let config: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("config is JSON");
+    assert_eq!(config["compilerOptions"]["baseUrl"], "./deps");
+
+    for flag in ["--noEmit", "--showConfig"] {
+        let output = project
+            .command()
+            .args(["-p", "tsconfig.json", "--baseUrl", "null", flag])
+            .current_dir(&project.path)
+            .output()
+            .expect("project null override starts");
+        assert_success(&output, "argv null clears inherited baseUrl");
+        if flag == "--showConfig" {
+            let config: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("config is JSON");
+            assert!(config["compilerOptions"].get("baseUrl").is_none());
+        }
+    }
+
+    project.write(
+        "tsconfig.json",
+        r#"{"extends":"./base.json","compilerOptions":{"baseUrl":null},"files":["main.ts"]}"#,
+    );
+    let output = project
+        .command()
+        .args(["-p", "tsconfig.json", "--noEmit"])
+        .current_dir(&project.path)
+        .output()
+        .expect("config null override starts");
+    assert_success(&output, "config null clears inherited baseUrl");
+}
+
+#[test]
+fn tsc_base_url_null_preserves_the_paths_declaration_origin() {
+    for (config, clear, expected_file, expected_value) in [
+        (
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            true,
+            "util.ts",
+            "root",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","files":["main.ts"]}"#,
+            true,
+            "configs/util.ts",
+            "base",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","compilerOptions":{"paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            true,
+            "util.ts",
+            "root",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","compilerOptions":{"baseUrl":null},"files":["main.ts"]}"#,
+            false,
+            "configs/util.ts",
+            "base",
+        ),
+        (
+            r#"{"extends":"./configs/middle.json","files":["main.ts"]}"#,
+            true,
+            "configs/util.ts",
+            "base",
+        ),
+        (
+            r#"{"compilerOptions":{"baseUrl":"../outside","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            true,
+            "util.ts",
+            "root",
+        ),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("tsconfig.json", config);
+        project.write(
+            "configs/base.json",
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}}}"#,
+        );
+        project.write(
+            "configs/middle.json",
+            r#"{"extends":"./base.json","compilerOptions":{"baseUrl":"elsewhere"}}"#,
+        );
+        project.write("util.ts", "export const selected: 'root' = 'root';\n");
+        project.write(
+            "configs/util.ts",
+            "export const selected: 'base' = 'base';\n",
+        );
+        for file in [
+            "vendor/util.ts",
+            "configs/vendor/util.ts",
+            "configs/elsewhere/util.ts",
+        ] {
+            project.write(file, "export const selected: 'stale' = 'stale';\n");
+        }
+        project.write(
+            "main.ts",
+            &format!("import {{ selected }} from '@util';\nexport const result: '{expected_value}' = selected;\n"),
+        );
+        let overrides = if clear {
+            &["--baseUrl", "null"][..]
+        } else {
+            &[][..]
+        };
+        let checked = project
+            .command()
+            .args(["-p", "tsconfig.json", "--noEmit", "--listFiles"])
+            .args(overrides)
+            .current_dir(&project.path)
+            .output()
+            .expect("path mapping check starts");
+        assert_success(
+            &checked,
+            "cleared baseUrl preserves paths declaration origin",
+        );
+        let expected = project
+            .path
+            .join(expected_file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            stdout(&checked).lines().any(|line| line == expected),
+            "{}",
+            stdout(&checked)
+        );
+        assert!(
+            !stdout(&checked).contains("/vendor/"),
+            "{}",
+            stdout(&checked)
+        );
+
+        let shown = project
+            .command()
+            .args(["-p", "tsconfig.json", "--showConfig"])
+            .args(overrides)
+            .current_dir(&project.path)
+            .output()
+            .expect("path mapping showConfig starts");
+        assert_success(&shown, "showConfig retains the paths substitution spelling");
+        let shown: serde_json::Value =
+            serde_json::from_slice(&shown.stdout).expect("config is JSON");
+        assert_eq!(shown["compilerOptions"]["paths"]["@util"][0], "./util.ts");
+        assert!(shown["compilerOptions"].get("baseUrl").is_none());
+    }
+}
+
+#[test]
+fn tsc_removed_base_url_never_rebases_path_mappings() {
+    for (config, overrides, expected_file) in [
+        (
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            &[][..],
+            "util.ts",
+        ),
+        (
+            r#"{"compilerOptions":{"baseUrl":"../outside","paths":{"@util":["./util.ts"]}},"files":["main.ts"]}"#,
+            &[][..],
+            "util.ts",
+        ),
+        (
+            r#"{"extends":"./configs/base.json","files":["main.ts"]}"#,
+            &["--baseUrl", "./new"][..],
+            "configs/util.ts",
+        ),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("tsconfig.json", config);
+        project.write(
+            "configs/base.json",
+            r#"{"compilerOptions":{"baseUrl":"vendor","paths":{"@util":["./util.ts"]}}}"#,
+        );
+        project.write(
+            "main.ts",
+            "import { value } from '@util';\nexport { value };\n",
+        );
+        for file in [
+            "util.ts",
+            "configs/util.ts",
+            "vendor/util.ts",
+            "configs/vendor/util.ts",
+            "new/util.ts",
+        ] {
+            project.write(file, "export const value = 42;\n");
+        }
+        let output = project
+            .command()
+            .args(["-p", "tsconfig.json", "--noEmit", "--listFiles"])
+            .args(overrides)
+            .current_dir(&project.path)
+            .output()
+            .expect("removed baseUrl path mapping check starts");
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stdout(&output).contains("error TS5102"),
+            "{}",
+            stdout(&output)
+        );
+        let expected = project
+            .path
+            .join(expected_file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            stdout(&output).lines().any(|line| line == expected),
+            "{}",
+            stdout(&output)
+        );
+        assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    }
+}
+
+#[test]
+fn check_resolves_paths_from_the_config_directory() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":"../outside","paths":{"@util":["./util.ts"]}}}"#,
+    );
+    project.write("util.ts", "export const value: number = 42;\n");
+    project.write(
+        "main.ts",
+        "import { value } from '@util';\nexport const result: number = value;\n",
+    );
+    let output = project
+        .command()
+        .args(["check", "main.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("native config check starts");
+    assert_success(&output, "shared config parsing ignores baseUrl for paths");
 }
 
 #[test]

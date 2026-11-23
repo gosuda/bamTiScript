@@ -24,14 +24,27 @@ function appendTail(tail, chunk, limit) {
   const next = Buffer.concat([tail, Buffer.from(chunk)]);
   return next.byteLength <= limit ? next : next.subarray(next.byteLength - limit);
 }
+
+function destroyChildStreams(child) {
+  child.stdin.destroy?.();
+  child.stdout.destroy?.();
+  child.stderr.destroy?.();
+}
+
 async function waitForExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
   let timer;
-  const exited = new Promise((resolve) => child.once("exit", () => resolve(true)));
+  let onExit;
+  const exited = new Promise((resolve) => {
+    onExit = () => resolve(true);
+    child.once("exit", onExit);
+  });
   const timedOut = new Promise((resolve) => {
     timer = setTimeout(resolve, timeoutMs, false);
   });
   const result = await Promise.race([exited, timedOut]);
   clearTimeout(timer);
+  child.removeListener("exit", onExit);
   return result;
 }
 
@@ -117,6 +130,10 @@ export class Transport {
       throw new RestartLimitError(this.#restarts, this.options.maxRestarts);
     }
 
+    const decoder = new FrameDecoder({
+      maxHeaderBytes: this.options.maxHeaderBytes,
+      maxFrameBytes: this.options.maxFrameBytes,
+    });
     const binary = this.options.binary ?? resolveBinary(this.options.binaryOptions);
     const child = this.options.spawnChild(binary, ["--api", ...this.options.args], {
       cwd: this.options.cwd,
@@ -128,22 +145,42 @@ export class Transport {
     }
 
     this.#child = child;
-    this.#decoder = new FrameDecoder({
-      maxHeaderBytes: this.options.maxHeaderBytes,
-      maxFrameBytes: this.options.maxFrameBytes,
-    });
+    this.#decoder = decoder;
+    this.#stderr = Buffer.alloc(0);
     this.#generation += 1;
     const generation = this.#generation;
+    let drainTimer;
+    const drain = () => {
+      if (this.#child !== child || drainTimer !== undefined) return;
+      drainTimer = setTimeout(() => {
+        this.#crash(generation, { code: child.exitCode, signal: child.signalCode });
+      }, this.options.disposeTimeoutMs);
+      drainTimer.unref();
+    };
 
     child.stdout.on("data", (chunk) => this.#receive(generation, chunk));
     child.stdout.on("error", (cause) => this.#crash(generation, { cause }));
+    child.stdout.on("end", () => {
+      if (generation !== this.#generation || !this.#decoder) return;
+      try {
+        this.#decoder.end();
+        drain();
+      } catch (cause) {
+        this.#crash(generation, { cause });
+      }
+    });
     child.stderr.on("data", (chunk) => {
+      if (generation !== this.#generation || !this.#child) return;
       this.#stderr = appendTail(this.#stderr, chunk, this.options.stderrBytes);
     });
     child.stderr.on("error", (cause) => this.#crash(generation, { cause }));
     child.stdin.on("error", (cause) => this.#crash(generation, { cause }));
     child.once("error", (cause) => this.#crash(generation, { cause }));
-    child.once("exit", (code, signal) => this.#crash(generation, { code, signal }));
+    child.once("exit", drain);
+    child.once("close", (code, signal) => {
+      clearTimeout(drainTimer);
+      this.#crash(generation, { code, signal });
+    });
     return generation;
   }
 
@@ -204,7 +241,7 @@ export class Transport {
     try {
       messages = this.#decoder.push(chunk);
     } catch (error) {
-      this.#protocolFailure(generation, error);
+      this.#crash(generation, { cause: error });
       return;
     }
     for (const message of messages) {
@@ -212,19 +249,35 @@ export class Transport {
         continue;
       }
       if ("error" in message && message.error !== undefined) {
+        const error = message.error;
+        if (
+          error === null ||
+          typeof error !== "object" ||
+          Array.isArray(error) ||
+          (error.code !== undefined &&
+            error.code !== null &&
+            typeof error.code !== "string" &&
+            !Number.isFinite(error.code)) ||
+          typeof error.message !== "string" ||
+          "result" in message
+        ) {
+          this.#crash(generation, {
+            cause: new ProtocolError("response has an invalid error payload."),
+          });
+          return;
+        }
         const pending = this.#pending.get(message.id);
         this.#settle(
           message.id,
           "reject",
-          new ServiceRequestError(pending?.method ?? "request", message.error),
+          new ServiceRequestError(pending?.method ?? "request", error),
         );
       } else if ("result" in message) {
         this.#settle(message.id, "resolve", message.result);
       } else {
-        this.#protocolFailure(
-          generation,
-          new ProtocolError(`response ${JSON.stringify(message.id)} has neither result nor error.`),
-        );
+        this.#crash(generation, {
+          cause: new ProtocolError(`response ${JSON.stringify(message.id)} has neither result nor error.`),
+        });
         return;
       }
     }
@@ -238,19 +291,9 @@ export class Transport {
     pending[action](value);
   }
 
-  #protocolFailure(generation, error) {
-    const child = this.#child;
-    this.#crash(generation, { cause: error });
-    try {
-      child?.kill();
-    } catch {
-      // The transport state is already detached and all callers already see the
-      // protocol failure. Process termination is necessarily best effort.
-    }
-  }
-
   #crash(generation, details) {
     if (generation !== this.#generation || !this.#child) return;
+    const child = this.#child;
     this.#child = null;
     this.#decoder = null;
     if (this.#disposed) return;
@@ -261,6 +304,14 @@ export class Transport {
         ? details.cause
         : new TransportCrashError({ ...details, stderr: this.stderrTail() });
     for (const id of [...this.#pending.keys()]) this.#settle(id, "reject", crash);
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The child may have exited before the termination signal arrived.
+      }
+    }
+    destroyChildStreams(child);
   }
 
   async dispose() {
@@ -276,20 +327,23 @@ export class Transport {
     this.#disposing = (async () => {
       if (!child) return;
       try {
-        child.stdin.end();
-      } catch {
-        // The process may have closed stdin before disposal began.
-      }
-      if (child.exitCode !== null || child.signalCode !== null) return;
+        try {
+          child.stdin.end();
+        } catch {
+          // The process may have closed stdin before disposal began.
+        }
+        if (child.exitCode !== null || child.signalCode !== null) return;
 
-      if (await waitForExit(child, this.options.disposeTimeoutMs)) return;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Windows and already-dead children can reject SIGKILL. No resources
-        // remain reachable from this disposed transport either way.
+        if (await waitForExit(child, this.options.disposeTimeoutMs)) return;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The child may have exited before the termination signal arrived.
+        }
+        await waitForExit(child, 100);
+      } finally {
+        destroyChildStreams(child);
       }
-      await waitForExit(child, 100);
     })();
     return this.#disposing;
   }

@@ -15,6 +15,7 @@
  * cannot make it allocate a huge body by declaring an enormous length.
  */
 
+import { isAscii } from "node:buffer";
 import { ProtocolError } from "./errors.js";
 
 /** Largest permitted header block, terminator included. */
@@ -48,6 +49,9 @@ export function encodeFrame(message, { maxFrameBytes = MAX_FRAME_BYTES } = {}) {
 }
 
 function parseHeaders(block) {
+  if (!isAscii(block)) {
+    throw new ProtocolError("frame header is not ASCII.");
+  }
   let contentLength;
   for (const line of block.toString("ascii").split("\r\n")) {
     if (line === "") continue;

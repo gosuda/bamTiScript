@@ -1,6 +1,6 @@
 # bamti
 
-`bamti` is the Node.js 24 interface for the BamTS compiler. The root exposes two distinct execution paths: `runNative()` executes the compiler in-process through the verified native Node-API addon, and `run()` invokes the `bamts` binary from `bamti-cli` for classic exit-code semantics. Persistent TypeScript service and public AST requests share one framed `bamti-cli --api` child process so project state survives across requests.
+`bamti` is the Node.js 24 interface for the BamTS compiler. The root exposes two distinct execution paths: `runNative()` executes the compiler in-process through the verified native Node-API addon, and `run()` invokes the `bamts` binary from `bamti-cli` for classic exit-code semantics. Each default session owns one framed `bamts --api` child process. TypeScript service and public AST requests use that session's child, retaining its project state across requests.
 
 ## In-process native execution
 

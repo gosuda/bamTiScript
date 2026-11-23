@@ -381,6 +381,7 @@ pub struct ProgramFrontendOutput {
     entrypoint: SourceId,
     modules: Vec<FrontendOutput>,
     index: HashMap<SourceId, usize>,
+    syntax_diagnostics: Vec<Diagnostic>,
 }
 #[cfg(test)]
 thread_local! {
@@ -405,6 +406,29 @@ impl ProgramFrontendOutput {
     #[must_use]
     pub fn modules(&self) -> &[FrontendOutput] {
         &self.modules
+    }
+
+    /// Selects the first failing TypeScript compilation stage: syntax,
+    /// compiler options, then semantic checking. Module products still retain
+    /// every diagnostic for callers that need the complete recovered frontend.
+    #[must_use]
+    pub fn compilation_diagnostics(&self, option_diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
+        if self
+            .syntax_diagnostics
+            .iter()
+            .any(|diagnostic| !diagnostic.is_warning())
+        {
+            return self.syntax_diagnostics.clone();
+        }
+        if !option_diagnostics.is_empty() {
+            return option_diagnostics.to_vec();
+        }
+        canonicalize(
+            self.modules
+                .iter()
+                .flat_map(|module| module.diagnostics().iter().cloned())
+                .collect(),
+        )
     }
 
     /// Each module's export names with no runtime form. A name forwarded from
@@ -2316,6 +2340,12 @@ pub fn compile_program_frontend_with_cancel(
             );
             cancel.check()?;
         }
+        let syntax_diagnostics = canonicalize(
+            parsed
+                .iter()
+                .flat_map(|source| source.diagnostics().iter().cloned())
+                .collect(),
+        );
 
         let edges = resolved_checker_edges_with_cancel(program, &parsed, cancel)?;
         cancel.check()?;
@@ -2411,6 +2441,7 @@ pub fn compile_program_frontend_with_cancel(
             entrypoint: program.entrypoint_id(),
             modules,
             index,
+            syntax_diagnostics,
         })
     })
 }
@@ -4628,6 +4659,7 @@ mod tests {
             entrypoint: SourceId::new(7),
             modules,
             index,
+            syntax_diagnostics: Vec::new(),
         };
         let found = output
             .module(SourceId::new(7))

@@ -138,14 +138,17 @@ pub(super) fn terminate_managed_process(child: &mut std::process::Child) -> io::
     let pid = child.id().to_string();
     let terminated = Command::new("taskkill")
         .args(["/PID", &pid, "/T", "/F"])
-        .output()
-        .and_then(|output| {
-            if output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .and_then(|status| {
+            if status.success() {
                 Ok(())
             } else {
                 Err(io::Error::other(format!(
                     "cannot terminate managed process tree {pid}: taskkill exited with {}",
-                    output.status
+                    status
                 )))
             }
         });

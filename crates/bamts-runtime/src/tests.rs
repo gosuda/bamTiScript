@@ -2051,6 +2051,93 @@ fn sync_generator_is_lazy_resumes_registers_and_stays_completed() {
 }
 
 #[test]
+fn generator_iterator_results_bypass_inherited_setters() {
+    fn inherited_setter(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(EvalFailure::ThrowValue(Value::int32(99)))
+    }
+
+    let program = verified(
+        vec![Constant::Int32(7)],
+        vec![
+            function(0, 1, vec![Instruction::Halt], Vec::new()),
+            generator_function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::Suspend {
+                        dst: reg(1),
+                        src: reg(0),
+                        resume: pc(2),
+                        mode: reg(2),
+                    },
+                    Instruction::Return { value: reg(0) },
+                ],
+                Vec::new(),
+            ),
+        ],
+    );
+    let mut host = TestHost;
+    let mut machine = Machine::new(&program, &mut host, Limits::default());
+    machine.frames.clear();
+    machine.live_registers = 0;
+    let callable = generator_callable(&mut machine, 1);
+    let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+    let setter_id = machine.intrinsics.builtins.register(BuiltinDef {
+        name: "inherited generator result setter",
+        length: 1,
+        handler: inherited_setter,
+    });
+    let setter = intrinsics::native_function(
+        &mut machine.heap,
+        &mut machine.atoms,
+        &mut machine.shapes,
+        setter_id,
+        "inherited generator result setter",
+        1,
+    );
+    let prototype = machine.intrinsics.object_prototype;
+    for name in ["value", "done"] {
+        let key = PropertyKey::Named(machine.intern_str(name));
+        machine
+            .define_accessor(prototype, key, setter, AccessorKind::Setter)
+            .unwrap();
+    }
+    let next = machine.get_named_property(generator, "next").unwrap();
+    for (expected, done) in [
+        (Value::int32(7), false),
+        (Value::int32(7), true),
+        (Value::UNDEFINED, true),
+    ] {
+        let result = machine.call_value(next, generator, &[]).unwrap();
+        assert_eq!(
+            machine.internal_get_prototype_of(result).unwrap(),
+            Some(prototype)
+        );
+        for (name, expected) in [("value", expected), ("done", Value::boolean(done))] {
+            let key = PropertyKey::Named(machine.intern_str(name));
+            assert!(matches!(
+                machine.own_descriptor(result, &key).unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                }) if value == expected
+            ));
+        }
+    }
+}
+
+#[test]
 fn reentrant_resume_reports_generator_is_already_running() {
     let program = verified(
         Vec::new(),
