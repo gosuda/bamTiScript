@@ -5013,7 +5013,7 @@ mod tests {
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
             let rank = machine.get_named_property(this, "rank")?;
-            log_event(machine.string_value(rank).unwrap().to_string_lossy());
+            log_event(machine.string_value(rank).unwrap().to_utf8_lossy());
             Ok(BuiltinOutcome::Value(rank))
         }
 
