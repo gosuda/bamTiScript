@@ -13602,8 +13602,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible: true,
             })
             .map_err(EvalFailure::Runtime)?;
-        self.set_data_property(result, "value", value)?;
-        self.set_data_property(result, "done", Value::boolean(done))?;
+        let value_key = PropertyKey::Named(self.intern_str("value"));
+        self.create_data_property_key(result, value_key, value)?;
+        let done_key = PropertyKey::Named(self.intern_str("done"));
+        self.create_data_property_key(result, done_key, Value::boolean(done))?;
         Ok(result)
     }
 

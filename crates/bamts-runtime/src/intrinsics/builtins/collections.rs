@@ -701,10 +701,9 @@ fn iterator_next<H: Host>(
         }
     })?;
     machine.with_native_roots(&[value], |machine| {
-        let result = ordinary_runtime(machine, None)?;
-        machine.set_data_property(result, "value", value)?;
-        machine.set_data_property(result, "done", Value::boolean(done))?;
-        Ok(BuiltinOutcome::Value(result))
+        machine
+            .iterator_result(value, done)
+            .map(BuiltinOutcome::Value)
     })
 }
 
@@ -2907,6 +2906,103 @@ mod tests {
         assert_eq!(result_value, value);
         assert_eq!(done, Value::TRUE);
     }
+
+    #[test]
+    fn builtin_iterator_results_have_own_data_properties_and_object_prototype() {
+        fn inherited_setter(
+            _machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::int32(99)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(7)]).unwrap();
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        map_set(
+            &mut machine,
+            map,
+            &[Value::int32(0), Value::int32(7)],
+            false,
+        )
+        .unwrap();
+        let set = construct_builtin(&mut machine, "Set", &[]);
+        set_add(&mut machine, set, &[Value::int32(7)], false).unwrap();
+        let letter = machine
+            .allocate(HeapEntry::String(EcmaString::encode("a")))
+            .unwrap();
+        let string_elements = allocate_array(&mut machine, vec![letter]).unwrap();
+        let typed_array = construct_builtin(&mut machine, "Uint8Array", &[Value::int32(1)]);
+        let setter = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "inherited iterator result setter",
+                length: 1,
+                handler: inherited_setter,
+            },
+        );
+        let prototype = machine.intrinsics.object_prototype;
+        for name in ["value", "done"] {
+            let key = PropertyKey::Named(machine.intern_str(name));
+            machine
+                .define_accessor(prototype, key, setter, crate::AccessorKind::Setter)
+                .unwrap();
+        }
+
+        for (source, kind, expected) in [
+            (
+                array,
+                IterationKind::Value(IteratorFamily::Array),
+                Value::int32(7),
+            ),
+            (
+                map,
+                IterationKind::Value(IteratorFamily::Map),
+                Value::int32(7),
+            ),
+            (
+                set,
+                IterationKind::Value(IteratorFamily::Set),
+                Value::int32(7),
+            ),
+            (string_elements, IterationKind::StringCodePoint, letter),
+            (
+                typed_array,
+                IterationKind::Value(IteratorFamily::Array),
+                Value::int32(0),
+            ),
+        ] {
+            let iterator = iterator(&mut machine, source, kind).unwrap();
+            let next = machine.get_named_property(iterator, "next").unwrap();
+            for (expected, done) in [(expected, false), (Value::UNDEFINED, true)] {
+                let result = machine.call_value(next, iterator, &[]).unwrap();
+                assert_eq!(
+                    machine.internal_get_prototype_of(result).unwrap(),
+                    Some(prototype)
+                );
+                for (name, expected) in [("value", expected), ("done", Value::boolean(done))] {
+                    let key = PropertyKey::Named(machine.intern_str(name));
+                    assert!(matches!(
+                        machine.own_descriptor(result, &key).unwrap(),
+                        Some(Property::Data {
+                            value,
+                            writable: true,
+                            enumerable: true,
+                            configurable: true,
+                        }) if value == expected
+                    ));
+                }
+            }
+        }
+    }
+
     #[test]
     fn map_and_set_to_string_tags() {
         let module = blank_program("<test>");
