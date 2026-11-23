@@ -715,9 +715,9 @@ fn array_iterator_item<H: Host>(
     cursor: u64,
 ) -> Result<Option<(Value, Value)>, EvalFailure> {
     let source_index = machine.runtime_slot(source).map_err(EvalFailure::Runtime)?;
-    let length = if source_index
-        .is_some_and(|index| matches!(machine.heap[index], HeapEntry::TypedArray { .. }))
-    {
+    let is_typed_array = source_index
+        .is_some_and(|index| matches!(machine.heap[index], HeapEntry::TypedArray { .. }));
+    let length = if is_typed_array {
         let bounds = super::typedarray::typed_array_bounds(machine, source)?;
         if bounds.out_of_bounds {
             return Err(type_error("iterated typed array is out of bounds"));
@@ -734,6 +734,8 @@ fn array_iterator_item<H: Host>(
     let key = crate::number_value(cursor as f64);
     let value = if matches!(kind, IterationKind::Key(_)) {
         Value::UNDEFINED
+    } else if is_typed_array {
+        super::typedarray::read_element(machine, source, cursor as usize)?
     } else {
         super::array::get_index(machine, source, cursor as usize)?
     };
@@ -2905,6 +2907,110 @@ mod tests {
         let done = machine.get_named_property(result, "done").unwrap();
         assert_eq!(result_value, value);
         assert_eq!(done, Value::TRUE);
+    }
+
+    #[test]
+    fn typed_array_iterators_do_not_intern_element_indices() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = construct_builtin(&mut machine, "Uint8Array", &[Value::int32(32)]);
+        for index in 0..32 {
+            super::super::typedarray::write_element(
+                &mut machine,
+                source,
+                index,
+                Value::int32(index as u32 + 1),
+            )
+            .unwrap();
+        }
+        machine.intern_str("value");
+        machine.intern_str("done");
+
+        for kind in [
+            IterationKind::Value(IteratorFamily::Array),
+            IterationKind::Entry(IteratorFamily::Array),
+        ] {
+            let iterator = iterator(&mut machine, source, kind).unwrap();
+            let next = machine.get_named_property(iterator, "next").unwrap();
+            let atoms_before = machine.atoms.strings.len();
+            for index in 0..32 {
+                let result = machine.call_value(next, iterator, &[]).unwrap();
+                assert_eq!(
+                    machine.get_named_property(result, "done").unwrap(),
+                    Value::FALSE
+                );
+                let value = machine.get_named_property(result, "value").unwrap();
+                if matches!(kind, IterationKind::Entry(_)) {
+                    assert_eq!(
+                        machine.array_elements(value).unwrap().unwrap(),
+                        [Value::int32(index), Value::int32(index + 1)]
+                    );
+                } else {
+                    assert_eq!(value, Value::int32(index + 1));
+                }
+            }
+            let result = machine.call_value(next, iterator, &[]).unwrap();
+            assert_eq!(
+                machine.get_named_property(result, "done").unwrap(),
+                Value::TRUE
+            );
+            assert_eq!(machine.atoms.strings.len(), atoms_before);
+        }
+    }
+
+    #[test]
+    fn array_iterator_preserves_typed_array_proxy_gets() {
+        fn get(
+            machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let key = machine.string_value(args[1]).unwrap();
+            let value = if key.eq_ascii("length") {
+                Value::int32(1)
+            } else {
+                assert!(key.eq_ascii("0"));
+                Value::int32(99)
+            };
+            Ok(BuiltinOutcome::Value(value))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = construct_builtin(&mut machine, "Uint8Array", &[Value::int32(2)]);
+        let handler = ordinary_object(&mut machine);
+        let get = install_function(
+            &mut machine.heap,
+            &mut machine.atoms,
+            &mut machine.shapes,
+            &mut machine.intrinsics.builtins,
+            crate::intrinsics::BuiltinDef {
+                name: "typed array proxy get",
+                length: 3,
+                handler: get,
+            },
+        );
+        machine.set_data_property(handler, "get", get).unwrap();
+        let proxy = construct_builtin(&mut machine, "Proxy", &[source, handler]);
+        let BuiltinOutcome::Value(iterator) =
+            call_prototype_method(&mut machine, "Array", "values", proxy, &[]).unwrap()
+        else {
+            panic!("Array.prototype.values returns an iterator");
+        };
+        let next = machine.get_named_property(iterator, "next").unwrap();
+        let result = machine.call_value(next, iterator, &[]).unwrap();
+        assert_eq!(
+            machine.get_named_property(result, "value").unwrap(),
+            Value::int32(99)
+        );
+        let result = machine.call_value(next, iterator, &[]).unwrap();
+        assert_eq!(
+            machine.get_named_property(result, "done").unwrap(),
+            Value::TRUE
+        );
     }
 
     #[test]
