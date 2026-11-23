@@ -1621,6 +1621,34 @@ pub struct ConstructorProjection {
     pub(crate) this_receiver: Option<(SymbolId, TypeId)>,
 }
 
+#[derive(Default)]
+struct KeyofReduction {
+    types: HashSet<TypeId>,
+    aliases: HashSet<SymbolId>,
+}
+
+impl KeyofReduction {
+    fn enter(&mut self, table: &TypeTable, ty: TypeId) -> bool {
+        if !self.types.insert(ty) {
+            return false;
+        }
+        if let Type::AppliedAlias { symbol, .. } = table.instantiation_type(ty)
+            && !self.aliases.insert(*symbol)
+        {
+            self.types.remove(&ty);
+            return false;
+        }
+        true
+    }
+
+    fn leave(&mut self, table: &TypeTable, ty: TypeId) {
+        self.types.remove(&ty);
+        if let Type::AppliedAlias { symbol, .. } = table.instantiation_type(ty) {
+            self.aliases.remove(symbol);
+        }
+    }
+}
+
 /// An interning table for structural types plus the assignability relation.
 ///
 /// The table is append-only while checking and frozen into the immutable
@@ -3146,7 +3174,11 @@ impl TypeTable {
     /// retain their operand so aliases see later namespace augmentation.
     pub fn keyof(&mut self, operand: TypeId) -> TypeId {
         let mut constructors = Vec::new();
-        let reduced = self.try_reduce_keyof(operand, &mut HashSet::new(), &mut constructors);
+        let reduced = self.try_reduce_keyof(
+            operand,
+            &mut KeyofReduction::default(),
+            &mut constructors,
+        );
         if constructors.is_empty() {
             return reduced.unwrap_or_else(|| self.intern(Type::Keyof(operand)));
         }
@@ -3167,8 +3199,9 @@ impl TypeTable {
                 .or_default()
                 .insert(head);
         }
-        if let Some(reduced) = reduced {
-            debug_assert!(!matches!(self.types[reduced.0 as usize], Type::Keyof(_)));
+        if let Some(reduced) = reduced
+            && !matches!(self.types[reduced.0 as usize], Type::Keyof(_))
+        {
             self.keyof_views.insert(head, reduced);
         } else {
             self.keyof_views.remove(&head);
@@ -3187,7 +3220,11 @@ impl TypeTable {
             };
             let operand = *operand;
             let mut constructors = Vec::new();
-            let reduced = self.try_reduce_keyof(operand, &mut HashSet::new(), &mut constructors);
+            let reduced = self.try_reduce_keyof(
+                operand,
+                &mut KeyofReduction::default(),
+                &mut constructors,
+            );
             self.publish_keyof_view(head, reduced, constructors);
         }
     }
@@ -3195,10 +3232,10 @@ impl TypeTable {
     fn try_reduce_keyof(
         &mut self,
         operand: TypeId,
-        visiting: &mut HashSet<TypeId>,
+        visiting: &mut KeyofReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
-        if !visiting.insert(operand) {
+        if !visiting.enter(self, operand) {
             return None;
         }
         let view = self.indexed_access_view(operand);
@@ -3207,14 +3244,14 @@ impl TypeTable {
         } else {
             self.keyof_view(view, visiting, constructors)
         };
-        visiting.remove(&operand);
+        visiting.leave(self, operand);
         reduced
     }
 
     fn keyof_view(
         &mut self,
         view: TypeId,
-        visiting: &mut HashSet<TypeId>,
+        visiting: &mut KeyofReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
         match self.get(view).clone() {
@@ -3295,21 +3332,21 @@ impl TypeTable {
     fn keyof_domain(
         &mut self,
         domain: TypeId,
-        visiting: &mut HashSet<TypeId>,
+        visiting: &mut KeyofReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
-        if !visiting.insert(domain) {
+        if !visiting.enter(self, domain) {
             return None;
         }
         let reduced = self.keyof_domain_view(domain, visiting, constructors);
-        visiting.remove(&domain);
+        visiting.leave(self, domain);
         reduced
     }
 
     fn keyof_domain_view(
         &mut self,
         domain: TypeId,
-        visiting: &mut HashSet<TypeId>,
+        visiting: &mut KeyofReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
         let view = self.indexed_access_view(domain);
@@ -3317,7 +3354,9 @@ impl TypeTable {
             return self.keyof_domain(view, visiting, constructors);
         }
         match self.instantiation_type(domain).clone() {
-            Type::Keyof(operand) => self.try_reduce_keyof(operand, visiting, constructors),
+            Type::Keyof(operand) => self
+                .try_reduce_keyof(operand, visiting, constructors)
+                .or(Some(domain)),
             Type::TypeQuery { target, .. } => self.keyof_domain(target, visiting, constructors),
             Type::Union(members) => {
                 let mut keys = Vec::with_capacity(members.len());
@@ -3333,7 +3372,6 @@ impl TypeTable {
                 }
                 Some(self.intersection_ordered(keys))
             }
-            Type::AppliedAlias { .. } | Type::AppliedClass { .. } => None,
             _ => Some(domain),
         }
     }
@@ -3343,39 +3381,73 @@ impl TypeTable {
     pub fn record(&mut self, key: TypeId, value: TypeId) -> TypeId {
         let mut properties = Vec::new();
         let mut index_keys = Vec::new();
-        match self.collect_record_members(key, value, &mut properties, &mut index_keys) {
-            RecordKeyState::Concrete => {
-                index_keys.sort_by_key(|type_id| type_id.get());
-                index_keys.dedup();
-                let index_signatures = index_keys
-                    .into_iter()
-                    .map(|key_type| IndexSignature {
-                        readonly: false,
-                        enum_reverse: false,
-                        parameters: vec![FunctionParameter::new(
-                            "key".to_owned(),
-                            key_type,
-                            false,
-                            false,
-                        )],
-                        value_type: value,
-                        declaring_types: Vec::new(),
-                    })
-                    .collect();
-                self.object_type_with_members(ObjectType {
-                    properties,
-                    call_signatures: Vec::new(),
-                    call_candidate_order: Vec::new(),
-                    construct_signatures: Vec::new(),
-                    index_signatures,
-                    generator_return: None,
-                    iterator_property: None,
-                    async_iterator_property: None,
-                })
-            }
+        match self.collect_record_members(key, value, &mut properties, &mut index_keys, true) {
+            RecordKeyState::Concrete => self.intern(Type::ObjectType(Self::record_object(
+                properties,
+                index_keys,
+                value,
+            ))),
             RecordKeyState::Deferred => self.intern(Type::Record { key, value }),
             RecordKeyState::Invalid => self.error_type(),
         }
+    }
+
+    /// Relations read a concrete record's current shape without changing its
+    /// retained key domain or interning a snapshot.
+    pub(super) fn record_structural_view(&self, key: TypeId, value: TypeId) -> Option<ObjectType> {
+        let mut properties = Vec::new();
+        let mut index_keys = Vec::new();
+        let state =
+            self.collect_record_members(key, value, &mut properties, &mut index_keys, false);
+        (state == RecordKeyState::Concrete)
+            .then(|| Self::record_object(properties, index_keys, value))
+    }
+
+    fn record_object(
+        mut properties: Vec<PropertyType>,
+        mut index_keys: Vec<TypeId>,
+        value: TypeId,
+    ) -> ObjectType {
+        Self::normalize_record_properties(&mut properties);
+        index_keys.sort_by_key(|type_id| type_id.get());
+        index_keys.dedup();
+        let index_signatures = index_keys
+            .into_iter()
+            .map(|key_type| IndexSignature {
+                readonly: false,
+                enum_reverse: false,
+                parameters: vec![FunctionParameter::new(
+                    "key".to_owned(),
+                    key_type,
+                    false,
+                    false,
+                )],
+                value_type: value,
+                declaring_types: Vec::new(),
+            })
+            .collect();
+        ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures,
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        }
+    }
+
+    fn normalize_record_properties(properties: &mut Vec<PropertyType>) {
+        properties.sort_by(|left, right| left.name().cmp(right.name()));
+        properties.dedup_by(|later, earlier| {
+            if later.name() != earlier.name() {
+                return false;
+            }
+            debug_assert_eq!(later.type_id(), earlier.type_id());
+            earlier.name_kind = earlier.name_kind.union(later.name_kind);
+            true
+        });
     }
 
     fn collect_record_members(
@@ -3384,8 +3456,14 @@ impl TypeTable {
         value: TypeId,
         properties: &mut Vec<PropertyType>,
         index_keys: &mut Vec<TypeId>,
+        preserve_keyof: bool,
     ) -> RecordKeyState {
-        match self.instantiation_type(key) {
+        let domain = if preserve_keyof {
+            self.instantiation_type(key)
+        } else {
+            self.get(key)
+        };
+        match domain {
             Type::String => index_keys.push(self.string()),
             Type::Number => index_keys.push(self.number()),
             Type::Symbol => index_keys.push(self.symbol_type()),
@@ -3396,15 +3474,25 @@ impl TypeTable {
                 properties.push(PropertyType::new(name, false, value));
             }
             Type::NumberLiteral(name) => {
-                properties
-                    .push(PropertyType::new(name.clone(), false, value).with_numeric_name(true));
+                let Some(number) = number_value(name) else {
+                    return RecordKeyState::Invalid;
+                };
+                properties.push(
+                    PropertyType::new(format_number(number), false, value).with_numeric_name(true),
+                );
             }
             Type::Any => index_keys.extend([self.string(), self.number(), self.symbol_type()]),
             Type::Never => {}
             Type::Union(members) => {
                 let mut deferred = false;
                 for member in members {
-                    match self.collect_record_members(*member, value, properties, index_keys) {
+                    match self.collect_record_members(
+                        *member,
+                        value,
+                        properties,
+                        index_keys,
+                        preserve_keyof,
+                    ) {
                         RecordKeyState::Concrete => {}
                         RecordKeyState::Deferred => deferred = true,
                         RecordKeyState::Invalid => return RecordKeyState::Invalid,
@@ -3425,6 +3513,7 @@ impl TypeTable {
                         value,
                         &mut member_properties,
                         &mut member_indexes,
+                        preserve_keyof,
                     ) {
                         RecordKeyState::Concrete => {
                             domains.push((member_properties, member_indexes));
@@ -3444,14 +3533,25 @@ impl TypeTable {
                 let mut literal_keys = domains
                     .iter()
                     .flat_map(|(member_properties, _)| member_properties.iter().cloned())
-                    .filter(|property| {
-                        members.iter().all(|member| {
-                            self.property_name_assignable_to_key(property.name(), *member)
-                        })
+                    .filter_map(|mut property| {
+                        let string = property.string_name()
+                            && members.iter().all(|member| {
+                                self.literal_key_in_domain(property.name(), false, *member)
+                            });
+                        let number = property.numeric_name()
+                            && members.iter().all(|member| {
+                                self.literal_key_in_domain(property.name(), true, *member)
+                            });
+                        property.name_kind = match (string, number) {
+                            (true, true) => PropertyNameKind::StringAndNumber,
+                            (true, false) => PropertyNameKind::String,
+                            (false, true) => PropertyNameKind::Number,
+                            (false, false) => return None,
+                        };
+                        Some(property)
                     })
                     .collect::<Vec<_>>();
-                literal_keys.sort_by(|left, right| left.name().cmp(right.name()));
-                literal_keys.dedup_by(|left, right| left.name() == right.name());
+                Self::normalize_record_properties(&mut literal_keys);
                 properties.extend(literal_keys);
 
                 for domain in [self.string(), self.number(), self.symbol_type()] {
@@ -3470,6 +3570,28 @@ impl TypeTable {
         }
         RecordKeyState::Concrete
     }
+    fn literal_key_in_domain(&self, name: &str, numeric: bool, key: TypeId) -> bool {
+        match self.get(key) {
+            Type::Any | Type::Error => true,
+            Type::String => !numeric,
+            Type::Number => numeric,
+            Type::StringLiteral(literal) => {
+                !numeric && literal.to_utf8_strict().is_ok_and(|literal| literal == name)
+            }
+            Type::NumberLiteral(literal) => {
+                numeric
+                    && number_value(literal).is_some_and(|number| format_number(number) == name)
+            }
+            Type::Union(members) => members
+                .iter()
+                .any(|member| self.literal_key_in_domain(name, numeric, *member)),
+            Type::Intersection(members) => members
+                .iter()
+                .all(|member| self.literal_key_in_domain(name, numeric, *member)),
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub(crate) fn property_name_assignable_to_key(&self, name: &str, key: TypeId) -> bool {
         match self.get(key) {
@@ -3481,7 +3603,9 @@ impl TypeTable {
             Type::StringLiteral(literal) => literal
                 .to_utf8_strict()
                 .is_ok_and(|literal| literal == name),
-            Type::NumberLiteral(literal) => literal.as_ref() == name,
+            Type::NumberLiteral(literal) => {
+                number_value(literal).is_some_and(|number| format_number(number) == name)
+            }
             Type::Union(members) => members
                 .iter()
                 .any(|member| self.property_name_assignable_to_key(name, *member)),
@@ -3891,8 +4015,8 @@ impl TypeTable {
                 };
                 self.property_type(view, &key).or(Some(self.error_type()))
             }
-            Type::NumberLiteral(name) => self
-                .property_type(view, name.as_ref())
+            Type::NumberLiteral(name) => number_value(&name)
+                .and_then(|number| self.property_type(view, &format_number(number)))
                 .or(Some(self.error_type())),
             Type::String => {
                 if let Type::ObjectType(object) = self.get(view).clone()
