@@ -620,16 +620,34 @@ fn rename_property(
     if !anchors.iter().any(|anchor| anchor.declaration) {
         return Err(ServiceError::RenameUnavailable);
     }
+    if new_name == "constructor"
+        && anchors
+            .iter()
+            .any(|anchor| matches!(anchor.kind, PropertyAnchorKind::ClassMember { .. }))
+    {
+        return Err(ServiceError::InvalidRename(
+            "rename to `constructor` is not supported for class members".to_owned(),
+        ));
+    }
+    let quote_declaration_name = !is_binding_identifier(new_name);
     let edits = anchors
         .iter()
         .map(|anchor| {
-            let replacement = match anchor.kind {
-                PropertyAnchorKind::Plain => new_name.to_owned(),
-                PropertyAnchorKind::Shorthand => format!("{new_name}: {old_name}"),
+            let (range, replacement) = match anchor.kind {
+                PropertyAnchorKind::ClassMember { name_range }
+                | PropertyAnchorKind::TypeMember { name_range }
+                    if quote_declaration_name =>
+                {
+                    (name_range, format!("\"{new_name}\""))
+                }
+                PropertyAnchorKind::Plain
+                | PropertyAnchorKind::ClassMember { .. }
+                | PropertyAnchorKind::TypeMember { .. } => (anchor.range, new_name.to_owned()),
+                PropertyAnchorKind::Shorthand => (anchor.range, format!("{new_name}: {old_name}")),
             };
             DocumentEdit {
                 path: document.path().to_path_buf(),
-                range: anchor.range,
+                range,
                 replacement,
             }
         })
@@ -716,6 +734,7 @@ mod tests {
 
     use super::*;
     use crate::service::{ServiceError, ServiceState, filesystem::OsFileSystem};
+    use crate::syntax::{ClassMember, PropertyName, SourceFile, Statement, TypeMember};
 
     fn state(source: &str) -> (PathBuf, ServiceState<OsFileSystem>) {
         let root = crate::service::test_support::fresh_dir("bamts-language-service");
@@ -912,6 +931,12 @@ mod tests {
             (r"\u0064efault", "default"),
             ("await", "await"),
             (r"\u0061wait", "await"),
+            ("new", "new"),
+            (r"\u006eew", "new"),
+            ("readonly", "readonly"),
+            (r"\u0072eadonly", "readonly"),
+            ("constructor", "constructor"),
+            (r"\u0063onstructor", "constructor"),
         ] {
             let rename = state
                 .rename("a.ts", cursor(source, "object.value", 7), name)
@@ -926,6 +951,106 @@ mod tests {
                 };
                 assert_eq!(edit.replacement, expected, "{name:?}");
             }
+        }
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_class_members_rejects_constructor_targets() {
+        for source in [
+            "class C { value() {} } const c = new C(); c.value();",
+            "class C { \"value\"() {} } const c = new C(); c.value();",
+            "class C { value = 1; } const c = new C(); c.value;",
+            "class C { \"value\" = 1; } const c = new C(); c.value;",
+        ] {
+            let (root, mut state) = state(source);
+            for name in ["constructor", r"\u0063onstructor"] {
+                assert!(
+                    matches!(
+                        state.rename("a.ts", cursor(source, "c.value", 2), name),
+                        Err(ServiceError::InvalidRename(_))
+                    ),
+                    "{source}: {name:?}"
+                );
+            }
+            fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[test]
+    fn rename_type_method_keywords_preserves_method_signatures() {
+        for source in [
+            "interface I { value(): void; } declare const object: I; object.value();",
+            "interface I { \"value\"(): void; } declare const object: I; object.value();",
+        ] {
+            let (root, mut state) = state(source);
+            for name in ["new", "readonly"] {
+                let rename = state
+                    .rename("a.ts", cursor(source, "object.value", 7), name)
+                    .expect("type method rename");
+                assert_eq!(rename.edit.edits.len(), 2);
+                let renamed = parse_renamed_source(source, rename);
+                let Statement::Interface(interface) = renamed.statements()[0].data() else {
+                    panic!("interface declaration changed kind");
+                };
+                assert_eq!(interface.members.len(), 1);
+                let TypeMember::Method(method) = interface.members[0].data() else {
+                    panic!("property rename changed the method signature kind");
+                };
+                assert_quoted_property_name(&renamed, &method.name, name);
+            }
+            fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[test]
+    fn rename_type_property_to_readonly_preserves_the_property() {
+        let source = "interface I { value: number; } const object: I = { value: 1 }; object.value;";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "object.value", 7), "readonly")
+            .expect("type property rename");
+        assert_eq!(rename.edit.edits.len(), 3);
+        let renamed = parse_renamed_source(source, rename);
+        let Statement::Interface(interface) = renamed.statements()[0].data() else {
+            panic!("interface declaration changed kind");
+        };
+        assert_eq!(interface.members.len(), 1);
+        let TypeMember::Property(property) = interface.members[0].data() else {
+            panic!("property rename changed the property signature kind");
+        };
+        assert!(!property.readonly);
+        assert_quoted_property_name(&renamed, &property.name, "readonly");
+        assert!(renamed.source_text().as_str().contains("{ readonly: 1 }"));
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_class_field_keywords_preserves_following_members() {
+        let source = "class C { value\nnext: number; }";
+        let (root, mut state) = state(source);
+        for name in ["readonly", "static", "public", "get", "set"] {
+            let rename = state
+                .rename("a.ts", cursor(source, "value", 0), name)
+                .expect("class field rename");
+            assert_eq!(rename.edit.edits.len(), 1);
+            let renamed = parse_renamed_source(source, rename);
+            let Statement::Class(class) = renamed.statements()[0].data() else {
+                panic!("class declaration changed kind");
+            };
+            assert_eq!(class.members.len(), 2, "{name:?}");
+            for member in &class.members {
+                let ClassMember::Property(property) = member.data() else {
+                    panic!("property rename changed the class field kind");
+                };
+                assert!(!property.modifiers.is_readonly);
+                assert!(!property.modifiers.is_static);
+                assert!(property.modifiers.accessibility.is_none());
+            }
+            let ClassMember::Property(property) = class.members[0].data() else {
+                unreachable!("class property checked above");
+            };
+            assert_quoted_property_name(&renamed, &property.name, name);
         }
         fs::remove_dir_all(root).expect("remove root");
     }
@@ -1103,6 +1228,38 @@ mod tests {
         let start = edit.range.start().get();
         let end = edit.range.end().get();
         source.get(start..end).expect("ASCII fixture edit range")
+    }
+
+    fn parse_renamed_source(source: &str, rename: RenameResult) -> SourceFile {
+        let positions = SourceText::new(source).expect("source");
+        let mut edits = rename.edit.edits;
+        edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.range.start()));
+        let mut renamed = source.to_owned();
+        for edit in edits {
+            let start = positions.utf16_to_byte(edit.range.start()).expect("start");
+            let end = positions.utf16_to_byte(edit.range.end()).expect("end");
+            renamed.replace_range(start..end, &edit.replacement);
+        }
+        let parsed = crate::parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(renamed).expect("renamed source")),
+        ));
+        assert!(
+            parsed.diagnostics().is_empty(),
+            "{:?}",
+            parsed.diagnostics()
+        );
+        parsed.into_parts().0
+    }
+
+    fn assert_quoted_property_name(source: &SourceFile, name: &PropertyName, expected: &str) {
+        let PropertyName::String(literal) = name else {
+            panic!("keyword declaration name must be quoted");
+        };
+        let lexeme = source.token_text(literal.data().token()).expect("literal");
+        let value = crate::literal::string_value(lexeme).expect("string literal");
+        assert!(value.eq_ascii(expected), "{lexeme}: {expected}");
     }
 
     #[test]

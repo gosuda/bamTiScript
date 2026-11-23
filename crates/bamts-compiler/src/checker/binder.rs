@@ -802,6 +802,8 @@ pub(crate) struct PropertyId(usize);
 pub(crate) enum PropertyAnchorKind {
     Plain,
     Shorthand,
+    ClassMember { name_range: TextRange },
+    TypeMember { name_range: TextRange },
 }
 
 /// One property occurrence recorded for rename support.
@@ -12564,7 +12566,9 @@ impl<'src> Binder<'src> {
                             owner,
                             &name,
                             bare,
-                            PropertyAnchorKind::Plain,
+                            PropertyAnchorKind::TypeMember {
+                                name_range: Self::property_name_range(&property.name),
+                            },
                             true,
                         );
                     }
@@ -12586,7 +12590,9 @@ impl<'src> Binder<'src> {
                             owner,
                             &name,
                             bare,
-                            PropertyAnchorKind::Plain,
+                            PropertyAnchorKind::TypeMember {
+                                name_range: Self::property_name_range(&method.name),
+                            },
                             true,
                         );
                     }
@@ -17637,7 +17643,15 @@ impl<'src> Binder<'src> {
             .map(PropertyOwner::Member);
         let anchor = |binder: &mut Self, name: &str, property_name: &PropertyName| {
             if let (Some(owner), Some(bare)) = (owner, Self::property_bare_range(property_name)) {
-                binder.record_property_anchor(owner, name, bare, PropertyAnchorKind::Plain, true);
+                binder.record_property_anchor(
+                    owner,
+                    name,
+                    bare,
+                    PropertyAnchorKind::ClassMember {
+                        name_range: Self::property_name_range(property_name),
+                    },
+                    true,
+                );
             }
         };
         match member.data() {
