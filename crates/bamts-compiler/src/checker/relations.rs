@@ -1209,6 +1209,12 @@ impl<'table> TypeRelations<'table> {
                 .any(|member| self.relates(*member, target, strictness)),
             (Type::StringLiteral(_), Type::String) => true,
             (Type::NumberLiteral(_), Type::Number) => true,
+            (Type::NumberLiteral(left), Type::NumberLiteral(right)) => {
+                match (number_value(left), number_value(right)) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => false,
+                }
+            }
             (Type::BooleanLiteral(_), Type::Boolean) => true,
             (Type::BigIntLiteral(_), Type::BigInt) => true,
             // Enum member types are genuine subtypes of `number`; the reverse
@@ -4641,5 +4647,29 @@ mod tests {
             !relations.assignable(source, target),
             "() => number should NOT be assignable to {{ extra: string; (x: number): void }}"
         );
+    }
+
+    #[test]
+    fn numeric_literal_relations_compare_values_without_erasing_spelling() {
+        let mut table = TypeTable::new();
+        for (left, right) in [
+            ("2.5", "2.50"),
+            ("2.5", "25e-1"),
+            ("16", "0x10"),
+            ("1000", "1_000"),
+        ] {
+            let left = table.number_literal(left);
+            let right = table.number_literal(right);
+            assert_ne!(left, right, "literal spellings remain available to rendering");
+            assert!(table.assignable(left, right));
+            assert!(table.assignable(right, left));
+        }
+        let value = table.number_literal("2.5");
+        let different = table.number_literal("2.51");
+        let quoted = table.string_literal("2.5");
+        assert!(!table.assignable(value, different));
+        assert!(!table.assignable(different, value));
+        assert!(!table.assignable(quoted, value));
+        assert!(!table.assignable(value, quoted));
     }
 }
