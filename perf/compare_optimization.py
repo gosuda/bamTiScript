@@ -848,9 +848,8 @@ def main() -> None:
                 for side in ("baseline", "candidate")
                 for name in required_binaries
             }
-            if (
-                set(available) != expected_binaries
-                or len(report.binaries) != len(expected_binaries)
+            if set(available) != expected_binaries or len(report.binaries) != len(
+                expected_binaries
             ):
                 raise ComparisonError(
                     "built executables do not match selected workloads"
