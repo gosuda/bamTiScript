@@ -56,7 +56,7 @@
 use super::binder::{
     Binder, DemandPoll, DemandResult, FunctionParameter, FunctionSignature, IndexSignature,
     ObjectType, PropertyType, PublicationOrder, ScopeId, SlotContext, SymbolId, SymbolKind, Type,
-    TypeId, demand_ready,
+    TypeId, TypeTable, demand_ready,
 };
 use super::inference::{InferenceContext, InferenceParameter};
 use super::{
@@ -631,12 +631,13 @@ impl<'src> Binder<'src> {
                     } else {
                         branches
                     };
-                    variants = variants
-                        .iter()
-                        .flat_map(|variant| {
-                            branches.iter().map(|branch| variant.merged_with(branch))
-                        })
-                        .collect();
+                    let mut merged = Vec::with_capacity(variants.len() * branches.len());
+                    for variant in &variants {
+                        for branch in &branches {
+                            merged.push(variant.merged_with(branch, &mut self.types));
+                        }
+                    }
+                    variants = merged;
                 }
             }
         }
@@ -1448,12 +1449,12 @@ struct JsxSpreadBranch {
 }
 
 impl JsxSpreadBranch {
-    /// Merges one branch's members behind `self`, later members winning in
-    /// source order.
-    fn merged_with(&self, branch: &Self) -> Self {
+    /// Merges a later spread while preserving required defaults when an
+    /// optional member is absent.
+    fn merged_with(&self, branch: &Self, types: &mut TypeTable) -> Self {
         let mut properties = self.properties.clone();
         for property in &branch.properties {
-            upsert_property(&mut properties, property.clone());
+            types.upsert_spread_property(&mut properties, property.clone());
         }
         let mut index_signatures = self.index_signatures.clone();
         index_signatures.extend(branch.index_signatures.iter().cloned());
