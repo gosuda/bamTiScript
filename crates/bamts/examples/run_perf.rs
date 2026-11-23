@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("program returned a nonzero exit status".into());
     }
     io::stdout().lock().write_all(host.stdout())?;
+    io::stderr().lock().write_all(host.stderr())?;
     if let Some(collector) = collector {
         let phases = collector.snapshot();
         eprintln!(
