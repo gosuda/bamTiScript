@@ -9,12 +9,15 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
 
+/// Captures a noninteractive child without sharing the caller's stdin.
+/// A pending read on Windows can otherwise block the child's startup.
 pub(crate) fn capture_process_with_cancel(
     command: &mut Command,
     cancel: &CancellationToken,
 ) -> io::Result<Option<Output>> {
     configure_managed_process(command);
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -135,13 +138,17 @@ pub(super) fn terminate_managed_process(child: &mut std::process::Child) -> io::
     let pid = child.id().to_string();
     let terminated = Command::new("taskkill")
         .args(["/PID", &pid, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .and_then(|status| {
             if status.success() {
                 Ok(())
             } else {
                 Err(io::Error::other(format!(
-                    "cannot terminate managed process tree {pid}: taskkill exited with {status}"
+                    "cannot terminate managed process tree {pid}: taskkill exited with {}",
+                    status
                 )))
             }
         });

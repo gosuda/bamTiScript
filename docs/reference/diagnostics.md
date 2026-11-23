@@ -25,7 +25,7 @@ bamts --noEmit --pretty false example.ts
 bamts --noEmit --pretty example.ts
 ```
 
-`--pretty false` produces stable one-line TypeScript diagnostics. `--pretty` enables color and context intended for an interactive terminal. The legacy `--diagnostics-format`, `--format`, and `--error-limit` options are not part of the current public CLI.
+`--pretty false` produces stable one-line TypeScript diagnostics. `--pretty` enables color and context intended for an interactive terminal. The native execution interface selected by `--run` accepts `--diagnostics-format`, `--format`, and `--error-limit`; the TypeScript-compatible interface does not accept those option names.
 
 ## Coordinate system and UTF-16 positioning
 

@@ -315,7 +315,8 @@ fn context_command(program: impl AsRef<OsStr>, context: &ExecutionContext) -> Co
     command
         .current_dir(context.cwd())
         .env_clear()
-        .envs(context.envs());
+        .envs(context.envs())
+        .stdin(std::process::Stdio::null());
     command
 }
 

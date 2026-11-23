@@ -487,6 +487,12 @@ fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
 struct LoadedProgramFrontend {
     pub(super) program: ResolvedProgram,
     pub(super) output: ProgramFrontendOutput,
+    option_diagnostics: Vec<Diagnostic>,
+}
+
+enum FrontendConfig<'a> {
+    Discovered,
+    CommandLine(&'a ParsedTscCommand),
 }
 
 fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, DriverError> {
@@ -498,6 +504,15 @@ fn load_program_frontend_in_context_with_cancel(
     args: &CliArgs,
     context: &ExecutionContext,
     cancel: &CancellationToken,
+) -> Result<LoadedProgramFrontend, DriverError> {
+    load_program_frontend_in_context(args, context, cancel, FrontendConfig::Discovered)
+}
+
+fn load_program_frontend_in_context(
+    args: &CliArgs,
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+    configuration: FrontendConfig<'_>,
 ) -> Result<LoadedProgramFrontend, DriverError> {
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
@@ -531,22 +546,38 @@ fn load_program_frontend_in_context_with_cancel(
             error,
         )))
     })?;
-    let config_path = project.config().to_owned();
-    let config_source = if config_path.is_file() {
-        fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
-            path: config_path.clone(),
-            source,
-        })?
-    } else {
-        "{}".to_owned()
-    };
-    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
-        DriverError::ProjectConfig {
-            path: config_path,
-            message: error.to_string(),
+    let (options, option_diagnostics) = match configuration {
+        FrontendConfig::Discovered => {
+            let config_path = project.config().to_owned();
+            let config_source = if config_path.is_file() {
+                fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
+                    path: config_path.clone(),
+                    source,
+                })?
+            } else {
+                "{}".to_owned()
+            };
+            let config =
+                ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
+                    DriverError::ProjectConfig {
+                        path: config_path,
+                        message: error.to_string(),
+                    }
+                })?;
+            (config.options().clone(), Vec::new())
         }
-    })?;
-    let loader = ProgramLoader::new(&root, config.options()).map_err(DriverError::ProgramLoad)?;
+        FrontendConfig::CommandLine(command) => {
+            let project =
+                tsc::native_frontend_project(command, context, &root, &absolute_entrypoint)?;
+            (project.options().clone(), project.option_diagnostics().0)
+        }
+    };
+    let loader = ProgramLoader::new(&root, &options).map_err(DriverError::ProgramLoad)?;
+    let loader = if option_diagnostics.is_empty() {
+        loader
+    } else {
+        loader.tolerating_unresolved_imports()
+    };
     let program = loader
         .load_with_cancel(&absolute_entrypoint, cancel)
         .map_err(DriverError::ProgramLoad)?;
@@ -554,7 +585,11 @@ fn load_program_frontend_in_context_with_cancel(
     let output =
         compile_program_frontend_with_cancel(&program, FrontendMode::Check, &levels, cancel)
             .map_err(|_| DriverError::Cancelled)?;
-    Ok(LoadedProgramFrontend { program, output })
+    Ok(LoadedProgramFrontend {
+        program,
+        output,
+        option_diagnostics,
+    })
 }
 
 struct RenderedDiagnostics {
@@ -611,10 +646,7 @@ fn render_tsc_program_diagnostics(
 ) -> (String, bool) {
     let native = frontend
         .output
-        .modules()
-        .iter()
-        .flat_map(|module| module.diagnostics().iter().cloned())
-        .collect::<Vec<Diagnostic>>();
+        .compilation_diagnostics(&frontend.option_diagnostics);
     let diagnostics = map_parse_diagnostics(&native);
     let has_errors = diagnostics
         .iter()

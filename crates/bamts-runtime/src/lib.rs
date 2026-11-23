@@ -1048,6 +1048,24 @@ impl PropertyMap {
             },
         }
     }
+    fn for_each_unordered(
+        &self,
+        shapes: &ShapeTable,
+        mut visit: impl FnMut(&PropertyKey, &Property),
+    ) {
+        match self {
+            PropertyMap::Shaped { shape, slots } => {
+                for (key, slot) in shapes.unordered_entries(*shape) {
+                    visit(key, &slots[slot as usize]);
+                }
+            }
+            PropertyMap::Dictionary { entries, .. } => {
+                for (key, property) in entries.iter().flatten() {
+                    visit(key, property);
+                }
+            }
+        }
+    }
     fn for_each_property_mut(&mut self, mut update: impl FnMut(&mut Property)) {
         match self {
             PropertyMap::Shaped { slots, .. } => {
@@ -1157,9 +1175,9 @@ impl<'a> Iterator for PropertyMapIter<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IterationKind {
-    Key,
-    Value,
-    Entry,
+    Key(intrinsics::IteratorFamily),
+    Value(intrinsics::IteratorFamily),
+    Entry(intrinsics::IteratorFamily),
     /// A `%StringIteratorPrototype%` instance; `source` is its code points.
     StringCodePoint,
     /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.
@@ -10568,15 +10586,9 @@ impl<'a, H: Host> Machine<'a, H> {
             self.property_sites
                 .insert((module, function), FunctionSites::build(code));
         }
-        let sites = self.property_sites.get_mut(&(module, function))?;
-        let index = match which {
-            Which::Get => sites.gets.get_mut(pc)?,
-            Which::Set => sites.sets.get_mut(pc)?,
-        };
-        if !index.usable() {
-            return None;
-        }
-        Some(pc)
+        self.property_sites
+            .get(&(module, function))?
+            .site_index(pc, which)
     }
 
     #[cfg(test)]
@@ -10621,11 +10633,8 @@ impl<'a, H: Host> Machine<'a, H> {
             let PropertyMap::Shaped { shape, slots } = properties else {
                 return None;
             };
-            let site_state = &self.property_sites[&(module, function)].gets[site_index];
-            if !site_state.matches(*shape, key) {
-                return None;
-            }
-            let slot = self.shapes.slot_of(*shape, key)?;
+            let site_state = &self.property_sites[&(module, function)].sites[site_index];
+            let slot = site_state.slot(*shape, key)?;
             match slots.get(slot as usize) {
                 Some(Property::Data { value, .. }) if *value != Value::UNINITIALIZED => {
                     Some(*value)
@@ -10635,7 +10644,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    /// Records `(shape, key)` at `site` when the generic read found the key
+    /// Records `(shape, key, slot)` at `site` when the generic read found the key
     /// as an own data property of a plain shaped object.
     pub(crate) fn property_site_record_get(
         &mut self,
@@ -10651,26 +10660,29 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(index) = self.runtime_slot(receiver).ok().flatten() else {
             return;
         };
-        let Some(shape) = (match &self.heap[index] {
+        let Some((shape, slot)) = (match &self.heap[index] {
             HeapEntry::Object {
-                properties: PropertyMap::Shaped { shape, .. },
+                properties: PropertyMap::Shaped { shape, slots },
                 boxed_primitive: None,
                 ..
-            } => Some(*shape),
+            } => self
+                .shapes
+                .slot_of(*shape, key)
+                .and_then(|slot| match slots.get(slot as usize) {
+                    Some(Property::Data { value, .. }) if *value != Value::UNINITIALIZED => {
+                        Some((*shape, slot))
+                    }
+                    _ => None,
+                }),
             _ => None,
         }) else {
             return;
         };
-        match self.own_get(index, key) {
-            Some(Found::Value(value)) if value != Value::UNINITIALIZED => {}
-            Some(Found::Text(_)) => {}
-            _ => return,
-        }
         let sites = self
             .property_sites
             .get_mut(&(module, function))
             .expect("site table was built above");
-        sites.gets[site_index].record(shape, key.clone());
+        sites.sites[site_index].record(shape, key.clone(), slot);
     }
 
     /// Writes `value` through the cache at `site` when the receiver matches
@@ -10699,11 +10711,8 @@ impl<'a, H: Host> Machine<'a, H> {
             let PropertyMap::Shaped { shape, slots } = properties else {
                 return None;
             };
-            let site_state = &self.property_sites[&(module, function)].sets[site_index];
-            if !site_state.matches(*shape, key) {
-                return None;
-            }
-            let slot = self.shapes.slot_of(*shape, key)?;
+            let site_state = &self.property_sites[&(module, function)].sites[site_index];
+            let slot = site_state.slot(*shape, key)?;
             match slots.get(slot as usize)? {
                 Property::Data {
                     writable: true,
@@ -10738,7 +10747,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Some(())
     }
 
-    /// Records `(shape, key)` at `site` when the key is already an own
+    /// Records `(shape, key, slot)` at `site` when the key is already an own
     /// writable data property of a plain shaped object, so a later store
     /// keeps its attributes and never adds a property.
     pub(crate) fn property_site_record_set(
@@ -10766,14 +10775,14 @@ impl<'a, H: Host> Machine<'a, H> {
         {
             cacheable = Some((*shape, slot));
         }
-        let Some((shape, _slot)) = cacheable else {
+        let Some((shape, slot)) = cacheable else {
             return;
         };
         let sites = self
             .property_sites
             .get_mut(&(module, function))
             .expect("site table was built above");
-        sites.sets[site_index].record(shape, key.clone());
+        sites.sites[site_index].record(shape, key.clone(), slot);
     }
 
     pub(crate) fn set_super(
@@ -13602,8 +13611,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible: true,
             })
             .map_err(EvalFailure::Runtime)?;
-        self.set_data_property(result, "value", value)?;
-        self.set_data_property(result, "done", Value::boolean(done))?;
+        let value_key = PropertyKey::Named(self.intern_str("value"));
+        self.create_data_property_key(result, value_key, value)?;
+        let done_key = PropertyKey::Named(self.intern_str("done"));
+        self.create_data_property_key(result, done_key, Value::boolean(done))?;
         Ok(result)
     }
 
@@ -15757,6 +15768,14 @@ mod shape_property_tests {
             .map(|(key, property)| (key.clone(), property.clone()))
             .collect();
         assert_eq!(live, oracle.0);
+        let mut unordered = Vec::new();
+        map.for_each_unordered(shapes, |key, property| {
+            unordered.push((key.clone(), property.clone()));
+        });
+        unordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = oracle.0.clone();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(unordered, expected);
     }
 
     fn canned(rng: &mut XorShift64) -> Property {

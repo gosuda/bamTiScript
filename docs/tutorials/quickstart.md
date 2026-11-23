@@ -62,7 +62,7 @@ target/release/bamts --help
 target/release/bamts --help --all
 ```
 
-The CLI follows the TypeScript 7.0.2 `tsc` argument model. It supports direct source-file compilation, `tsconfig.json` discovery, `--project`, `--build`, and response files. The former `check`, `run`, `compile`, `explain`, `--target jit`, and `--target aot` forms are not public commands.
+The CLI follows the TypeScript 7.0.2 `tsc` argument model. It supports direct source-file compilation, `tsconfig.json` discovery, `--project`, `--build`, and response files. Use `bamts --run --jit hello.ts` or `bamts --run --aot hello.ts` to compile and execute a program directly. The bare `check`, `run`, `compile`, and `explain` subcommand forms do not select this public interface. See the [CLI reference](../reference/cli.md) for the native execution options.
 
 ## Resource limits
 

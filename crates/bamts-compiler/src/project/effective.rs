@@ -60,7 +60,8 @@ pub struct ProjectOptionOverrides {
     pub jsx_import_source: Option<Arc<str>>,
     pub resolve_json_module: Option<bool>,
     pub declaration_dir: Option<PathBuf>,
-    pub base_url: Option<PathBuf>,
+    /// Absent preserves the config value; `Some(None)` clears it as argv `null`.
+    pub base_url: Option<Option<PathBuf>>,
     // Boolean compiler options forwarded from argv.
     pub emit_declaration_only: Option<bool>,
     pub incremental: Option<bool>,
@@ -96,6 +97,7 @@ pub struct EffectiveProject {
     /// The tsconfig text this project was loaded from, when one exists.
     /// Diagnostics that must anchor inside the configuration read it.
     config_source: Option<Arc<str>>,
+    paths_base_directory: Option<PathBuf>,
 }
 
 impl EffectiveProject {
@@ -116,10 +118,10 @@ impl EffectiveProject {
             .map_err(ProjectCompileError::Path)?;
         // Direct CLI compilation supplies its own roots and no configuration
         // document: the effective options come only from the overrides.
-        let (raw, diagnostic_patterns, config_source) = match &request.source_files {
+        let (raw, path_origins, config_source) = match &request.source_files {
             Some(_) => (
                 JsonObject::from_entries(Vec::new()),
-                DiagnosticPatterns::default(),
+                ConfigPathOrigins::default(),
                 None,
             ),
             None => {
@@ -146,7 +148,7 @@ impl EffectiveProject {
             TsConfig::parse_value(&root, &config_path, raw).map_err(ProjectCompileError::Config)?;
         let source_files = match &request.source_files {
             Some(paths) => materialize_explicit_sources(&root, paths)?,
-            None => materialize_sources(&root, &config, &diagnostic_patterns, fs)?,
+            None => materialize_sources(&root, &config, &path_origins, fs)?,
         };
         let build_info_path = effective_build_info_path(&root, &config)?;
 
@@ -159,6 +161,7 @@ impl EffectiveProject {
             build_info_path,
             config,
             config_source,
+            paths_base_directory: path_origins.paths,
         })
     }
 
@@ -200,6 +203,76 @@ impl EffectiveProject {
     #[must_use]
     pub const fn config(&self) -> &TsConfig {
         &self.config
+    }
+
+    /// The declaring directory of the effective `paths` option. TypeScript 7
+    /// resolves substitutions there independently of the removed `baseUrl`.
+    #[must_use]
+    pub fn paths_base_directory(&self) -> Option<&Path> {
+        self.paths_base_directory.as_deref()
+    }
+
+    /// Reports removed compiler options without reading source files. The
+    /// frontend selects these only after source syntax has been validated.
+    #[must_use]
+    pub fn option_diagnostics(&self) -> (Vec<Diagnostic>, Option<ProjectSource>) {
+        let has_base_url = self
+            .config()
+            .config()
+            .raw()
+            .get("compilerOptions")
+            .and_then(JsonValue::as_object)
+            .and_then(|options| options.get("baseUrl"))
+            .and_then(JsonValue::as_str)
+            .is_some();
+        let mut diagnostics = Vec::new();
+        let mut source = None;
+        for (name, present) in [
+            ("outFile", self.options().out_file().is_some()),
+            ("baseUrl", has_base_url),
+        ] {
+            if !present {
+                continue;
+            }
+            let catalog = crate::checker::diagnostic_messages::by_u32(5102)
+                .expect("TS5102 is in the generated catalog");
+            let range = option_diagnostic_range(self, name);
+            let mut message = catalog
+                .format(crate::checker::diagnostic_messages::Args::new([name]))
+                .expect("arity matches");
+            if name == "baseUrl" && self.config_source().is_some() {
+                let directory = self
+                    .config_path()
+                    .parent()
+                    .expect("a project config has a parent directory");
+                let target = self.options().base_url().join("*");
+                let relative = if directory.components().next() == target.components().next() {
+                    relative_path_between(directory, &target)
+                } else {
+                    target
+                };
+                let pattern = if relative.is_absolute() || relative.starts_with("..") {
+                    slash_text(&relative)
+                } else {
+                    format!("./{}", slash_text(&relative))
+                };
+                let pattern =
+                    super::build_mode::canonical_json(&JsonValue::String(Arc::from(pattern)));
+                message.push_str(&format!(
+                    "\n  Use '\"paths\": {{\"*\": [{pattern}]}}' instead."
+                ));
+            }
+            diagnostics.push(Diagnostic::error(
+                catalog.diagnostic_code(),
+                SourceId::new(u32::MAX),
+                range,
+                message,
+            ));
+            if source.is_none() {
+                source = option_diagnostic_source(self, range);
+            }
+        }
+        (diagnostics, source)
     }
 }
 
@@ -252,7 +325,7 @@ pub fn compile_project<F: FileSystem + Clone>(
     options: &ProjectCompileOptions,
     fs: &F,
 ) -> Result<ProjectCompileResult, ProjectCompileError> {
-    let (mut diagnostics, tsconfig_source) = removed_out_file_diagnostics(project);
+    let (option_diagnostics, tsconfig_source) = project.option_diagnostics();
     if project.options().source_map() && project.options().inline_source_map() {
         return Err(ProjectCompileError::UnsupportedOption {
             option: "sourceMap with inlineSourceMap",
@@ -270,6 +343,11 @@ pub fn compile_project<F: FileSystem + Clone>(
     let loader =
         ProgramLoader::with_file_system(project.root(), project.options(), Arc::new(fs.clone()))
             .map_err(|error| ProjectCompileError::Load(Arc::from(error.to_string())))?;
+    let loader = if option_diagnostics.is_empty() {
+        loader
+    } else {
+        loader.tolerating_unresolved_imports()
+    };
     let program = loader
         .load_roots(project.source_files())
         .map_err(|error| ProjectCompileError::Load(Arc::from(error.to_string())))?;
@@ -336,7 +414,8 @@ pub fn compile_project<F: FileSystem + Clone>(
         .map_err(ProjectCompileError::Output)?;
 
     let build_state = build_state(project, &program, output_plan.as_ref(), options)?;
-    if !options.force
+    if option_diagnostics.is_empty()
+        && !options.force
         && should_emit
         && let Some((path, current)) = &build_state
         && let Ok(encoded) = fs.read(path)
@@ -361,7 +440,7 @@ pub fn compile_project<F: FileSystem + Clone>(
             &outputs_present,
         ) {
             return Ok(ProjectCompileResult {
-                diagnostics,
+                diagnostics: Vec::new(),
                 sources,
                 tsconfig_source: tsconfig_source.clone(),
                 outputs: BuildOutputs::default(),
@@ -377,12 +456,7 @@ pub fn compile_project<F: FileSystem + Clone>(
         FrontendMode::Check,
         &LintTable::new(LintProfile::Default),
     );
-    diagnostics.extend(
-        checked
-            .modules()
-            .iter()
-            .flat_map(|module| module.diagnostics().iter().cloned()),
-    );
+    let mut diagnostics = checked.compilation_diagnostics(&option_diagnostics);
     let pre_emit_errors = diagnostics
         .iter()
         .any(|diagnostic| !diagnostic.is_warning());
@@ -500,38 +574,10 @@ pub fn compile_project<F: FileSystem + Clone>(
     })
 }
 
-/// TypeScript 7.0.2 removed `outFile`: any project that still declares it
-/// compiles per-file and reports TS5102 at the option key. The diagnostic
-/// anchors at the `outFile` key when the loaded configuration text carries
-/// one, at `compilerOptions` when the loaded text carries that object but no
-/// `outFile` key, and unanchored otherwise (extended base or direct route).
-fn removed_out_file_diagnostics(
-    project: &EffectiveProject,
-) -> (Vec<Diagnostic>, Option<ProjectSource>) {
-    if project.options().out_file().is_none() {
-        return (Vec::new(), None);
-    }
-    let catalog = crate::checker::diagnostic_messages::by_u32(5102)
-        .expect("TS5102 is in the generated catalog");
-    let range = out_file_diagnostic_range(project);
-    let diagnostic = Diagnostic::error(
-        catalog.diagnostic_code(),
-        SourceId::new(u32::MAX),
-        range,
-        catalog
-            .format(crate::checker::diagnostic_messages::Args::new(["outFile"]))
-            .expect("arity matches"),
-    );
-    (vec![diagnostic], out_file_diagnostic_source(project, range))
-}
-
 /// The tsconfig source anchoring `range`, when `range` points into the loaded
 /// configuration text. An empty range is unanchored: no source is returned
 /// so rendering prints a bare `error TS5102` with no file prefix.
-fn out_file_diagnostic_source(
-    project: &EffectiveProject,
-    range: TextRange,
-) -> Option<ProjectSource> {
+fn option_diagnostic_source(project: &EffectiveProject, range: TextRange) -> Option<ProjectSource> {
     if range == TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid") {
         return None;
     }
@@ -544,10 +590,10 @@ fn out_file_diagnostic_source(
     })
 }
 
-/// The UTF-16 range anchoring the TS5102 `outFile` diagnostic: the `outFile`
+/// The UTF-16 range anchoring a removed-option diagnostic: the option's
 /// key inside `compilerOptions` when the loaded text declares it, else the
 /// `compilerOptions` key itself, else an empty range.
-fn out_file_diagnostic_range(project: &EffectiveProject) -> TextRange {
+fn option_diagnostic_range(project: &EffectiveProject, name: &str) -> TextRange {
     let empty =
         || TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid");
     let Some(source) = project.config_source() else {
@@ -557,7 +603,7 @@ fn out_file_diagnostic_range(project: &EffectiveProject) -> TextRange {
         return empty();
     };
     let position = match config_object_value_offset(source, compiler_options) {
-        Some(value) => config_key_offset(&source[value..], "outFile")
+        Some(value) => config_key_offset(&source[value..], name)
             .map_or(compiler_options, |offset| value + offset),
         None => compiler_options,
     };
@@ -1311,9 +1357,10 @@ impl From<MaterializeError> for ProjectCompileError {
 }
 
 #[derive(Default)]
-struct DiagnosticPatterns {
+struct ConfigPathOrigins {
     include: Option<PatternSource>,
     exclude: Option<PatternSource>,
+    paths: Option<PathBuf>,
 }
 
 struct PatternSource {
@@ -1321,7 +1368,7 @@ struct PatternSource {
     values: Arc<[Arc<str>]>,
 }
 
-impl DiagnosticPatterns {
+impl ConfigPathOrigins {
     fn capture(&mut self, raw: &JsonObject, config_path: &Path) {
         let Some(directory) = config_path.parent() else {
             return;
@@ -1337,6 +1384,13 @@ impl DiagnosticPatterns {
                 directory: directory.to_path_buf(),
                 values,
             });
+        }
+        if raw
+            .get("compilerOptions")
+            .and_then(JsonValue::as_object)
+            .is_some_and(|options| options.get("paths").is_some())
+        {
+            self.paths = Some(directory.to_path_buf());
         }
     }
 }
@@ -1358,7 +1412,7 @@ fn load_merged_raw(
     config_path: &Path,
     source: &str,
     fs: &dyn FileSystem,
-) -> Result<(JsonObject, DiagnosticPatterns, Arc<str>), ProjectCompileError> {
+) -> Result<(JsonObject, ConfigPathOrigins, Arc<str>), ProjectCompileError> {
     let chain = resolve_extends(
         root,
         config_path,
@@ -1385,17 +1439,17 @@ fn merge_config_layers(
     chain: &[ResolvedExtends],
     derived_path: &Path,
     derived_raw: &JsonObject,
-) -> Result<(JsonObject, DiagnosticPatterns), ProjectCompileError> {
+) -> Result<(JsonObject, ConfigPathOrigins), ProjectCompileError> {
     let mut merged = JsonObject::from_entries(Vec::new());
-    let mut patterns = DiagnosticPatterns::default();
+    let mut patterns = ConfigPathOrigins::default();
     for layer in chain.iter().rev() {
         let raw = parse_object(layer.source()).map_err(ProjectCompileError::Config)?;
         patterns.capture(&raw, layer.path());
-        let rewritten = rewrite_layer_paths(root, layer.path(), &raw, &merged)?;
+        let rewritten = rewrite_layer_paths(root, layer.path(), &raw)?;
         merged = merge_objects(&merged, &rewritten);
     }
     patterns.capture(derived_raw, derived_path);
-    let rewritten = rewrite_layer_paths(root, derived_path, derived_raw, &merged)?;
+    let rewritten = rewrite_layer_paths(root, derived_path, derived_raw)?;
     Ok((merge_objects(&merged, &rewritten), patterns))
 }
 
@@ -1425,7 +1479,6 @@ fn rewrite_layer_paths(
     root: &ProjectRoot,
     config_path: &Path,
     raw: &JsonObject,
-    inherited: &JsonObject,
 ) -> Result<JsonObject, ProjectCompileError> {
     let directory = config_path.parent().ok_or_else(|| {
         ProjectCompileError::Path(PathError::PathHasNoParent {
@@ -1449,11 +1502,17 @@ fn rewrite_layer_paths(
             rewrite_references(root, directory, value)?,
         );
     }
-    if let Some(compiler) = raw.get("compilerOptions").and_then(JsonValue::as_object) {
-        let inherited_compiler = inherited
-            .get("compilerOptions")
-            .and_then(JsonValue::as_object);
-        let rewritten = rewrite_compiler_paths(root, directory, compiler, inherited_compiler)?;
+    if let Some(value) = raw.get("compilerOptions") {
+        let compiler = value.as_object().ok_or_else(|| {
+            ProjectCompileError::Config(
+                super::ConfigError::InvalidField {
+                    field: Arc::from("compilerOptions"),
+                    expected: "an object",
+                }
+                .into(),
+            )
+        })?;
+        let rewritten = rewrite_compiler_paths(root, directory, compiler)?;
         set_named_entry(
             &mut entries,
             "compilerOptions",
@@ -1467,25 +1526,22 @@ fn rewrite_compiler_paths(
     root: &ProjectRoot,
     directory: &Path,
     compiler: &JsonObject,
-    inherited: Option<&JsonObject>,
 ) -> Result<JsonObject, ProjectCompileError> {
     let mut entries = compiler.entries().to_vec();
-    let inherited_base = inherited
-        .and_then(|object| object.get("baseUrl"))
-        .and_then(JsonValue::as_str)
-        .map(PathBuf::from);
-    let base_url = match compiler.get("baseUrl") {
-        Some(value) => {
-            let value = value
-                .as_str()
-                .ok_or_else(|| invalid_config_field("baseUrl"))?;
-            root.resolve_from(directory, value)
-                .map_err(ProjectCompileError::Path)?
-        }
-        None => inherited_base.unwrap_or_else(|| directory.to_path_buf()),
-    };
+    if let Some(value) = compiler.get("baseUrl")
+        && !matches!(value, JsonValue::Null)
+    {
+        let value = value
+            .as_str()
+            .ok_or_else(|| invalid_config_field("baseUrl"))?;
+        let path = root.resolve_output_from(directory, value);
+        set_named_entry(
+            &mut entries,
+            "baseUrl",
+            JsonValue::String(path_to_arc(&path)),
+        );
+    }
     for field in [
-        "baseUrl",
         "rootDir",
         "outDir",
         "declarationDir",
@@ -1521,7 +1577,7 @@ fn rewrite_compiler_paths(
         for (pattern, targets) in mappings.entries() {
             rewritten.push((
                 Arc::clone(pattern),
-                rewrite_string_array(root, &base_url, targets)?,
+                rewrite_string_array(root, directory, targets)?,
             ));
         }
         set_named_entry(
@@ -1652,7 +1708,6 @@ fn apply_overrides(
         ("outFile", overrides.out_file.as_deref()),
         ("tsBuildInfoFile", overrides.ts_build_info_file.as_deref()),
         ("declarationDir", overrides.declaration_dir.as_deref()),
-        ("baseUrl", overrides.base_url.as_deref()),
     ] {
         if let Some(value) = value {
             let value = root
@@ -1661,6 +1716,14 @@ fn apply_overrides(
             set_named_entry(&mut compiler, key, JsonValue::String(path_to_arc(&value)));
         }
     }
+    if let Some(base_url) = &overrides.base_url {
+        let value = match base_url {
+            Some(path) => JsonValue::String(path_to_arc(&root.resolve_output_from(cwd, path))),
+            None => JsonValue::Null,
+        };
+        set_named_entry(&mut compiler, "baseUrl", value);
+    }
+    compiler.retain(|(key, value)| key.as_ref() != "baseUrl" || !matches!(value, JsonValue::Null));
     for (key, value) in [
         ("mapRoot", overrides.map_root.as_deref()),
         ("sourceRoot", overrides.source_root.as_deref()),
@@ -1688,7 +1751,7 @@ fn apply_overrides(
             .collect();
         set_named_entry(&mut compiler, "lib", JsonValue::Array(Arc::from(entries)));
     }
-    if !compiler.is_empty() {
+    if !compiler.is_empty() || raw.get("compilerOptions").is_some() {
         set_named_entry(
             &mut top,
             "compilerOptions",
@@ -1755,7 +1818,7 @@ fn materialize_explicit_sources(
 fn materialize_sources(
     root: &ProjectRoot,
     config: &TsConfig,
-    diagnostic_patterns: &DiagnosticPatterns,
+    diagnostic_patterns: &ConfigPathOrigins,
     fs: &dyn FileSystem,
 ) -> Result<Arc<[PathBuf]>, MaterializeError> {
     let project = config.config();
@@ -2085,6 +2148,7 @@ pub fn load_reference_closure(
             }
         })?;
         let (raw, ..) = load_merged_raw(root, &path, &source, fs)?;
+        let raw = apply_overrides(root, root.path(), raw, &ProjectOptionOverrides::default())?;
         let config =
             TsConfig::parse_value(root, &path, raw).map_err(ProjectCompileError::Config)?;
         let mut referenced = BTreeSet::new();
@@ -2424,6 +2488,55 @@ mod tests {
                 fixture.0.join("app/tsconfig.json"),
             ]
         );
+    }
+
+    #[test]
+    fn malformed_compiler_options_are_rejected_before_merging_or_overrides() {
+        for invalid in ["[]", "null", "false", "42", r#""invalid""#] {
+            for inherited in [false, true] {
+                let fixture = Fixture::new();
+                fixture.write("main.ts", "export const value = 1;\n");
+                let malformed = format!(r#"{{"compilerOptions":{invalid}}}"#);
+                if inherited {
+                    fixture.write("base.json", &malformed);
+                    fixture.write(
+                        "tsconfig.json",
+                        r#"{"extends":"./base.json","files":["main.ts"],"compilerOptions":{}}"#,
+                    );
+                } else {
+                    fixture.write("tsconfig.json", &malformed);
+                }
+                let filesystem = fixture.filesystem();
+                let mut request = fixture.request("tsconfig.json");
+                request.overrides.strict = Some(true);
+                let root = ProjectRoot::new(&fixture.0).unwrap();
+                let errors = [
+                    EffectiveProject::load(&request, &filesystem).unwrap_err(),
+                    load_reference_closure(
+                        &root,
+                        &[fixture.0.join("tsconfig.json")],
+                        &filesystem,
+                    )
+                    .unwrap_err(),
+                ];
+                for error in errors {
+                    assert!(
+                        matches!(
+                            error,
+                            ProjectCompileError::Config(ref diagnostics)
+                                if diagnostics.iter().any(|diagnostic| matches!(
+                                    diagnostic,
+                                    super::super::tsconfig::TsConfigDiagnostic::InvalidField {
+                                        field,
+                                        expected: "an object",
+                                    } if field.as_ref() == "compilerOptions"
+                                ))
+                        ),
+                        "invalid={invalid}, inherited={inherited}: {error}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

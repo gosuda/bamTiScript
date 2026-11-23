@@ -1,0 +1,56 @@
+[
+  {
+    "variant": "base",
+    "case": "straight",
+    "stdout": "case=straight instructions=4096 registers=64 iterations=1 failures=0 total_ns=405434 ns_per_verify=405434 wire_digest=9513b82edd74b9c8\n",
+    "counts": "profile rounds=2 normal_transfers=8192 handler_transfers=0 protected_intersections=0\nprofile rounds=2 normal_transfers=8192 handler_transfers=0 protected_intersections=0\n"
+  },
+  {
+    "variant": "base",
+    "case": "reverse",
+    "stdout": "case=reverse instructions=2048 registers=64 iterations=1 failures=0 total_ns=115354261 ns_per_verify=115354261 wire_digest=db84d4359aa8d984\n",
+    "counts": "profile rounds=2047 normal_transfers=4192256 handler_transfers=0 protected_intersections=0\nprofile rounds=2047 normal_transfers=4192256 handler_transfers=0 protected_intersections=0\n"
+  },
+  {
+    "variant": "base",
+    "case": "handlers",
+    "stdout": "case=handlers instructions=1024 registers=64 iterations=1 failures=0 total_ns=235179115 ns_per_verify=235179115 wire_digest=36fb0b3928f3060b\n",
+    "counts": "profile rounds=1023 normal_transfers=1047552 handler_transfers=32736 protected_intersections=32506848\nprofile rounds=1023 normal_transfers=1047552 handler_transfers=32736 protected_intersections=32506848\n"
+  },
+  {
+    "variant": "scratch",
+    "case": "straight",
+    "stdout": "case=straight instructions=4096 registers=64 iterations=1 failures=0 total_ns=166883 ns_per_verify=166883 wire_digest=9513b82edd74b9c8\n",
+    "counts": "profile rounds=2 normal_transfers=8192 handler_transfers=0 protected_intersections=0\nprofile rounds=2 normal_transfers=8192 handler_transfers=0 protected_intersections=0\n"
+  },
+  {
+    "variant": "scratch",
+    "case": "reverse",
+    "stdout": "case=reverse instructions=2048 registers=64 iterations=1 failures=0 total_ns=48897838 ns_per_verify=48897838 wire_digest=db84d4359aa8d984\n",
+    "counts": "profile rounds=2047 normal_transfers=4192256 handler_transfers=0 protected_intersections=0\nprofile rounds=2047 normal_transfers=4192256 handler_transfers=0 protected_intersections=0\n"
+  },
+  {
+    "variant": "scratch",
+    "case": "handlers",
+    "stdout": "case=handlers instructions=1024 registers=64 iterations=1 failures=0 total_ns=76873464 ns_per_verify=76873464 wire_digest=36fb0b3928f3060b\n",
+    "counts": "profile rounds=1023 normal_transfers=1047552 handler_transfers=32736 protected_intersections=32474112\nprofile rounds=1023 normal_transfers=1047552 handler_transfers=32736 protected_intersections=32474112\n"
+  },
+  {
+    "variant": "worklist",
+    "case": "straight",
+    "stdout": "case=straight instructions=4096 registers=64 iterations=1 failures=0 total_ns=8466287 ns_per_verify=8466287 wire_digest=9513b82edd74b9c8\n",
+    "counts": "profile rounds=1 normal_transfers=4096 handler_transfers=0 protected_intersections=0\nprofile rounds=1 normal_transfers=4096 handler_transfers=0 protected_intersections=0\n"
+  },
+  {
+    "variant": "worklist",
+    "case": "reverse",
+    "stdout": "case=reverse instructions=2048 registers=64 iterations=1 failures=0 total_ns=225091 ns_per_verify=225091 wire_digest=db84d4359aa8d984\n",
+    "counts": "profile rounds=1 normal_transfers=2048 handler_transfers=0 protected_intersections=0\nprofile rounds=1 normal_transfers=2048 handler_transfers=0 protected_intersections=0\n"
+  },
+  {
+    "variant": "worklist",
+    "case": "handlers",
+    "stdout": "case=handlers instructions=1024 registers=64 iterations=1 failures=0 total_ns=128915 ns_per_verify=128915 wire_digest=36fb0b3928f3060b\n",
+    "counts": "profile rounds=1 normal_transfers=1024 handler_transfers=32 protected_intersections=31744\nprofile rounds=1 normal_transfers=1024 handler_transfers=32 protected_intersections=31744\n"
+  }
+]
