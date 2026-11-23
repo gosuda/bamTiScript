@@ -722,6 +722,17 @@ pub(super) fn write_then_verify(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Returns a cached archive only after its SHA-256 matches the supplied pin.
 /// Transient download failures retry within bounded connection and transfer limits.
 pub(crate) fn fetch_archive(url: &str, expected_digest: &str, cache_dir: &Path) -> Result<PathBuf> {
+    fetch_archive_with_curl(url, expected_digest, cache_dir, || Command::new("curl"))
+}
+
+/// The supplied factory must construct curl with the caller's process context.
+/// It is invoked only after the verified cache misses.
+pub(super) fn fetch_archive_with_curl(
+    url: &str,
+    expected_digest: &str,
+    cache_dir: &Path,
+    curl: impl FnOnce() -> Command,
+) -> Result<PathBuf> {
     let cache_path = cache_dir.join(format!("{expected_digest}.tar.gz"));
     if cache_path.exists() {
         let bytes = fs::read(&cache_path).map_err(|e| io_err(&cache_path, &e))?;
@@ -732,7 +743,7 @@ pub(crate) fn fetch_archive(url: &str, expected_digest: &str, cache_dir: &Path) 
         fs::remove_file(&cache_path).map_err(|e| io_err(&cache_path, &e))?;
     }
 
-    let status = Command::new("curl")
+    let status = curl()
         .args([
             "-fsSL",
             "--connect-timeout",

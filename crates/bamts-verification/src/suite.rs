@@ -431,13 +431,36 @@ mod tests {
         (url, server, stop)
     }
 
+    fn fetch_loopback_archive(
+        url: &str,
+        expected_digest: &str,
+        cache_dir: &Path,
+    ) -> Result<PathBuf> {
+        snapshot::fetch_archive_with_curl(url, expected_digest, cache_dir, || {
+            let mut curl = std::process::Command::new("curl");
+            for name in [
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+            ] {
+                curl.env(name, "http://127.0.0.1:1");
+            }
+            curl.env_remove("NO_PROXY").env_remove("no_proxy");
+            curl.args(["--noproxy", "127.0.0.1"]);
+            curl
+        })
+    }
+
     #[test]
     fn archive_fetch_retries_transient_failures_and_reuses_verified_bytes() {
         let cache = TestDir::new("archive-retry");
         let payload = b"verified archive";
         let expected = sha256_hex(payload);
         let (url, server, stop) = serve_archive_responses(vec![(504, b""), (200, payload)]);
-        let result = fetch_archive(&url, &expected, cache.path());
+        let result = fetch_loopback_archive(&url, &expected, cache.path());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(server.join().expect("archive server"), 2);
         let archive = result.expect("transient failure retried");
@@ -454,7 +477,7 @@ mod tests {
         let expected = sha256_hex(b"expected archive");
         let (url, server, stop) =
             serve_archive_responses(vec![(504, b""), (200, b"incorrect archive")]);
-        let result = fetch_archive(&url, &expected, cache.path());
+        let result = fetch_loopback_archive(&url, &expected, cache.path());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(server.join().expect("archive server"), 2);
         assert_eq!(result.unwrap_err().code(), ErrorCode::Digest);
@@ -467,7 +490,7 @@ mod tests {
         let expected = sha256_hex(b"missing archive");
         let (url, server, stop) =
             serve_archive_responses(vec![(404, b""), (200, b"missing archive")]);
-        let result = fetch_archive(&url, &expected, cache.path());
+        let result = fetch_loopback_archive(&url, &expected, cache.path());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(server.join().expect("archive server"), 1);
         assert_eq!(result.unwrap_err().code(), ErrorCode::ToolFailed);
