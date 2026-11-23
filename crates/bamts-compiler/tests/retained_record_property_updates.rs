@@ -37,7 +37,9 @@ fn checked_model(source: &str, kind: ScriptKind, expected: &[&str]) -> SemanticM
         .collect();
     assert_eq!(codes, expected, "{source}");
     let mut program = checked.into_product();
-    program.remove_file(source_id).expect("fixture semantic model")
+    program
+        .remove_file(source_id)
+        .expect("fixture semantic model")
 }
 
 fn binding_type(model: &SemanticModel, name: &str) -> TypeId {
