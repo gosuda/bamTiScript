@@ -213,21 +213,36 @@ impl From<PathError> for TsConfigDiagnostic {
 
 /// One or more tsconfig diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TsConfigError(Arc<[TsConfigDiagnostic]>);
+pub struct TsConfigError {
+    diagnostics: Arc<[TsConfigDiagnostic]>,
+    config_path: Option<PathBuf>,
+}
 
 impl TsConfigError {
     pub fn new(diagnostics: impl IntoIterator<Item = TsConfigDiagnostic>) -> Self {
-        Self(Arc::from(diagnostics.into_iter().collect::<Vec<_>>()))
+        Self {
+            diagnostics: Arc::from(diagnostics.into_iter().collect::<Vec<_>>()),
+            config_path: None,
+        }
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, TsConfigDiagnostic> {
-        self.0.iter()
+        self.diagnostics.iter()
+    }
+
+    #[must_use]
+    pub(crate) fn with_config_path(mut self, path: &Path) -> Self {
+        self.config_path = Some(path.to_path_buf());
+        self
     }
 }
 
 impl fmt::Display for TsConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, diagnostic) in self.0.iter().enumerate() {
+        if let Some(path) = &self.config_path {
+            write!(formatter, "{}: ", path.display())?;
+        }
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             if index > 0 {
                 formatter.write_str("; ")?;
             }
