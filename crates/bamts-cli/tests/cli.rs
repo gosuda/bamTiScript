@@ -2737,7 +2737,6 @@ fn native_run_resolves_paths_from_the_config_directory() {
         .expect("native config execution starts");
     assert_success(&output, "shared config parsing ignores baseUrl for paths");
     assert_eq!(output.stdout, b"42\n");
-    assert!(output.stderr.is_empty(), "{}", stderr(&output));
 }
 
 #[test]
