@@ -212,3 +212,114 @@ const numeric: keyof R = 2;
 "#,
     );
 }
+
+#[test]
+fn captured_constructor_keys_follow_successive_namespace_merges() {
+    assert_checks(
+        r#"
+class C {}
+class D extends C {}
+type K = keyof typeof D;
+const initial: K = "prototype";
+namespace C { export const extra = 1; }
+const first: K = "extra";
+namespace C { export const second = 2; }
+const second: K = "second";
+const stillFirst: K = "extra";
+"#,
+    );
+}
+
+#[test]
+fn a_key_query_before_the_class_body_tracks_constructor_finalization() {
+    assert_checks(
+        r#"
+type K = keyof typeof C;
+class C { static own = 1; }
+namespace C { export const extra = 2; }
+const own: K = "own";
+const extra: K = "extra";
+"#,
+    );
+}
+
+#[test]
+fn constructor_key_projections_survive_unions_and_intersections() {
+    assert_checks(
+        r#"
+class C {}
+class D extends C {}
+type Union = keyof typeof D | "separate";
+type Intersection = (keyof typeof D) & ("prototype" | "extra");
+const initialUnion: Union = "prototype";
+const initialIntersection: Intersection = "prototype";
+namespace C { export const extra = 1; }
+const laterUnion: Union = "extra";
+const separate: Union = "separate";
+const laterIntersection: Intersection = "extra";
+"#,
+    );
+}
+
+#[test]
+fn constructor_key_projections_survive_generic_alias_materialization() {
+    assert_checks(
+        r#"
+class C {}
+class D extends C {}
+type K = keyof typeof D;
+type Box<T> = { key: T };
+const before: Box<K> = { key: "prototype" };
+namespace C { export const extra = 1; }
+const after: Box<K> = { key: "extra" };
+const read: K = after.key;
+"#,
+    );
+}
+
+#[test]
+fn keyof_a_constructor_union_refreshes_both_dependencies() {
+    assert_checks(
+        r#"
+class C {}
+class D extends C {}
+type K = keyof (typeof C | typeof D);
+const initial: K = "prototype";
+namespace C { export const extra = 1; }
+const later: K = "extra";
+"#,
+    );
+}
+
+#[test]
+fn record_key_domains_keep_live_constructor_projections() {
+    assert_checks(
+        r#"
+class C {}
+type Fields = Record<keyof typeof C, number>;
+declare const captured: Fields;
+namespace C { export const extra = 1; }
+const value: number = captured.extra;
+type K = keyof Fields;
+const extra: K = "extra";
+"#,
+    );
+}
+
+#[test]
+fn updating_constructor_keys_does_not_redirect_shared_literal_types() {
+    assert_assignment_errors(
+        r#"
+class C {}
+class Other {}
+type Changed = keyof typeof C;
+type Untouched = keyof typeof Other;
+type Literal = "prototype";
+namespace C { export const extra = 1; }
+const changed: Changed = "extra";
+const unrelated: Untouched = "extra";
+const literal: Literal = "extra";
+"#,
+        2,
+    );
+}

@@ -1591,6 +1591,9 @@ pub struct TypeTable {
     /// Captured constructor identities map directly to their current raw
     /// namespace-augmented representation. Interned nodes and keys stay fixed.
     constructor_revisions: HashMap<TypeId, TypeId>,
+    /// Materialized key sets live outside the immutable interned nodes.
+    keyof_views: HashMap<TypeId, TypeId>,
+    constructor_keyof_dependents: HashMap<SymbolId, HashSet<TypeId>>,
     error: TypeId,
     any: TypeId,
     unknown: TypeId,
@@ -1659,6 +1662,8 @@ impl TypeTable {
             types: Vec::new(),
             index: HashMap::new(),
             constructor_revisions: HashMap::new(),
+            keyof_views: HashMap::new(),
+            constructor_keyof_dependents: HashMap::new(),
             error: TypeId(0),
             any: TypeId(0),
             unknown: TypeId(0),
@@ -1740,7 +1745,33 @@ impl TypeTable {
         {
             return &self.types[current.0 as usize];
         }
+        if matches!(ty, Type::Keyof(_))
+            && let Some(view) = self.keyof_views.get(&id)
+        {
+            return &self.types[view.0 as usize];
+        }
         ty
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn keyof_projection_view(&self, id: TypeId) -> Option<TypeId> {
+        if matches!(self.types[id.0 as usize], Type::Keyof(_)) {
+            self.keyof_views.get(&id).copied()
+        } else {
+            None
+        }
+    }
+
+    /// Transformations preserve the operand of a live key projection instead
+    /// of copying its current literal set into a permanent snapshot.
+    pub(crate) fn instantiation_type(&self, id: TypeId) -> &Type {
+        let ty = &self.types[id.0 as usize];
+        if matches!(ty, Type::Keyof(_)) {
+            ty
+        } else {
+            self.get(id)
+        }
     }
 
     #[must_use]
@@ -2803,6 +2834,7 @@ impl TypeTable {
         };
         assert_eq!(previous_symbol, current_symbol);
         assert_eq!(previous_arguments, current_arguments);
+        let symbol = *current_symbol;
         for view in self.constructor_revisions.values_mut() {
             if *view == previous {
                 *view = current;
@@ -2810,6 +2842,7 @@ impl TypeTable {
         }
         self.constructor_revisions.remove(&current);
         self.constructor_revisions.insert(previous, current);
+        self.refresh_constructor_keyof(symbol);
     }
 
     /// Returns the parameter-relative self head used inside a class declaration.
@@ -2966,24 +2999,91 @@ impl TypeTable {
         self.prepare_applied_class_view(type_id).unwrap_or(type_id)
     }
 
-    /// Reduces `keyof T` when `T` is a concrete object, tuple, or array;
-    /// otherwise interns a deferred `Type::Keyof`.
+    /// Reduces concrete key domains. Queries that depend on constructors
+    /// retain their operand so aliases see later namespace augmentation.
     pub fn keyof(&mut self, operand: TypeId) -> TypeId {
-        self.try_reduce_keyof(operand)
-            .unwrap_or_else(|| self.intern(Type::Keyof(operand)))
+        let mut constructors = Vec::new();
+        let reduced = self.try_reduce_keyof(operand, &mut HashSet::new(), &mut constructors);
+        if constructors.is_empty() {
+            return reduced.unwrap_or_else(|| self.intern(Type::Keyof(operand)));
+        }
+        let head = self.intern(Type::Keyof(operand));
+        self.publish_keyof_view(head, reduced, constructors);
+        head
     }
 
-    fn try_reduce_keyof(&mut self, operand: TypeId) -> Option<TypeId> {
+    fn publish_keyof_view(
+        &mut self,
+        head: TypeId,
+        reduced: Option<TypeId>,
+        constructors: Vec<SymbolId>,
+    ) {
+        for symbol in constructors {
+            self.constructor_keyof_dependents
+                .entry(symbol)
+                .or_default()
+                .insert(head);
+        }
+        if let Some(reduced) = reduced {
+            debug_assert!(!matches!(self.types[reduced.0 as usize], Type::Keyof(_)));
+            self.keyof_views.insert(head, reduced);
+        } else {
+            self.keyof_views.remove(&head);
+        }
+    }
+
+    fn refresh_constructor_keyof(&mut self, symbol: SymbolId) {
+        let Some(dependents) = self.constructor_keyof_dependents.get(&symbol) else {
+            return;
+        };
+        let mut heads: Vec<_> = dependents.iter().copied().collect();
+        heads.sort_by_key(|head| head.get());
+        for head in heads {
+            let Type::Keyof(operand) = &self.types[head.0 as usize] else {
+                unreachable!("constructor key dependents retain their keyof identity");
+            };
+            let operand = *operand;
+            let mut constructors = Vec::new();
+            let reduced = self.try_reduce_keyof(operand, &mut HashSet::new(), &mut constructors);
+            self.publish_keyof_view(head, reduced, constructors);
+        }
+    }
+
+    fn try_reduce_keyof(
+        &mut self,
+        operand: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        constructors: &mut Vec<SymbolId>,
+    ) -> Option<TypeId> {
+        if !visiting.insert(operand) {
+            return None;
+        }
         let view = self.indexed_access_view(operand);
-        self.keyof_view(view)
+        let reduced = if view != operand {
+            self.try_reduce_keyof(view, visiting, constructors)
+        } else {
+            self.keyof_view(view, visiting, constructors)
+        };
+        visiting.remove(&operand);
+        reduced
     }
 
-    fn keyof_view(&mut self, view: TypeId) -> Option<TypeId> {
+    fn keyof_view(
+        &mut self,
+        view: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        constructors: &mut Vec<SymbolId>,
+    ) -> Option<TypeId> {
         match self.get(view).clone() {
             Type::ConstructorType {
-                structural: target, ..
+                symbol, structural, ..
+            } => {
+                if !constructors.contains(&symbol) {
+                    constructors.push(symbol);
+                }
+                self.try_reduce_keyof(structural, visiting, constructors)
             }
-            | Type::TypeQuery { target, .. } => self.try_reduce_keyof(target),
+            Type::TypeQuery { target, .. } => self.try_reduce_keyof(target, visiting, constructors),
             Type::ObjectType(object) => {
                 let mut keys =
                     Vec::with_capacity(object.properties.len() + object.index_signatures.len());
@@ -3003,7 +3103,7 @@ impl TypeTable {
                     if !signature.enum_reverse
                         && let Some(parameter) = signature.parameters.first()
                     {
-                        keys.push(parameter.type_id());
+                        keys.push(self.keyof_domain(parameter.type_id(), visiting, constructors)?);
                     }
                 }
                 Some(self.union_or_single(keys))
@@ -3021,28 +3121,76 @@ impl TypeTable {
                 }
             }
             Type::Array(_) => Some(self.number()),
-            Type::Record { key, .. } => Some(key),
+            Type::Record { key, .. } => self.keyof_domain(key, visiting, constructors),
             Type::Union(members) => {
                 // keyof(A | B) = keyof(A) & keyof(B)
                 let mut keys = Vec::with_capacity(members.len());
-                for &member in &members {
-                    let key = self.keyof_view(member)?;
-                    keys.push(key);
+                for member in members {
+                    keys.push(self.try_reduce_keyof(member, visiting, constructors)?);
                 }
                 Some(self.intersection(keys))
             }
             Type::Intersection(members) => {
                 // keyof(A & B) = keyof(A) | keyof(B)
-                let mut keys = Vec::new();
-                for &member in &members {
-                    let key = self.keyof_view(member)?;
-                    keys.push(key);
+                let mut keys = Vec::with_capacity(members.len());
+                for member in members {
+                    keys.push(self.try_reduce_keyof(member, visiting, constructors)?);
                 }
                 Some(self.union_or_single(keys))
             }
             _ => None,
         }
     }
+
+    /// Re-evaluates nested key projections from their operands rather than
+    /// reading a cached snapshot. Dependencies are therefore transitive and
+    /// refresh order cannot freeze a key domain inside another projection.
+    fn keyof_domain(
+        &mut self,
+        domain: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        constructors: &mut Vec<SymbolId>,
+    ) -> Option<TypeId> {
+        if !visiting.insert(domain) {
+            return None;
+        }
+        let reduced = self.keyof_domain_view(domain, visiting, constructors);
+        visiting.remove(&domain);
+        reduced
+    }
+
+    fn keyof_domain_view(
+        &mut self,
+        domain: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        constructors: &mut Vec<SymbolId>,
+    ) -> Option<TypeId> {
+        let view = self.indexed_access_view(domain);
+        if view != domain {
+            return self.keyof_domain(view, visiting, constructors);
+        }
+        match self.instantiation_type(domain).clone() {
+            Type::Keyof(operand) => self.try_reduce_keyof(operand, visiting, constructors),
+            Type::TypeQuery { target, .. } => self.keyof_domain(target, visiting, constructors),
+            Type::Union(members) => {
+                let mut keys = Vec::with_capacity(members.len());
+                for member in members {
+                    keys.push(self.keyof_domain(member, visiting, constructors)?);
+                }
+                Some(self.union_or_single(keys))
+            }
+            Type::Intersection(members) => {
+                let mut keys = Vec::with_capacity(members.len());
+                for member in members {
+                    keys.push(self.keyof_domain(member, visiting, constructors)?);
+                }
+                Some(self.intersection_ordered(keys))
+            }
+            Type::AppliedAlias { .. } | Type::AppliedClass { .. } => None,
+            _ => Some(domain),
+        }
+    }
+
     /// Reduces `Record<K, V>` for concrete keys and preserves a mapped type
     /// while `K` still depends on a type parameter.
     pub fn record(&mut self, key: TypeId, value: TypeId) -> TypeId {
@@ -3090,7 +3238,7 @@ impl TypeTable {
         properties: &mut Vec<PropertyType>,
         index_keys: &mut Vec<TypeId>,
     ) -> RecordKeyState {
-        match self.get(key) {
+        match self.instantiation_type(key) {
             Type::String => index_keys.push(self.string()),
             Type::Number => index_keys.push(self.number()),
             Type::Symbol => index_keys.push(self.symbol_type()),
@@ -4239,7 +4387,7 @@ impl TypeTable {
     pub fn union(&mut self, members: &[TypeId]) -> TypeId {
         let mut flat = Vec::new();
         for member in members {
-            match self.get(*member) {
+            match self.instantiation_type(*member) {
                 Type::Any => return self.any,
                 Type::Unknown => return self.unknown,
                 Type::Never => {}
@@ -4276,7 +4424,7 @@ impl TypeTable {
 
     /// Removes `null` and `undefined` while preserving every other constituent.
     pub fn non_nullable(&mut self, type_id: TypeId) -> TypeId {
-        match self.get(type_id).clone() {
+        match self.instantiation_type(type_id).clone() {
             Type::Null | Type::Undefined => self.never,
             Type::Union(members) => {
                 let members: Vec<_> = members
@@ -34102,5 +34250,105 @@ namespace undefined { export var x = 42; }",
         };
         assert_eq!(object.call_candidate_order, vec![2, 0, 1]);
         assert_eq!(object.call_signatures.len(), 3);
+    }
+
+    #[test]
+    fn imported_constructor_key_projection_tracks_target_revisions() {
+        let mut source_table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let initial = source_table.object_type(vec![PropertyType::new(
+            "prototype",
+            false,
+            source_table.object(),
+        )]);
+        let constructor = source_table.constructor_type(owner, Vec::new(), initial);
+        let keys = source_table.keyof(constructor);
+        let augmented = source_table.object_type(vec![
+            PropertyType::new("prototype", false, source_table.object()),
+            PropertyType::new("exported", false, source_table.number()),
+        ]);
+        let augmented = source_table.constructor_type(owner, Vec::new(), augmented);
+        source_table.publish_constructor_revision(constructor, augmented);
+
+        let mut target = TypeTable::new();
+        let mut next_symbol = 1_000;
+        let (imported, _) = target.import_type(
+            &source_table,
+            keys,
+            &[],
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let exported = target.string_literal("exported");
+        assert!(target.assignable(exported, imported));
+        let Type::Keyof(imported_constructor) = target.instantiation_type(imported) else {
+            panic!("import keeps the constructor query rather than its current literals");
+        };
+        let imported_constructor = *imported_constructor;
+        let Type::ConstructorType { symbol, .. } = target.get(imported_constructor) else {
+            panic!("the key query retains a constructor operand");
+        };
+        let symbol = *symbol;
+        let updated = target.object_type(vec![
+            PropertyType::new("prototype", false, target.object()),
+            PropertyType::new("exported", false, target.number()),
+            PropertyType::new("extra", false, target.number()),
+        ]);
+        let current = target.constructor_type(symbol, Vec::new(), updated);
+        target.publish_constructor_revision(imported_constructor, current);
+
+        let extra = target.string_literal("extra");
+        let prototype = target.string_literal("prototype");
+        assert!(target.assignable(extra, imported));
+        assert!(target.assignable(prototype, imported));
+        assert!(!target.assignable(extra, prototype));
+    }
+
+    #[test]
+    fn imported_key_domains_keep_numeric_and_enum_reverse_provenance() {
+        let mut source_table = TypeTable::new();
+        let number = source_table.number();
+        let structure = source_table.object_type_with_members(ObjectType {
+            properties: vec![
+                PropertyType::new("01", false, number),
+                PropertyType::new("2", false, number).with_numeric_name(true),
+            ],
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: vec![super::IndexSignature {
+                readonly: false,
+                enum_reverse: true,
+                parameters: vec![FunctionParameter::new(
+                    "index".to_owned(),
+                    number,
+                    false,
+                    false,
+                )],
+                value_type: source_table.string(),
+                declaring_types: Vec::new(),
+            }],
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let constructor = source_table.constructor_type(SymbolId::new(1), Vec::new(), structure);
+        let mut target = TypeTable::new();
+        let mut next_symbol = 1_000;
+        let (imported, _) = target.import_type(
+            &source_table,
+            constructor,
+            &[],
+            &mut super::ImportedTypeMap::default(),
+            &mut next_symbol,
+        );
+        let keys = target.keyof(imported);
+        let quoted = target.string_literal("01");
+        let numeric = target.number_literal("2");
+        let rewritten = target.number_literal("1");
+        assert!(target.assignable(quoted, keys));
+        assert!(target.assignable(numeric, keys));
+        assert!(!target.assignable(rewritten, keys));
+        assert!(!target.assignable(target.number(), keys));
     }
 }
