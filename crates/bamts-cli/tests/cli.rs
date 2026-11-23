@@ -283,26 +283,36 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
     }
     stdin.flush().expect("API requests are flushed");
     let published = project.path.join("cache").join("run");
-    let (image_published, output) = thread::scope(|scope| {
+    let image_prefix = format!("bamts-run-{}-", child.id());
+    let image_published = || -> std::io::Result<bool> {
+        let mut entries = match fs::read_dir(&published) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        entries.try_fold(false, |found, entry| {
+            let entry = entry?;
+            let is_image = entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(image_prefix.as_str())
+                    && name.ends_with(std::env::consts::EXE_SUFFIX)
+            });
+            let is_file = is_image && entry.file_type()?.is_file();
+            Ok(found || is_file)
+        })
+    };
+    let (publication, output) = thread::scope(|scope| {
         let stdout = child.stdout.take().expect("API child stdout is piped");
         let stderr = child.stderr.take().expect("API child stderr is piped");
         let stdout = scope.spawn(move || read_output(stdout));
         let stderr = scope.spawn(move || read_output(stderr));
         let deadline = Instant::now() + Duration::from_secs(120);
-        let image_published = loop {
-            let found = fs::read_dir(&published).is_ok_and(|entries| {
-                entries.filter_map(Result::ok).any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("bamts-run-")
-                        && entry.path().is_file()
-                })
-            });
-            if found || Instant::now() >= deadline {
-                break found;
+        let publication = loop {
+            match image_published() {
+                Ok(false) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                result => break result,
             }
-            thread::sleep(Duration::from_millis(20));
         };
         let cancel = serde_json::json!({
             "jsonrpc": "2.0",
@@ -318,11 +328,11 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
             wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
         output.stdout = stdout.join().expect("stdout reader");
         output.stderr = stderr.join().expect("stderr reader");
-        (image_published, output)
+        (publication, output)
     });
     assert!(
-        image_published,
-        "the AOT image was never published\nstdout:\n{}\nstderr:\n{}",
+        matches!(publication, Ok(true)),
+        "the AOT image was never published: {publication:?}\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -333,8 +343,14 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
         .as_str()
         .expect("a cancelled AOT request is an API error");
     assert_eq!(message, "request was cancelled");
+    let mut remaining =
+        fs::read_dir(&published).expect("AOT publication directory remains readable");
     assert!(
-        fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()),
+        remaining
+            .next()
+            .transpose()
+            .expect("AOT publication directory entry is readable")
+            .is_none(),
         "the cancelled AOT image is removed"
     );
 }

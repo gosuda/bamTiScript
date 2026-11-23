@@ -2363,17 +2363,15 @@ pub fn compile_program_frontend_with_cancel(
         })
         .map_err(Cancelled::from)?;
         cancel.check()?;
-        let program_diagnostics = checked.diagnostics();
+        let (mut semantic_models, program_diagnostics) = checked.into_parts();
         let tslib_diagnostics = tslib_helper_diagnostics_for_program(program, &parsed);
         let mut modules = Vec::with_capacity(parsed.len());
         for (index, parsed) in parsed.into_iter().enumerate() {
             cancel.check()?;
             let source_id = parsed.product().source_id();
-            let semantic_model = checked
-                .product()
-                .file(source_id)
-                .expect("whole-program checker returns every parsed module")
-                .clone();
+            let semantic_model = semantic_models
+                .remove_file(source_id)
+                .expect("whole-program checker returns every parsed module");
             let module = &program.modules()[index];
             let source_name = Arc::from(
                 module

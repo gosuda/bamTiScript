@@ -113,6 +113,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -2787,27 +2788,42 @@ fn definite_initialization(
     let mut entry = RegisterSet::empty(register_count);
     entry.insert_prefix(function.entry_initialized());
     facts[0] = entry;
+    let mut after = RegisterSet::empty(register_count);
+    let mut worklist = VecDeque::from([0usize]);
+    let mut queued = vec![false; function.code.len()];
+    queued[0] = true;
 
     loop {
-        let mut changed = false;
-        for (pc, instruction) in function.code.iter().copied().enumerate() {
-            let mut after = facts[pc].clone();
+        // Unchanged top facts already satisfy every normal transfer, including
+        // unreachable instructions. Only a decreased pre-fact needs propagation.
+        while let Some(pc) = worklist.pop_front() {
+            queued[pc] = false;
+            let instruction = function.code[pc];
+            after.words.copy_from_slice(&facts[pc].words);
             instruction.visit_writes(|write| after.insert(write));
             instruction.visit_successors(pc as u32, |successor| {
-                changed |= facts[successor.get() as usize].intersect(&after);
+                let successor = successor.get() as usize;
+                if facts[successor].intersect(&after) && !queued[successor] {
+                    worklist.push_back(successor);
+                    queued[successor] = true;
+                }
             });
         }
         for handler in function.handlers.iter().copied() {
             let start = handler.start.get() as usize;
             let end = handler.end.get() as usize;
-            let mut contribution = RegisterSet::full(register_count);
-            for protected in &facts[start..end] {
-                contribution.intersect(protected);
+            after.words.copy_from_slice(&facts[start].words);
+            for protected in &facts[start + 1..end] {
+                after.intersect(protected);
             }
-            contribution.insert(handler.catch_register);
-            changed |= facts[handler.handler.get() as usize].intersect(&contribution);
+            after.insert(handler.catch_register);
+            let target = handler.handler.get() as usize;
+            if facts[target].intersect(&after) && !queued[target] {
+                worklist.push_back(target);
+                queued[target] = true;
+            }
         }
-        if !changed {
+        if worklist.is_empty() {
             break;
         }
     }
@@ -4024,3 +4040,6 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod verifier_tests;
