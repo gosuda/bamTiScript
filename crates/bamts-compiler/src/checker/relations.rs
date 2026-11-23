@@ -1176,9 +1176,20 @@ impl<'table> TypeRelations<'table> {
             ) => {
                 self.object_satisfies_record(source_object, *target_key, *target_value, strictness)
             }
+            (
+                Type::Record {
+                    key: source_key,
+                    value: source_value,
+                },
+                Type::ObjectType(target_object),
+            ) => self.record_satisfies_object(
+                *source_key,
+                *source_value,
+                target_object,
+                strictness,
+            ),
             (Type::Record { .. }, Type::Object) => true,
             (Type::Never, Type::Record { .. }) => true,
-            (Type::Record { .. }, _) | (_, Type::Record { .. }) => false,
             // An interface with a completed structural body expands through that body
             // once. The `visiting` set in `relates` terminates recursive self and mutual
             // interface pairs; returned member types that are the interface's own head stay inert.
@@ -1207,6 +1218,7 @@ impl<'table> TypeRelations<'table> {
             (Type::Intersection(sources), _) => sources
                 .iter()
                 .any(|member| self.relates(*member, target, strictness)),
+            (Type::Record { .. }, _) | (_, Type::Record { .. }) => false,
             (Type::StringLiteral(_), Type::String) => true,
             (Type::NumberLiteral(_), Type::Number) => true,
             (Type::NumberLiteral(left), Type::NumberLiteral(right)) => {
@@ -2212,79 +2224,21 @@ impl<'table> TypeRelations<'table> {
         value: TypeId,
         strictness: Strictness,
     ) -> bool {
-        if let Some(names) = self.record_literal_keys(key) {
-            return names.iter().all(|name| {
-                source
-                    .properties
-                    .iter()
-                    .find(|property| property.name() == name)
-                    .map(|property| self.relates(property.type_id(), value, strictness))
-                    .or_else(|| {
-                        source.index_signatures.iter().find_map(|signature| {
-                            let parameter = signature.parameters.first()?;
-                            self.table
-                                .property_name_assignable_to_key(name, parameter.type_id())
-                                .then(|| self.relates(signature.value_type, value, strictness))
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-        }
-        if !self.record_key_is_concrete_domain(key) {
-            return false;
-        }
-        source
-            .properties
-            .iter()
-            .filter(|property| {
-                self.table
-                    .property_name_assignable_to_key(property.name(), key)
-            })
-            .all(|property| self.relates(property.type_id(), value, strictness))
-            && source.index_signatures.iter().all(|signature| {
-                let Some(parameter) = signature.parameters.first() else {
-                    return false;
-                };
-                let parameter = parameter.type_id();
-                let overlaps = self.relates(parameter, key, Strictness::Comparable)
-                    || self.relates(key, parameter, Strictness::Comparable);
-                !overlaps || self.relates(signature.value_type, value, strictness)
-            })
+        self.table
+            .record_structural_view(key, value)
+            .is_some_and(|target| self.object_relates(source, &target, strictness))
     }
 
-    fn record_literal_keys(&self, key: TypeId) -> Option<Vec<String>> {
-        match self.table.get(key) {
-            Type::Never => Some(Vec::new()),
-            Type::StringLiteral(name) => name.to_utf8_strict().ok().map(|name| vec![name]),
-            Type::NumberLiteral(name) => Some(vec![name.to_string()]),
-            Type::Union(members) => {
-                let mut names = Vec::new();
-                for member in members {
-                    names.extend(self.record_literal_keys(*member)?);
-                }
-                names.sort_unstable();
-                names.dedup();
-                Some(names)
-            }
-            _ => None,
-        }
-    }
-
-    fn record_key_is_concrete_domain(&self, key: TypeId) -> bool {
-        match self.table.get(key) {
-            Type::Any
-            | Type::Error
-            | Type::Never
-            | Type::String
-            | Type::Number
-            | Type::Symbol
-            | Type::StringLiteral(_)
-            | Type::NumberLiteral(_) => true,
-            Type::Union(members) => members
-                .iter()
-                .all(|member| self.record_key_is_concrete_domain(*member)),
-            _ => false,
-        }
+    fn record_satisfies_object(
+        &self,
+        key: TypeId,
+        value: TypeId,
+        target: &ObjectType,
+        strictness: Strictness,
+    ) -> bool {
+        self.table
+            .record_structural_view(key, value)
+            .is_some_and(|source| self.object_relates(&source, target, strictness))
     }
 
     fn property_type_relates(

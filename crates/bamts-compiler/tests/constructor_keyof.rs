@@ -483,3 +483,150 @@ const wrongNumber: keyof typeof Quoted = 2.50;
         3,
     );
 }
+
+#[test]
+fn growing_generic_aliases_do_not_recurse_through_unbounded_keyof_views() {
+    for source in [
+        r#"
+type Expanding<T> = Expanding<T[]>;
+type Keys = keyof (Expanding<string> | { x: number });
+"#,
+        r#"
+type First<T> = Second<T[]>;
+type Second<T> = First<T[]>;
+type Keys = keyof (First<string> | { x: number });
+"#,
+    ] {
+        let codes = checker_codes(source);
+        assert!(codes.iter().any(|code| code == "BAMTS-C072"), "{codes:?}");
+    }
+}
+
+#[test]
+fn alias_recursion_guards_allow_object_recursion_and_repeated_siblings() {
+    assert_checks(
+        r#"
+type Tree<T> = { next: Tree<T[]> };
+type Box<T> = { value: T };
+const recursive: keyof Tree<string> = "next";
+const siblings: keyof (Box<string> | Box<number>) = "value";
+"#,
+    );
+}
+
+#[test]
+fn unresolved_record_keyof_keeps_the_original_generic_key_domain() {
+    assert_checks(
+        r#"
+function f<T>(r: Record<keyof T, number>, k: keyof T) {
+    const j: keyof typeof r = k;
+    const original: keyof T = j;
+}
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+function f<T>(r: Record<keyof T, number>) {
+    const missing: keyof typeof r = "missing";
+}
+"#,
+        1,
+    );
+}
+
+#[test]
+fn live_records_relate_to_structural_objects_before_and_after_namespace_merges() {
+    assert_checks(
+        r#"
+class C {}
+declare const fields: Record<keyof typeof C, number>;
+const before: { prototype: number } = fields;
+namespace C { export const extra = 1; }
+const after: { prototype: number; extra: number } = fields;
+interface Fields { prototype: number; extra: number; }
+const named: Fields = fields;
+const intersection: { prototype: number } & { extra: number } = fields;
+const fromObject: typeof fields = { prototype: 1, extra: 2 };
+"#,
+    );
+}
+
+#[test]
+fn live_record_relations_reject_missing_optional_and_incompatible_members() {
+    assert_assignment_errors(
+        r#"
+class C {}
+declare const fields: Record<keyof typeof C, number>;
+namespace C { export const extra = 1; }
+const missing: typeof fields = { prototype: 1 };
+declare const optional: { prototype: number; extra?: number };
+const required: typeof fields = optional;
+const wrongValue: { extra: string } = fields;
+const absent: { missing: number } = fields;
+"#,
+        4,
+    );
+}
+
+#[test]
+fn numeric_record_names_and_index_types_use_number_values() {
+    assert_checks(
+        r#"
+type R = Record<2.50 | 0x10, boolean>;
+declare const record: R;
+const decimal: boolean = record[2.5];
+const hexadecimal: boolean = record[16];
+const originalSpelling: boolean = record[2.50];
+type Indexed = R[0x10];
+const indexed: Indexed = true;
+type Quoted = Record<"2.50" | "0x10", boolean>;
+declare const quoted: Quoted;
+const quotedDecimal: boolean = quoted["2.50"];
+const quotedHexadecimal: boolean = quoted["0x10"];
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+type R = Record<2.50 | 0x10, boolean>;
+const quotedDecimal: keyof R = "2.50";
+const quotedHexadecimal: keyof R = "0x10";
+type Quoted = Record<"2.50" | "0x10", boolean>;
+const decimal: keyof Quoted = 2.5;
+const hexadecimal: keyof Quoted = 16;
+"#,
+        4,
+    );
+    let codes = checker_codes(
+        r#"
+declare const record: Record<2.50, boolean>;
+const wrongSpelling: boolean = record["2.50"];
+"#,
+    );
+    assert!(!codes.is_empty(), "quoted keys keep their spelling");
+}
+
+#[test]
+fn record_key_intersections_preserve_each_literal_kind() {
+    assert_checks(
+        r#"
+type Strings = Record<(1 | "1") & string, boolean>;
+type Numbers = Record<(1 | "1") & number, boolean>;
+type Both = Record<(1 | "1") & (string | number), boolean>;
+const stringKey: keyof Strings = "1";
+const numberKey: keyof Numbers = 1;
+const bothString: keyof Both = "1";
+const bothNumber: keyof Both = 1;
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+type Strings = Record<(1 | "1") & string, boolean>;
+type Numbers = Record<(1 | "1") & number, boolean>;
+type Empty = Record<1 & "1", boolean>;
+const numericInString: keyof Strings = 1;
+const stringInNumber: keyof Numbers = "1";
+const empty: keyof Empty = 1;
+"#,
+        3,
+    );
+}
