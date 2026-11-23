@@ -619,6 +619,129 @@ fn gc_traces_active_builtin_new_target() {
 }
 
 #[test]
+fn gc_traces_shaped_and_dictionary_property_edges() {
+    for dictionary in [false, true] {
+        with_machine(Limits::default(), |machine| {
+            let symbol = machine
+                .allocate(HeapEntry::Symbol {
+                    description: EcmaString::encode("symbol key"),
+                })
+                .unwrap();
+            let private = machine
+                .allocate(HeapEntry::PrivateName {
+                    description: EcmaString::encode("private key"),
+                })
+                .unwrap();
+            let symbol_key = PropertyKey::Symbol(
+                u32::try_from(machine.runtime_slot(symbol).unwrap().unwrap()).unwrap(),
+            );
+            let private_key = PropertyKey::Private(
+                u32::try_from(machine.runtime_slot(private).unwrap().unwrap()).unwrap(),
+            );
+            let data = site_object(machine, &[]);
+            let getter = site_object(machine, &[]);
+            let setter = site_object(machine, &[]);
+            let removed = PropertyKey::Named(machine.intern_str("removed"));
+            let mut properties = PropertyMap::default();
+            properties.insert(
+                &mut machine.shapes,
+                removed.clone(),
+                Property::Data {
+                    value: Value::UNDEFINED,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+            properties.insert(
+                &mut machine.shapes,
+                symbol_key.clone(),
+                Property::Data {
+                    value: data,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+            properties.insert(
+                &mut machine.shapes,
+                private_key,
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: Some(setter),
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+            if dictionary {
+                properties.remove(&machine.shapes, &removed);
+            }
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties,
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            machine.test_set_global("propertyRoot", object);
+            machine.collect_garbage();
+            for value in [symbol, private, data, getter, setter] {
+                let index = machine.runtime_slot(value).unwrap().unwrap();
+                assert!(!matches!(machine.heap[index], HeapEntry::Vacant));
+            }
+            assert_eq!(machine.get_property_key(object, &symbol_key).unwrap(), data);
+            machine.assert_heap_ledger();
+        });
+    }
+}
+
+#[test]
+#[ignore = "development-host performance measurement"]
+fn profile_shaped_gc() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    with_machine(Limits::default(), |machine| {
+        let objects = 10_000;
+        let collections = 20;
+        let entries = [
+            ("a", Value::int32(1)),
+            ("b", Value::int32(2)),
+            ("c", Value::int32(3)),
+            ("d", Value::int32(4)),
+            ("e", Value::int32(5)),
+            ("f", Value::int32(6)),
+            ("g", Value::int32(7)),
+            ("h", Value::int32(8)),
+        ];
+        let roots: Vec<_> = (0..objects)
+            .map(|_| site_object(machine, &entries))
+            .collect();
+        machine.push_native_roots(0, &roots);
+        machine.collect_garbage();
+        let live = machine.live_runtime_slots();
+        let started = Instant::now();
+        for _ in 0..collections {
+            black_box(&mut *machine).collect_garbage();
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(machine.live_runtime_slots(), live);
+        for object in roots {
+            assert_eq!(
+                machine.get_named_property(object, "h").unwrap(),
+                Value::int32(8)
+            );
+        }
+        eprintln!(
+            "shaped_gc objects={objects} collections={collections} elapsed_ns={} live_slots={live}",
+            elapsed.as_nanos()
+        );
+        machine.pop_native_roots(0);
+    });
+}
+
+#[test]
 fn interpreter_safe_point_reclaims_overwritten_values() {
     let program = verified(
         vec![Constant::Int32(7)],

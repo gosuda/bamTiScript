@@ -953,7 +953,7 @@ fn trace_property_map(
     marks: &mut [bool],
     work: &mut Vec<usize>,
 ) {
-    for (key, property) in properties.iter(shapes) {
+    properties.for_each_unordered(shapes, |key, property| {
         match key {
             PropertyKey::Named(_) => {}
             PropertyKey::Symbol(index) | PropertyKey::Private(index) => {
@@ -971,7 +971,7 @@ fn trace_property_map(
                 }
             }
         }
-    }
+    });
 }
 
 fn trace_properties_and_prototype(

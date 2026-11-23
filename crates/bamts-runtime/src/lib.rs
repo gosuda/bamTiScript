@@ -1048,6 +1048,24 @@ impl PropertyMap {
             },
         }
     }
+    fn for_each_unordered(
+        &self,
+        shapes: &ShapeTable,
+        mut visit: impl FnMut(&PropertyKey, &Property),
+    ) {
+        match self {
+            PropertyMap::Shaped { shape, slots } => {
+                for (key, slot) in shapes.unordered_entries(*shape) {
+                    visit(key, &slots[slot as usize]);
+                }
+            }
+            PropertyMap::Dictionary { entries, .. } => {
+                for (key, property) in entries.iter().flatten() {
+                    visit(key, property);
+                }
+            }
+        }
+    }
     fn for_each_property_mut(&mut self, mut update: impl FnMut(&mut Property)) {
         match self {
             PropertyMap::Shaped { slots, .. } => {
@@ -15754,6 +15772,14 @@ mod shape_property_tests {
             .map(|(key, property)| (key.clone(), property.clone()))
             .collect();
         assert_eq!(live, oracle.0);
+        let mut unordered = Vec::new();
+        map.for_each_unordered(shapes, |key, property| {
+            unordered.push((key.clone(), property.clone()));
+        });
+        unordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = oracle.0.clone();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(unordered, expected);
     }
 
     fn canned(rng: &mut XorShift64) -> Property {

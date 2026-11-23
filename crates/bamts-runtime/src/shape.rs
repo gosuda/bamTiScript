@@ -94,6 +94,18 @@ impl ShapeTable {
         keys
     }
 
+    pub(crate) fn unordered_entries(
+        &self,
+        id: ShapeId,
+    ) -> impl Iterator<Item = (&PropertyKey, u32)> {
+        let mut current = id;
+        std::iter::from_fn(move || {
+            let shape = &self.0[current.index()];
+            current = shape.parent?;
+            Some((&shape.key, shape.slot))
+        })
+    }
+
     pub(crate) fn live_keys(&self) -> impl Iterator<Item = &PropertyKey> {
         self.0
             .iter()
