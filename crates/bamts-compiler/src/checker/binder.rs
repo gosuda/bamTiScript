@@ -2098,6 +2098,84 @@ impl TypeTable {
         }
     }
 
+    /// Protocol members must be declared properties. Index signatures constrain
+    /// existing keys but do not guarantee that a required member exists.
+    pub(crate) fn read_named_property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
+        self.read_named_property_type_on_path(ty, name, &mut Vec::new())
+    }
+
+    fn read_named_property_type_on_path(
+        &mut self,
+        ty: TypeId,
+        name: &str,
+        path: &mut Vec<TypeId>,
+    ) -> Option<TypeId> {
+        let ty = self.named_structural_view(ty);
+        let ty = match self.get(ty) {
+            Type::Named(symbol) => self
+                .classes
+                .get(symbol)
+                .and_then(|metadata| metadata.template.as_ref())
+                .map_or(ty, |template| template.raw),
+            _ => ty,
+        };
+        if matches!(self.get(ty), Type::ObjectType(_) | Type::Record { .. }) {
+            let (type_id, optional) = {
+                let object = self.current_object_view(ty)?;
+                let property = object.property(name)?;
+                (property.type_id(), property.optional())
+            };
+            return Some(if optional {
+                self.union(&[type_id, self.undefined_type()])
+            } else {
+                type_id
+            });
+        }
+        if path.len() >= MAX_TYPE_DEPTH as usize || path.contains(&ty) {
+            return None;
+        }
+        path.push(ty);
+        let property = match self.get(ty) {
+            Type::Union(members) => {
+                let members = members.clone();
+                let found: Option<Vec<_>> = members
+                    .into_iter()
+                    .map(|member| self.read_named_property_type_on_path(member, name, path))
+                    .collect();
+                found.map(|found| self.union(&found))
+            }
+            Type::Intersection(members) => {
+                let members = members.clone();
+                let mut found = Vec::with_capacity(members.len());
+                for member in members {
+                    if let Some(property) =
+                        self.read_named_property_type_on_path(member, name, path)
+                    {
+                        found.push(property);
+                    }
+                }
+                match found.len() {
+                    0 => None,
+                    1 => Some(found[0]),
+                    _ => Some(self.intersection(found)),
+                }
+            }
+            Type::AppliedClass { .. } => self
+                .prepare_applied_class_view(ty)
+                .and_then(|view| self.read_named_property_type_on_path(view, name, path)),
+            Type::AppliedAlias { .. } => self
+                .prepare_applied_alias_view(ty)
+                .and_then(|view| self.read_named_property_type_on_path(view, name, path)),
+            Type::TypeQuery { .. } => self
+                .type_query_target(ty)
+                .and_then(|target| self.read_named_property_type_on_path(target, name, path)),
+            _ => None,
+        };
+        let previous = path.pop();
+        debug_assert_eq!(previous, Some(ty));
+        property
+    }
+
     pub(crate) fn generator_return_type(&mut self, ty: TypeId) -> Option<TypeId> {
         let ty = self.named_structural_view(ty);
         let ty = match self.get(ty) {
@@ -20800,7 +20878,7 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::ObjectType(_) | Type::Record { .. } => {
-                let next = self.types.read_property_type(iterator, "next")?;
+                let next = self.types.read_named_property_type(iterator, "next")?;
                 let result = self.zero_argument_return_type(next)?;
                 let result = match protocol {
                     ForOfMode::Sync => result,
@@ -20827,28 +20905,11 @@ impl<'src> Binder<'src> {
                 }
                 Some(self.types.union(&yields))
             }
-            Type::ObjectType(_) | Type::Record { .. } => {
-                let value = self.types.property_type(result, "value")?;
-                let object = self.types.current_object_view(result)?;
-                let returns_only = object.properties.iter().any(|property| {
-                    property.name() == "done"
-                        && !property.optional()
-                        && matches!(
-                            self.types.get(property.type_id()),
-                            Type::BooleanLiteral(true)
-                        )
-                });
-                Some(if returns_only {
-                    self.types.never()
-                } else {
-                    value
-                })
-            }
-            Type::Intersection(_) => {
-                let value = self.types.property_type(result, "value")?;
+            Type::ObjectType(_) | Type::Record { .. } | Type::Intersection(_) => {
+                let value = self.types.read_named_property_type(result, "value")?;
                 let returns_only = self
                     .types
-                    .read_property_type(result, "done")
+                    .read_named_property_type(result, "done")
                     .is_some_and(|done| matches!(self.types.get(done), Type::BooleanLiteral(true)));
                 Some(if returns_only {
                     self.types.never()
@@ -33686,6 +33747,61 @@ mod tests {
         ]);
 
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn named_protocol_lookup_bounds_recursive_views_and_preserves_other_members() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let first_symbol = SymbolId::new(1);
+        let second_symbol = SymbolId::new(2);
+        table.declare_alias(first_symbol, Vec::new());
+        table.declare_alias(second_symbol, Vec::new());
+        let first = table.applied_alias(first_symbol, Vec::new());
+        let second = table.applied_alias(second_symbol, Vec::new());
+        let queried = table.type_query("Cyclic".into(), Vec::new(), first);
+        table.set_applied_alias_view(first, second);
+        table.set_applied_alias_view(second, queried);
+        assert_eq!(table.read_named_property_type(first, "value"), None);
+
+        let declared = table.object_type(vec![PropertyType::new("value", true, number)]);
+        let with_declared = table.intersection(vec![first, declared]);
+        let expected = table.union(&[number, table.undefined_type()]);
+        assert_eq!(
+            table.read_named_property_type(with_declared, "value"),
+            Some(expected)
+        );
+        assert_eq!(
+            table.read_named_property_type(with_declared, "missing"),
+            None
+        );
+        let either = table.union(&[first, declared]);
+        assert_eq!(table.read_named_property_type(either, "value"), None);
+
+        table.set_applied_alias_view(second, declared);
+        let left = table.type_query("Left".into(), Vec::new(), first);
+        let right = table.type_query("Right".into(), Vec::new(), first);
+        let shared = table.union(&[left, right]);
+        assert_eq!(
+            table.read_named_property_type(shared, "value"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn named_protocol_lookup_bounds_distinct_deep_views() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let declared = table.object_type(vec![PropertyType::new("value", false, number)]);
+        let mut wrapped = declared;
+        for depth in 0..=super::MAX_TYPE_DEPTH {
+            wrapped = table.type_query(format!("View{depth}").into(), Vec::new(), wrapped);
+        }
+        assert_eq!(table.read_named_property_type(wrapped, "value"), None);
+        assert_eq!(
+            table.read_named_property_type(declared, "value"),
+            Some(number)
+        );
     }
 
     #[test]

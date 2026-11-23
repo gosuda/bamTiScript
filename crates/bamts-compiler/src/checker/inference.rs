@@ -1619,7 +1619,7 @@ impl<'table> InferenceContext<'table> {
             Type::Function(signature) => signature.return_type(),
             _ => return None,
         };
-        let next = self.table.property_type(iterator, "next")?;
+        let next = self.table.read_named_property_type(iterator, "next")?;
         let result = match self.table.get(next) {
             Type::Any | Type::Never | Type::Error => return Some(next),
             Type::Function(signature) => signature.return_type(),
@@ -1639,8 +1639,12 @@ impl<'table> InferenceContext<'table> {
                 Some(self.table.union(&yields))
             }
             Type::ObjectType(_) | Type::Record { .. } => {
-                let value = self.table.property_type(result, "value")?;
                 let object = self.table.current_object_view(result)?;
+                let value = object
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == "value")?
+                    .type_id();
                 let completes = object.properties.iter().any(|property| {
                     property.name() == "done"
                         && !property.optional()
