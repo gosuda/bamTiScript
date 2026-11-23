@@ -400,11 +400,11 @@ impl InferredTypeArguments {
     }
 }
 
-/// A substitution expands each constructor at most once along an active path.
+/// A substitution expands each constructor identity once along an active path.
 /// Recursive static views keep their nominal head, including across functions.
 struct TypeInstantiation<'a> {
     substitution: &'a InferredTypeArguments,
-    active_constructors: HashSet<SymbolId>,
+    active_constructors: HashSet<TypeId>,
 }
 
 impl TypeInstantiation<'_> {
@@ -567,7 +567,8 @@ impl TypeInstantiation<'_> {
                 arguments,
                 structural,
             } => {
-                if !self.active_constructors.insert(symbol) {
+                let identity = table.constructor_identity(ty);
+                if !self.active_constructors.insert(identity) {
                     return ty;
                 }
                 let arguments = arguments
@@ -575,7 +576,7 @@ impl TypeInstantiation<'_> {
                     .map(|&argument| self.instantiate_inner(table, argument))
                     .collect();
                 let structural = self.instantiate_inner(table, structural);
-                let removed = self.active_constructors.remove(&symbol);
+                let removed = self.active_constructors.remove(&identity);
                 debug_assert!(removed);
                 table.constructor_type(symbol, arguments, structural)
             }
@@ -1620,6 +1621,41 @@ mod tests {
 
     fn parameter(id: u32) -> SymbolId {
         SymbolId::new(id)
+    }
+
+    #[test]
+    fn constructor_substitution_distinguishes_acyclic_shapes_of_the_same_symbol() {
+        let mut table = TypeTable::new();
+        let owner = parameter(1);
+        let parameter = parameter(2);
+        let variable = table.named(parameter);
+        let number = table.number();
+        let inner_shape = table.object_type(vec![PropertyType::new("value", false, variable)]);
+        let inner = table.constructor_type(owner, vec![variable], inner_shape);
+        let outer_shape = table.object_type(vec![PropertyType::new("inner", false, inner)]);
+        let outer = table.constructor_type(owner, vec![number], outer_shape);
+        let substitution = InferredTypeArguments::new(vec![InferredTypeArgument::new(
+            parameter,
+            number,
+            InferenceProvenance::Explicit,
+        )]);
+
+        let instantiated = substitution.instantiate(&mut table, outer);
+        let Type::ConstructorType { structural, .. } = table.get(instantiated).clone() else {
+            panic!("outer constructor");
+        };
+        let copied_inner = table.property_type(structural, "inner").expect("inner");
+        let Type::ConstructorType {
+            arguments,
+            structural,
+            ..
+        } = table.get(copied_inner).clone()
+        else {
+            panic!("inner constructor");
+        };
+        assert_eq!(arguments, vec![number]);
+        assert_eq!(table.property_type(structural, "value"), Some(number));
+        assert_eq!(table.property_type(inner_shape, "value"), Some(variable));
     }
 
     #[test]
