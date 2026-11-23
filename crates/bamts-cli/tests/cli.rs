@@ -283,25 +283,49 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
     }
     stdin.flush().expect("API requests are flushed");
     let published = project.path.join("cache").join("run");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()) {
-        assert!(
-            Instant::now() < deadline,
-            "the AOT image was never published"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    let cancel = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "$/cancelRequest",
-        "params": { "id": 2 },
+    let (image_published, output) = thread::scope(|scope| {
+        let stdout = child.stdout.take().expect("API child stdout is piped");
+        let stderr = child.stderr.take().expect("API child stderr is piped");
+        let stdout = scope.spawn(move || read_output(stdout));
+        let stderr = scope.spawn(move || read_output(stderr));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let image_published = loop {
+            let found = fs::read_dir(&published).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("bamts-run-")
+                        && entry.path().is_file()
+                })
+            });
+            if found || Instant::now() >= deadline {
+                break found;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let cancel = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": 2 },
+        });
+        let payload = serde_json::to_vec(&cancel).expect("cancel request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("cancel request is written");
+        drop(stdin);
+        let mut output =
+            wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+        output.stdout = stdout.join().expect("stdout reader");
+        output.stderr = stderr.join().expect("stderr reader");
+        (image_published, output)
     });
-    let payload = serde_json::to_vec(&cancel).expect("cancel request serializes");
-    stdin
-        .write_all(&framed(&payload))
-        .expect("cancel request is written");
-    drop(stdin);
-    let output = wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+    assert!(
+        image_published,
+        "the AOT image was never published\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_success(&output, "bamts --api");
     let responses = decode_frames(&output.stdout);
     assert_eq!(responses.len(), 2, "initialize and execute both respond");
