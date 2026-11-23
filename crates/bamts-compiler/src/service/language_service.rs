@@ -668,9 +668,7 @@ fn is_identifier(text: &str) -> bool {
     let Some(first) = characters.next() else {
         return false;
     };
-    (first == '_' || first == '$' || first.is_alphabetic())
-        && characters
-            .all(|character| character == '_' || character == '$' || character.is_alphanumeric())
+    scanner::is_id_start(first) && characters.all(scanner::is_id_continue)
 }
 
 fn is_rename_identifier(text: &str) -> bool {
@@ -742,6 +740,47 @@ mod tests {
                 .all(|edit| edit.replacement == "result")
         );
         fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn unicode_identifiers_support_completion_navigation_and_rename() {
+        for name in [
+            "e\u{301}",
+            "a\u{200c}",
+            "a\u{200d}",
+            "\u{2118}",
+            "\u{10400}",
+        ] {
+            let source = format!("const {name} = 1;\n{name};");
+            let positions = SourceText::new(source.as_str()).expect("source");
+            let reference_byte = source.rfind(name).expect("reference");
+            let reference = positions.byte_to_utf16(reference_byte).expect("boundary");
+            let end = positions
+                .byte_to_utf16(reference_byte + name.len())
+                .expect("boundary");
+            let (root, mut state) = state(&source);
+
+            let definition = state
+                .definition("a.ts", reference)
+                .expect("definition query")
+                .expect("Unicode identifier definition");
+            assert_eq!(definition.range.start(), Utf16Pos::new(6), "{name:?}");
+            let references = state.references("a.ts", reference).expect("references");
+            assert_eq!(references.len(), 2, "{name:?}");
+            let info = state
+                .quick_info("a.ts", reference)
+                .expect("quick info query")
+                .expect("Unicode identifier quick info");
+            assert_eq!(info.name, name);
+            let completions = state.completions("a.ts", end).expect("completions");
+            assert_eq!(completions.len(), 1, "{name:?}: {completions:?}");
+            assert_eq!(completions[0].name, name);
+            assert_eq!(completions[0].replacement.start(), reference);
+            assert_eq!(completions[0].replacement.end(), end);
+            let rename = state.rename("a.ts", reference, "result").expect("rename");
+            assert_eq!(rename.edit.edits.len(), 2, "{name:?}");
+            fs::remove_dir_all(root).expect("remove root");
+        }
     }
 
     #[test]
