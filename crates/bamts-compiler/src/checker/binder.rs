@@ -2904,7 +2904,11 @@ impl TypeTable {
             structural,
             projection: Some(projection.clone()),
         });
-        assert!(self.constructor_projections.insert(projection, identity).is_none());
+        assert!(
+            self.constructor_projections
+                .insert(projection, identity)
+                .is_none()
+        );
         identity
     }
 
@@ -3177,11 +3181,8 @@ impl TypeTable {
     /// retain their operand so aliases see later namespace augmentation.
     pub fn keyof(&mut self, operand: TypeId) -> TypeId {
         let mut constructors = Vec::new();
-        let reduced = self.try_reduce_keyof(
-            operand,
-            &mut KeyofReduction::default(),
-            &mut constructors,
-        );
+        let reduced =
+            self.try_reduce_keyof(operand, &mut KeyofReduction::default(), &mut constructors);
         if constructors.is_empty() {
             return reduced.unwrap_or_else(|| self.intern(Type::Keyof(operand)));
         }
@@ -3223,11 +3224,8 @@ impl TypeTable {
             };
             let operand = *operand;
             let mut constructors = Vec::new();
-            let reduced = self.try_reduce_keyof(
-                operand,
-                &mut KeyofReduction::default(),
-                &mut constructors,
-            );
+            let reduced =
+                self.try_reduce_keyof(operand, &mut KeyofReduction::default(), &mut constructors);
             self.publish_keyof_view(head, reduced, constructors);
         }
     }
@@ -3386,9 +3384,7 @@ impl TypeTable {
         let mut index_keys = Vec::new();
         match self.collect_record_members(key, value, &mut properties, &mut index_keys, true) {
             RecordKeyState::Concrete => self.intern(Type::ObjectType(Self::record_object(
-                properties,
-                index_keys,
-                value,
+                properties, index_keys, value,
             ))),
             RecordKeyState::Deferred => self.intern(Type::Record { key, value }),
             RecordKeyState::Invalid => self.error_type(),
@@ -3579,11 +3575,13 @@ impl TypeTable {
             Type::String => !numeric,
             Type::Number => numeric,
             Type::StringLiteral(literal) => {
-                !numeric && literal.to_utf8_strict().is_ok_and(|literal| literal == name)
+                !numeric
+                    && literal
+                        .to_utf8_strict()
+                        .is_ok_and(|literal| literal == name)
             }
             Type::NumberLiteral(literal) => {
-                numeric
-                    && number_value(literal).is_some_and(|number| format_number(number) == name)
+                numeric && number_value(literal).is_some_and(|number| format_number(number) == name)
             }
             Type::Union(members) => members
                 .iter()
@@ -30344,7 +30342,7 @@ mod tests {
         DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
         FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
         FunctionParameter, FunctionSignature, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-        MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, ObjectType,
+        ImportedTypeMap, MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, ObjectType,
         PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, PropertyType,
         SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
         SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
@@ -30352,6 +30350,7 @@ mod tests {
     };
     use crate::checker::{
         EVAL_OR_ARGUMENTS_IN_CLASS, EVAL_OR_ARGUMENTS_IN_MODULE, EVAL_OR_ARGUMENTS_IN_STRICT_MODE,
+        InferenceProvenance, InferredTypeArgument, InferredTypeArguments,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -30908,11 +30907,17 @@ mod tests {
         assert_ne!(projected, current);
         let mut cursor = projected;
         for _ in 0..64 {
-            assert_eq!(constructor_member(&mut table, cursor, "value"), Some(number));
+            assert_eq!(
+                constructor_member(&mut table, cursor, "value"),
+                Some(number)
+            );
             cursor = constructor_member(&mut table, cursor, "self").expect("recursive self");
             assert_eq!(table.constructor_identity(cursor), projected);
         }
-        assert_eq!(constructor_member(&mut table, captured, "value"), Some(variable));
+        assert_eq!(
+            constructor_member(&mut table, captured, "value"),
+            Some(variable)
+        );
         assert_eq!(table.types[captured.get() as usize], captured_raw);
         let count = table.types.len();
         for _ in 0..16 {
@@ -30967,7 +30972,10 @@ mod tests {
         ]);
         let augmented = table.constructor_type(owner, Vec::new(), augmented);
         table.publish_constructor_revision(current, augmented);
-        assert_eq!(constructor_member(&mut table, captured, "added"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, captured, "added"),
+            Some(number)
+        );
     }
 
     #[test]
@@ -31001,7 +31009,10 @@ mod tests {
         assert_eq!(constructor_member(&mut table, peer, "value"), Some(number));
         let returned = constructor_member(&mut table, peer, "peer").expect("left peer");
         assert_eq!(table.constructor_identity(returned), projected);
-        assert_eq!(constructor_member(&mut table, returned, "value"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, returned, "value"),
+            Some(number)
+        );
     }
 
     #[test]
@@ -31035,10 +31046,16 @@ mod tests {
         ]);
         let augmented = table.constructor_type(owner, Vec::new(), augmented);
         table.publish_constructor_revision(current, augmented);
-        assert_eq!(constructor_member(&mut table, projected, "added"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, projected, "added"),
+            Some(number)
+        );
         assert!(table.assignable(added, keys));
         let returned = constructor_member(&mut table, projected, "self").expect("self");
-        assert_eq!(constructor_member(&mut table, returned, "added"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, returned, "added"),
+            Some(number)
+        );
         assert_eq!(
             table.constructor_identity(projected),
             substitution.instantiate(&mut table, captured)
@@ -31046,10 +31063,16 @@ mod tests {
         table.publish_constructor_revision(augmented, current);
         assert_eq!(constructor_member(&mut table, projected, "added"), None);
         assert!(!table.assignable(added, keys));
-        assert_eq!(constructor_member(&mut table, projected, "value"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, projected, "value"),
+            Some(number)
+        );
         let returned = constructor_member(&mut table, projected, "self").expect("restored self");
         assert_eq!(constructor_member(&mut table, returned, "added"), None);
-        assert_eq!(constructor_member(&mut table, returned, "value"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, returned, "value"),
+            Some(number)
+        );
     }
 
     #[test]
@@ -31085,7 +31108,10 @@ mod tests {
         let revised_parent = table.constructor_type(parent_owner, vec![child], revised_shape);
         table.publish_constructor_revision(parent, revised_parent);
 
-        assert_eq!(constructor_member(&mut table, projected, "fresh"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, projected, "fresh"),
+            Some(number)
+        );
         let Type::ConstructorType { arguments, .. } = table.get(projected) else {
             panic!("constructor type");
         };
@@ -31099,7 +31125,10 @@ mod tests {
             constructor_member(&mut table, projected_child, "added"),
             Some(number)
         );
-        assert_eq!(constructor_member(&mut table, child, "added"), Some(variable));
+        assert_eq!(
+            constructor_member(&mut table, child, "added"),
+            Some(variable)
+        );
 
         let mut target = TypeTable::new();
         let mut imported = ImportedTypeMap::default();
@@ -31148,7 +31177,10 @@ mod tests {
         ]);
         let fixed = table.constructor_type(owner, Vec::new(), fixed_shape);
         table.publish_constructor_revision(generic, fixed);
-        assert_eq!(constructor_member(&mut table, projected, "value"), Some(string));
+        assert_eq!(
+            constructor_member(&mut table, projected, "value"),
+            Some(string)
+        );
         assert_eq!(substitution.instantiate(&mut table, captured), captured);
         assert_ne!(
             table.constructor_identity(projected),
@@ -31157,13 +31189,8 @@ mod tests {
         let mut imported_table = TypeTable::new();
         let mut imported = ImportedTypeMap::default();
         let mut next_symbol = 100;
-        let (imported_projection, _) = imported_table.import_type(
-            &table,
-            projected,
-            &[],
-            &mut imported,
-            &mut next_symbol,
-        );
+        let (imported_projection, _) =
+            imported_table.import_type(&table, projected, &[], &mut imported, &mut next_symbol);
         let imported_fixed = imported.types[&fixed];
         let imported_generic = imported.types[&generic];
         imported_table.publish_constructor_revision(imported_fixed, imported_generic);
@@ -31176,10 +31203,19 @@ mod tests {
         assert_eq!(imported_base, Some(imported.types[&variable]));
 
         table.publish_constructor_revision(fixed, generic);
-        assert_eq!(constructor_member(&mut table, captured, "value"), Some(variable));
-        assert_eq!(constructor_member(&mut table, projected, "value"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, captured, "value"),
+            Some(variable)
+        );
+        assert_eq!(
+            constructor_member(&mut table, projected, "value"),
+            Some(number)
+        );
         let returned = constructor_member(&mut table, projected, "self").expect("self");
-        assert_eq!(constructor_member(&mut table, returned, "value"), Some(number));
+        assert_eq!(
+            constructor_member(&mut table, returned, "value"),
+            Some(number)
+        );
         assert_eq!(
             table.constructor_identity(returned),
             table.constructor_identity(projected)
@@ -31217,23 +31253,17 @@ mod tests {
         let mut target = TypeTable::new();
         let mut imported = ImportedTypeMap::default();
         let mut next_symbol = 100;
-        let (root, _) = target.import_type(
-            &source,
-            root,
-            &[],
-            &mut imported,
-            &mut next_symbol,
-        );
+        let (root, _) = target.import_type(&source, root, &[], &mut imported, &mut next_symbol);
         let base = target.property_type(root, "base").expect("base");
         let imported_parameter = imported.symbols[&parameter];
-        for (name, expected) in [
-            ("number", target.number()),
-            ("string", target.string()),
-        ] {
+        for (name, expected) in [("number", target.number()), ("string", target.string())] {
             let specialized = target.property_type(root, name).expect("specialization");
             let mut cursor = specialized;
             for _ in 0..16 {
-                assert_eq!(constructor_member(&mut target, cursor, "value"), Some(expected));
+                assert_eq!(
+                    constructor_member(&mut target, cursor, "value"),
+                    Some(expected)
+                );
                 cursor = constructor_member(&mut target, cursor, "self").expect("self");
                 assert_eq!(
                     target.constructor_identity(cursor),
@@ -31275,13 +31305,8 @@ mod tests {
         let mut target = TypeTable::new();
         let mut imported = ImportedTypeMap::default();
         let mut next_symbol = 100;
-        let (mut constructor, _) = target.import_type(
-            model.types(),
-            result,
-            &[],
-            &mut imported,
-            &mut next_symbol,
-        );
+        let (mut constructor, _) =
+            target.import_type(model.types(), result, &[], &mut imported, &mut next_symbol);
         for _ in 0..16 {
             let read = constructor_member(&mut target, constructor, "read").expect("read");
             let Type::Function(read) = target.get(read) else {
@@ -35030,12 +35055,7 @@ namespace undefined { export var x = 42; }",
             index_signatures: vec![super::IndexSignature {
                 readonly: false,
                 enum_reverse: false,
-                parameters: vec![FunctionParameter::new(
-                    "key".to_owned(),
-                    keys,
-                    false,
-                    false,
-                )],
+                parameters: vec![FunctionParameter::new("key".to_owned(), keys, false, false)],
                 value_type: number,
                 declaring_types: Vec::new(),
             }],
