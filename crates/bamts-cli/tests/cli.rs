@@ -196,8 +196,25 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
     }
     stdin.flush().expect("API requests are flushed");
     let published = project.path.join("cache").join("run");
+    let image_prefix = format!("bamts-run-{}-", child.id());
+    let image_published = || -> std::io::Result<bool> {
+        let mut entries = match fs::read_dir(&published) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        entries.try_fold(false, |found, entry| {
+            let entry = entry?;
+            let is_image = entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(image_prefix.as_str())
+                    && name.ends_with(std::env::consts::EXE_SUFFIX)
+            });
+            let is_file = is_image && entry.file_type()?.is_file();
+            Ok(found || is_file)
+        })
+    };
     let deadline = Instant::now() + Duration::from_secs(120);
-    while fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()) {
+    while !image_published().expect("AOT publication directory is readable") {
         assert!(
             Instant::now() < deadline,
             "the AOT image was never published"
@@ -222,8 +239,14 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
         .as_str()
         .expect("a cancelled AOT request is an API error");
     assert_eq!(message, "request was cancelled");
+    let mut remaining =
+        fs::read_dir(&published).expect("AOT publication directory remains readable");
     assert!(
-        fs::read_dir(&published).map_or(true, |mut entries| entries.next().is_none()),
+        remaining
+            .next()
+            .transpose()
+            .expect("AOT publication directory entry is readable")
+            .is_none(),
         "the cancelled AOT image is removed"
     );
 }
