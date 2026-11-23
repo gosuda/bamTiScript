@@ -9,7 +9,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
-use std::process::Output;
 use std::sync::atomic::Ordering;
 
 pub(super) fn check(
@@ -396,7 +395,7 @@ impl Linker {
         command
     }
 
-    pub(super) fn diagnostics(&self, output: &Output) -> String {
+    pub(super) fn diagnostics(&self, output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 }
