@@ -7,8 +7,10 @@ Run with Python 3.11+ through uv:
 Instrumentation uses a disposable local clone of the baseline: only benchmark
 examples, their manifest stanza, and three ignored tests are replaced. Both
 caller checkouts remain unchanged. Baseline production source must not change.
-Both builds finish before measurement. Raw subprocess output and an incomplete
-report survive failure; only a fully validated run receives status "complete".
+Each revision has an isolated target directory and must produce fresh, distinct
+benchmark executables. Both builds finish before measurement. Raw subprocess
+output and an incomplete report survive failure; only a fully validated run
+receives status "complete".
 """
 
 from __future__ import annotations
@@ -278,6 +280,8 @@ def artifact(
         if target.get("name") == name and profile.get("test") is is_test:
             if not isinstance(executable, str):
                 continue
+            if message.get("fresh") is not False:
+                raise ComparisonError("Cargo reused a cached benchmark executable")
             manifest_path = message.get("manifest_path")
             if (
                 not isinstance(manifest_path, str)
@@ -289,7 +293,7 @@ def artifact(
             path = Path(executable).resolve(strict=True)
             if not path.is_relative_to(target_root.resolve()) or not path.is_file():
                 raise ComparisonError(
-                    "Cargo executable is outside the shared target directory"
+                    "Cargo executable is outside its variant target directory"
                 )
             paths.add(path)
     if len(paths) != 1:
@@ -324,6 +328,14 @@ def build(
         ),
         ("bamts_runtime", "test", "bamts-runtime", ("--lib", "--no-run"), True),
     )
+    target_root = work / "target" / side
+    build_environment = {
+        **environment,
+        "CARGO_TARGET_DIR": str(target_root),
+        "CARGO_BUILD_BUILD_DIR": str(target_root),
+        "RUSTC_WRAPPER": "",
+        "RUSTC_WORKSPACE_WRAPPER": "",
+    }
     binaries: list[Binary] = []
     for name, operation, package, arguments, is_test in targets:
         prefix = output / "build" / f"{side}-{name}"
@@ -341,12 +353,12 @@ def build(
             "--message-format=json",
         )
         print(f"Building {side} {name}", flush=True)
-        logged(command, root, environment, prefix, deadline, 1200)
+        logged(command, root, build_environment, prefix, deadline, 1200)
         executable = artifact(
             prefix.with_suffix(".stdout.log"),
             name,
             is_test,
-            work / "target",
+            target_root,
             root / "crates" / package / "Cargo.toml",
         )
         destination = work / "bin" / side / name
@@ -701,7 +713,6 @@ def main() -> None:
             prefix="bamts-optimization-", dir=output.parent
         ) as temporary:
             work = Path(temporary)
-            environment["CARGO_TARGET_DIR"] = str(work / "target")
             disposable_baseline = work / "baseline"
             logged(
                 (
@@ -778,6 +789,14 @@ def main() -> None:
             available = {
                 (binary.side, binary.name): binary for binary in report.binaries
             }
+            for name in ("compiler_perf", "run_perf", "bamts_runtime"):
+                if (
+                    available[("baseline", name)].sha256
+                    == available[("candidate", name)].sha256
+                ):
+                    raise ComparisonError(
+                        f"identical {name} binaries cannot establish a code-change effect"
+                    )
             for case in cases(fixtures):
                 expected: dict[str, int | str] | None = None
                 roles: tuple[Role, ...] = (
@@ -833,6 +852,9 @@ def main() -> None:
             host={**report.host, "load_after": os.getloadavg()},
         )
         save(report, output)
+        print("BEGIN_OPTIMIZATION_REPORT", flush=True)
+        print(json.dumps(asdict(report), indent=2), flush=True)
+        print("END_OPTIMIZATION_REPORT", flush=True)
     except (ComparisonError, OSError, ValueError, subprocess.SubprocessError) as error:
         save(replace(report, status="failed", error=str(error)), output)
         raise
