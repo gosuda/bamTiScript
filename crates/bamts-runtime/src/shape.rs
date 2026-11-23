@@ -1,5 +1,6 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use bamts_bytecode::Instruction;
 
@@ -126,7 +127,7 @@ impl ShapeTable {
         table
     }
 }
-/// Which cache table a site index addresses.
+/// The property operation that owns a cache site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Which {
     Get,
@@ -135,12 +136,14 @@ pub(crate) enum Which {
 /// One inline cache site for named property get or set.
 #[derive(Clone, Debug)]
 pub(crate) struct PropertySite {
+    which: Which,
     entries: [(ShapeId, PropertyKey, u32); 4],
     pub(crate) len: u8,
 }
 impl PropertySite {
-    const fn new() -> Self {
+    const fn new(which: Which) -> Self {
         Self {
+            which,
             entries: [
                 (ShapeId::ROOT, PropertyKey::Private(u32::MAX), 0),
                 (ShapeId::ROOT, PropertyKey::Private(u32::MAX), 0),
@@ -172,31 +175,36 @@ impl PropertySite {
 /// Per-function inline cache sites: one entry per get or set instruction.
 #[derive(Debug, Default)]
 pub(crate) struct FunctionSites {
-    pub(crate) gets: Vec<PropertySite>,
-    pub(crate) sets: Vec<PropertySite>,
+    by_pc: Box<[Option<NonZeroU32>]>,
+    pub(crate) sites: Box<[PropertySite]>,
 }
 impl FunctionSites {
     pub(crate) fn build(code: &[Instruction]) -> Self {
-        Self {
-            gets: (0..code.len())
-                .map(|pc| match code[pc] {
-                    Instruction::GetProperty { .. } => PropertySite::new(),
-                    _ => PropertySite {
-                        len: u8::MAX,
-                        ..PropertySite::new()
-                    },
-                })
-                .collect(),
-            sets: (0..code.len())
-                .map(|pc| match code[pc] {
-                    Instruction::SetProperty { .. } => PropertySite::new(),
-                    _ => PropertySite {
-                        len: u8::MAX,
-                        ..PropertySite::new()
-                    },
-                })
-                .collect(),
+        let mut by_pc = vec![None; code.len()];
+        let mut sites = Vec::new();
+        for (pc, instruction) in code.iter().enumerate() {
+            let which = match instruction {
+                Instruction::GetProperty { .. } => Which::Get,
+                Instruction::SetProperty { .. } => Which::Set,
+                _ => continue,
+            };
+            let index = NonZeroU32::new(
+                u32::try_from(sites.len() + 1).expect("property site count fits u32"),
+            )
+            .expect("one-based site index is nonzero");
+            by_pc[pc] = Some(index);
+            sites.push(PropertySite::new(which));
         }
+        Self {
+            by_pc: by_pc.into_boxed_slice(),
+            sites: sites.into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn site_index(&self, pc: usize, which: Which) -> Option<usize> {
+        let index = self.by_pc.get(pc).copied().flatten()?.get() as usize - 1;
+        let site = &self.sites[index];
+        (site.which == which && site.usable()).then_some(index)
     }
 }
 #[cfg(test)]
@@ -211,5 +219,38 @@ mod tests {
         assert_eq!(shapes.slot_count(child), 1);
         let grandchild = shapes.transition(child, &PropertyKey::Private(1));
         assert_eq!(shapes.slot_count(grandchild), 2);
+    }
+
+    #[test]
+    fn compact_sites_preserve_instruction_pcs_and_kinds() {
+        let register = bamts_bytecode::Register::new(0);
+        let code = [
+            Instruction::Halt,
+            Instruction::GetProperty {
+                dst: register,
+                object: register,
+                key: register,
+            },
+            Instruction::Halt,
+            Instruction::SetProperty {
+                object: register,
+                key: register,
+                value: register,
+            },
+            Instruction::Halt,
+        ];
+        let mut sites = FunctionSites::build(&code);
+        assert_eq!(sites.sites.len(), 2);
+        assert_eq!(sites.site_index(0, Which::Get), None);
+        assert_eq!(sites.site_index(1, Which::Get), Some(0));
+        assert_eq!(sites.site_index(1, Which::Set), None);
+        assert_eq!(sites.site_index(2, Which::Set), None);
+        assert_eq!(sites.site_index(3, Which::Set), Some(1));
+        assert_eq!(sites.site_index(3, Which::Get), None);
+        assert_eq!(sites.site_index(4, Which::Get), None);
+        assert_eq!(sites.site_index(5, Which::Get), None);
+        sites.sites[0].len = u8::MAX;
+        assert_eq!(sites.site_index(1, Which::Get), None);
+        assert_eq!(sites.site_index(3, Which::Set), Some(1));
     }
 }
