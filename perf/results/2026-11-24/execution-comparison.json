@@ -1,0 +1,772 @@
+{
+  "schema": "bamts.optimization-comparison/v1",
+  "scope": "Same-host execution-only development comparison; not BH1 or product-completion evidence. Process wall time uses Linux pidfd readiness.",
+  "status": "complete",
+  "revisions": {
+    "baseline": "37f76d4f68e5b9b1797f61c44d1893a7705f8389",
+    "candidate": "cef40437c4d698755af60b47b577f26971fd3432"
+  },
+  "host": {
+    "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "cpu_count": 4,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "load_before": [
+      0.62646484375,
+      0.2734375,
+      0.10546875
+    ],
+    "load_after": [
+      1.1513671875,
+      0.98291015625,
+      0.55029296875
+    ]
+  },
+  "build_environment": {
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_RELEASE_OPT_LEVEL": "3",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+    "CARGO_PROFILE_RELEASE_DEBUG": "0",
+    "CARGO_PROFILE_RELEASE_LTO": "false"
+  },
+  "rounds": 6,
+  "instrumentation": {
+    "crates/bamts-compiler/examples/compiler_perf.rs": "43f813c5c85fc51816e137c4c79b00635c22cb85c0dc1c7d05b52f987cef7d05",
+    "crates/bamts-runtime/src/tests.rs": "c35abf037c9101115e0728b10a80e0a114a2d8d20f746f16dbb0e14e6c5fae73",
+    "crates/bamts/Cargo.toml": "d910b3c6b390d728870919ffc136efada605dfcd339d069e00ec77fd4380a483",
+    "crates/bamts/examples/run_perf.rs": "0204575a3690ce96a4a9661051d675a458b1f82f0e8e665fd132b97f9cec856c"
+  },
+  "fixture_sha256": {
+    "allocation_churn.stdout": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+    "allocation_churn.ts": "23805f74dc2ff2f5fa22720b5cd269b5d9c765ff99e66b92b89cc2de40cdc47f",
+    "graph/main.ts": "c8a4240a64af39a63a72774218a0dd1d9af5344c3c9850fe4857cbf8d94ca042",
+    "graph/module0.ts": "9a8f59dabe673091500a89dc678d6f8ca239ab74d79e14f8a5324791299d7f5e",
+    "graph/module1.ts": "37146ac92f8595e46de0af202bce94540fe796af23c47429db9af2197b46810c",
+    "graph/module10.ts": "4157e07d793033949da96527cad15d324f5ed9c25b96f7909aa58ad7cd9a6d56",
+    "graph/module11.ts": "572a4a2f0cbd583dd16d1d4083c171e95a5751c4d30dab5ed639ce13840d3f22",
+    "graph/module12.ts": "3a23403b392b2bf2bb2cc86ffb9f92dcfded51b7e3e7909e2d279ce19c80acc6",
+    "graph/module13.ts": "12ef230645d541719a4dda4e15cd3192376031e72a49d40244d420716b883e46",
+    "graph/module14.ts": "c5af9aea1313cc537855ed594818be19fec060538a1b7a05cdb82774490bd460",
+    "graph/module15.ts": "ba3fd18b3a246ba7f58b91f2f69c5a4a06a8643280c0856196c7aa6a31f20027",
+    "graph/module16.ts": "b167488c384a0e2023daf2b7151f32be102bb7f2778b742e3a98d6db87855318",
+    "graph/module17.ts": "ee7c566c3489fe5fe1c4242a2a71045cf7d19596ed44597bb1cb6d34d03df862",
+    "graph/module18.ts": "71910429ef6da9728a94a1546facf08d3f159a7daa3c73afa9a77fb965b8cf27",
+    "graph/module19.ts": "b3045352496ef605cf693d4346bcdb937e2cb4275958cd50e3637f8c406670f2",
+    "graph/module2.ts": "c8856e213af142bc347cac0c05738cbfc21689263ca65dbc57e42ffca6dc867d",
+    "graph/module20.ts": "05a27acd66c25c1b6803ea11394b467a1b7ba2f2ac32b80589b2f9d4186ccab4",
+    "graph/module21.ts": "0078dbeabaaafcf10d4d7cc049af997e608a2c9cdc74762955505331b9358d22",
+    "graph/module22.ts": "90a160cc4ad556b7455ede40576222b2b7e068a3563865d09d342f9e9eeeb034",
+    "graph/module23.ts": "6a5936915ba1d9105233979474b4cee5c4ab4313647ea56de165b0c1d32e6eb7",
+    "graph/module24.ts": "42f6cdfcc41e0416258ecbd05ad808290f00b5f827798e1cf6effa264e8664b3",
+    "graph/module25.ts": "5a11f2306cdb03de9698293a4e9d2f7648e40bc16eb8b87b851e5ed33f626cf3",
+    "graph/module26.ts": "dc30e3a28d01564227279d032212020813a99d4103728ee4f274d888dcee5335",
+    "graph/module27.ts": "e5d9a82a15d05adc874365f5c2cbfad9b77a0783b0ca1e22e930260a015b41df",
+    "graph/module28.ts": "271005f242963758d76ccc469785989e5f0e3678dce827479255a4679620b9cd",
+    "graph/module29.ts": "f2cfe68432cbb9ab14a207dfc999fca22fdcaca6b1d5c39697f3cbed27a1308c",
+    "graph/module3.ts": "e2259724f0cd7b20017756a5de9d9582587c9ed4da39215f6a4f64c5f73170c4",
+    "graph/module30.ts": "ba0bdfc68285ef20e77b20044504b13208623825e053b3cb55ed1e858613ea57",
+    "graph/module31.ts": "0a676e9781e482cf6cda5acc459e71332e96ee5ff058fb2bff5be66659333ee3",
+    "graph/module4.ts": "016a501bb4550c3f5d027c192a05cfae559da91c04069a3c0b1d8694f6ff4fac",
+    "graph/module5.ts": "445cc2a4aafbfe028573fbd3ea1df26af5d5684d79d19d23f264d559db027ea3",
+    "graph/module6.ts": "9d4fa33dee363bd35f504afc3c8194b01059f27c81a1a867c99bc324833680d1",
+    "graph/module7.ts": "af6566725d27ed9eb3a487b982a7c2c0e665897a5a4c4cc20b2d8723713be3b9",
+    "graph/module8.ts": "81442651c2df8596a1d611e93c59806627f5c792909b7f6e2e321c9336460f6e",
+    "graph/module9.ts": "72791659f55625ff4f9ec2d0601300a62d62d5432b4c9ddbdb34d5563afed16b",
+    "property_loop.stdout": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+    "property_loop.ts": "dfcf33bb29f84debb6d93a1788dbcbd12d249003f5d21cfd325fd6c1b3ec2070",
+    "wide_properties.ts": "6d219f0ad692597ffcaa16586ccb199755634bec30262e13a90c1a24ca1da3a1"
+  },
+  "binaries": [
+    {
+      "side": "baseline",
+      "name": "run_perf",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-biv_6_nb/bin/baseline/run_perf",
+      "sha256": "cd26cc119cbfac32c4cd449ac1916ddff183794a62e12e8cfe4b8c21ef5cf21a"
+    },
+    {
+      "side": "candidate",
+      "name": "run_perf",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-biv_6_nb/bin/candidate/run_perf",
+      "sha256": "1cb3cd7e06967717877cd5e18a1dbdb3ee177c31fe6d223358f71108abec065a"
+    }
+  ],
+  "samples": [
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 276434295
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-warmup-00-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 262687186
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-warmup-00-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2941535,
+          "scan_ns": 7967,
+          "parse_ns": 21603,
+          "check_ns": 2239925,
+          "frontend_ns": 2484499,
+          "run_ns": 266804668,
+          "process_wall_ns": 271569874
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "bfcb3704a16a69bf2b49970890bebd5527145ae5a26d1e6229900f0e2c97b2a5",
+      "log_prefix": "samples/execution_properties-diagnostic-00-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2718158,
+          "scan_ns": 6981,
+          "parse_ns": 10111,
+          "check_ns": 2256003,
+          "frontend_ns": 2284907,
+          "run_ns": 254501112,
+          "process_wall_ns": 258851540
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e4e0230c8e64d264a4edb2770b57efa24145130b6d5b6bf527469226c7a52ffb",
+      "log_prefix": "samples/execution_properties-diagnostic-00-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 277876980
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-01-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 254254775
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-01-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 258154609
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-02-1-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 267586353
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-02-2-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 282512562
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-03-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 259365346
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-03-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 263396158
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-04-1-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 284405214
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-04-2-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 280771943
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-05-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 261958164
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-05-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 261267700
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-06-1-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 280018614
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-06-2-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 335931583
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-warmup-00-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 331686416
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-warmup-00-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 3078687,
+          "scan_ns": 9180,
+          "parse_ns": 14939,
+          "check_ns": 2394901,
+          "frontend_ns": 2638464,
+          "run_ns": 333422989,
+          "process_wall_ns": 339086042
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "3161bbc5288baf277dc6441fe3aab0c777a6c99f3a3dfc7f83b5179a2c4e62de",
+      "log_prefix": "samples/execution_allocations-diagnostic-00-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2851259,
+          "scan_ns": 8666,
+          "parse_ns": 13172,
+          "check_ns": 2331650,
+          "frontend_ns": 2364695,
+          "run_ns": 324642718,
+          "process_wall_ns": 329963433
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e8669f64b4eac66fe5b0ebe3c14c286364cffdf05a70f83b4b7b3d2949366817",
+      "log_prefix": "samples/execution_allocations-diagnostic-00-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 339831997
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-01-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 333363366
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-01-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 332243459
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-02-1-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 333716537
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-02-2-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 340076334
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-03-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 336537445
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-03-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 337096914
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-04-1-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 338190413
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-04-2-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 340676814
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-05-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 330761045
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-05-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 336000947
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-06-1-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 336305100
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-06-2-baseline"
+    }
+  ],
+  "summaries": [
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 339011205.0,
+      "minimum_ns": 333716537,
+      "maximum_ns": 340676814
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 334682156.5,
+      "minimum_ns": 330761045,
+      "maximum_ns": 337096914
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 280395278.5,
+      "minimum_ns": 267586353,
+      "maximum_ns": 284405214
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 260316523.0,
+      "minimum_ns": 254254775,
+      "maximum_ns": 263396158
+    }
+  ],
+  "error": null
+}
