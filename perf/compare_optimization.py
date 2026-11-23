@@ -286,6 +286,7 @@ def logged(
         raise ComparisonError(f"command exited {returncode}; see {prefix}.stderr.log")
     return elapsed
 
+
 def artifact(
     stdout: Path, name: str, is_test: bool, target_root: Path, manifest: Path
 ) -> Path:
