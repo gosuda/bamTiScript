@@ -72,6 +72,53 @@ jobs:
           facets::tests::forged_unpinned_js_outcomes_are_not_a_public_proof_path
       - name: Test npm interfaces
         run: node --test --test-skip-pattern='staged cli-|clean consumer' npm/test/*.test.mjs
+      - name: Test Linux native addon lifecycle
+        timeout-minutes: 15
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { execFileSync } from "node:child_process";
+          import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+          import { join, resolve } from "node:path";
+          import { createNativeBuildPlan, NATIVE_RELEASE_TARGETS } from "./npm/scripts/native-build-plan.mjs";
+          import { packageNativeTarget } from "./npm/scripts/package-native-platform.mjs";
+
+          const hashFile = async (path) =>
+            createHash("sha256").update(await readFile(path)).digest("hex");
+          const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+          const { version } = JSON.parse(await readFile("npm/bamti/package.json", "utf8"));
+          const toolchainSource = await readFile("rust-toolchain.toml", "utf8");
+          const toolchain = /channel\s*=\s*"([^"]+)"/.exec(toolchainSource)?.[1];
+          if (toolchain === undefined) throw new Error("rust-toolchain.toml has no pinned channel");
+          const cargoLockSha256 = await hashFile("Cargo.lock");
+          const workflowRevision = await hashFile(".github/workflows/ci-depot.yml");
+          const builderRevision = await hashFile("npm/scripts/package-native-platform.mjs");
+          const { canonicalPlan, buildSetId } = createNativeBuildPlan({
+            sourceCommit, sourceVersion: version, cargoLockSha256,
+            workflowRevision, toolchain, builderRevision, targets: NATIVE_RELEASE_TARGETS,
+          });
+          const smokeRoot = resolve("target/native-smoke");
+          await rm(smokeRoot, { recursive: true, force: true });
+          await mkdir(smokeRoot, { recursive: true });
+          await writeFile(join(smokeRoot, "native-build-plan.json"), canonicalPlan);
+          const { record, tarballPath } = await packageNativeTarget("x86_64-unknown-linux-gnu", {
+            outputDirectory: join(smokeRoot, "dist"),
+            sourceCommit, buildSetId, cargoLockSha256,
+            workflowRevision, toolchain, builderRevision,
+          });
+          const stage = join(smokeRoot, "stage");
+          await mkdir(stage);
+          execFileSync("tar", ["-xzf", tarballPath, "-C", stage], { stdio: "inherit" });
+          execFileSync(process.execPath, ["--test", "npm/test/bamti-native-addon-lifecycle.test.mjs"], {
+            stdio: "inherit",
+            env: {
+              ...process.env,
+              BAMTI_NATIVE_ADDON_PATH: join(stage, "package", record.entry),
+              BAMTI_EXPECTED_SOURCE_COMMIT: sourceCommit,
+              BAMTI_EXPECTED_BUILD_SET_ID: buildSetId,
+            },
+          });
+          NODE
 
   formal:
     runs-on: depot-ubuntu-24.04-4
