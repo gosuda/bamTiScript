@@ -5,12 +5,18 @@ on:
     paths:
       - .github/workflows/optimization-performance.yml
       - perf/compare_optimization.py
+      - perf/test_compare_optimization.py
   workflow_dispatch:
     inputs:
       baseline_ref:
         description: Baseline branch, tag, or commit in this repository
         required: true
-        default: main
+        default: "37f76d4f68e5b9b1797f61c44d1893a7705f8389"
+        type: string
+      candidate_ref:
+        description: Optimized source revision to measure
+        required: true
+        default: "cef40437c4d698755af60b47b577f26971fd3432"
         type: string
 
 permissions:
@@ -34,24 +40,31 @@ jobs:
       UV_NO_PROGRESS: "1"
       NO_COLOR: "1"
     steps:
-      - name: Checkout candidate
+      - name: Checkout measurement tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Checkout measured candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && 'cef40437c4d698755af60b47b577f26971fd3432' || inputs.candidate_ref }}
           path: candidate
           persist-credentials: false
 
       - name: Checkout baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.baseline_ref }}
+          ref: ${{ github.event_name == 'pull_request' && '37f76d4f68e5b9b1797f61c44d1893a7705f8389' || inputs.baseline_ref }}
           path: baseline
           persist-credentials: false
 
-      - name: Assert candidate source
+      - name: Assert measurement tooling source
         env:
           EXPECTED_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: test "$(git -C candidate rev-parse HEAD)" = "$EXPECTED_HEAD"
+        run: test "$(git -C tooling rev-parse HEAD)" = "$EXPECTED_HEAD"
 
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal
@@ -62,11 +75,34 @@ jobs:
           "$RUNNER_TEMP/optimization-python/bin/pip" install --disable-pip-version-check --no-input uv==0.13.9
           echo "$RUNNER_TEMP/optimization-python/bin" >> "$GITHUB_PATH"
 
+      - name: Validate comparison tooling and process cleanup
+        timeout-minutes: 3
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          validation_arguments=(
+            --no-project --no-python-downloads
+            --python "$RUNNER_TEMP/optimization-python/bin/python"
+            --with pytest==9.0.2 --with ruff==0.14.3 --with ty==0.0.52
+          )
+          validation_files=(
+            tooling/perf/compare_optimization.py
+            tooling/perf/test_compare_optimization.py
+          )
+          uv run "${validation_arguments[@]}" ruff check --no-cache "${validation_files[@]}"
+          uv run "${validation_arguments[@]}" ruff format --no-cache --diff "${validation_files[@]}"
+          uv run "${validation_arguments[@]}" ty check \
+            --extra-search-path tooling/perf "${validation_files[@]}"
+          uv run "${validation_arguments[@]}" python -m pytest \
+            -q -p no:cacheprovider --import-mode=prepend \
+            --basetemp "$RUNNER_TEMP/optimization-pytest" \
+            tooling/perf/test_compare_optimization.py
+
       - name: Build and measure both revisions
         run: |
           uv run --no-project --no-python-downloads \
             --python "$RUNNER_TEMP/optimization-python/bin/python" \
-            candidate/perf/compare_optimization.py \
+            tooling/perf/compare_optimization.py \
             --baseline "$GITHUB_WORKSPACE/baseline" \
             --candidate "$GITHUB_WORKSPACE/candidate" \
             --output "$GITHUB_WORKSPACE/optimization-results" \
