@@ -3,8 +3,12 @@
 use std::{fs, sync::Arc};
 
 use bamts_compiler::{
-    checker::{PropertyType, SemanticModel, SymbolId, TypeId, TypeTable, check},
+    checker::{
+        ProgramCheckInput, ProgramCheckOptions, PropertyType, SemanticModel, SymbolId, TypeId,
+        TypeTable, check, check_program_with_options,
+    },
     diagnostic::DiagnosticSeverity,
+    lint::{LintProfile, LintTable},
     parser,
     pipeline::{FrontendMode, compile_program_frontend},
     program::ProgramLoader,
@@ -33,6 +37,35 @@ fn checker_output(source: &str) -> (Vec<&'static str>, SemanticModel) {
 
 fn checker_errors(source: &str) -> Vec<&'static str> {
     checker_output(source).0
+}
+
+fn strict_checker_output(source: &str) -> (Vec<&'static str>, SemanticModel) {
+    let source_id = SourceId::new(0);
+    let files = [parser::parse(scanner::scan(
+        source_id,
+        ScriptKind::TypeScript,
+        Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
+    ))];
+    let checked = check_program_with_options(
+        ProgramCheckInput {
+            files: &files,
+            edges: &[],
+        },
+        &LintTable::new(LintProfile::Default),
+        ProgramCheckOptions::standard().with_strict_null_checks(true),
+    );
+    let errors = files[0]
+        .diagnostics()
+        .iter()
+        .chain(checked.diagnostics())
+        .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
+        .map(|diagnostic| diagnostic.code().as_str())
+        .collect();
+    let model = checked
+        .into_product()
+        .remove_file(source_id)
+        .expect("checked file");
+    (errors, model)
 }
 
 fn binding_type(model: &SemanticModel, name: &str) -> TypeId {
@@ -222,6 +255,251 @@ declare function invalid<K extends "x" | "absent" | never>(value: Row[K]): void;
         checker_errors(source),
         ["BAMTS-C004", "BAMTS-C004", "BAMTS-C064"]
     );
+}
+
+#[test]
+fn numeric_tuple_keys_keep_the_pinned_broad_index_behavior() {
+    let source = r#"
+type Pair = [number, string];
+function broad<K extends number>(): Pair[K] { return 1; }
+function read<K extends number>(value: Pair[K]): number | string { return value; }
+type Overlap = [number | string, number | boolean];
+function overlap<K extends number>(): Overlap[K] { return "accepted"; }
+function literal<K extends 0 | 1>(): Pair[K] { return 1; }
+type Empty = [];
+function empty<K extends number>(): Empty[K] { return 1; }
+const first = broad<0>();
+const second = broad<1>();
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"; 2]);
+    assert_eq!(binding_type(&model, "first"), model.types().number());
+    assert_eq!(binding_type(&model, "second"), model.types().string());
+}
+
+#[test]
+fn generic_indexed_sources_match_their_identity_inside_target_unions() {
+    let source = r#"
+type Row = { x: number; y: string };
+function optional<K extends "x" | "y">(value: Row[K]): Row[K] | undefined { return value; }
+function widen<K extends "x" | "y">(value: Row[K]): number | string | undefined { return value; }
+declare function accept<K extends "x" | "y">(key: K, value?: Row[K]): void;
+function forward<K extends "x" | "y">(key: K, value: Row[K]) { accept<K>(key, value); }
+function independent<K extends "x" | "y", P extends "x" | "y">(value: Row[K]): Row[P] | undefined {
+    return value;
+}
+function incomplete<K extends "x" | "y">(value: Row[K]): number | undefined { return value; }
+const optionalX = optional<"x">(1);
+const optionalY = optional<"y">("accepted");
+declare const expectedX: number | undefined;
+declare const expectedY: string | undefined;
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"; 2]);
+    assert_eq!(
+        binding_type(&model, "optionalX"),
+        binding_type(&model, "expectedX")
+    );
+    assert_eq!(
+        binding_type(&model, "optionalY"),
+        binding_type(&model, "expectedY")
+    );
+}
+
+#[test]
+fn renamed_generic_indexed_signatures_keep_their_parameter_correlations() {
+    let source = r#"
+type Row = { x: number; y: string };
+declare const original: <K extends "x" | "y">(key: K) => Row[K];
+const renamed: <P extends "x" | "y">(key: P) => Row[P] = original;
+const first = renamed("x");
+const second = renamed<"y">("y");
+declare const independent: <K extends "x" | "y", P extends "x" | "y">(key: K, other: P) => Row[P];
+const paired: <A extends "x" | "y", B extends "x" | "y">(key: A, other: B) => Row[B] = independent;
+const wrongKey: <A extends "x" | "y", B extends "x" | "y">(key: A, other: B) => Row[A] = independent;
+type Reversed = { x: string; y: number };
+const wrongObject: <P extends "x" | "y">(key: P) => Reversed[P] = original;
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"; 2]);
+    assert_eq!(binding_type(&model, "first"), model.types().number());
+    assert_eq!(binding_type(&model, "second"), model.types().string());
+}
+
+#[test]
+fn generic_indexed_targets_check_union_source_members_independently() {
+    let source = r#"
+type Row = { x: number | string; y: number | string };
+type Payload = number | string;
+function direct<K extends "x" | "y">(value: number | string): Row[K] { return value; }
+function alias<K extends "x" | "y">(value: Payload): Row[K] { return value; }
+function generic<V extends Payload, K extends "x" | "y">(value: V): Row[K] { return value; }
+function rejected<K extends "x" | "y">(value: number | boolean): Row[K] { return value; }
+type Overlap = { x: number | string; y: string | boolean };
+function common<K extends "x" | "y">(value: string): Overlap[K] { return value; }
+function incomplete<K extends "x" | "y">(value: Payload): Overlap[K] { return value; }
+function compare<K extends "x" | "y">(comparableSource: number | boolean, comparableTarget: Row[K]) {}
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"; 2]);
+    let source = binding_type(&model, "comparableSource");
+    let target = binding_type(&model, "comparableTarget");
+    assert!(!model.types().assignable_with_strict_null(source, target));
+    assert!(model.types().comparable(source, target));
+    assert!(!model.types().comparable(model.types().boolean(), target));
+}
+
+#[test]
+fn generic_tuple_lengths_keep_exact_finite_and_variadic_bounds() {
+    let source = r#"
+type Pair = [number, string];
+function read<K extends "length">(value: Pair[K]): 2 { return value; }
+function readNumber<K extends "length">(value: Pair[K]): number { return value; }
+function write<K extends "length">(): Pair[K] { return 2; }
+function wrongRead<K extends "length">(value: Pair[K]): 3 { return value; }
+function wrongWrite<K extends "length">(): Pair[K] { return 3; }
+type Optional = [number, string?];
+function readOptional<K extends "length">(value: Optional[K]): 1 | 2 { return value; }
+function writeOptional<K extends "length">(value: 1 | 2): Optional[K] { return value; }
+function wrongOptional<K extends "length">(): Optional[K] { return 3; }
+type Variadic = [number, ...string[]];
+function readVariadic<K extends "length">(value: Variadic[K]): number { return value; }
+function writeVariadic<K extends "length">(value: number): Variadic[K] { return value; }
+declare function invalid<K extends "length" | "absent">(value: Pair[K]): void;
+declare function select<K extends "length">(key: K): Pair[K];
+declare function selectOptional<K extends "length">(key: K): Optional[K];
+declare function selectVariadic<K extends "length">(key: K): Variadic[K];
+const fixedLength = select("length");
+const optionalLength = selectOptional("length");
+const variadicLength = selectVariadic("length");
+declare const expectedFixed: 2;
+declare const expectedOptional: 1 | 2;
+"#;
+    let (errors, model) = checker_output(source);
+    assert_eq!(
+        errors,
+        ["BAMTS-C004", "BAMTS-C004", "BAMTS-C004", "BAMTS-C064"]
+    );
+    assert_eq!(
+        binding_type(&model, "fixedLength"),
+        binding_type(&model, "expectedFixed")
+    );
+    assert_eq!(
+        binding_type(&model, "optionalLength"),
+        binding_type(&model, "expectedOptional")
+    );
+    assert_eq!(
+        binding_type(&model, "variadicLength"),
+        model.types().number()
+    );
+}
+
+#[test]
+fn intersection_key_bounds_keep_string_map_read_and_write_evidence() {
+    let source = r#"
+type Key<T> = keyof T & string;
+function read<T, K extends Key<T>>(values: { [key: string]: number }, key: K): number {
+    return values[key];
+}
+function write<T, K extends Key<T>>(values: { [key: string]: number }, key: K, value: number) {
+    values[key] = value;
+    values[key] = "wrong";
+}
+type Entry<T> = { to: Key<T> };
+function save<T extends Record<string, unknown>, K extends Key<T>>(name: K, value: Key<T> | Entry<T>) {
+    const output: Record<string, Entry<T>> = {};
+    if (typeof value === "string") {
+        output[name] = { to: value };
+    } else {
+        output[name] = value;
+    }
+}
+"#;
+    assert_eq!(checker_errors(source), ["BAMTS-C004"]);
+}
+
+#[test]
+fn indexed_read_iteration_keeps_nullable_and_noniterable_members_rejected() {
+    let source = r#"
+type Row = { x: number[]; y: string[] };
+function iterate<K extends "x" | "y">(value: Row[K]) {
+    for (const item of value) {
+        const accepted: number | string = item;
+        const rejected: boolean = item;
+    }
+}
+type Nullable = { x: number[] | undefined; y: string[] | undefined };
+function nullable<K extends "x" | "y">(value: Nullable[K]) {
+    for (const item of value) {}
+}
+type Mixed = { x: number[]; y: number };
+function mixed<K extends "x" | "y">(value: Mixed[K]) {
+    for (const item of value) {}
+}
+"#;
+    assert_eq!(
+        strict_checker_output(source).0,
+        ["BAMTS-C004", "BAMTS-C065", "BAMTS-C065"]
+    );
+}
+
+#[test]
+fn indexed_nullable_fallbacks_keep_correlation_and_iterable_read_evidence() {
+    let source = r#"
+type Row = { x: number[] | undefined; y: string[] | undefined };
+function preserve<K extends "x" | "y">(value: Row[K]): Row[K] {
+    const disjunction = value || [];
+    const coalesced = value ?? [];
+    const same: Row[K] = disjunction;
+    for (const item of disjunction) { const accepted: number | string = item; }
+    for (const item of coalesced) { const accepted: number | string = item; }
+    return coalesced;
+}
+function nestedUnion<K extends "x" | "y">(value: Row[K] | null) {
+    const fallback = value || [];
+    for (const item of fallback) { const accepted: number | string = item; }
+}
+function independent<K extends "x" | "y", P extends "x" | "y">(value: Row[K]): Row[P] {
+    return value ?? [];
+}
+const selectedX = preserve<"x">([1]);
+const selectedY = preserve<"y">(["accepted"]);
+declare const expectedX: number[] | undefined;
+declare const expectedY: string[] | undefined;
+const wrongX: string[] | undefined = selectedX;
+const wrongY: number[] | undefined = selectedY;
+"#;
+    let (errors, model) = strict_checker_output(source);
+    assert_eq!(errors, ["BAMTS-C004"; 3]);
+    assert_eq!(
+        binding_type(&model, "selectedX"),
+        binding_type(&model, "expectedX")
+    );
+    assert_eq!(
+        binding_type(&model, "selectedY"),
+        binding_type(&model, "expectedY")
+    );
+}
+
+#[test]
+fn narrowed_indexed_arrays_keep_prototype_members_and_argument_checks() {
+    let source = r#"
+type Key<T> = keyof T & string;
+function append<T, K extends Key<T>>(values: { [key: string]: number[] | undefined }, key: K) {
+    const length = values[key]!.push(1);
+    const accepted: number = length;
+    (values[key] || []).push(1);
+    (values[key] ?? []).push(1);
+    values[key]!.push("wrong");
+    values[key]!.absent();
+}
+declare const enriched: number[] & { label: string };
+const label: string = enriched.label;
+enriched.push(1);
+"#;
+    let (errors, model) = strict_checker_output(source);
+    assert_eq!(errors, ["BAMTS-C053", "BAMTS-C057"]);
+    assert_eq!(binding_type(&model, "length"), model.types().number());
 }
 
 #[test]
