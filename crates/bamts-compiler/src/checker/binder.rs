@@ -450,13 +450,30 @@ struct HoistedDeclarationIdentity {
     kind: SymbolKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PropertyNameKind {
+    String,
+    Number,
+    StringAndNumber,
+}
+
+impl PropertyNameKind {
+    fn union(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::StringAndNumber
+        }
+    }
+}
+
 /// One member of an interned object type.
 #[derive(Clone, Debug)]
 pub struct PropertyType {
     name: Box<str>,
-    /// Whether the declaration used a numeric property name. The cooked
-    /// spelling alone cannot distinguish `1` from `"1"`.
-    numeric_name: bool,
+    /// Numeric and string keys can share a cooked name, as in
+    /// `Record<1 | "1", V>`, while contributing both kinds to `keyof`.
+    name_kind: PropertyNameKind,
     optional: bool,
     readonly: bool,
     getter_only: bool,
@@ -493,7 +510,7 @@ impl PropertyType {
     pub fn new(name: impl Into<Box<str>>, optional: bool, type_id: TypeId) -> Self {
         Self {
             name: name.into(),
-            numeric_name: false,
+            name_kind: PropertyNameKind::String,
             optional,
             readonly: false,
             getter_only: false,
@@ -510,13 +527,28 @@ impl PropertyType {
 
     #[must_use]
     pub(crate) fn with_numeric_name(mut self, numeric_name: bool) -> Self {
-        self.numeric_name = numeric_name;
+        self.name_kind = if numeric_name {
+            PropertyNameKind::Number
+        } else {
+            PropertyNameKind::String
+        };
         self
     }
 
     #[must_use]
     pub(crate) const fn numeric_name(&self) -> bool {
-        self.numeric_name
+        matches!(
+            self.name_kind,
+            PropertyNameKind::Number | PropertyNameKind::StringAndNumber
+        )
+    }
+
+    #[must_use]
+    const fn string_name(&self) -> bool {
+        matches!(
+            self.name_kind,
+            PropertyNameKind::String | PropertyNameKind::StringAndNumber
+        )
     }
 
     #[must_use]
@@ -661,7 +693,7 @@ impl PropertyType {
 impl PartialEq for PropertyType {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
-            && self.numeric_name == other.numeric_name
+            && self.name_kind == other.name_kind
             && self.optional == other.optional
             && self.readonly == other.readonly
             && self.getter_only == other.getter_only
@@ -681,7 +713,7 @@ impl Eq for PropertyType {}
 impl std::hash::Hash for PropertyType {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
-        self.numeric_name.hash(state);
+        self.name_kind.hash(state);
         self.optional.hash(state);
         self.readonly.hash(state);
         self.getter_only.hash(state);
@@ -3092,12 +3124,12 @@ impl TypeTable {
                         continue;
                     }
                     let name = property.name.as_ref();
-                    let key = if property.numeric_name() {
-                        self.number_literal(name)
-                    } else {
-                        self.string_literal(name)
-                    };
-                    keys.push(key);
+                    if property.string_name() {
+                        keys.push(self.string_literal(name));
+                    }
+                    if property.numeric_name() {
+                        keys.push(self.number_literal(name));
+                    }
                 }
                 for signature in &object.index_signatures {
                     if !signature.enum_reverse
@@ -4305,16 +4337,14 @@ impl TypeTable {
                             async_iterator_property: None,
                         }))
                     };
-                    property =
-                        PropertyType::new(first.name().to_owned(), first.optional(), type_id)
-                            .with_numeric_name(first.numeric_name())
-                            .with_readonly(first.readonly())
-                            .with_getter_only(first.getter_only())
-                            .with_accessibility(first.access(), first.declaring_class())
-                            .with_declaring_types(declaring_types)
-                            .with_method(true)
-                            .with_spreadable(first.spreadable());
+                    property = first
+                        .with_type_id(type_id)
+                        .with_declaring_types(declaring_types)
+                        .with_method(true);
                 }
+            }
+            for member in &group[1..] {
+                property.name_kind = property.name_kind.union(member.name_kind);
             }
             merged.push(property);
             i = j;
@@ -4774,19 +4804,16 @@ impl TypeTable {
                                     remap_symbol(target, source, symbol, imported, next_symbol)
                                 })
                                 .collect();
-                            PropertyType::new(
-                                property.name.clone(),
-                                property.optional,
-                                copy(target, source, property.type_id, imported, next_symbol),
-                            )
-                            .with_numeric_name(property.numeric_name)
-                            .with_readonly(property.readonly)
-                            .with_getter_only(property.getter_only)
-                            .with_accessibility(property.access(), declaring_class)
-                            .with_declaring_types(declaring_types)
-                            .with_method(property.is_method)
-                            .with_accessor(property.accessor)
-                            .with_spreadable(property.spreadable)
+                            property
+                                .with_type_id(copy(
+                                    target,
+                                    source,
+                                    property.type_id,
+                                    imported,
+                                    next_symbol,
+                                ))
+                                .with_accessibility(property.access(), declaring_class)
+                                .with_declaring_types(declaring_types)
                         })
                         .collect();
                     let call_signatures: Vec<FunctionSignature> = object
@@ -21526,9 +21553,14 @@ impl<'src> Binder<'src> {
         {
             property.type_id = self.types.union(&[property.type_id(), source_type]);
         } else {
+            let numeric_name = matches!(
+                &member.property,
+                MemberProperty::Computed(expression)
+                    if matches!(expression.data(), Expression::Literal(Literal::Number(_)))
+            );
             object
                 .properties
-                .push(PropertyType::new(name, false, source_type));
+                .push(PropertyType::new(name, false, source_type).with_numeric_name(numeric_name));
         }
         self.symbol_types[symbol.get() as usize] = self.types.object_type_with_members(object);
     }
@@ -25149,13 +25181,13 @@ impl<'src> Binder<'src> {
                                 if Self::is_spread_excluded(source_property) {
                                     continue;
                                 }
-                                let fresh = PropertyType::new(
+                                let mut fresh = PropertyType::new(
                                     source_property.name.as_ref(),
                                     source_property.optional(),
                                     source_property.type_id(),
                                 )
-                                .with_numeric_name(source_property.numeric_name())
                                 .with_spreadable(source_property.spreadable());
+                                fresh.name_kind = source_property.name_kind;
                                 upsert_property(&mut properties, fresh);
                             }
                             index_signatures.extend(object.index_signatures);
@@ -34350,5 +34382,65 @@ namespace undefined { export var x = 42; }",
         assert!(target.assignable(numeric, keys));
         assert!(!target.assignable(rewritten, keys));
         assert!(!target.assignable(target.number(), keys));
+    }
+
+    #[test]
+    fn imported_record_keys_keep_both_kinds_for_one_cooked_name() {
+        for number_first in [false, true] {
+            let mut source_table = TypeTable::new();
+            let quoted = source_table.string_literal("1");
+            let numeric = source_table.number_literal("1");
+            let keys = if number_first {
+                source_table.union(&[numeric, quoted])
+            } else {
+                source_table.union(&[quoted, numeric])
+            };
+            let record = source_table.record(keys, source_table.boolean());
+            let mut target = TypeTable::new();
+            let mut next_symbol = 1_000;
+            let (imported, _) = target.import_type(
+                &source_table,
+                record,
+                &[],
+                &mut super::ImportedTypeMap::default(),
+                &mut next_symbol,
+            );
+            let keys = target.keyof(imported);
+            let quoted = target.string_literal("1");
+            let numeric = target.number_literal("1");
+            let other = target.number_literal("2");
+            assert!(target.assignable(quoted, keys));
+            assert!(target.assignable(numeric, keys));
+            assert!(!target.assignable(other, keys));
+        }
+    }
+
+    #[test]
+    fn imported_javascript_assignment_keys_keep_numeric_syntax() {
+        for (source, quoted_name, numeric) in [
+            ("export const cfg = {}; cfg[1] = true;", "1", true),
+            ("export const cfg = {}; cfg[\"1\"] = true;", "1", false),
+            ("export const cfg = {}; cfg[\"01\"] = true;", "01", false),
+        ] {
+            let (model, diagnostics) = bound_js(source);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let cfg = value_symbol(&model, "cfg");
+            let mut target = TypeTable::new();
+            let mut next_symbol = 1_000;
+            let (imported, _) = target.import_type(
+                model.types(),
+                model.symbol_type(cfg),
+                &[],
+                &mut super::ImportedTypeMap::default(),
+                &mut next_symbol,
+            );
+            let keys = target.keyof(imported);
+            let quoted = target.string_literal(quoted_name);
+            let number = target.number_literal("1");
+            let absent = target.string_literal("missing");
+            assert_eq!(target.assignable(number, keys), numeric, "{source}");
+            assert_eq!(target.assignable(quoted, keys), !numeric, "{source}");
+            assert!(!target.assignable(absent, keys), "{source}");
+        }
     }
 }
