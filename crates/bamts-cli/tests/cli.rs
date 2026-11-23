@@ -1535,6 +1535,49 @@ fn build_mode_rejects_unimplemented_options() {
 }
 
 #[test]
+fn build_and_clean_reject_malformed_reference_compiler_options() {
+    for inherited in [false, true] {
+        let project = ScratchDirectory::new();
+        project.write(
+            "tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./lib"}]}"#,
+        );
+        project.write("lib/main.ts", "export const value = 1;\n");
+        project.write("lib/main.js", "existing output\n");
+        if inherited {
+            project.write("lib/base.json", r#"{"compilerOptions":[]}"#);
+            project.write(
+                "lib/tsconfig.json",
+                r#"{"extends":"./base.json","files":["main.ts"],"compilerOptions":{}}"#,
+            );
+        } else {
+            project.write(
+                "lib/tsconfig.json",
+                r#"{"files":["main.ts"],"compilerOptions":[]}"#,
+            );
+        }
+        for flags in [&[][..], &["--clean"][..]] {
+            let output = project
+                .command()
+                .args(["--build", "tsconfig.json"])
+                .args(flags)
+                .current_dir(&project.path)
+                .output()
+                .expect("malformed reference validation starts");
+            let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(!output.status.success(), "{diagnostic}");
+            assert!(diagnostic.contains("compilerOptions"), "{diagnostic}");
+            assert_eq!(
+                fs::read_to_string(project.path.join("lib/main.js")).unwrap(),
+                "existing output\n",
+                "invalid reference configurations must not modify outputs"
+            );
+            assert!(!project.path.join("lib/main.d.ts").exists());
+        }
+    }
+}
+
+#[test]
 fn build_mode_consumes_build_controls_and_reports_verbose_status() {
     let project = ScratchDirectory::new();
     project.write("src/main.ts", "export const answer = 42;\n");
