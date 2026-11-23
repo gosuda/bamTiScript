@@ -149,6 +149,10 @@ jobs:
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.fixtures.outcome == 'success' && steps.npm.outcome == 'success' && steps.quint.outcome == 'success' }}
         run: cargo test --workspace --locked --no-fail-fast
 
+      - name: Test npm interfaces
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.npm.outcome == 'success' }}
+        run: node --test --test-skip-pattern='staged cli-|clean consumer' npm/test/*.test.mjs
+
   preflight:
     name: Preflight
     runs-on: ubuntu-24.04

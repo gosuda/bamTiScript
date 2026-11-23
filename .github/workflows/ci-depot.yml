@@ -64,6 +64,8 @@ jobs:
         run: cargo run --locked -p bamts-verification -- source fetch typescript-primary-tests --dest target/authority/typescript-7.0.2-tests
       - name: Test workspace (includes the corpus differential)
         run: cargo test --workspace --locked --no-fail-fast
+      - name: Test npm interfaces
+        run: node --test --test-skip-pattern='staged cli-|clean consumer' npm/test/*.test.mjs
 
   formal:
     runs-on: depot-ubuntu-24.04-4
