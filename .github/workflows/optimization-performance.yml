@@ -18,6 +18,11 @@ on:
         required: true
         default: "cef40437c4d698755af60b47b577f26971fd3432"
         type: string
+      execution_only:
+        description: Limit manual runs to the two compile-and-execute workloads
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -32,7 +37,7 @@ defaults:
 
 jobs:
   compare:
-    name: Compare compiler and runtime workloads
+    name: Compare optimization workloads
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -99,14 +104,20 @@ jobs:
             tooling/perf/test_compare_optimization.py
 
       - name: Build and measure both revisions
+        env:
+          EXECUTION_ONLY: ${{ github.event_name == 'pull_request' || inputs.execution_only }}
         run: |
+          comparison_arguments=()
+          if [[ "$EXECUTION_ONLY" == "true" ]]; then
+            comparison_arguments+=(--execution-only)
+          fi
           uv run --no-project --no-python-downloads \
             --python "$RUNNER_TEMP/optimization-python/bin/python" \
             tooling/perf/compare_optimization.py \
             --baseline "$GITHUB_WORKSPACE/baseline" \
             --candidate "$GITHUB_WORKSPACE/candidate" \
             --output "$GITHUB_WORKSPACE/optimization-results" \
-            --rounds 6
+            --rounds 6 "${comparison_arguments[@]}"
 
       - name: Upload comparison and diagnostic logs
         if: always()
