@@ -3135,7 +3135,11 @@ impl TypeTable {
                     if !signature.enum_reverse
                         && let Some(parameter) = signature.parameters.first()
                     {
-                        keys.push(self.keyof_domain(parameter.type_id(), visiting, constructors)?);
+                        keys.push(self.keyof_domain(
+                            parameter.type_id(),
+                            visiting,
+                            constructors,
+                        )?);
                     }
                 }
                 Some(self.union_or_single(keys))
