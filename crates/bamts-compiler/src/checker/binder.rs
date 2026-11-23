@@ -14111,6 +14111,9 @@ impl<'src> Binder<'src> {
         let Some(existing) = self.class_constructor_types.insert(owner, current) else {
             return;
         };
+        if existing == current {
+            return;
+        }
         self.types.publish_constructor_revision(existing, current);
         self.symbol_types
             .iter_mut()
