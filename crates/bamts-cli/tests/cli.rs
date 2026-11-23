@@ -1967,6 +1967,73 @@ fn tsc_direct_native_output_can_stay_outside_the_source_root() {
     );
 }
 
+#[test]
+fn tsc_native_root_dir_does_not_change_the_source_boundary() {
+    let project = ScratchDirectory::new();
+    project.write("src/bamts.toml", "");
+    project.write("src/main.ts", include_str!("fixtures/hello.ts"));
+
+    let checked = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "src/main.ts",
+            "--rootDir",
+            ".",
+            "--noEmit",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("nested native check starts");
+    assert_success(&checked, "rootDir may include the discovered source root");
+
+    let compiled = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "src/main.ts",
+            "--rootDir",
+            ".",
+            "--outDir",
+            "out",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("nested native compilation starts");
+    assert_success(&compiled, "native emission ignores artifact layout rootDir");
+    let executable = project
+        .path
+        .join("out")
+        .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+    let executed = Command::new(executable)
+        .output()
+        .expect("nested native executable starts");
+    assert_success(&executed, "nested native executable runs");
+    assert_eq!(executed.stdout, b"hello from bamts\n");
+
+    project.write("outside.ts", "export const value = 42;\n");
+    project.write(
+        "src/main.ts",
+        "import { value } from '../outside';\nconsole.log(value);\n",
+    );
+    let escaped = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "src/main.ts",
+            "--rootDir",
+            ".",
+            "--noEmit",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("confined native check starts");
+    assert!(
+        !escaped.status.success(),
+        "rootDir must not widen source access"
+    );
+}
+
 const REMOVED_BASE_URL_DIAGNOSTIC: &str = concat!(
     "error TS5102: Option 'baseUrl' has been removed. ",
     "Please remove it from your configuration.\n",

@@ -227,7 +227,7 @@ pub(super) fn native_frontend_project(
     let resolve = |path: Option<PathBuf>| path.map(|path| context.resolve_path(path));
     let overrides = ProjectOptionOverrides {
         out_dir: None,
-        root_dir: resolve(overrides.root_dir),
+        root_dir: None,
         out_file: resolve(overrides.out_file),
         ts_build_info_file: resolve(overrides.ts_build_info_file),
         declaration_dir: resolve(overrides.declaration_dir),
