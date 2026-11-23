@@ -25,6 +25,7 @@ fn main() {
         expected_certificate.instruction_count(),
         instructions as usize
     );
+    let mut fact_digest = 0xcbf29ce484222325u64;
     for pc in 0..instructions {
         assert_eq!(
             expected_certificate.initialized_before(Pc::new(pc), Register::new(0)),
@@ -34,6 +35,12 @@ fn main() {
             expected_certificate.initialized_before(Pc::new(pc), Register::new(registers - 1)),
             Some(false)
         );
+        for register in 0..registers {
+            let initialized = expected_certificate
+                .initialized_before(Pc::new(pc), Register::new(register))
+                .expect("queried certificate coordinate is in bounds");
+            fact_digest = (fact_digest ^ u64::from(initialized)).wrapping_mul(0x100000001b3);
+        }
     }
 
     let mut elapsed = Duration::ZERO;
@@ -55,7 +62,7 @@ fn main() {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
     println!(
-        "case={} instructions={instructions} registers={registers} iterations={iterations} failures=0 total_ns={} ns_per_verify={} wire_digest={digest:016x}",
+        "case={} instructions={instructions} registers={registers} iterations={iterations} failures=0 total_ns={} ns_per_verify={} wire_digest={digest:016x} fact_digest={fact_digest:016x}",
         args[1],
         elapsed.as_nanos(),
         elapsed.as_nanos() / u128::from(iterations),
