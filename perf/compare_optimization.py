@@ -1,4 +1,4 @@
-"""Build and compare two clean checkouts on one Linux host; not BH1 evidence.
+"""Build and compare two clean checkouts on one Linux 5.3+ host; not BH1 evidence.
 
 Run with Python 3.11+ through uv:
   uv run --no-project python perf/compare_optimization.py \
@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
+import select
 import shutil
 import signal
 import statistics
@@ -227,8 +229,14 @@ def logged(
     deadline: float,
     maximum_seconds: float,
 ) -> int:
-    remaining = min(maximum_seconds, deadline - time.monotonic())
-    if remaining <= 0:
+    """Capture a child group and reap it before returning or propagating failure.
+
+    Requires Linux pidfds, normal SIGCHLD handling, and exclusive child reaping.
+    """
+    now = time.monotonic()
+    expires_at = min(deadline, now + maximum_seconds)
+    timeout = expires_at - now
+    if timeout <= 0:
         raise ComparisonError("comparison exceeded its overall time budget")
     prefix.parent.mkdir(parents=True, exist_ok=True)
     prefix.with_suffix(".command.json").write_text(
@@ -250,16 +258,29 @@ def logged(
         ) as process,
     ):
         try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
+            pidfd = os.pidfd_open(process.pid)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                # The process can exit between the timeout and the signal.
-                if process.poll() is None:
+                poller = select.poll()
+                poller.register(pidfd, select.POLLIN)
+                remaining = expires_at - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                events = poller.poll(math.ceil(remaining * 1000))
+                if not events:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if not (events[0][1] & select.POLLIN):
+                    raise ComparisonError("unexpected process-exit notification")
+                returncode = process.wait()
+            finally:
+                os.close(pidfd)
+        finally:
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
                     process.kill()
-            process.wait()
-            raise
+                finally:
+                    process.wait()
     elapsed = time.perf_counter_ns() - started
     if returncode != 0:
         raise ComparisonError(f"command exited {returncode}; see {prefix}.stderr.log")
@@ -310,6 +331,7 @@ def build(
     output: Path,
     environment: dict[str, str],
     deadline: float,
+    required_binaries: frozenset[str],
 ) -> tuple[Binary, ...]:
     targets = (
         (
@@ -338,6 +360,8 @@ def build(
     }
     binaries: list[Binary] = []
     for name, operation, package, arguments, is_test in targets:
+        if name not in required_binaries:
+            continue
         prefix = output / "build" / f"{side}-{name}"
         command = (
             "cargo",
@@ -651,13 +675,21 @@ def main() -> None:
     parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--rounds", type=int, default=6)
+    parser.add_argument(
+        "--execution-only",
+        action="store_true",
+        help="build and measure only the two compile-and-execute workloads",
+    )
     args = parser.parse_args()
     if sys.platform != "linux":
-        parser.error("this runner requires Linux process groups and CPU affinity APIs")
+        parser.error(
+            "this runner requires Linux 5.3+ process descriptors and CPU affinity APIs"
+        )
     baseline: Path = args.baseline.resolve(strict=True)
     candidate: Path = args.candidate.resolve(strict=True)
     output: Path = args.output.resolve()
     rounds: int = args.rounds
+    execution_only: bool = args.execution_only
     if rounds < 6 or rounds % 2 != 0:
         parser.error("--rounds must be even and at least six")
     if baseline == candidate or any(
@@ -681,7 +713,15 @@ def main() -> None:
     environment.update({"NO_COLOR": "1", "RUST_BACKTRACE": "1", "TZ": "UTC"})
     report = Report(
         "bamts.optimization-comparison/v1",
-        "Same-host development comparison; not BH1 or product-completion evidence.",
+        (
+            "Same-host execution-only development comparison; not BH1 or "
+            "product-completion evidence. Process wall time uses Linux pidfd readiness."
+            if execution_only
+            else (
+                "Same-host development comparison; not BH1 or product-completion "
+                "evidence. Process wall time uses Linux pidfd readiness."
+            )
+        ),
         "incomplete",
         {},
         {
@@ -713,6 +753,13 @@ def main() -> None:
             prefix="bamts-optimization-", dir=output.parent
         ) as temporary:
             work = Path(temporary)
+            fixtures = work / "fixtures"
+            selected_cases = tuple(
+                case
+                for case in cases(fixtures)
+                if not execution_only or case.kind == "execution"
+            )
+            required_binaries = frozenset(case.binary for case in selected_cases)
             disposable_baseline = work / "baseline"
             logged(
                 (
@@ -760,11 +807,18 @@ def main() -> None:
                     report,
                     binaries=(
                         *report.binaries,
-                        *build(root, side, work, output, environment, deadline),
+                        *build(
+                            root,
+                            side,
+                            work,
+                            output,
+                            environment,
+                            deadline,
+                            required_binaries,
+                        ),
                     ),
                 )
                 save(report, output)
-            fixtures = work / "fixtures"
             logged(
                 (
                     sys.executable,
@@ -789,15 +843,26 @@ def main() -> None:
             available = {
                 (binary.side, binary.name): binary for binary in report.binaries
             }
-            for name in ("compiler_perf", "run_perf", "bamts_runtime"):
+            expected_binaries = {
+                (side, name)
+                for side in ("baseline", "candidate")
+                for name in required_binaries
+            }
+            if set(available) != expected_binaries or len(report.binaries) != len(
+                expected_binaries
+            ):
+                raise ComparisonError(
+                    "built executables do not match selected workloads"
+                )
+            for name in sorted(required_binaries):
                 if (
                     available[("baseline", name)].sha256
                     == available[("candidate", name)].sha256
                 ):
                     raise ComparisonError(
-                        f"identical {name} binaries cannot establish a code-change effect"
+                        f"identical {name} binaries cannot measure a code change"
                     )
-            for case in cases(fixtures):
+            for case in selected_cases:
                 expected: dict[str, int | str] | None = None
                 roles: tuple[Role, ...] = (
                     ("warmup", "diagnostic")
@@ -842,6 +907,16 @@ def main() -> None:
                     f"Validated {case.name}: {rounds} counterbalanced rounds",
                     flush=True,
                 )
+        expected_counts: dict[Role, int] = {
+            "measurement": 2 * rounds * len(selected_cases),
+            "warmup": 2 * len(selected_cases),
+            "diagnostic": 2 * sum(case.kind == "execution" for case in selected_cases),
+        }
+        if any(
+            sum(sample.role == role for sample in report.samples) != count
+            for role, count in expected_counts.items()
+        ):
+            raise ComparisonError("incomplete selected workloads")
         summaries = summarize(report.samples)
         if not summaries or any(summary.count != rounds for summary in summaries):
             raise ComparisonError("incomplete measurement groups")
