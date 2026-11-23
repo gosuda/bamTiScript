@@ -372,16 +372,47 @@ impl InferredTypeArguments {
     /// their original [`TypeId`].
     pub fn instantiate(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         let marker = table.substituted_alias_marker();
-        let instantiated = self.instantiate_inner(table, ty);
+        let instantiated = TypeInstantiation {
+            substitution: self,
+            active_constructors: HashSet::new(),
+        }
+        .instantiate_inner(table, ty);
         table.prepare_substituted_aliases(marker);
         instantiated
     }
 
-    fn instantiate_inner(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
+    /// Substitutes the inferred arguments through a generic signature and
+    /// interns the result: the *contextual signature* a lambda argument is
+    /// checked against once the call's type arguments are known.
+    pub fn instantiate_signature(
+        &self,
+        table: &mut TypeTable,
+        signature: &FunctionSignature,
+    ) -> TypeId {
+        let marker = table.substituted_alias_marker();
+        let instantiated = TypeInstantiation {
+            substitution: self,
+            active_constructors: HashSet::new(),
+        }
+        .instantiate_function(table, &[], signature);
+        table.prepare_substituted_aliases(marker);
+        instantiated
+    }
+}
+
+/// A substitution expands each constructor at most once along an active path.
+/// Recursive static views keep their nominal head, including across functions.
+struct TypeInstantiation<'a> {
+    substitution: &'a InferredTypeArguments,
+    active_constructors: HashSet<SymbolId>,
+}
+
+impl TypeInstantiation<'_> {
+    fn instantiate_inner(&mut self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         match table.get(ty).clone() {
-            Type::Named(symbol) => self.get(symbol).unwrap_or(ty),
+            Type::Named(symbol) => self.substitution.get(symbol).unwrap_or(ty),
             Type::This { owner, constraint } => {
-                if let Some((expected, receiver)) = self.this_receiver
+                if let Some((expected, receiver)) = self.substitution.this_receiver
                     && expected == owner
                 {
                     receiver
@@ -434,17 +465,7 @@ impl InferredTypeArguments {
                     .properties
                     .iter()
                     .map(|property| {
-                        PropertyType::new(
-                            property.name(),
-                            property.optional(),
-                            self.instantiate_inner(table, property.type_id()),
-                        )
-                        .with_readonly(property.readonly())
-                        .with_getter_only(property.getter_only())
-                        .with_accessibility(property.access(), property.declaring_class())
-                        .with_declaring_types(property.declaring_types().to_vec())
-                        .with_method(property.is_method())
-                        .with_spreadable(property.spreadable())
+                        property.with_type_id(self.instantiate_inner(table, property.type_id()))
                     })
                     .collect();
                 let call_signatures: Vec<FunctionSignature> = object
@@ -489,11 +510,8 @@ impl InferredTypeArguments {
                             .parameters
                             .iter()
                             .map(|parameter| {
-                                FunctionParameter::new(
-                                    parameter.name().to_owned(),
+                                parameter.with_type_id(
                                     self.instantiate_inner(table, parameter.type_id()),
-                                    parameter.optional(),
-                                    parameter.rest(),
                                 )
                             })
                             .collect(),
@@ -548,11 +566,16 @@ impl InferredTypeArguments {
                 arguments,
                 structural,
             } => {
+                if !self.active_constructors.insert(symbol) {
+                    return ty;
+                }
                 let arguments = arguments
                     .iter()
                     .map(|&argument| self.instantiate_inner(table, argument))
                     .collect();
                 let structural = self.instantiate_inner(table, structural);
+                let removed = self.active_constructors.remove(&symbol);
+                debug_assert!(removed);
                 table.constructor_type(symbol, arguments, structural)
             }
             Type::AppliedAlias { symbol, arguments } => {
@@ -610,28 +633,10 @@ impl InferredTypeArguments {
         }
     }
 
-    /// Substitutes the inferred arguments through a generic signature and
-    /// interns the result: the *contextual signature* a lambda argument is
-    /// checked against once the call's type arguments are known.
-    pub fn instantiate_signature(
-        &self,
-        table: &mut TypeTable,
-        signature: &FunctionSignature,
-    ) -> TypeId {
-        let marker = table.substituted_alias_marker();
-        let instantiated = self.instantiate_function(table, &[], signature);
-        table.prepare_substituted_aliases(marker);
-        instantiated
-    }
-
-    /// Shared core of [`Self::instantiate`] and [`Self::instantiate_signature`]:
-    /// substitutes the inferred arguments through `signature`'s parameters and
-    /// return type, preserving `type_parameters` on the interned result. The
-    /// top-level contextual signature passes `&[]` (its own generics are
-    /// resolved); nested function types pass their own `type_parameters` so
-    /// inner generics survive instantiation.
+    /// Substitutes parameters and returns while preserving nested generic
+    /// parameters. The top-level contextual signature passes an empty list.
     fn instantiate_function(
-        &self,
+        &mut self,
         table: &mut TypeTable,
         type_parameters: &[SymbolId],
         signature: &FunctionSignature,
@@ -640,12 +645,7 @@ impl InferredTypeArguments {
             .parameters()
             .iter()
             .map(|parameter| {
-                FunctionParameter::new(
-                    parameter.name().to_owned(),
-                    self.instantiate_inner(table, parameter.type_id()),
-                    parameter.optional(),
-                    parameter.rest(),
-                )
+                parameter.with_type_id(self.instantiate_inner(table, parameter.type_id()))
             })
             .collect();
         let mut bounds = Vec::with_capacity(type_parameters.len());
@@ -1619,6 +1619,32 @@ mod tests {
 
     fn parameter(id: u32) -> SymbolId {
         SymbolId::new(id)
+    }
+
+    #[test]
+    fn empty_substitution_preserves_declared_parameter_identity() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let signature = table.function_with_parameters(
+            Vec::new(),
+            vec![FunctionParameter::new_declared(
+                "value".to_owned(),
+                number,
+                false,
+                false,
+            )],
+            number,
+        );
+        let substitution = InferredTypeArguments::new(Vec::new());
+        assert_eq!(substitution.instantiate(&mut table, signature), signature);
+        let Type::Function(parameters) = table.get(signature).clone() else {
+            panic!("function signature");
+        };
+        assert_eq!(
+            substitution.instantiate_signature(&mut table, &parameters),
+            signature
+        );
+        assert!(parameters.parameters()[0].declared());
     }
 
     /// `identity<T>(value: T): T` with a concrete argument infers the argument
