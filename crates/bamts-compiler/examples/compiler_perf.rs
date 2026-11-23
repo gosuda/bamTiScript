@@ -49,6 +49,19 @@ fn lookup(width: usize, repetitions: usize) {
             .map(|(name, type_id)| PropertyType::new(name.as_str(), false, *type_id))
             .collect(),
     );
+    // The rolling digest can cancel, so validate every member before timing.
+    for (name, expected_type) in names.iter().zip(&types) {
+        assert_eq!(
+            table.property_type(object, name.as_str()),
+            Some(*expected_type),
+            "property type for {name}"
+        );
+        assert_eq!(
+            table.read_property_type(object, name.as_str()),
+            Some(*expected_type),
+            "read property type for {name}"
+        );
+    }
     let started = Instant::now();
     let mut checksum = 0u64;
     for index in 0..repetitions {
