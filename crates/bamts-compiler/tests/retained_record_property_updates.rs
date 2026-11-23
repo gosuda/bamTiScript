@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use bamts_compiler::{
     checker::{
-        ProgramCheckInput, ProgramCheckOptions, SemanticModel, TypeId, check_program_with_options,
+        ProgramCheckInput, ProgramCheckOptions, ResolvedModuleEdge, SemanticModel, TypeId,
+        check_program_with_options,
     },
     diagnostic::DiagnosticSeverity,
     lint::{LintProfile, LintTable},
@@ -13,32 +14,54 @@ use bamts_compiler::{
 };
 
 fn checked_model(source: &str, kind: ScriptKind, expected: &[&str]) -> SemanticModel {
-    let source_id = SourceId::new(0);
-    let scanned = scanner::scan(
-        source_id,
-        kind,
-        Arc::new(SourceText::new(source).expect("fixture source fits")),
-    );
-    let files = [parser::parse(scanned)];
+    checked_linked_model(&[(source, kind)], &[], 0, expected)
+}
+
+fn checked_linked_model(
+    sources: &[(&str, ScriptKind)],
+    edges: &[(usize, usize, usize)],
+    result: usize,
+    expected: &[&str],
+) -> SemanticModel {
+    let source_id = |index| SourceId::new(u32::try_from(index).expect("fixture index fits"));
+    let files: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, (source, kind))| {
+            parser::parse(scanner::scan(
+                source_id(index),
+                *kind,
+                Arc::new(SourceText::new(*source).expect("fixture source fits")),
+            ))
+        })
+        .collect();
+    let edges: Vec<_> = edges
+        .iter()
+        .map(|&(from, statement, to)| ResolvedModuleEdge {
+            from: source_id(from),
+            specifier: files[from].product().statements()[statement].id(),
+            to: source_id(to),
+        })
+        .collect();
     let checked = check_program_with_options(
         ProgramCheckInput {
             files: &files,
-            edges: &[],
+            edges: &edges,
         },
         &LintTable::new(LintProfile::Default),
         ProgramCheckOptions::standard().with_strict_null_checks(true),
     );
-    let codes: Vec<_> = files[0]
-        .diagnostics()
+    let codes: Vec<_> = files
         .iter()
+        .flat_map(|file| file.diagnostics())
         .chain(checked.diagnostics())
         .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
         .map(|diagnostic| diagnostic.code().as_str())
         .collect();
-    assert_eq!(codes, expected, "{source}");
+    assert_eq!(codes, expected, "{sources:?}");
     let mut program = checked.into_product();
     program
-        .remove_file(source_id)
+        .remove_file(source_id(result))
         .expect("fixture semantic model")
 }
 
@@ -370,4 +393,216 @@ function updateConstrained<T extends bigint, U extends T>(constrained: U): U {
     ] {
         assert_eq!(binding_type(&model, after), binding_type(&model, operand));
     }
+}
+
+#[test]
+fn constant_key_writes_invalidate_updated_optional_properties() {
+    for key in [
+        "declare const key: 'value';",
+        "type Key = 'value'; declare const key: Key;",
+        "type Id<T> = T; type Key = Id<'value'>; declare const key: Key;",
+        "type Id<T> = T; type Other<T> = T; declare const key: Id<'value'> | Other<'value'>;",
+        "declare const original: 'value'; declare const key: typeof original;",
+        "const key = 'value';",
+        "const key: 'value' | 'other' = 'value';",
+        "const original: 'value' | 'other' = 'value'; const key = original;",
+    ] {
+        for fields in [
+            "Partial<Record<keyof typeof Keys, bigint>>",
+            "{ value?: bigint; other?: bigint }",
+        ] {
+            let model = checked_model(
+                &format!(
+                    r#"
+class Keys {{ static value = 0; static other = 0; }}
+{key}
+declare const guarded: {fields};
+declare const expected: bigint | undefined;
+if (guarded.value !== undefined && guarded.other !== undefined) {{
+    guarded.value++;
+    guarded.other++;
+    guarded[key] = undefined;
+    const after = guarded.value;
+    const untouched = guarded.other;
+    const accepted: bigint = untouched;
+    const rejected: bigint = after;
+    guarded.value++;
+}}
+"#
+                ),
+                ScriptKind::TypeScript,
+                &["BAMTS-C004", "BAMTS-C062"],
+            );
+            assert_eq!(
+                binding_type(&model, "after"),
+                binding_type(&model, "expected"),
+            );
+            assert_eq!(binding_type(&model, "untouched"), model.types().bigint());
+        }
+    }
+}
+
+#[test]
+fn mutable_and_ambiguous_key_writes_keep_reference_flow_behavior() {
+    for key in [
+        "let key: 'value' = 'value';",
+        "declare const key: 'value' | 'other';",
+        "type Key = 'value' | 'other'; declare const key: Key;",
+        "declare const key: string;",
+    ] {
+        let model = checked_model(
+            &format!(
+                r#"
+{key}
+declare const guarded: {{ value?: bigint; other?: bigint; [name: string]: bigint | undefined }};
+if (guarded.value !== undefined) {{
+    guarded.value++;
+    guarded[key] = undefined;
+    const after = guarded.value;
+    const accepted: bigint = after;
+}}
+"#
+            ),
+            ScriptKind::TypeScript,
+            &[],
+        );
+        assert_eq!(binding_type(&model, "after"), model.types().bigint());
+    }
+}
+
+#[test]
+fn nested_constant_key_writes_invalidate_the_same_property_path() {
+    for target in [
+        "nested[\"inner\"].value",
+        "nested[key].value",
+        "(nested.inner).value",
+    ] {
+        let model = checked_model(
+            &format!(
+                r#"
+type Key = 'inner';
+declare const key: Key;
+declare const nested: {{ inner: {{ value?: bigint }} }};
+declare const expected: bigint | undefined;
+if (nested.inner.value !== undefined) {{
+    nested.inner.value++;
+    {target} = undefined;
+    const after = nested.inner.value;
+    const rejected: bigint = after;
+    nested.inner.value++;
+}}
+"#
+            ),
+            ScriptKind::TypeScript,
+            &["BAMTS-C004", "BAMTS-C062"],
+        );
+        assert_eq!(
+            binding_type(&model, "after"),
+            binding_type(&model, "expected"),
+        );
+    }
+}
+
+#[test]
+fn unsupported_updates_do_not_publish_successful_numeric_flow() {
+    checked_model(
+        r#"
+declare function takesString(value: string): void;
+declare let root: string | number;
+declare const member: { value: string | number };
+type Text = string;
+declare let aliased: Text | number;
+if (typeof root === 'string') {
+    root++;
+    takesString(root);
+}
+if (typeof member.value === 'string') {
+    member.value++;
+    takesString(member.value);
+}
+if (typeof aliased === 'string') {
+    aliased++;
+    takesString(aliased);
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C053"; 3],
+    );
+}
+
+#[test]
+fn imported_constant_keys_preserve_origin_and_initializer_evidence() {
+    for (exporter, invalidates) in [
+        ("declare const key: 'value'; export { key };", true),
+        (
+            "type Key = 'value'; declare const key: Key; export { key };",
+            true,
+        ),
+        ("export const key: 'value' | 'other' = 'value';", true),
+        (
+            "declare const key: 'value' | 'other'; export { key };",
+            false,
+        ),
+        ("declare let key: 'value'; export { key };", false),
+    ] {
+        let main = r#"
+import { key } from './keys.js';
+declare const guarded: { value?: bigint; other?: bigint; [name: string]: bigint | undefined };
+declare const expected: bigint | undefined;
+if (guarded.value !== undefined) {
+    guarded.value++;
+    guarded[key] = undefined;
+    const after = guarded.value;
+    const rejected: bigint = after;
+}
+"#;
+        let model = checked_linked_model(
+            &[
+                (exporter, ScriptKind::TypeScript),
+                (main, ScriptKind::TypeScript),
+            ],
+            &[(1, 0, 0)],
+            1,
+            if invalidates { &["BAMTS-C004"] } else { &[] },
+        );
+        let expected = if invalidates {
+            binding_type(&model, "expected")
+        } else {
+            model.types().bigint()
+        };
+        assert_eq!(binding_type(&model, "after"), expected);
+    }
+}
+
+#[test]
+fn copies_of_imported_constants_keep_the_published_union_key_type() {
+    let model = checked_linked_model(
+        &[
+            (
+                "export const key: 'value' | 'other' = 'value';",
+                ScriptKind::TypeScript,
+            ),
+            (
+                "import { key as original } from './keys.js'; export const key = original;",
+                ScriptKind::TypeScript,
+            ),
+            (
+                r#"
+import { key } from './copy.js';
+declare const guarded: { value?: bigint; other?: bigint };
+if (guarded.value !== undefined) {
+    guarded.value++;
+    guarded[key] = undefined;
+    const after = guarded.value;
+    const accepted: bigint = after;
+}
+"#,
+                ScriptKind::TypeScript,
+            ),
+        ],
+        &[(1, 0, 0), (2, 0, 1)],
+        2,
+        &[],
+    );
+    assert_eq!(binding_type(&model, "after"), model.types().bigint());
 }
