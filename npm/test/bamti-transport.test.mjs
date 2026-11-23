@@ -190,6 +190,62 @@ test("real child output buffered until exit still resolves its request", { timeo
   }
 });
 
+test("process exit bounds draining even when a descendant inherits stdio", { timeout: 5000 }, async () => {
+  let closed = false;
+  let close;
+  const transport = new Transport({
+    binary: process.execPath,
+    disposeTimeoutMs: 20,
+    spawnChild(binary, _args, options) {
+      const script = `
+        import { spawn } from "node:child_process";
+        process.stdin.once("data", () => {
+          spawn(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], {
+            stdio: "inherit",
+          }).unref();
+          process.exit(0);
+        });
+      `;
+      const child = spawn(binary, ["--input-type=module", "-e", script], options);
+      close = new Promise((resolve) => child.once("close", () => {
+        closed = true;
+        resolve();
+      }));
+      return child;
+    },
+  });
+  try {
+    await assert.rejects(transport.request("compiler/version"), { name: "TransportCrashError" });
+    assert.equal(closed, false, "the request must settle before inherited pipes close");
+  } finally {
+    await transport.dispose();
+    await close;
+  }
+});
+
+test("clean stdout EOF rejects pending requests while the child remains alive", { timeout: 5000 }, async () => {
+  let child;
+  const transport = new Transport({
+    binary: process.execPath,
+    disposeTimeoutMs: 20,
+    spawnChild(binary, _args, options) {
+      const script = `
+        process.stdin.once("data", () => process.stdout.end());
+        setTimeout(() => process.exit(0), 1000);
+      `;
+      child = spawn(binary, ["--input-type=module", "-e", script], options);
+      return child;
+    },
+  });
+  try {
+    await assert.rejects(transport.request("compiler/version"), { name: "TransportCrashError" });
+    assert.equal(child.killed, true, "a child without a response stream must be terminated");
+  } finally {
+    await transport.dispose();
+    child?.kill("SIGKILL");
+  }
+});
+
 test("a valid service error keeps the transport available for the next request", async () => {
   const { transport, children, requests } = requestFixture();
   try {

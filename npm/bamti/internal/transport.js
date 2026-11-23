@@ -142,6 +142,14 @@ export class Transport {
     this.#stderr = Buffer.alloc(0);
     this.#generation += 1;
     const generation = this.#generation;
+    let drainTimer;
+    const drain = () => {
+      if (this.#child !== child || drainTimer !== undefined) return;
+      drainTimer = setTimeout(() => {
+        this.#crash(generation, { code: child.exitCode, signal: child.signalCode });
+      }, this.options.disposeTimeoutMs);
+      drainTimer.unref();
+    };
 
     child.stdout.on("data", (chunk) => this.#receive(generation, chunk));
     child.stdout.on("error", (cause) => this.#crash(generation, { cause }));
@@ -149,6 +157,7 @@ export class Transport {
       if (generation !== this.#generation || !this.#decoder) return;
       try {
         this.#decoder.end();
+        drain();
       } catch (cause) {
         this.#crash(generation, { cause });
       }
@@ -160,7 +169,11 @@ export class Transport {
     child.stderr.on("error", (cause) => this.#crash(generation, { cause }));
     child.stdin.on("error", (cause) => this.#crash(generation, { cause }));
     child.once("error", (cause) => this.#crash(generation, { cause }));
-    child.once("close", (code, signal) => this.#crash(generation, { code, signal }));
+    child.once("exit", drain);
+    child.once("close", (code, signal) => {
+      clearTimeout(drainTimer);
+      this.#crash(generation, { code, signal });
+    });
     return generation;
   }
 
