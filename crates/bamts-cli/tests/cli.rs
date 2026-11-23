@@ -2689,7 +2689,7 @@ fn tsc_removed_base_url_never_rebases_path_mappings() {
 }
 
 #[test]
-fn check_resolves_paths_from_the_config_directory() {
+fn native_run_resolves_paths_from_the_config_directory() {
     let project = ScratchDirectory::new();
     project.write(
         "tsconfig.json",
@@ -2698,15 +2698,17 @@ fn check_resolves_paths_from_the_config_directory() {
     project.write("util.ts", "export const value: number = 42;\n");
     project.write(
         "main.ts",
-        "import { value } from '@util';\nexport const result: number = value;\n",
+        "import { value } from '@util';\nprocess.stdout.write(String(value) + '\\n');\n",
     );
     let output = project
         .command()
-        .args(["check", "main.ts"])
+        .args(["--run", "--jit", "main.ts"])
         .current_dir(&project.path)
         .output()
-        .expect("native config check starts");
+        .expect("native config execution starts");
     assert_success(&output, "shared config parsing ignores baseUrl for paths");
+    assert_eq!(output.stdout, b"42\n");
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
 }
 
 #[test]
