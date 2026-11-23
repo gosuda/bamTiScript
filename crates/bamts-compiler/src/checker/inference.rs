@@ -49,11 +49,11 @@
 //! constraint. Each outcome is recorded as [`InferenceProvenance`] so future
 //! diagnostics can attribute a type argument to its source.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::binder::{
-    ConstructEntry, FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType,
-    SymbolId, TupleShape, Type, TypeId, TypeParameterBounds, TypeTable,
+    ConstructEntry, ConstructorProjection, FunctionParameter, FunctionSignature, IndexSignature,
+    ObjectType, PropertyType, SymbolId, TupleShape, Type, TypeId, TypeParameterBounds, TypeTable,
 };
 use super::relations::TypeRelations;
 
@@ -321,6 +321,19 @@ impl InferredTypeArguments {
         }
     }
 
+    pub(crate) fn for_constructor_projection(projection: &ConstructorProjection) -> Self {
+        Self {
+            arguments: projection
+                .substitutions
+                .iter()
+                .map(|&(symbol, type_id)| {
+                    InferredTypeArgument::new(symbol, type_id, InferenceProvenance::Explicit)
+                })
+                .collect(),
+            this_receiver: projection.this_receiver,
+        }
+    }
+
     /// Widens primitive-literal type arguments whose type parameter has no
     /// `extends` constraint and is not the naked top-level return type, in
     /// place. Constrained parameters, non-literal arguments, and type
@@ -372,11 +385,18 @@ impl InferredTypeArguments {
     /// their original [`TypeId`].
     pub fn instantiate(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         let marker = table.substituted_alias_marker();
-        let instantiated = TypeInstantiation {
-            substitution: self,
-            active_constructors: HashSet::new(),
-        }
-        .instantiate_inner(table, ty);
+        let instantiated = TypeInstantiation::new(self).instantiate_inner(table, ty);
+        table.prepare_substituted_aliases(marker);
+        instantiated
+    }
+
+    pub(crate) fn instantiate_constructor_projection(
+        &self,
+        table: &mut TypeTable,
+        ty: TypeId,
+    ) -> TypeId {
+        let marker = table.substituted_alias_marker();
+        let instantiated = TypeInstantiation::new(self).instantiate_constructor(table, ty, true);
         table.prepare_substituted_aliases(marker);
         instantiated
     }
@@ -390,24 +410,35 @@ impl InferredTypeArguments {
         signature: &FunctionSignature,
     ) -> TypeId {
         let marker = table.substituted_alias_marker();
-        let instantiated = TypeInstantiation {
-            substitution: self,
-            active_constructors: HashSet::new(),
-        }
-        .instantiate_function(table, &[], signature);
+        let instantiated = TypeInstantiation::new(self).instantiate_function(table, &[], signature);
         table.prepare_substituted_aliases(marker);
         instantiated
     }
 }
 
-/// A substitution expands each constructor identity once along an active path.
-/// Recursive static views keep their nominal head, including across functions.
+/// Recursive constructor edges retain the same source and substitution identity.
 struct TypeInstantiation<'a> {
     substitution: &'a InferredTypeArguments,
-    active_constructors: HashSet<TypeId>,
+    substitutions: Box<[(SymbolId, TypeId)]>,
+    active_constructors: HashMap<TypeId, TypeId>,
 }
 
-impl TypeInstantiation<'_> {
+impl<'a> TypeInstantiation<'a> {
+    fn new(substitution: &'a InferredTypeArguments) -> Self {
+        let mut substitutions: Vec<_> = substitution
+            .arguments()
+            .iter()
+            .map(|argument| (argument.symbol(), argument.type_id()))
+            .collect();
+        substitutions.sort_by_key(|&(symbol, _)| symbol);
+        substitutions.dedup_by_key(|(symbol, _)| *symbol);
+        Self {
+            substitution,
+            substitutions: substitutions.into_boxed_slice(),
+            active_constructors: HashMap::new(),
+        }
+    }
+
     fn instantiate_inner(&mut self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         match table.instantiation_type(ty).clone() {
             Type::Named(symbol) => self.substitution.get(symbol).unwrap_or(ty),
@@ -562,24 +593,7 @@ impl TypeInstantiation<'_> {
                     .collect();
                 table.applied_class(symbol, arguments)
             }
-            Type::ConstructorType {
-                symbol,
-                arguments,
-                structural,
-            } => {
-                let identity = table.constructor_identity(ty);
-                if !self.active_constructors.insert(identity) {
-                    return ty;
-                }
-                let arguments = arguments
-                    .iter()
-                    .map(|&argument| self.instantiate_inner(table, argument))
-                    .collect();
-                let structural = self.instantiate_inner(table, structural);
-                let removed = self.active_constructors.remove(&identity);
-                debug_assert!(removed);
-                table.constructor_type(symbol, arguments, structural)
-            }
+            Type::ConstructorType { .. } => self.instantiate_constructor(table, ty, false),
             Type::AppliedAlias { symbol, arguments } => {
                 let arguments = arguments
                     .iter()
@@ -633,6 +647,180 @@ impl TypeInstantiation<'_> {
             | Type::NumericEnum(_)
             | Type::EnumMember { .. } => ty,
         }
+    }
+
+    fn instantiate_constructor(
+        &mut self,
+        table: &mut TypeTable,
+        ty: TypeId,
+        preserve_projection: bool,
+    ) -> TypeId {
+        let source = table.constructor_identity(ty);
+        if let Some(&identity) = self.active_constructors.get(&source) {
+            return identity;
+        }
+        if !preserve_projection && !self.affects_type(table, ty, &mut HashSet::new()) {
+            return ty;
+        }
+        let projection = ConstructorProjection {
+            source,
+            substitutions: self.substitutions.clone(),
+            this_receiver: self.substitution.this_receiver,
+        };
+        if let Some(projected) = table.constructor_projection(&projection) {
+            return projected;
+        }
+        let Type::ConstructorType {
+            arguments,
+            structural,
+            ..
+        } = table.instantiation_type(ty).clone()
+        else {
+            panic!("constructor projection requires a constructor source");
+        };
+        let identity = table.begin_constructor_projection(projection);
+        self.active_constructors.insert(source, identity);
+        let arguments = arguments
+            .iter()
+            .map(|&argument| self.instantiate_inner(table, argument))
+            .collect();
+        let structural = self.instantiate_inner(table, structural);
+        let removed = self.active_constructors.remove(&source);
+        debug_assert_eq!(removed, Some(identity));
+        table.finish_constructor_projection(identity, arguments, structural)
+    }
+
+    fn affects_type(
+        &self,
+        table: &TypeTable,
+        ty: TypeId,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visiting.insert(ty) {
+            return false;
+        }
+        match table.instantiation_type(ty) {
+            Type::Named(symbol) => self
+                .substitution
+                .get(*symbol)
+                .is_some_and(|replacement| replacement != ty),
+            Type::This { owner, constraint } => {
+                if let Some((expected, receiver)) = self.substitution.this_receiver
+                    && expected == *owner
+                {
+                    receiver != ty
+                } else {
+                    self.affects_type(table, *constraint, visiting)
+                }
+            }
+            Type::Array(element) | Type::Keyof(element) => {
+                self.affects_type(table, *element, visiting)
+            }
+            Type::Tuple(shape) => shape
+                .prefix
+                .iter()
+                .chain(shape.rest.iter())
+                .chain(shape.suffix.iter())
+                .any(|&element| self.affects_type(table, element, visiting)),
+            Type::Union(members)
+            | Type::Intersection(members)
+            | Type::AppliedClass {
+                arguments: members,
+                ..
+            }
+            | Type::AppliedAlias {
+                arguments: members,
+                ..
+            } => members
+                .iter()
+                .any(|&member| self.affects_type(table, member, visiting)),
+            Type::ObjectType(object) => {
+                object.properties.iter().any(|property| {
+                    self.affects_type(table, property.type_id(), visiting)
+                }) || object.call_signatures.iter().any(|signature| {
+                    self.affects_signature(table, signature, visiting)
+                }) || object.construct_signatures.iter().any(|entry| {
+                    self.affects_signature(table, &entry.signature, visiting)
+                }) || object.index_signatures.iter().any(|signature| {
+                    signature.parameters.iter().any(|parameter| {
+                        self.affects_type(table, parameter.type_id(), visiting)
+                    }) || self.affects_type(table, signature.value_type, visiting)
+                }) || object.generator_return.is_some_and(|return_type| {
+                    self.affects_type(table, return_type, visiting)
+                }) || object.iterator_property.as_ref().is_some_and(|property| {
+                    self.affects_type(table, property.type_id(), visiting)
+                }) || object.async_iterator_property.as_ref().is_some_and(|property| {
+                    self.affects_type(table, property.type_id(), visiting)
+                })
+            }
+            Type::Function(signature) => self.affects_signature(table, signature, visiting),
+            Type::ConstructorType {
+                arguments,
+                structural,
+                ..
+            } => {
+                arguments
+                    .iter()
+                    .any(|&argument| self.affects_type(table, argument, visiting))
+                    || self.affects_type(table, *structural, visiting)
+            }
+            Type::TypeQuery {
+                arguments, target, ..
+            } => {
+                arguments
+                    .iter()
+                    .any(|&argument| self.affects_type(table, argument, visiting))
+                    || self.affects_type(table, *target, visiting)
+            }
+            Type::IndexedAccess { object, index } => {
+                self.affects_type(table, *object, visiting)
+                    || self.affects_type(table, *index, visiting)
+            }
+            Type::Record { key, value } => {
+                self.affects_type(table, *key, visiting)
+                    || self.affects_type(table, *value, visiting)
+            }
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::NumericEnum(_)
+            | Type::EnumMember { .. } => false,
+        }
+    }
+
+    fn affects_signature(
+        &self,
+        table: &TypeTable,
+        signature: &FunctionSignature,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        signature
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.type_id())
+            .chain(std::iter::once(signature.return_type()))
+            .chain(signature.declared_return())
+            .chain(
+                signature
+                    .type_parameter_bounds()
+                    .iter()
+                    .flat_map(|bounds| bounds.constraint().into_iter().chain(bounds.default())),
+            )
+            .any(|member| self.affects_type(table, member, visiting))
     }
 
     /// Substitutes parameters and returns while preserving nested generic
