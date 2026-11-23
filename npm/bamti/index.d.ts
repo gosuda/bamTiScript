@@ -153,6 +153,7 @@ export interface SpawnOptions {
 export interface ReadableStreamLike {
   on(event: "data", listener: (chunk: Uint8Array) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
+  on(event: "end", listener: () => void): this;
 }
 
 export interface WritableStreamLike {
@@ -169,9 +170,10 @@ export interface ChildProcessLike {
   signalCode: string | null;
   once(event: "error", listener: (error: Error) => void): this;
   once(
-    event: "exit",
+    event: "exit" | "close",
     listener: (code: number | null, signal: string | null) => void,
   ): this;
+  removeListener(event: "exit", listener: () => void): this;
   kill(signal?: string): boolean;
 }
 

@@ -1,30 +1,31 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
-import { FrameDecoder, encodeFrame } from "./framing.js";
+import { FrameDecoder, encodeFrame } from "../bamti/internal/framing.js";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "bamti-cli") {
       return {
         shortCircuit: true,
-        url: new URL("../../bamti-cli/index.js", import.meta.url).href,
+        url: new URL("../bamti-cli/index.js", import.meta.url).href,
       };
     }
     return nextResolve(specifier, context);
   },
 });
 
-const { Transport } = await import("./transport.js");
-const { runExecutable } = await import("../native-runner.js");
-const api = await import("../index.js");
-const { SERVICE_METHODS } = await import("./session.js");
-const { createAsyncService } = await import("../unstable/async.js");
-const { createSerialService } = await import("../unstable/sync.js");
+const { Transport } = await import("../bamti/internal/transport.js");
+const { runExecutable } = await import("../bamti/native-runner.js");
+const api = await import("../bamti/index.js");
+const { SERVICE_METHODS } = await import("../bamti/internal/session.js");
+const { createAsyncService } = await import("../bamti/unstable/async.js");
+const { createSerialService } = await import("../bamti/unstable/sync.js");
 
 const PUBLIC_EXPORTS = [
   ".",
@@ -54,7 +55,10 @@ class FakeChild extends EventEmitter {
 
   kill(signal = "SIGTERM") {
     this.signalCode = signal;
-    queueMicrotask(() => this.emit("exit", this.exitCode, this.signalCode));
+    queueMicrotask(() => {
+      this.emit("exit", this.exitCode, this.signalCode);
+      this.emit("close", this.exitCode, this.signalCode);
+    });
     return true;
   }
 }
@@ -91,7 +95,7 @@ async function awaitRequests(requests, count) {
 
 test("manifest publishes thirteen subpaths and the tsc executable", async () => {
   const manifest = JSON.parse(
-    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+    await readFile(new URL("../bamti/package.json", import.meta.url), "utf8"),
   );
   assert.deepEqual(Object.keys(manifest.exports), PUBLIC_EXPORTS);
   assert.deepEqual(manifest.bin, { tsc: "native-runner.js" });
@@ -139,9 +143,149 @@ test("persistent transport correlates fragmented out-of-order responses", async 
   const firstCrash = assert.rejects(first, { name: "TransportCrashError", code: 9 });
   const secondCrash = assert.rejects(second, { name: "TransportCrashError", code: 9 });
   children[0].emit("exit", 9, null);
+  children[0].emit("close", 9, null);
   await Promise.all([firstCrash, secondCrash]);
   assert.equal(transport.inFlight, 0);
   await transport.dispose();
+});
+
+test("transport accepts the last response after process exit until stdio closes", async () => {
+  const { transport, children, requests } = requestFixture();
+  const outcome = transport.request("compiler/version").then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  try {
+    children[0].exitCode = 0;
+    children[0].emit("exit", 0, null);
+    children[0].stdout.write(encodeFrame({ id: requests[0].id, result: "7.0.2" }));
+    children[0].emit("close", 0, null);
+    assert.deepEqual(await outcome, { value: "7.0.2" });
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("real child output buffered until exit still resolves its request", { timeout: 5000 }, async () => {
+  const transport = new Transport({
+    binary: process.execPath,
+    spawnChild(binary, _args, options) {
+      const script = `
+        process.stdin.once("data", () => {
+          const body = JSON.stringify({ id: 1, result: "final response" });
+          process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body);
+          process.stdin.destroy();
+        });
+      `;
+      const child = spawn(binary, ["--input-type=module", "-e", script], options);
+      child.stdout.pause();
+      child.once("exit", () => child.stdout.resume());
+      return child;
+    },
+  });
+  try {
+    assert.equal(await transport.request("compiler/version"), "final response");
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("a valid service error keeps the transport available for the next request", async () => {
+  const { transport, children, requests } = requestFixture();
+  try {
+    const rejected = assert.rejects(transport.request("service/rename"), {
+      name: "ServiceRequestError",
+      code: -32602,
+      method: "service/rename",
+      data: { position: 2 },
+    });
+    children[0].stdout.write(encodeFrame({
+      id: requests[0].id,
+      error: { code: -32602, message: "invalid position", data: { position: 2 } },
+    }));
+    await rejected;
+    const next = transport.request("compiler/version");
+    children[0].stdout.write(encodeFrame({ id: requests[1].id, result: "7.0.2" }));
+    assert.equal(await next, "7.0.2");
+    assert.equal(children.length, 1);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("truncated stdout rejects pending requests and terminates the broken child", async () => {
+  const { transport, children } = requestFixture();
+  const outcome = transport.request("compiler/version").catch((error) => error);
+  try {
+    children[0].stdout.end("Content-Length: 20\r\n\r\n{");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(transport.inFlight, 0);
+    assert.equal((await outcome).name, "ProtocolError");
+    assert.notEqual(children[0].signalCode, null);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("transport keeps stderr within its process generation", async () => {
+  const { transport, children } = requestFixture();
+  const first = transport.request("compiler/version").catch((error) => error);
+  children[0].stderr.write("first process\n");
+  children[0].emit("error", new Error("first process failed"));
+  assert.equal((await first).stderr, "first process\n");
+  const second = transport.request("compiler/version").catch((error) => error);
+  try {
+    children[0].stderr.write("late first process\n");
+    children[1].stderr.write("second process\n");
+    children[1].emit("error", new Error("second process failed"));
+    assert.equal((await second).stderr, "second process\n");
+    assert.notEqual(children[0].signalCode, null);
+    assert.notEqual(children[1].signalCode, null);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("invalid frame limits fail before a child is spawned", async () => {
+  let spawned = 0;
+  const transport = new Transport({
+    binary: "/virtual/bamts",
+    maxFrameBytes: 0,
+    disposeTimeoutMs: 0,
+    spawnChild() {
+      spawned += 1;
+      return new FakeChild();
+    },
+  });
+  try {
+    await assert.rejects(transport.request("compiler/version"), RangeError);
+    assert.equal(spawned, 0);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("malformed error responses reject requests without escaping a stream listener", async () => {
+  for (const error of [null, false, "failure", [], { code: "bad", message: "bad" }]) {
+    const { transport, children, requests } = requestFixture();
+    const outcome = transport.request("compiler/version").catch((failure) => failure);
+    try {
+      assert.doesNotThrow(() => {
+        children[0].stdout.write(encodeFrame({ id: requests[0].id, error }));
+      });
+      assert.equal((await outcome).name, "ProtocolError");
+    } finally {
+      await transport.dispose();
+    }
+  }
+});
+
+test("frame headers reject bytes that ASCII decoding would silently change", () => {
+  for (const offset of [0, 16]) {
+    const frame = encodeFrame({ id: 1, result: true });
+    frame[offset] |= 0x80;
+    assert.throws(() => new FrameDecoder().push(frame), { name: "ProtocolError" });
+  }
 });
 
 test("session publishes exactly the ten service methods including quickInfo", () => {
