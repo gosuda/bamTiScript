@@ -6084,6 +6084,9 @@ pub(crate) struct ImportedSymbolType<'a> {
     pub value_type_id: TypeId,
     pub type_parameters: &'a [SymbolId],
     pub type_plane_id: Option<TypeId>,
+    /// Present only for a const-origin value. The source initializer can
+    /// identify one property even when its published value type is a union.
+    pub const_key_type_id: Option<TypeId>,
     /// Member names and source-table types for a namespace-style import
     /// (`import * as ns`, `import ns = require(...)`). The importing binder
     /// translates each member and wraps them in a `typeof` constructor named
@@ -7195,6 +7198,7 @@ pub struct SemanticModel {
     symbols: Vec<Symbol>,
     generic_type_parameters: HashMap<SymbolId, Vec<SymbolId>>,
     symbol_types: Vec<TypeId>,
+    const_key_types: HashMap<SymbolId, TypeId>,
     #[cfg(test)]
     overload_signatures: Vec<Vec<FunctionSignature>>,
     references: HashMap<NodeId, SymbolId>,
@@ -7327,6 +7331,14 @@ impl SemanticModel {
     #[must_use]
     pub fn symbol_type(&self, id: SymbolId) -> TypeId {
         self.symbol_types[id.0 as usize]
+    }
+
+    /// Preserves const-origin key evidence across linked module checking.
+    pub(crate) fn const_key_type(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.const_key_types.get(&symbol).copied().or_else(|| {
+            (self.symbol(symbol).kind() == SymbolKind::Variable(VariableKind::Const))
+                .then(|| self.symbol_type(symbol))
+        })
     }
 
     /// Returns the constructor (static) type for a class symbol, or the
@@ -7902,6 +7914,9 @@ pub(crate) struct Binder<'src> {
     flow: FlowNodeId,
     non_null_operand: Option<NodeId>,
     assignment_facts: HashMap<(FlowNodeId, SymbolId), TypeId>,
+    /// Const-origin types from local initializers or linked imports, used only
+    /// to identify stable computed names without branch-local key narrowing.
+    const_key_types: HashMap<SymbolId, TypeId>,
     /// Roots written through an identifier assignment or update in the
     /// statement list currently being resolved. Captured narrowing may cross
     /// a function boundary only when the root is immutable or no such write
@@ -8142,6 +8157,7 @@ impl<'src> Binder<'src> {
             flow: FlowNodeId::ROOT,
             non_null_operand: None,
             assignment_facts: HashMap::new(),
+            const_key_types: HashMap::new(),
             ambient_stack: Vec::new(),
             strict_null_checks: options.strict_null_checks(),
             no_implicit_any: options.no_implicit_any(),
@@ -11183,6 +11199,16 @@ impl<'src> Binder<'src> {
                 identities,
                 &mut next_imported_symbol,
             );
+            if let Some(source_type_id) = imported.const_key_type_id {
+                let (type_id, _) = self.types.import_type(
+                    source_types,
+                    source_type_id,
+                    &[],
+                    identities,
+                    &mut next_imported_symbol,
+                );
+                self.const_key_types.insert(imported.symbol, type_id);
+            }
             if !type_parameters.is_empty() {
                 self.imported_type_parameters
                     .insert(imported.symbol, type_parameters);
@@ -11504,6 +11530,7 @@ impl<'src> Binder<'src> {
             scopes: self.scopes,
             symbols: self.symbols,
             symbol_types: self.symbol_types,
+            const_key_types: self.const_key_types,
             #[cfg(test)]
             overload_signatures: self.overload_signatures,
             references: self.references,
@@ -11900,18 +11927,80 @@ impl<'src> Binder<'src> {
                 .copied()
                 .map(FlowKey::root),
             AssignmentTarget::Member(member) => {
-                let resolver = BinderGuardResolver {
-                    references: &self.references,
-                    node_types: &self.node_types,
-                    fallback: self.types.any(),
-                    source: self.source,
-                };
-                let key = flow_key_of(&member.object, &resolver)?;
-                let name = enum_plan::cook_member_property_name(self.source, &member.property)?;
-                Some(key.child(&Self::semantic_property_key(&name)))
+                let key = self.assignment_receiver_flow_key(&member.object)?;
+                Some(key.child(&self.assignment_property_name(&member.property)?))
             }
             _ => None,
         }
+    }
+
+    fn assignment_receiver_flow_key(&self, expression: &Expr) -> Option<FlowKey> {
+        match expression.data() {
+            Expression::Identifier(identifier) => self
+                .references
+                .get(&identifier.id())
+                .copied()
+                .map(FlowKey::root),
+            Expression::Member(member) if !member.optional => {
+                let key = self.assignment_receiver_flow_key(&member.object)?;
+                Some(key.child(&self.assignment_property_name(&member.property)?))
+            }
+            Expression::Parenthesized(inner) => self.assignment_receiver_flow_key(inner),
+            _ => None,
+        }
+    }
+
+    fn assignment_property_name(&self, property: &MemberProperty) -> Option<String> {
+        if let Some(name) = enum_plan::cook_member_property_name(self.source, property) {
+            return Some(Self::semantic_property_key(&name));
+        }
+        let MemberProperty::Computed(expression) = property else {
+            return None;
+        };
+        // A const key can be identified from its initializer or declared
+        // singleton type. Branch narrowing and multi-key domains do not
+        // identify one stable name. Cached views keep this walk finite.
+        let mut pending = vec![self.const_key_type(expression)?];
+        let mut visited = HashSet::new();
+        let mut name = None;
+        while let Some(type_id) = pending.pop() {
+            if !visited.insert(type_id) {
+                continue;
+            }
+            let candidate = match self.types.get(type_id) {
+                Type::StringLiteral(value) => Self::semantic_property_key(value),
+                Type::NumberLiteral(value) => format_number(number_value(value)?),
+                Type::AppliedAlias { .. } => {
+                    pending.push(self.types.applied_alias_view(type_id)?);
+                    continue;
+                }
+                Type::TypeQuery { target, .. } => {
+                    pending.push(*target);
+                    continue;
+                }
+                Type::Union(members) => {
+                    pending.extend(members);
+                    continue;
+                }
+                _ => return None,
+            };
+            if name.as_ref().is_some_and(|name| name != &candidate) {
+                return None;
+            }
+            name = Some(candidate);
+        }
+        name
+    }
+
+    fn const_key_type(&self, expression: &Expr) -> Option<TypeId> {
+        let Expression::Identifier(identifier) = expression.data() else {
+            return None;
+        };
+        let symbol = *self.references.get(&identifier.id())?;
+        self.const_key_types.get(&symbol).copied().or_else(|| {
+            (self.symbols[symbol.get() as usize].kind == SymbolKind::Variable(VariableKind::Const))
+                .then_some(self.symbol_types[symbol.get() as usize])
+        })
     }
 
     fn invalidate_assignment_flow(&mut self, target: &'src crate::syntax::AssignmentTargetNode) {
@@ -16186,6 +16275,24 @@ impl<'src> Binder<'src> {
             if let BindingPattern::Identifier(name) = declarator.binding.data()
                 && let Some(symbol) = self.lookup_value(scope, &self.identifier_text(name))
             {
+                if variable.kind == VariableKind::Const
+                    && let Some(initializer) = &declarator.initializer
+                {
+                    // Imported const evidence identifies that import's own
+                    // key. A fresh local copy keeps the import's published
+                    // type rather than adopting its hidden initializer type.
+                    let local_const =
+                        self.resolved_expression_reference(initializer)
+                            .filter(|symbol| {
+                                self.symbols[symbol.get() as usize].kind
+                                    == SymbolKind::Variable(VariableKind::Const)
+                            });
+                    let local_key_type =
+                        local_const.and_then(|symbol| self.const_key_types.get(&symbol).copied());
+                    if let Some(type_id) = local_key_type.or(initializer_type) {
+                        self.const_key_types.insert(symbol, type_id);
+                    }
+                }
                 // Seed the symbol anchor so member accesses on this variable
                 // resolve to the property owner for rename anchoring.
                 let owner = declarator
@@ -19681,7 +19788,7 @@ impl<'src> Binder<'src> {
                 self.inventory_assignment_target_writes_in_scope(&update.argument, scope);
                 self.resolve_assignment_target(&update.argument, scope);
                 let operand = self.assignment_target_type(&update.argument, scope, true);
-                let (result, nullable) = self.numeric_update_type(operand);
+                let (result, nullable, numeric) = self.numeric_update_type(operand);
                 if self.strict_null_checks && nullable {
                     self.emit(
                         STRICT_NULL_MEMBER_ACCESS,
@@ -19693,7 +19800,10 @@ impl<'src> Binder<'src> {
                     self.typed_expressions.push((expression.range(), result));
                 }
                 self.invalidate_assignment_flow(&update.argument);
-                if !nullable && let Some(key) = self.assignment_flow_key(&update.argument) {
+                if numeric
+                    && !nullable
+                    && let Some(key) = self.assignment_flow_key(&update.argument)
+                {
                     let symbol = key.root_symbol();
                     let root = key.path().is_empty();
                     let written = self.types.widen(operand, false);
@@ -27033,27 +27143,48 @@ impl<'src> Binder<'src> {
     /// Cached aliases and constraints expose nullability without materializing
     /// new types. Constraints do not change a generic update result's numeric
     /// category, and each existing type is visited at most once per purpose.
-    fn numeric_update_type(&mut self, operand: TypeId) -> (TypeId, bool) {
+    /// The final flag permits a successful-write fact only for numeric operands;
+    /// unsupported operands retain invalidation-based error recovery.
+    fn numeric_update_type(&mut self, operand: TypeId) -> (TypeId, bool, bool) {
         match self.types.get(operand) {
-            Type::BigInt | Type::BigIntLiteral(_) => return (self.types.bigint(), false),
-            Type::Null | Type::Undefined => return (self.types.number(), true),
+            Type::BigInt | Type::BigIntLiteral(_) => return (self.types.bigint(), false, true),
+            Type::Number
+            | Type::NumberLiteral(_)
+            | Type::NumericEnum(_)
+            | Type::EnumMember {
+                string_value: None, ..
+            }
+            | Type::Any
+            | Type::Never
+            | Type::Error => return (self.types.number(), false, true),
+            Type::Null | Type::Undefined => return (self.types.number(), true, false),
             Type::AppliedAlias { .. }
             | Type::TypeQuery { .. }
             | Type::Union(_)
             | Type::Named(_) => {}
-            _ => return (self.types.number(), false),
+            _ => return (self.types.number(), false, false),
         }
         let mut pending = vec![(operand, true)];
         let mut visited = HashSet::new();
         let mut bigint = false;
         let mut number = false;
         let mut nullable = false;
+        let mut numeric = true;
         while let Some((member, classify_numeric)) = pending.pop() {
             if !visited.insert((member, classify_numeric)) {
                 continue;
             }
             match self.types.get(member) {
                 Type::BigInt | Type::BigIntLiteral(_) => bigint |= classify_numeric,
+                Type::Number
+                | Type::NumberLiteral(_)
+                | Type::NumericEnum(_)
+                | Type::EnumMember {
+                    string_value: None, ..
+                }
+                | Type::Any
+                | Type::Never
+                | Type::Error => number |= classify_numeric,
                 Type::Null | Type::Undefined => nullable = true,
                 Type::Union(members) => {
                     pending.extend(members.iter().map(|member| (*member, classify_numeric)));
@@ -27063,6 +27194,7 @@ impl<'src> Binder<'src> {
                         pending.push((view, classify_numeric));
                     } else {
                         number |= classify_numeric;
+                        numeric = false;
                     }
                 }
                 Type::TypeQuery { target, .. } => pending.push((*target, classify_numeric)),
@@ -27070,9 +27202,14 @@ impl<'src> Binder<'src> {
                     number |= classify_numeric;
                     if let Some(constraint) = self.types.type_parameter_constraint(*symbol) {
                         pending.push((constraint, false));
+                    } else {
+                        numeric = false;
                     }
                 }
-                _ => number |= classify_numeric,
+                _ => {
+                    number |= classify_numeric;
+                    numeric = false;
+                }
             }
         }
         let result = match (bigint, number) {
@@ -27082,7 +27219,7 @@ impl<'src> Binder<'src> {
                 .union(&[self.types.number(), self.types.bigint()]),
             _ => self.types.number(),
         };
-        (result, nullable)
+        (result, nullable, numeric)
     }
 
     fn is_bigint_like(&self, type_id: TypeId) -> bool {
@@ -30909,6 +31046,7 @@ impl<'src> Binder<'src> {
             expected_diagnostics: Vec<ExpectedDiagnostic>,
             uninitialized_variables: HashSet<SymbolId>,
             declarator_symbols: HashMap<NodeId, Vec<SymbolId>>,
+            const_key_types: HashMap<SymbolId, TypeId>,
             return_types: HashMap<NodeId, Vec<TypeId>>,
             yield_types: HashMap<NodeId, Vec<TypeId>>,
             interface_member_occurrences: Vec<DeclarationOccurrence>,
@@ -30955,6 +31093,7 @@ impl<'src> Binder<'src> {
             expected_diagnostics: std::mem::take(&mut self.expected_diagnostics),
             uninitialized_variables: std::mem::take(&mut self.uninitialized_variables),
             declarator_symbols: std::mem::take(&mut self.declarator_symbols),
+            const_key_types: std::mem::take(&mut self.const_key_types),
             return_types: std::mem::take(&mut self.return_types),
             yield_types: std::mem::take(&mut self.yield_types),
             interface_member_occurrences: std::mem::take(&mut self.interface_member_occurrences),
@@ -31008,6 +31147,7 @@ impl<'src> Binder<'src> {
         self.expected_diagnostics = isolated.expected_diagnostics;
         self.uninitialized_variables = isolated.uninitialized_variables;
         self.declarator_symbols = isolated.declarator_symbols;
+        self.const_key_types = isolated.const_key_types;
         self.return_types = isolated.return_types;
         self.yield_types = isolated.yield_types;
         self.interface_member_occurrences = isolated.interface_member_occurrences;

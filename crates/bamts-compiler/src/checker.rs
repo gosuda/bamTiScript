@@ -1457,6 +1457,7 @@ fn collect_imported_types_for_source<'a>(
                 value_type_id: target_model.types().object(),
                 type_parameters: &[],
                 type_plane_id: None,
+                const_key_type_id: None,
                 namespace_members: members,
             });
             continue;
@@ -1501,6 +1502,7 @@ fn collect_imported_types_for_source<'a>(
                     value_type_id: namespace_type,
                     type_parameters: &[],
                     type_plane_id: None,
+                    const_key_type_id: None,
                     namespace_members: namespace_member_types(
                         target_source,
                         tables.files,
@@ -1606,6 +1608,7 @@ fn build_imported_symbol_type<'a>(
                 value_type_id,
                 type_parameters: source_model.generic_type_parameters(linked.symbol),
                 type_plane_id,
+                const_key_type_id: source_model.const_key_type(linked.symbol),
                 namespace_members: Vec::new(),
             })
         }
@@ -1630,6 +1633,7 @@ fn build_imported_symbol_type<'a>(
                 value_type_id: namespace_model.types().object(),
                 type_parameters: &[],
                 type_plane_id: None,
+                const_key_type_id: None,
                 namespace_members: members,
             })
         }
