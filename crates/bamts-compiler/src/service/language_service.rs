@@ -685,6 +685,9 @@ fn rename_identifier(text: &str) -> Option<Cow<'_, str>> {
         return None;
     }
     let name = crate::syntax::cook_identifier_text(text)?;
+    if !is_identifier(&name) {
+        return None;
+    }
     let source = SourceText::new(name.as_ref()).ok()?;
     let scanned = scanner::scan(
         SourceId::new(u32::MAX),
@@ -839,6 +842,29 @@ mod tests {
                 matches!(result, Err(ServiceError::InvalidRename(_))),
                 "{result:?}"
             );
+            fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[test]
+    fn rename_rejects_escaped_backslashes_in_identifier_names() {
+        for (source, needle, offset) in [
+            ("const a = 1; const value = 2; value;", "value;", 0),
+            (
+                "const object = { a: 1, value: 2 }; object.value;",
+                "object.value",
+                7,
+            ),
+        ] {
+            let (root, mut state) = state(source);
+            let position = cursor(source, needle, offset);
+            for name in [r"\u005cu0061", r"\u{5c}u0061", r"a\u005cu0062"] {
+                let result = state.rename("a.ts", position, name);
+                assert!(
+                    matches!(result, Err(ServiceError::InvalidRename(_))),
+                    "{name:?}: {result:?}"
+                );
+            }
             fs::remove_dir_all(root).expect("remove root");
         }
     }
