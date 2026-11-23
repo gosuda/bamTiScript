@@ -217,7 +217,7 @@ pub fn parse_with_cancel(
     let script_kind = scanned.script_kind();
     let source = Arc::clone(scanned.source());
     let eof = *scanned.eof();
-    let tokens = scanned.tokens().to_vec();
+    let tokens = scanned.into_tokens();
     let json_is_data = script_kind == ScriptKind::Json && json_tokens_form_data(&tokens, &source);
 
     let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
