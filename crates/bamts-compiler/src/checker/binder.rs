@@ -3406,6 +3406,27 @@ impl TypeTable {
         }
     }
 
+    /// Merges one later spread member. An absent optional member preserves
+    /// an earlier value and its requiredness; a required member replaces it.
+    pub(crate) fn upsert_spread_property(
+        &mut self,
+        properties: &mut Vec<PropertyType>,
+        mut property: PropertyType,
+    ) {
+        if let Some(existing) = properties
+            .iter_mut()
+            .find(|existing| existing.name() == property.name())
+        {
+            if property.optional() {
+                property.type_id = self.union(&[existing.type_id(), property.type_id()]);
+                property.optional = existing.optional();
+            }
+            *existing = property;
+        } else {
+            properties.push(property);
+        }
+    }
+
     /// Reads an object's current shape without replacing a retained Record
     /// identity. Existing object types stay borrowed.
     pub(crate) fn current_object_view(&self, ty: TypeId) -> Option<Cow<'_, ObjectType>> {
@@ -21373,7 +21394,7 @@ impl<'src> Binder<'src> {
                 value,
                 optional_value,
             } => {
-                let value = if read && self.strict_null_checks {
+                let value = if self.strict_null_checks {
                     optional_value.unwrap_or(*value)
                 } else {
                     *value
@@ -21401,7 +21422,7 @@ impl<'src> Binder<'src> {
                         owner_hint,
                         receiver,
                     );
-                    if read && property.optional() && self.strict_null_checks {
+                    if property.optional() && self.strict_null_checks {
                         let undefined = self.types.undefined_type();
                         type_id = self.types.union(&[type_id, undefined]);
                     }
@@ -21526,7 +21547,9 @@ impl<'src> Binder<'src> {
                         {
                             self.call_member_type_for_callable(view)
                         }
-                        _ if read => self.types.read_property_type(view, name),
+                        _ if read || self.strict_null_checks => {
+                            self.types.read_property_type(view, name)
+                        }
                         _ => self.types.property_type(view, name),
                     };
                     if let Some(property) = property {
@@ -25567,7 +25590,7 @@ impl<'src> Binder<'src> {
                                 )
                                 .with_spreadable(source_property.spreadable());
                                 fresh.name_kind = source_property.name_kind;
-                                upsert_property(&mut properties, fresh);
+                                self.types.upsert_spread_property(&mut properties, fresh);
                             }
                             index_signatures.extend(object.index_signatures);
                         }
