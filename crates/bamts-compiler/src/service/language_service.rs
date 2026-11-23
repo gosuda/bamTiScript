@@ -229,6 +229,11 @@ impl<F: FileSystem> ServiceState<F> {
         if let Some(property_id) = property_anchor_at(&document, position) {
             return rename_property(&document, property_id, new_name);
         }
+        if !is_binding_identifier(new_name) {
+            return Err(ServiceError::InvalidRename(format!(
+                "rename target is not a binding identifier: {new_name}"
+            )));
+        }
         let symbol = symbol_at(&document, position)?.ok_or(ServiceError::RenameUnavailable)?;
         let target = document.semantic().symbol(symbol);
         let old_name = target.name();
@@ -685,18 +690,20 @@ fn rename_identifier(text: &str) -> Option<Cow<'_, str>> {
         return None;
     }
     let name = crate::syntax::cook_identifier_text(text)?;
-    if !is_identifier(&name) {
-        return None;
-    }
-    let source = SourceText::new(name.as_ref()).ok()?;
+    is_identifier(&name).then_some(name)
+}
+
+fn is_binding_identifier(text: &str) -> bool {
+    let Ok(source) = SourceText::new(text) else {
+        return false;
+    };
     let scanned = scanner::scan(
         SourceId::new(u32::MAX),
         ScriptKind::TypeScript,
         Arc::new(source),
     );
-    (scanned.diagnostics().is_empty()
-        && matches!(scanned.product().tokens(), [token] if token.kind() == TokenKind::Identifier))
-    .then_some(name)
+    scanned.diagnostics().is_empty()
+        && matches!(scanned.product().tokens(), [token] if token.kind() == TokenKind::Identifier)
 }
 
 const fn symbol_index(symbol: SymbolId) -> usize {
@@ -887,6 +894,38 @@ mod tests {
                 ),
                 "rename accepted invalid cooked identifier {name:?}"
             );
+        }
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_accepts_keyword_identifier_names() {
+        let source = "const value = 1; const object = { value }; object.value; object[\"value\"];";
+        let (root, mut state) = state(source);
+        let shorthand = cursor(source, "value };", 0);
+        for (name, canonical) in [
+            ("type", "type"),
+            (r"\u0074ype", "type"),
+            ("class", "class"),
+            (r"\u0063lass", "class"),
+            ("default", "default"),
+            (r"\u0064efault", "default"),
+            ("await", "await"),
+            (r"\u0061wait", "await"),
+        ] {
+            let rename = state
+                .rename("a.ts", cursor(source, "object.value", 7), name)
+                .expect("keywords are valid property names");
+            assert_eq!(rename.edit.edits.len(), 3, "{name:?}");
+            for edit in &rename.edit.edits {
+                assert_eq!(edited_text(source, edit), "value");
+                let expected = if edit.range.start() == shorthand {
+                    format!("{canonical}: value")
+                } else {
+                    canonical.to_owned()
+                };
+                assert_eq!(edit.replacement, expected, "{name:?}");
+            }
         }
         fs::remove_dir_all(root).expect("remove root");
     }
