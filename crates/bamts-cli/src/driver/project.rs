@@ -231,7 +231,16 @@ pub(super) fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOver
         jsx_import_source: string("jsxImportSource"),
         resolve_json_module: boolean("resolveJsonModule"),
         declaration_dir: command.option_str("declarationDir").map(PathBuf::from),
-        base_url: command.option_str("baseUrl").map(PathBuf::from),
+        base_url: command
+            .options
+            .get("baseUrl")
+            .and_then(|value| match value {
+                TscOptionValue::String(path) => Some(Some(PathBuf::from(path))),
+                TscOptionValue::Null => Some(None),
+                TscOptionValue::Bool(_) | TscOptionValue::Number(_) | TscOptionValue::List(_) => {
+                    None
+                }
+            }),
         emit_declaration_only: boolean("emitDeclarationOnly"),
         incremental: boolean("incremental"),
         composite: boolean("composite"),

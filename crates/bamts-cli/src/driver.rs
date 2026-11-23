@@ -487,6 +487,7 @@ fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
 struct LoadedProgramFrontend {
     pub(super) program: ResolvedProgram,
     pub(super) output: ProgramFrontendOutput,
+    option_diagnostics: Vec<Diagnostic>,
 }
 
 enum FrontendConfig<'a> {
@@ -545,7 +546,7 @@ fn load_program_frontend_in_context(
             error,
         )))
     })?;
-    let options = match configuration {
+    let (options, option_diagnostics) = match configuration {
         FrontendConfig::Discovered => {
             let config_path = project.config().to_owned();
             let config_source = if config_path.is_file() {
@@ -556,19 +557,27 @@ fn load_program_frontend_in_context(
             } else {
                 "{}".to_owned()
             };
-            ProjectConfig::parse(&root, &config_path, &config_source)
-                .map_err(|error| DriverError::ProjectConfig {
-                    path: config_path,
-                    message: error.to_string(),
-                })?
-                .options()
-                .clone()
+            let config =
+                ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
+                    DriverError::ProjectConfig {
+                        path: config_path,
+                        message: error.to_string(),
+                    }
+                })?;
+            (config.options().clone(), Vec::new())
         }
         FrontendConfig::CommandLine(command) => {
-            tsc::native_frontend_options(command, context, &root, &absolute_entrypoint)?
+            let project =
+                tsc::native_frontend_project(command, context, &root, &absolute_entrypoint)?;
+            (project.options().clone(), project.option_diagnostics().0)
         }
     };
     let loader = ProgramLoader::new(&root, &options).map_err(DriverError::ProgramLoad)?;
+    let loader = if option_diagnostics.is_empty() {
+        loader
+    } else {
+        loader.tolerating_unresolved_imports()
+    };
     let program = loader
         .load_with_cancel(&absolute_entrypoint, cancel)
         .map_err(DriverError::ProgramLoad)?;
@@ -576,7 +585,11 @@ fn load_program_frontend_in_context(
     let output =
         compile_program_frontend_with_cancel(&program, FrontendMode::Check, &levels, cancel)
             .map_err(|_| DriverError::Cancelled)?;
-    Ok(LoadedProgramFrontend { program, output })
+    Ok(LoadedProgramFrontend {
+        program,
+        output,
+        option_diagnostics,
+    })
 }
 
 struct RenderedDiagnostics {
@@ -633,10 +646,7 @@ fn render_tsc_program_diagnostics(
 ) -> (String, bool) {
     let native = frontend
         .output
-        .modules()
-        .iter()
-        .flat_map(|module| module.diagnostics().iter().cloned())
-        .collect::<Vec<Diagnostic>>();
+        .compilation_diagnostics(&frontend.option_diagnostics);
     let diagnostics = map_parse_diagnostics(&native);
     let has_errors = diagnostics
         .iter()

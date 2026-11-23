@@ -1301,7 +1301,9 @@ impl ProjectConfig {
                 expected: "an object",
             })?),
         };
-        let base_url = optional_path(root, directory, compiler, "baseUrl")?
+        // `baseUrl` is retained for configuration display and removal diagnostics;
+        // only actual source and path-mapping targets require confinement.
+        let base_url = optional_output_path(root, directory, compiler, "baseUrl")?
             .unwrap_or_else(|| directory.to_path_buf());
         let paths = parse_path_mappings(root, &base_url, compiler)?;
         let strict = optional_bool(compiler, "strict")?.unwrap_or(false);

@@ -3,7 +3,6 @@ use super::project::*;
 use super::*;
 use crate::cli::tsc_args::TscDispatchMode;
 use crate::cli::tsc_args::TscExitStatus;
-use bamts_compiler::project::CompilerOptions;
 use bamts_compiler::project::canonical::slash_text;
 use bamts_compiler::project::effective::EffectiveProject;
 use bamts_compiler::project::effective::ProjectCompileOptions;
@@ -218,12 +217,12 @@ pub(super) fn compile_tsc_native_roots(
     })
 }
 
-pub(super) fn native_frontend_options(
+pub(super) fn native_frontend_project(
     command: &ParsedTscCommand,
     context: &ExecutionContext,
     root: &ProjectRoot,
     entrypoint: &Path,
-) -> Result<CompilerOptions, DriverError> {
+) -> Result<EffectiveProject, DriverError> {
     let overrides = project_overrides(command);
     let resolve = |path: Option<PathBuf>| path.map(|path| context.resolve_path(path));
     let overrides = ProjectOptionOverrides {
@@ -232,12 +231,7 @@ pub(super) fn native_frontend_options(
         out_file: resolve(overrides.out_file),
         ts_build_info_file: resolve(overrides.ts_build_info_file),
         declaration_dir: resolve(overrides.declaration_dir),
-        base_url: resolve(overrides.base_url).or_else(|| {
-            context
-                .cwd()
-                .starts_with(root.path())
-                .then(|| context.cwd().to_path_buf())
-        }),
+        base_url: overrides.base_url.map(resolve),
         ..overrides
     };
     let filesystem = OsFileSystem::new(root.path()).map_err(|error| {
@@ -253,13 +247,10 @@ pub(super) fn native_frontend_options(
         allow_missing_config: true,
         source_files: Some(vec![entrypoint.to_path_buf()]),
     };
-    let project = EffectiveProject::load(&request, &filesystem).map_err(|error| {
-        DriverError::ProjectConfig {
-            path: root.path().join("tsconfig.json"),
-            message: error.to_string(),
-        }
-    })?;
-    Ok(project.options().clone())
+    EffectiveProject::load(&request, &filesystem).map_err(|error| DriverError::ProjectConfig {
+        path: root.path().join("tsconfig.json"),
+        message: error.to_string(),
+    })
 }
 
 /// The JavaScript-artifact direct route: all argv roots in one inferred

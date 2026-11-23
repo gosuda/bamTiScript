@@ -60,7 +60,8 @@ pub struct ProjectOptionOverrides {
     pub jsx_import_source: Option<Arc<str>>,
     pub resolve_json_module: Option<bool>,
     pub declaration_dir: Option<PathBuf>,
-    pub base_url: Option<PathBuf>,
+    /// Absent preserves the config value; `Some(None)` clears it as argv `null`.
+    pub base_url: Option<Option<PathBuf>>,
     // Boolean compiler options forwarded from argv.
     pub emit_declaration_only: Option<bool>,
     pub incremental: Option<bool>,
@@ -201,6 +202,69 @@ impl EffectiveProject {
     pub const fn config(&self) -> &TsConfig {
         &self.config
     }
+
+    /// Reports removed compiler options without reading source files. The
+    /// frontend selects these only after source syntax has been validated.
+    #[must_use]
+    pub fn option_diagnostics(&self) -> (Vec<Diagnostic>, Option<ProjectSource>) {
+        let has_base_url = self
+            .config()
+            .config()
+            .raw()
+            .get("compilerOptions")
+            .and_then(JsonValue::as_object)
+            .and_then(|options| options.get("baseUrl"))
+            .and_then(JsonValue::as_str)
+            .is_some();
+        let mut diagnostics = Vec::new();
+        let mut source = None;
+        for (name, present) in [
+            ("outFile", self.options().out_file().is_some()),
+            ("baseUrl", has_base_url),
+        ] {
+            if !present {
+                continue;
+            }
+            let catalog = crate::checker::diagnostic_messages::by_u32(5102)
+                .expect("TS5102 is in the generated catalog");
+            let range = option_diagnostic_range(self, name);
+            let mut message = catalog
+                .format(crate::checker::diagnostic_messages::Args::new([name]))
+                .expect("arity matches");
+            if name == "baseUrl" && self.config_source().is_some() {
+                let directory = self
+                    .config_path()
+                    .parent()
+                    .expect("a project config has a parent directory");
+                let target = self.options().base_url().join("*");
+                let relative = if directory.components().next() == target.components().next() {
+                    relative_path_between(directory, &target)
+                } else {
+                    target
+                };
+                let pattern = if relative.is_absolute() || relative.starts_with("..") {
+                    slash_text(&relative)
+                } else {
+                    format!("./{}", slash_text(&relative))
+                };
+                let pattern =
+                    super::build_mode::canonical_json(&JsonValue::String(Arc::from(pattern)));
+                message.push_str(&format!(
+                    "\n  Use '\"paths\": {{\"*\": [{pattern}]}}' instead."
+                ));
+            }
+            diagnostics.push(Diagnostic::error(
+                catalog.diagnostic_code(),
+                SourceId::new(u32::MAX),
+                range,
+                message,
+            ));
+            if source.is_none() {
+                source = option_diagnostic_source(self, range);
+            }
+        }
+        (diagnostics, source)
+    }
 }
 
 /// Controls one canonical project compilation.
@@ -252,7 +316,7 @@ pub fn compile_project<F: FileSystem + Clone>(
     options: &ProjectCompileOptions,
     fs: &F,
 ) -> Result<ProjectCompileResult, ProjectCompileError> {
-    let (mut diagnostics, tsconfig_source) = removed_out_file_diagnostics(project);
+    let (option_diagnostics, tsconfig_source) = project.option_diagnostics();
     if project.options().source_map() && project.options().inline_source_map() {
         return Err(ProjectCompileError::UnsupportedOption {
             option: "sourceMap with inlineSourceMap",
@@ -270,6 +334,11 @@ pub fn compile_project<F: FileSystem + Clone>(
     let loader =
         ProgramLoader::with_file_system(project.root(), project.options(), Arc::new(fs.clone()))
             .map_err(|error| ProjectCompileError::Load(Arc::from(error.to_string())))?;
+    let loader = if option_diagnostics.is_empty() {
+        loader
+    } else {
+        loader.tolerating_unresolved_imports()
+    };
     let program = loader
         .load_roots(project.source_files())
         .map_err(|error| ProjectCompileError::Load(Arc::from(error.to_string())))?;
@@ -336,7 +405,8 @@ pub fn compile_project<F: FileSystem + Clone>(
         .map_err(ProjectCompileError::Output)?;
 
     let build_state = build_state(project, &program, output_plan.as_ref(), options)?;
-    if !options.force
+    if option_diagnostics.is_empty()
+        && !options.force
         && should_emit
         && let Some((path, current)) = &build_state
         && let Ok(encoded) = fs.read(path)
@@ -361,7 +431,7 @@ pub fn compile_project<F: FileSystem + Clone>(
             &outputs_present,
         ) {
             return Ok(ProjectCompileResult {
-                diagnostics,
+                diagnostics: Vec::new(),
                 sources,
                 tsconfig_source: tsconfig_source.clone(),
                 outputs: BuildOutputs::default(),
@@ -377,12 +447,7 @@ pub fn compile_project<F: FileSystem + Clone>(
         FrontendMode::Check,
         &LintTable::new(LintProfile::Default),
     );
-    diagnostics.extend(
-        checked
-            .modules()
-            .iter()
-            .flat_map(|module| module.diagnostics().iter().cloned()),
-    );
+    let mut diagnostics = checked.compilation_diagnostics(&option_diagnostics);
     let pre_emit_errors = diagnostics
         .iter()
         .any(|diagnostic| !diagnostic.is_warning());
@@ -500,38 +565,10 @@ pub fn compile_project<F: FileSystem + Clone>(
     })
 }
 
-/// TypeScript 7.0.2 removed `outFile`: any project that still declares it
-/// compiles per-file and reports TS5102 at the option key. The diagnostic
-/// anchors at the `outFile` key when the loaded configuration text carries
-/// one, at `compilerOptions` when the loaded text carries that object but no
-/// `outFile` key, and unanchored otherwise (extended base or direct route).
-fn removed_out_file_diagnostics(
-    project: &EffectiveProject,
-) -> (Vec<Diagnostic>, Option<ProjectSource>) {
-    if project.options().out_file().is_none() {
-        return (Vec::new(), None);
-    }
-    let catalog = crate::checker::diagnostic_messages::by_u32(5102)
-        .expect("TS5102 is in the generated catalog");
-    let range = out_file_diagnostic_range(project);
-    let diagnostic = Diagnostic::error(
-        catalog.diagnostic_code(),
-        SourceId::new(u32::MAX),
-        range,
-        catalog
-            .format(crate::checker::diagnostic_messages::Args::new(["outFile"]))
-            .expect("arity matches"),
-    );
-    (vec![diagnostic], out_file_diagnostic_source(project, range))
-}
-
 /// The tsconfig source anchoring `range`, when `range` points into the loaded
 /// configuration text. An empty range is unanchored: no source is returned
 /// so rendering prints a bare `error TS5102` with no file prefix.
-fn out_file_diagnostic_source(
-    project: &EffectiveProject,
-    range: TextRange,
-) -> Option<ProjectSource> {
+fn option_diagnostic_source(project: &EffectiveProject, range: TextRange) -> Option<ProjectSource> {
     if range == TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid") {
         return None;
     }
@@ -544,10 +581,10 @@ fn out_file_diagnostic_source(
     })
 }
 
-/// The UTF-16 range anchoring the TS5102 `outFile` diagnostic: the `outFile`
+/// The UTF-16 range anchoring a removed-option diagnostic: the option's
 /// key inside `compilerOptions` when the loaded text declares it, else the
 /// `compilerOptions` key itself, else an empty range.
-fn out_file_diagnostic_range(project: &EffectiveProject) -> TextRange {
+fn option_diagnostic_range(project: &EffectiveProject, name: &str) -> TextRange {
     let empty =
         || TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid");
     let Some(source) = project.config_source() else {
@@ -557,7 +594,7 @@ fn out_file_diagnostic_range(project: &EffectiveProject) -> TextRange {
         return empty();
     };
     let position = match config_object_value_offset(source, compiler_options) {
-        Some(value) => config_key_offset(&source[value..], "outFile")
+        Some(value) => config_key_offset(&source[value..], name)
             .map_or(compiler_options, |offset| value + offset),
         None => compiler_options,
     };
@@ -1475,17 +1512,22 @@ fn rewrite_compiler_paths(
         .and_then(JsonValue::as_str)
         .map(PathBuf::from);
     let base_url = match compiler.get("baseUrl") {
+        Some(JsonValue::Null) => directory.to_path_buf(),
         Some(value) => {
             let value = value
                 .as_str()
                 .ok_or_else(|| invalid_config_field("baseUrl"))?;
-            root.resolve_from(directory, value)
-                .map_err(ProjectCompileError::Path)?
+            let path = root.resolve_output_from(directory, value);
+            set_named_entry(
+                &mut entries,
+                "baseUrl",
+                JsonValue::String(path_to_arc(&path)),
+            );
+            path
         }
         None => inherited_base.unwrap_or_else(|| directory.to_path_buf()),
     };
     for field in [
-        "baseUrl",
         "rootDir",
         "outDir",
         "declarationDir",
@@ -1652,7 +1694,6 @@ fn apply_overrides(
         ("outFile", overrides.out_file.as_deref()),
         ("tsBuildInfoFile", overrides.ts_build_info_file.as_deref()),
         ("declarationDir", overrides.declaration_dir.as_deref()),
-        ("baseUrl", overrides.base_url.as_deref()),
     ] {
         if let Some(value) = value {
             let value = root
@@ -1661,6 +1702,14 @@ fn apply_overrides(
             set_named_entry(&mut compiler, key, JsonValue::String(path_to_arc(&value)));
         }
     }
+    if let Some(base_url) = &overrides.base_url {
+        let value = match base_url {
+            Some(path) => JsonValue::String(path_to_arc(&root.resolve_output_from(cwd, path))),
+            None => JsonValue::Null,
+        };
+        set_named_entry(&mut compiler, "baseUrl", value);
+    }
+    compiler.retain(|(key, value)| key.as_ref() != "baseUrl" || !matches!(value, JsonValue::Null));
     for (key, value) in [
         ("mapRoot", overrides.map_root.as_deref()),
         ("sourceRoot", overrides.source_root.as_deref()),
@@ -1688,7 +1737,7 @@ fn apply_overrides(
             .collect();
         set_named_entry(&mut compiler, "lib", JsonValue::Array(Arc::from(entries)));
     }
-    if !compiler.is_empty() {
+    if !compiler.is_empty() || raw.get("compilerOptions").is_some() {
         set_named_entry(
             &mut top,
             "compilerOptions",
