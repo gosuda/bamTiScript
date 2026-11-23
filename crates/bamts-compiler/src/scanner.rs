@@ -416,6 +416,12 @@ impl ScannedSource {
         &self.tokens
     }
 
+    /// Transfers the token buffer to a parser that owns this scan result.
+    #[must_use]
+    pub(crate) fn into_tokens(self) -> Vec<Token> {
+        self.tokens
+    }
+
     /// Returns the terminal end-of-file token.
     #[must_use]
     pub const fn eof(&self) -> &Token {
