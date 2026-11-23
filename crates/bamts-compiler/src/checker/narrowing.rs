@@ -52,8 +52,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::binder::{
-    DeclId, ExecutionBoundary, ExecutionPoint, FlowPointId, FunctionParameter, ScopeId, SymbolId,
-    Type, TypeId, TypeTable,
+    DeclId, ExecutionBoundary, ExecutionPoint, FlowPointId, FunctionParameter, ObjectType, ScopeId,
+    SymbolId, Type, TypeId, TypeTable,
 };
 use super::relations::TypeRelations;
 use crate::literal::number_value;
@@ -1383,18 +1383,21 @@ impl<'a> NarrowingContext<'a> {
         specific.unwrap_or_else(|| self.table.intersection(vec![ty, instance]))
     }
 
-    /// Narrows by the `"property" in x` test: positive keeps object members
-    /// declaring the property, negative drops them. Members whose property
-    /// set is opaque (arrays, functions, nominal and generic objects) pass
-    /// both polarities; primitives can only take the negative branch.
+    /// Keeps members with a required property on the positive branch and
+    /// members missing it on the negative branch. Members with an optional
+    /// property or an opaque property set survive both branches.
     #[must_use]
     pub fn narrow_in(&mut self, ty: TypeId, property: &str, negated: bool) -> TypeId {
+        let optionality = |object: &ObjectType| {
+            object
+                .properties()
+                .iter()
+                .find(|member| member.name() == property)
+                .map(|member| member.optional())
+        };
         self.filter(ty, &|table, candidate| {
-            let declares = match candidate {
-                Type::ObjectType(object) => object
-                    .properties()
-                    .iter()
-                    .any(|member| member.name() == property),
+            let member = match candidate {
+                Type::ObjectType(object) => optionality(object),
                 Type::Record {
                     key,
                     value,
@@ -1404,22 +1407,18 @@ impl<'a> NarrowingContext<'a> {
                     else {
                         return Narrow::Keep;
                     };
-                    object
-                        .properties()
-                        .iter()
-                        .any(|member| member.name() == property)
+                    optionality(&object)
                 }
                 Type::Object
                 | Type::Function(_)
                 | Type::Array(_)
                 | Type::Named(_)
                 | Type::AppliedClass { .. } => return Narrow::Keep,
-                _ => false,
+                _ => None,
             };
-            if declares != negated {
-                Narrow::Keep
-            } else {
-                Narrow::Drop
+            match (member, negated) {
+                (Some(true), _) | (Some(false), false) | (None, true) => Narrow::Keep,
+                _ => Narrow::Drop,
             }
         })
     }

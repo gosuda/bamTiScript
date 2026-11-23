@@ -1,8 +1,10 @@
 //! Semantic evaluation for conditional, infer, template-literal, and mapped types.
 //!
-//! Syntax nodes are resolved into the canonical [`TypeTable`] before entering this
-//! module. Evaluation interns only canonical checker types; no parallel type graph
-//! or permissive recovery type is introduced here.
+//! Callers supply resolved requests in the canonical [`TypeTable`]. Evaluation
+//! interns only canonical checker types; no parallel type graph or permissive
+//! recovery type is introduced here. The source binder does not currently lower
+//! conditional or mapped syntax through this API, so its algebra tests do not
+//! establish source-level support for those constructs.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -793,6 +795,8 @@ mod tests {
     }
 
     #[test]
+    // This exercises the resolved-type API. Source-level Partial<Record<...>>
+    // coverage lives in tests/constructor_keyof.rs.
     fn mapped_types_read_retained_record_keys_and_preserve_optional_properties() {
         let mut types = TypeTable::new();
         let record = retained_record(&mut types, true);

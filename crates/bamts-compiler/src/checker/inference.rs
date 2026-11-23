@@ -1638,8 +1638,9 @@ impl<'table> InferenceContext<'table> {
                 }
                 Some(self.table.union(&yields))
             }
-            Type::ObjectType(object) => {
+            Type::ObjectType(_) | Type::Record { .. } => {
                 let value = self.table.property_type(result, "value")?;
+                let object = self.table.current_object_view(result)?;
                 let completes = object.properties.iter().any(|property| {
                     property.name() == "done"
                         && !property.optional()
