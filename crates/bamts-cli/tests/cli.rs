@@ -2213,6 +2213,48 @@ fn tsc_native_emission_keeps_erased_and_lazy_unresolved_imports() {
 }
 
 #[test]
+fn tsc_native_emission_quarantines_unresolved_static_imports_in_lazy_modules() {
+    for (source, expected) in [
+        (
+            "const load = () => import('./lazy.js');\nconsole.log('ok');\n",
+            "ok\n",
+        ),
+        (
+            "import('./lazy.js').then(\n\
+                 () => console.log('unexpected fulfillment'),\n\
+                 () => console.log('rejected'),\n\
+             );\n",
+            "rejected\n",
+        ),
+    ] {
+        let project = ScratchDirectory::new();
+        project.write("main.ts", source);
+        project.write(
+            "lazy.ts",
+            "import './missing.js';\nconsole.log('lazy body must not execute');\n",
+        );
+        let compiled = project
+            .command()
+            .args(["--ignoreConfig", "main.ts", "--baseUrl", "./deps"])
+            .current_dir(&project.path)
+            .output()
+            .expect("native compilation with an invalid lazy module starts");
+        assert_eq!(compiled.status.code(), Some(2), "{}", stderr(&compiled));
+        assert_eq!(stdout(&compiled), REMOVED_BASE_URL_DIAGNOSTIC);
+        assert!(stderr(&compiled).is_empty(), "{}", stderr(&compiled));
+        let executable = project
+            .path
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
+        let executed = Command::new(executable)
+            .output()
+            .expect("native executable with a quarantined lazy module starts");
+        assert_success(&executed, "invalid lazy modules reject only when imported");
+        assert_eq!(executed.stdout, expected.as_bytes());
+        assert!(executed.stderr.is_empty(), "{}", stderr(&executed));
+    }
+}
+
+#[test]
 fn tsc_artifact_emission_preserves_unresolved_static_imports() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "import './missing';\nconsole.log('ok');\n");

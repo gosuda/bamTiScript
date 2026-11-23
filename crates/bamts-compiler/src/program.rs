@@ -3179,18 +3179,10 @@ pub fn lower_program_with_cancel(
             let Some(current) = resolved.module(id) else {
                 continue;
             };
+            check_resolved_static_dependencies(current)?;
             for dep in current.dependencies() {
                 if dep.kind() != ModuleEdgeKind::StaticRuntime {
                     continue;
-                }
-                if dep.is_unresolved() {
-                    return Err(program_lower_error(
-                        current.path(),
-                        ProgramLowerPhase::Frontend,
-                        ProgramLowerErrorKind::UnresolvedStaticDependency {
-                            specifier: dep.specifier().to_owned(),
-                        },
-                    ));
                 }
                 if let ModuleTarget::Local(target) = dep.target()
                     && static_reachable.insert(*target)
@@ -3389,6 +3381,10 @@ pub fn lower_program_with_cancel(
             let code = if let Some(stub) = stub_codes.remove(&kept_module.source_id()) {
                 stub
             } else {
+                if let Err(error) = check_resolved_static_dependencies(kept_module) {
+                    module_failures.push((kept_module.source_id(), error));
+                    continue;
+                }
                 let output = frontend
                     .module(kept_module.source_id())
                     .expect("frontend presence checked above");
@@ -3519,6 +3515,23 @@ pub fn lower_program_with_cancel(
             }
         }
     }
+}
+
+fn check_resolved_static_dependencies(module: &ResolvedModule) -> Result<(), ProgramLowerError> {
+    if let Some(dependency) = module
+        .dependencies()
+        .iter()
+        .find(|edge| edge.kind() == ModuleEdgeKind::StaticRuntime && edge.is_unresolved())
+    {
+        return Err(program_lower_error(
+            module.path(),
+            ProgramLowerPhase::Frontend,
+            ProgramLowerErrorKind::UnresolvedStaticDependency {
+                specifier: dependency.specifier().to_owned(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn live_without(
