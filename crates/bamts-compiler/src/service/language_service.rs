@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -12,7 +13,7 @@ use crate::{
     },
     diagnostic::DiagnosticSeverity,
     scanner,
-    source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos},
+    source::{MAX_SOURCE_BYTES, ScriptKind, SourceId, SourceText, TextRange, Utf16Pos},
     syntax::{Accessibility, Token, TokenKind, VariableKind},
 };
 
@@ -217,11 +218,12 @@ impl<F: FileSystem> ServiceState<F> {
         position: Utf16Pos,
         new_name: &str,
     ) -> Result<RenameResult, ServiceError> {
-        if !is_rename_identifier(new_name) {
+        let Some(name) = rename_identifier(new_name) else {
             return Err(ServiceError::InvalidRename(format!(
                 "rename target is not an identifier: {new_name}"
             )));
-        }
+        };
+        let new_name = name.as_ref();
         let document = self.ensure_document(path.as_ref())?;
         validate_position(&document, position)?;
         if let Some(property_id) = property_anchor_at(&document, position) {
@@ -678,20 +680,20 @@ fn is_identifier(text: &str) -> bool {
     scanner::is_id_start(first) && characters.all(scanner::is_id_continue)
 }
 
-fn is_rename_identifier(text: &str) -> bool {
-    if text.is_empty() {
-        return false;
+fn rename_identifier(text: &str) -> Option<Cow<'_, str>> {
+    if text.len() > MAX_SOURCE_BYTES {
+        return None;
     }
-    let Ok(source) = SourceText::new(text) else {
-        return false;
-    };
+    let name = crate::syntax::cook_identifier_text(text)?;
+    let source = SourceText::new(name.as_ref()).ok()?;
     let scanned = scanner::scan(
         SourceId::new(u32::MAX),
         ScriptKind::TypeScript,
         Arc::new(source),
     );
-    scanned.diagnostics().is_empty()
-        && matches!(scanned.product().tokens(), [token] if token.kind() == TokenKind::Identifier)
+    (scanned.diagnostics().is_empty()
+        && matches!(scanned.product().tokens(), [token] if token.kind() == TokenKind::Identifier))
+    .then_some(name)
 }
 
 const fn symbol_index(symbol: SymbolId) -> usize {
@@ -818,6 +820,48 @@ mod tests {
             .rename("a.ts", cursor(source, "a.value", 2), "value")
             .expect("unchanged property name does not conflict with itself");
         assert!(rename.edit.edits.is_empty());
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_checks_collisions_using_cooked_identifier_names() {
+        for (source, needle, offset) in [
+            ("const a = 1; const value = 2; value;", "value;", 0),
+            (
+                "const object = { a: 1, value: 2 }; object.value;",
+                "object.value",
+                7,
+            ),
+        ] {
+            let (root, mut state) = state(source);
+            let result = state.rename("a.ts", cursor(source, needle, offset), r"\u0061");
+            assert!(
+                matches!(result, Err(ServiceError::InvalidRename(_))),
+                "{result:?}"
+            );
+            fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[test]
+    fn rename_validates_the_cooked_identifier_before_building_edits() {
+        let source = "const value = 1; value;";
+        let (root, mut state) = state(source);
+        let position = cursor(source, "value;", 0);
+        let rename = state
+            .rename("a.ts", position, r"\u0061")
+            .expect("escaped identifier rename");
+        assert_eq!(rename.edit.edits.len(), 2);
+        assert!(rename.edit.edits.iter().all(|edit| edit.replacement == "a"));
+        for name in [r"\u006cet", r"\u0061wait", r"\u0069f", r"\u0020", r"\u{}"] {
+            assert!(
+                matches!(
+                    state.rename("a.ts", position, name),
+                    Err(ServiceError::InvalidRename(_))
+                ),
+                "rename accepted invalid cooked identifier {name:?}"
+            );
+        }
         fs::remove_dir_all(root).expect("remove root");
     }
 
