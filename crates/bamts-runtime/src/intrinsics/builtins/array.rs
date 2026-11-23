@@ -804,8 +804,10 @@ fn stable_sort<H: Host>(
             // This sort takes quadratic steps, and a charge for each would make a
             // short array run out of fuel. A comparator pays for its own work.
             machine.check_cancel().map_err(EvalFailure::Runtime)?;
+            let comparison = machine.hold_temporaries(&[]);
             let order =
                 compare_array_elements(machine, values[index], values[index - 1], comparator)?;
+            machine.release_temporaries(comparison);
             if order != Ordering::Less {
                 break;
             }
@@ -5063,6 +5065,84 @@ mod tests {
                 Err(EvalFailure::ThrowValue(value)) if value == Value::int32(99)
             ));
             assert_eq!(array(machine, source), [object, Value::int32(0)]);
+        });
+    }
+
+    #[test]
+    fn to_sorted_releases_comparison_temporaries_and_keeps_operands_rooted() {
+        fn stringify(
+            machine: &mut Machine<'_, TestHost>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            machine.collect_garbage();
+            let rank = machine.get_named_property(this, "rank")?;
+            let text = machine.coerce_string_observable(rank)?;
+            Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
+        }
+
+        with_machine(|machine| {
+            let stringify = native(machine, "allocating sort conversion", stringify);
+            let mut values = Vec::new();
+            for rank in (0..8).rev() {
+                let object = ordinary_object(machine);
+                machine
+                    .set_data_property(object, "rank", Value::int32(rank))
+                    .unwrap();
+                machine
+                    .set_data_property(object, "toString", stringify)
+                    .unwrap();
+                values.push(object);
+            }
+
+            machine.with_temporaries(|machine| {
+                let before = machine.builtin_temporaries.len();
+                stable_sort(machine, &mut values, None).unwrap();
+                assert_eq!(machine.builtin_temporaries.len(), before + values.len());
+                machine.collect_garbage();
+                for (rank, object) in values.iter().enumerate() {
+                    assert_eq!(
+                        machine.get_named_property(*object, "rank").unwrap(),
+                        Value::int32(rank as u32)
+                    );
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn to_sorted_keeps_thrown_conversion_values_rooted() {
+        fn stringify(
+            machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            let error = allocate_string(machine, EcmaString::encode("sort conversion failed"))?;
+            Err(EvalFailure::ThrowValue(error))
+        }
+
+        with_machine(|machine| {
+            let object = ordinary_object(machine);
+            let stringify = native(machine, "allocating throwing sort conversion", stringify);
+            machine
+                .set_data_property(object, "toString", stringify)
+                .unwrap();
+            let mut values = [object, Value::int32(0)];
+            machine.with_temporaries(|machine| {
+                let EvalFailure::ThrowValue(error) =
+                    stable_sort(machine, &mut values, None).unwrap_err()
+                else {
+                    panic!("the string conversion must throw its allocated value");
+                };
+                machine.collect_garbage();
+                assert!(
+                    machine
+                        .string_value(error)
+                        .is_some_and(|text| text.eq_ascii("sort conversion failed"))
+                );
+            });
         });
     }
 
