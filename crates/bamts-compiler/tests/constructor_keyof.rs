@@ -323,3 +323,121 @@ const literal: Literal = "extra";
         2,
     );
 }
+
+#[test]
+fn record_keys_preserve_numeric_and_string_kinds_for_the_same_name() {
+    for domain in [r#""1" | 1"#, r#"1 | "1""#] {
+        assert_checks(&format!(
+            r#"
+type R = Record<{domain}, boolean>;
+type Identity<T> = T;
+type K = keyof Identity<R>;
+const stringKey: K = "1";
+const numberKey: K = 1;
+declare const source: R;
+const copy = {{ ...source }};
+const copiedString: keyof typeof copy = "1";
+const copiedNumber: keyof typeof copy = 1;
+"#
+        ));
+        assert_assignment_errors(
+            &format!(
+                r#"
+type R = Record<{domain}, boolean>;
+const otherString: keyof R = "2";
+const otherNumber: keyof R = 2;
+"#
+            ),
+            2,
+        );
+    }
+}
+
+#[test]
+fn distinct_quoted_record_keys_do_not_gain_numeric_spellings() {
+    assert_checks(
+        r#"
+type R = Record<"01" | 1, boolean>;
+const quoted: keyof R = "01";
+const numeric: keyof R = 1;
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+type R = Record<"01" | 1, boolean>;
+const absentString: keyof R = "1";
+const absentNumber: keyof R = 0;
+"#,
+        2,
+    );
+}
+
+#[test]
+fn inherited_numeric_keys_keep_the_overriding_declarations_kind() {
+    assert_checks(
+        r#"
+class Quoted { static "1" = true; }
+class Numeric extends Quoted { static 1 = true; }
+class NumberBase { static 1 = true; }
+class StringDerived extends NumberBase { static "1" = true; }
+const quoted: keyof typeof Quoted = "1";
+const numeric: keyof typeof Numeric = 1;
+const derivedString: keyof typeof StringDerived = "1";
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+class Quoted { static "1" = true; }
+class Numeric extends Quoted { static 1 = true; }
+class NumberBase { static 1 = true; }
+class StringDerived extends NumberBase { static "1" = true; }
+const wrongString: keyof typeof Numeric = "1";
+const wrongNumber: keyof typeof StringDerived = 1;
+"#,
+        2,
+    );
+}
+
+#[test]
+fn object_spread_uses_the_last_propertys_key_kind() {
+    assert_checks(
+        r#"
+const numeric = { 1: true };
+const quoted = { "1": true };
+const stringLast = { ...numeric, ...quoted };
+const numberLast = { ...quoted, ...numeric };
+const stringKey: keyof typeof stringLast = "1";
+const numberKey: keyof typeof numberLast = 1;
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+const numeric = { 1: true };
+const quoted = { "1": true };
+const stringLast = { ...numeric, ...quoted };
+const numberLast = { ...quoted, ...numeric };
+const wrongNumber: keyof typeof stringLast = 1;
+const wrongString: keyof typeof numberLast = "1";
+"#,
+        2,
+    );
+}
+
+#[test]
+fn a_named_numeric_enum_member_remains_a_key_beside_its_reverse_lookup() {
+    assert_checks(
+        r#"
+enum E { One = 1 }
+const named: keyof typeof E = "One";
+const reverse: string = E[1];
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+enum E { One = 1 }
+const reverseNumber: keyof typeof E = 1;
+const reverseString: keyof typeof E = "1";
+"#,
+        2,
+    );
+}
