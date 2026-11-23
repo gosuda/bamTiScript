@@ -690,12 +690,7 @@ impl<'a> TypeInstantiation<'a> {
         table.finish_constructor_projection(identity, arguments, structural)
     }
 
-    fn affects_type(
-        &self,
-        table: &TypeTable,
-        ty: TypeId,
-        visiting: &mut HashSet<TypeId>,
-    ) -> bool {
+    fn affects_type(&self, table: &TypeTable, ty: TypeId, visiting: &mut HashSet<TypeId>) -> bool {
         if !visiting.insert(ty) {
             return false;
         }
@@ -725,33 +720,43 @@ impl<'a> TypeInstantiation<'a> {
             Type::Union(members)
             | Type::Intersection(members)
             | Type::AppliedClass {
-                arguments: members,
-                ..
+                arguments: members, ..
             }
             | Type::AppliedAlias {
-                arguments: members,
-                ..
+                arguments: members, ..
             } => members
                 .iter()
                 .any(|&member| self.affects_type(table, member, visiting)),
             Type::ObjectType(object) => {
-                object.properties.iter().any(|property| {
-                    self.affects_type(table, property.type_id(), visiting)
-                }) || object.call_signatures.iter().any(|signature| {
-                    self.affects_signature(table, signature, visiting)
-                }) || object.construct_signatures.iter().any(|entry| {
-                    self.affects_signature(table, &entry.signature, visiting)
-                }) || object.index_signatures.iter().any(|signature| {
-                    signature.parameters.iter().any(|parameter| {
-                        self.affects_type(table, parameter.type_id(), visiting)
-                    }) || self.affects_type(table, signature.value_type, visiting)
-                }) || object.generator_return.is_some_and(|return_type| {
-                    self.affects_type(table, return_type, visiting)
-                }) || object.iterator_property.as_ref().is_some_and(|property| {
-                    self.affects_type(table, property.type_id(), visiting)
-                }) || object.async_iterator_property.as_ref().is_some_and(|property| {
-                    self.affects_type(table, property.type_id(), visiting)
-                })
+                object
+                    .properties
+                    .iter()
+                    .any(|property| self.affects_type(table, property.type_id(), visiting))
+                    || object
+                        .call_signatures
+                        .iter()
+                        .any(|signature| self.affects_signature(table, signature, visiting))
+                    || object
+                        .construct_signatures
+                        .iter()
+                        .any(|entry| self.affects_signature(table, &entry.signature, visiting))
+                    || object.index_signatures.iter().any(|signature| {
+                        signature.parameters.iter().any(|parameter| {
+                            self.affects_type(table, parameter.type_id(), visiting)
+                        }) || self.affects_type(table, signature.value_type, visiting)
+                    })
+                    || object
+                        .generator_return
+                        .is_some_and(|return_type| self.affects_type(table, return_type, visiting))
+                    || object.iterator_property.as_ref().is_some_and(|property| {
+                        self.affects_type(table, property.type_id(), visiting)
+                    })
+                    || object
+                        .async_iterator_property
+                        .as_ref()
+                        .is_some_and(|property| {
+                            self.affects_type(table, property.type_id(), visiting)
+                        })
             }
             Type::Function(signature) => self.affects_signature(table, signature, visiting),
             Type::ConstructorType {

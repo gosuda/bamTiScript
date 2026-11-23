@@ -1182,12 +1182,9 @@ impl<'table> TypeRelations<'table> {
                     value: source_value,
                 },
                 Type::ObjectType(target_object),
-            ) => self.record_satisfies_object(
-                *source_key,
-                *source_value,
-                target_object,
-                strictness,
-            ),
+            ) => {
+                self.record_satisfies_object(*source_key, *source_value, target_object, strictness)
+            }
             (Type::Record { .. }, Type::Object) => true,
             (Type::Never, Type::Record { .. }) => true,
             // An interface with a completed structural body expands through that body
@@ -4614,7 +4611,10 @@ mod tests {
         ] {
             let left = table.number_literal(left);
             let right = table.number_literal(right);
-            assert_ne!(left, right, "literal spellings remain available to rendering");
+            assert_ne!(
+                left, right,
+                "literal spellings remain available to rendering"
+            );
             assert!(table.assignable(left, right));
             assert!(table.assignable(right, left));
         }
