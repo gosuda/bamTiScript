@@ -1625,32 +1625,191 @@ pub struct ConstructorProjection {
 }
 
 #[derive(Default)]
-struct KeyofReduction {
-    types: HashSet<TypeId>,
-    aliases: HashSet<SymbolId>,
-    cycle_detected: bool,
+struct KeyReduction {
+    types: HashMap<TypeId, usize>,
+    aliases: HashMap<SymbolId, Vec<TypeId>>,
+    blocked: bool,
 }
 
-impl KeyofReduction {
+impl KeyReduction {
     fn enter(&mut self, table: &TypeTable, ty: TypeId) -> bool {
-        if !self.types.insert(ty) {
-            self.cycle_detected = true;
+        let depth = self.types.len();
+        if depth >= MAX_TYPE_DEPTH as usize || self.types.contains_key(&ty) {
+            self.blocked = true;
             return false;
         }
-        if let Type::AppliedAlias { symbol, .. } = table.instantiation_type(ty)
-            && !self.aliases.insert(*symbol)
-        {
-            self.types.remove(&ty);
-            self.cycle_detected = true;
-            return false;
+        if let Type::AppliedAlias { symbol, .. } = table.instantiation_type(ty) {
+            let active = self.aliases.entry(*symbol).or_default();
+            if let Some(&previous) = active.last() {
+                let Type::AppliedAlias { arguments, .. } = table.instantiation_type(previous)
+                else {
+                    unreachable!("active alias retains its application head");
+                };
+                let previous_depth = self.types[&previous];
+                // Re-entering a definition requires crossing an input argument.
+                // Only arguments on the current path count toward descent.
+                if !arguments.iter().any(|argument| {
+                    *argument == ty
+                        || self
+                            .types
+                            .get(argument)
+                            .is_some_and(|&argument_depth| argument_depth > previous_depth)
+                }) && !Self::input_contains_type(table, arguments, ty, *symbol)
+                {
+                    self.blocked = true;
+                    return false;
+                }
+            }
+            active.push(ty);
         }
+        self.types.insert(ty, depth);
         true
+    }
+
+    /// A projection can select a nested alias without visiting its container.
+    /// Read stored input nodes and existing container views without materializing
+    /// new types. Never expand the alias whose re-entry is being justified: its
+    /// recursive output must not become evidence of input descent. Each stored
+    /// node is visited once, so the work is bounded by the existing graph.
+    fn input_contains_type(
+        table: &TypeTable,
+        inputs: &[TypeId],
+        target: TypeId,
+        repeated_alias: SymbolId,
+    ) -> bool {
+        let mut pending = inputs.to_vec();
+        let mut visited = HashSet::new();
+        while let Some(input) = pending.pop() {
+            if input == target {
+                return true;
+            }
+            if !visited.insert(input) {
+                continue;
+            }
+            match &table.types[input.0 as usize] {
+                Type::Array(element) | Type::Keyof(element) => pending.push(*element),
+                Type::Tuple(shape) => {
+                    pending.extend(shape.prefix.iter().copied());
+                    pending.extend(shape.rest);
+                    pending.extend(shape.suffix.iter().copied());
+                }
+                Type::Union(members) | Type::Intersection(members) => {
+                    pending.extend(members.iter().copied());
+                }
+                Type::ObjectType(object) => {
+                    pending.extend(object.properties.iter().map(PropertyType::type_id));
+                    pending.extend(
+                        object
+                            .call_signatures
+                            .iter()
+                            .flat_map(TypeTable::signature_member_types),
+                    );
+                    pending.extend(
+                        object
+                            .construct_signatures
+                            .iter()
+                            .flat_map(|entry| TypeTable::signature_member_types(&entry.signature)),
+                    );
+                    pending.extend(object.index_signatures.iter().flat_map(|signature| {
+                        signature
+                            .parameters
+                            .iter()
+                            .map(FunctionParameter::type_id)
+                            .chain(std::iter::once(signature.value_type))
+                    }));
+                    pending.extend(object.generator_return);
+                    pending.extend(
+                        object
+                            .iterator_property
+                            .as_ref()
+                            .map(|property| property.type_id),
+                    );
+                    pending.extend(
+                        object
+                            .async_iterator_property
+                            .as_ref()
+                            .map(|property| property.type_id),
+                    );
+                }
+                Type::Function(signature) => {
+                    pending.extend(TypeTable::signature_member_types(signature));
+                }
+                Type::AppliedClass { arguments, .. } => {
+                    pending.extend(arguments.iter().copied());
+                    pending.extend(table.applied_class_view(input));
+                }
+                Type::AppliedAlias { symbol, arguments } => {
+                    pending.extend(arguments.iter().copied());
+                    if *symbol != repeated_alias {
+                        pending.extend(table.applied_alias_view(input));
+                    }
+                }
+                Type::Named(symbol) => {
+                    pending.extend(table.interface_structure(*symbol));
+                    pending.extend(table.classes.get(symbol).and_then(|metadata| {
+                        metadata.template.as_ref().map(|template| template.raw)
+                    }));
+                }
+                Type::IndexedAccess { object, index } => pending.extend([*object, *index]),
+                Type::Record {
+                    key,
+                    value,
+                    optional_value,
+                } => {
+                    pending.extend([*key, *value]);
+                    pending.extend(*optional_value);
+                }
+                Type::This { constraint, .. } => pending.push(*constraint),
+                Type::ConstructorType {
+                    arguments,
+                    structural,
+                    ..
+                } => {
+                    pending.extend(arguments.iter().copied());
+                    pending.push(*structural);
+                }
+                Type::TypeQuery {
+                    arguments, target, ..
+                } => {
+                    pending.extend(arguments.iter().copied());
+                    pending.push(*target);
+                }
+                Type::Error
+                | Type::Any
+                | Type::Unknown
+                | Type::Never
+                | Type::Void
+                | Type::Null
+                | Type::Undefined
+                | Type::Boolean
+                | Type::Number
+                | Type::BigInt
+                | Type::String
+                | Type::Symbol
+                | Type::Object
+                | Type::BooleanLiteral(_)
+                | Type::NumberLiteral(_)
+                | Type::StringLiteral(_)
+                | Type::BigIntLiteral(_)
+                | Type::NumericEnum(_)
+                | Type::EnumMember { .. } => {}
+            }
+        }
+        false
     }
 
     fn leave(&mut self, table: &TypeTable, ty: TypeId) {
         self.types.remove(&ty);
         if let Type::AppliedAlias { symbol, .. } = table.instantiation_type(ty) {
-            self.aliases.remove(symbol);
+            let active = self
+                .aliases
+                .get_mut(symbol)
+                .expect("active alias application");
+            let previous = active.pop();
+            debug_assert_eq!(previous, Some(ty));
+            if active.is_empty() {
+                self.aliases.remove(symbol);
+            }
         }
     }
 }
@@ -3180,7 +3339,7 @@ impl TypeTable {
     pub fn keyof(&mut self, operand: TypeId) -> TypeId {
         let mut constructors = Vec::new();
         let reduced =
-            self.try_reduce_keyof(operand, &mut KeyofReduction::default(), &mut constructors);
+            self.try_reduce_keyof(operand, &mut KeyReduction::default(), &mut constructors);
         if constructors.is_empty() {
             return reduced.unwrap_or_else(|| self.intern(Type::Keyof(operand)));
         }
@@ -3223,7 +3382,7 @@ impl TypeTable {
             let operand = *operand;
             let mut constructors = Vec::new();
             let reduced =
-                self.try_reduce_keyof(operand, &mut KeyofReduction::default(), &mut constructors);
+                self.try_reduce_keyof(operand, &mut KeyReduction::default(), &mut constructors);
             self.publish_keyof_view(head, reduced, constructors);
         }
     }
@@ -3231,7 +3390,7 @@ impl TypeTable {
     fn try_reduce_keyof(
         &mut self,
         operand: TypeId,
-        visiting: &mut KeyofReduction,
+        visiting: &mut KeyReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
         if !visiting.enter(self, operand) {
@@ -3250,7 +3409,7 @@ impl TypeTable {
     fn keyof_view(
         &mut self,
         view: TypeId,
-        visiting: &mut KeyofReduction,
+        visiting: &mut KeyReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
         match self.get(view).clone() {
@@ -3331,7 +3490,7 @@ impl TypeTable {
     fn keyof_domain(
         &mut self,
         domain: TypeId,
-        visiting: &mut KeyofReduction,
+        visiting: &mut KeyReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
         if !visiting.enter(self, domain) {
@@ -3345,7 +3504,7 @@ impl TypeTable {
     fn keyof_domain_view(
         &mut self,
         domain: TypeId,
-        visiting: &mut KeyofReduction,
+        visiting: &mut KeyReduction,
         constructors: &mut Vec<SymbolId>,
     ) -> Option<TypeId> {
         let view = self.indexed_access_view(domain);
@@ -3355,7 +3514,7 @@ impl TypeTable {
         match self.instantiation_type(domain).clone() {
             Type::Keyof(operand) => self
                 .try_reduce_keyof(operand, visiting, constructors)
-                .or_else(|| (!visiting.cycle_detected).then_some(domain)),
+                .or_else(|| (!visiting.blocked).then_some(domain)),
             Type::TypeQuery { target, .. } => self.keyof_domain(target, visiting, constructors),
             Type::Union(members) => {
                 let mut keys = Vec::with_capacity(members.len());
@@ -4095,6 +4254,29 @@ impl TypeTable {
         view: TypeId,
         index: TypeId,
     ) -> Option<TypeId> {
+        self.resolve_concrete_index_key(view, index, &mut KeyReduction::default())
+    }
+
+    fn resolve_concrete_index_key(
+        &mut self,
+        view: TypeId,
+        index: TypeId,
+        visiting: &mut KeyReduction,
+    ) -> Option<TypeId> {
+        if !visiting.enter(self, index) {
+            return Some(self.error_type());
+        }
+        let reduced = self.resolve_concrete_index_key_view(view, index, visiting);
+        visiting.leave(self, index);
+        reduced
+    }
+
+    fn resolve_concrete_index_key_view(
+        &mut self,
+        view: TypeId,
+        index: TypeId,
+        visiting: &mut KeyReduction,
+    ) -> Option<TypeId> {
         match self.get(index).clone() {
             Type::StringLiteral(name) => {
                 let Ok(key) = name.to_utf8_strict() else {
@@ -4160,14 +4342,26 @@ impl TypeTable {
             Type::Never => Some(self.never()),
             Type::Named(symbol) => self
                 .type_parameter_constraint(symbol)
-                .filter(|constraint| *constraint != index)
-                .and_then(|constraint| self.try_resolve_concrete_indexed_access(view, constraint)),
+                .and_then(|constraint| self.resolve_concrete_index_key(view, constraint, visiting)),
+            Type::Union(members) => {
+                let error = self.error_type();
+                let mut found = Vec::with_capacity(members.len());
+                let mut deferred = false;
+                for member in members {
+                    match self.resolve_concrete_index_key(view, member, visiting) {
+                        Some(value) if value == error => return Some(error),
+                        Some(value) => found.push(value),
+                        None => deferred = true,
+                    }
+                }
+                (!deferred).then(|| self.union(&found))
+            }
             Type::Intersection(members) => {
                 let error = self.error_type();
                 let found: Vec<_> = members
                     .into_iter()
                     .filter_map(|member| {
-                        self.try_resolve_concrete_indexed_access(view, member)
+                        self.resolve_concrete_index_key(view, member, visiting)
                             .filter(|reduced| *reduced != error)
                     })
                     .collect();
@@ -4176,9 +4370,9 @@ impl TypeTable {
             Type::AppliedAlias { .. } => self
                 .prepare_applied_alias_view(index)
                 .filter(|index_view| *index_view != index)
-                .and_then(|index_view| self.try_resolve_concrete_indexed_access(view, index_view)),
+                .and_then(|index_view| self.resolve_concrete_index_key(view, index_view, visiting)),
             Type::TypeQuery { target, .. } => {
-                self.try_resolve_concrete_indexed_access(view, target)
+                self.resolve_concrete_index_key(view, target, visiting)
             }
             Type::Keyof(_) | Type::IndexedAccess { .. } => None,
             _ => Some(self.error_type()),
@@ -22337,6 +22531,9 @@ impl<'src> Binder<'src> {
         if result == self.types.error_type()
             && !self.types.contains_error(object_type)
             && !self.types.contains_error(index_type)
+            && !self.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code() == INVALID_INDEXED_ACCESS_KEY && diagnostic.range() == range
+            })
         {
             self.emit(
                 INVALID_INDEXED_ACCESS_KEY,
