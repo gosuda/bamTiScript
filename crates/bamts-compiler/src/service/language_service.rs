@@ -223,6 +223,7 @@ impl<F: FileSystem> ServiceState<F> {
             )));
         }
         let document = self.ensure_document(path.as_ref())?;
+        validate_position(&document, position)?;
         if let Some(property_id) = property_anchor_at(&document, position) {
             return rename_property(&document, property_id, new_name);
         }
@@ -781,6 +782,26 @@ mod tests {
             assert_eq!(rename.edit.edits.len(), 2, "{name:?}");
             fs::remove_dir_all(root).expect("remove root");
         }
+    }
+
+    #[test]
+    fn rename_property_rejects_positions_inside_surrogate_pairs() {
+        let source = "const a = { \u{10400}: 1 }; a.\u{10400};";
+        let positions = SourceText::new(source).expect("source");
+        let (root, mut state) = state(source);
+        for (byte, _) in source.match_indices('\u{10400}') {
+            let start = positions.byte_to_utf16(byte).expect("boundary");
+            let position = Utf16Pos::new(start.get() + 1);
+            assert!(
+                matches!(
+                    state.rename("a.ts", position, "result"),
+                    Err(ServiceError::InvalidPosition { offset, .. })
+                        if offset == position.get()
+                ),
+                "rename accepted a position inside a surrogate pair at {position:?}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove root");
     }
 
     #[test]
