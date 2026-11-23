@@ -534,26 +534,16 @@ fn generator_throw<H: Host>(
     })
 }
 
-fn iterator_family<H: Host>(
-    machine: &Machine<'_, H>,
-    source: Value,
-    kind: IterationKind,
-) -> Result<IteratorFamily, EvalFailure> {
-    if kind == IterationKind::StringCodePoint {
-        return Ok(IteratorFamily::String);
+fn iterator_family(kind: IterationKind) -> Option<IteratorFamily> {
+    match kind {
+        IterationKind::Key(family)
+        | IterationKind::Value(family)
+        | IterationKind::Entry(family) => Some(family),
+        IterationKind::StringCodePoint => Some(IteratorFamily::String),
+        IterationKind::RegExpString
+        | IterationKind::IteratorHelper(_)
+        | IterationKind::WrapForValid => None,
     }
-    let index = machine.runtime_slot(source).map_err(EvalFailure::Runtime)?;
-    Ok(match index.map(|index| &machine.heap[index]) {
-        Some(HeapEntry::Collection {
-            kind: CollectionKind::Map,
-            ..
-        }) => IteratorFamily::Map,
-        Some(HeapEntry::Collection {
-            kind: CollectionKind::Set,
-            ..
-        }) => IteratorFamily::Set,
-        _ => IteratorFamily::Array,
-    })
 }
 
 pub(super) fn iterator<H: Host>(
@@ -561,7 +551,7 @@ pub(super) fn iterator<H: Host>(
     source: Value,
     kind: IterationKind,
 ) -> Result<Value, EvalFailure> {
-    let family = iterator_family(machine, source, kind)?;
+    let family = iterator_family(kind).expect("builtin iterator kind identifies its family");
     machine
         .allocate(HeapEntry::BuiltinIterator {
             source,
@@ -641,107 +631,138 @@ fn iterator_next<H: Host>(
     else {
         return Err(type_error("iterator next called on incompatible receiver"));
     };
-    let builtin_family = matches!(
-        kind,
-        IterationKind::Key
-            | IterationKind::Value
-            | IterationKind::Entry
-            | IterationKind::StringCodePoint
-    );
-    if !builtin_family || iterator_family(machine, source, kind)? != family {
+    if iterator_family(kind) != Some(family) {
         return Err(type_error("iterator next called on incompatible receiver"));
     }
-    let (done, value, next_position) = match position {
-        None => (true, Value::UNDEFINED, None),
-        Some(cursor) => {
+    let (done, value) = machine.with_native_roots(&[this, source], |machine| {
+        let Some(cursor) = position else {
+            return Ok((true, Value::UNDEFINED));
+        };
+        let item = if family == IteratorFamily::Array {
+            array_iterator_item(machine, iterator_index, source, kind, cursor)?
+        } else {
             let source_index = machine
                 .runtime_slot(source)
                 .map_err(EvalFailure::Runtime)?
                 .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
-            let item = if matches!(&machine.heap[source_index], HeapEntry::TypedArray { .. }) {
-                let bounds =
-                    crate::intrinsics::builtins::typedarray::typed_array_bounds(machine, source)?;
-                if bounds.out_of_bounds {
-                    return Err(type_error("iterated typed array is out of bounds"));
-                }
-                match usize::try_from(cursor) {
-                    Ok(index) if !bounds.out_of_bounds && index < bounds.element_length => {
-                        let value = crate::intrinsics::builtins::typedarray::read_element(
-                            machine, source, index,
-                        )?;
-                        let next = cursor
-                            .checked_add(1)
-                            .expect("typed-array bounds keep iterator positions below u64::MAX");
-                        Some((next, crate::number_value(index as f64), value))
-                    }
-                    _ => None,
-                }
-            } else {
-                match &machine.heap[source_index] {
-                    HeapEntry::Array { elements, .. } => {
-                        usize::try_from(cursor).ok().and_then(|index| {
-                            elements.get(index).map(|element| {
-                                let value = if *element == Value::HOLE {
-                                    Value::UNDEFINED
-                                } else {
-                                    *element
-                                };
-                                let next = cursor
-                                    .checked_add(1)
-                                    .expect("array bounds keep iterator positions below u64::MAX");
-                                (next, crate::number_value(index as f64), value)
-                            })
+            let item = match &machine.heap[source_index] {
+                HeapEntry::Array { elements, .. } => {
+                    usize::try_from(cursor).ok().and_then(|index| {
+                        elements.get(index).map(|element| {
+                            let next = cursor
+                                .checked_add(1)
+                                .expect("string bounds keep iterator positions below u64::MAX");
+                            (next, crate::number_value(index as f64), *element)
                         })
-                    }
-                    HeapEntry::TypedArray { .. } => unreachable!("typed arrays handled above"),
-                    HeapEntry::Collection { entries, .. } => {
-                        debug_assert!(
-                            entries.windows(2).all(|w| w[0].order <= w[1].order),
-                            "collection entries must stay sorted ascending by order"
-                        );
-                        let index = entries.partition_point(|entry| entry.order < cursor);
-                        entries[index..]
-                            .iter()
-                            .find(|entry| entry.live)
-                            .map(|entry| {
-                                let next = entry
-                                    .order
-                                    .checked_add(1)
-                                    .expect("heap limits keep collection order below u64::MAX");
-                                (next, entry.key, entry.value)
-                            })
-                    }
-                    _ => {
-                        return Err(type_error("iterator next called on incompatible receiver"));
-                    }
+                    })
                 }
+                HeapEntry::Collection { entries, .. } => {
+                    debug_assert!(
+                        entries.windows(2).all(|w| w[0].order <= w[1].order),
+                        "collection entries must stay sorted ascending by order"
+                    );
+                    let index = entries.partition_point(|entry| entry.order < cursor);
+                    entries[index..]
+                        .iter()
+                        .find(|entry| entry.live)
+                        .map(|entry| {
+                            let next = entry
+                                .order
+                                .checked_add(1)
+                                .expect("heap limits keep collection order below u64::MAX");
+                            (next, entry.key, entry.value)
+                        })
+                }
+                _ => return Err(type_error("iterator next called on incompatible receiver")),
             };
-            match item {
-                None => (true, Value::UNDEFINED, None),
-                Some((next, key, item_value)) => {
-                    let value = match kind {
-                        IterationKind::Key => key,
-                        IterationKind::Value | IterationKind::StringCodePoint => item_value,
-                        IterationKind::Entry => allocate_array(machine, vec![key, item_value])?,
-                        IterationKind::RegExpString
-                        | IterationKind::IteratorHelper(_)
-                        | IterationKind::WrapForValid => {
-                            unreachable!("the family check admits only the four families")
-                        }
-                    };
-                    (false, value, Some(next))
-                }
+            item.map(|(next, key, value)| {
+                set_iterator_position(machine, iterator_index, Some(next));
+                (key, value)
+            })
+        };
+        match item {
+            None => {
+                set_iterator_position(machine, iterator_index, None);
+                Ok((true, Value::UNDEFINED))
+            }
+            Some((key, item_value)) => {
+                let value = match kind {
+                    IterationKind::Key(_) => key,
+                    IterationKind::Value(_) | IterationKind::StringCodePoint => item_value,
+                    IterationKind::Entry(_) => allocate_array(machine, vec![key, item_value])?,
+                    IterationKind::RegExpString
+                    | IterationKind::IteratorHelper(_)
+                    | IterationKind::WrapForValid => {
+                        unreachable!("the family check admits only the four families")
+                    }
+                };
+                Ok((false, value))
             }
         }
+    })?;
+    machine.with_native_roots(&[value], |machine| {
+        let result = ordinary_runtime(machine, None)?;
+        machine.set_data_property(result, "value", value)?;
+        machine.set_data_property(result, "done", Value::boolean(done))?;
+        Ok(BuiltinOutcome::Value(result))
+    })
+}
+
+fn array_iterator_item<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterator_index: usize,
+    source: Value,
+    kind: IterationKind,
+    cursor: u64,
+) -> Result<Option<(Value, Value)>, EvalFailure> {
+    let source_index = machine.runtime_slot(source).map_err(EvalFailure::Runtime)?;
+    let length = if source_index
+        .is_some_and(|index| matches!(machine.heap[index], HeapEntry::TypedArray { .. }))
+    {
+        let bounds = super::typedarray::typed_array_bounds(machine, source)?;
+        if bounds.out_of_bounds {
+            return Err(type_error("iterated typed array is out of bounds"));
+        }
+        bounds.element_length
+    } else {
+        super::length_of_array_like(machine, source)?
     };
-    let HeapEntry::BuiltinIterator { position, .. } = &mut machine.heap[iterator_index] else {
+    if cursor >= length as u64 {
+        return Ok(None);
+    }
+
+    set_iterator_position(machine, iterator_index, Some(cursor + 1));
+    let key = crate::number_value(cursor as f64);
+    let value = if matches!(kind, IterationKind::Key(_)) {
+        Value::UNDEFINED
+    } else {
+        super::array::get_index(machine, source, cursor as usize)?
+    };
+    Ok(Some((key, value)))
+}
+
+fn set_iterator_position<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterator_index: usize,
+    next: Option<u64>,
+) {
+    let HeapEntry::BuiltinIterator {
+        source, position, ..
+    } = &mut machine.heap[iterator_index]
+    else {
         unreachable!("iterator brand was checked")
     };
-    *position = next_position;
-    let result = ordinary_runtime(machine, None)?;
-    machine.set_data_property(result, "value", value)?;
-    machine.set_data_property(result, "done", Value::boolean(done))?;
-    Ok(BuiltinOutcome::Value(result))
+    match next {
+        Some(next) => {
+            if let Some(position) = position {
+                *position = next;
+            }
+        }
+        None => {
+            *position = None;
+            *source = Value::UNDEFINED;
+        }
+    }
 }
 
 fn weak_map_set<H: Host>(
@@ -954,7 +975,12 @@ fn map_keys<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, CollectionKind::Map, IterationKind::Key)
+    collection_iterator(
+        machine,
+        this,
+        CollectionKind::Map,
+        IterationKind::Key(IteratorFamily::Map),
+    )
 }
 
 fn map_values<H: Host>(
@@ -963,7 +989,12 @@ fn map_values<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, CollectionKind::Map, IterationKind::Value)
+    collection_iterator(
+        machine,
+        this,
+        CollectionKind::Map,
+        IterationKind::Value(IteratorFamily::Map),
+    )
 }
 
 fn map_entries<H: Host>(
@@ -972,7 +1003,12 @@ fn map_entries<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, CollectionKind::Map, IterationKind::Entry)
+    collection_iterator(
+        machine,
+        this,
+        CollectionKind::Map,
+        IterationKind::Entry(IteratorFamily::Map),
+    )
 }
 
 fn map_for_each<H: Host>(
@@ -1077,7 +1113,12 @@ fn set_values<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, CollectionKind::Set, IterationKind::Value)
+    collection_iterator(
+        machine,
+        this,
+        CollectionKind::Set,
+        IterationKind::Value(IteratorFamily::Set),
+    )
 }
 
 fn set_entries<H: Host>(
@@ -1086,7 +1127,12 @@ fn set_entries<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    collection_iterator(machine, this, CollectionKind::Set, IterationKind::Entry)
+    collection_iterator(
+        machine,
+        this,
+        CollectionKind::Set,
+        IterationKind::Entry(IteratorFamily::Set),
+    )
 }
 
 fn set_for_each<H: Host>(
@@ -2551,10 +2597,16 @@ mod tests {
             "a subclass of Iterator must not inherit a builtin next"
         );
         let array = allocate_array(&mut machine, Vec::new()).unwrap();
-        let array_iterator = iterator(&mut machine, array, IterationKind::Value).unwrap();
+        let array_iterator = iterator(
+            &mut machine,
+            array,
+            IterationKind::Value(IteratorFamily::Array),
+        )
+        .unwrap();
         let map_constructor = machine.intrinsics.global("Map").unwrap();
         let map = machine.construct_value(map_constructor, &[]).unwrap();
-        let map_iterator = iterator(&mut machine, map, IterationKind::Entry).unwrap();
+        let map_iterator =
+            iterator(&mut machine, map, IterationKind::Entry(IteratorFamily::Map)).unwrap();
 
         let array_next = machine.get_named_property(array_iterator, "next").unwrap();
         let map_next = machine.get_named_property(map_iterator, "next").unwrap();

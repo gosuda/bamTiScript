@@ -1157,9 +1157,9 @@ impl<'a> Iterator for PropertyMapIter<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IterationKind {
-    Key,
-    Value,
-    Entry,
+    Key(intrinsics::IteratorFamily),
+    Value(intrinsics::IteratorFamily),
+    Entry(intrinsics::IteratorFamily),
     /// A `%StringIteratorPrototype%` instance; `source` is its code points.
     StringCodePoint,
     /// A `%RegExpStringIteratorPrototype%` instance; `source` is its hidden state.

@@ -14,7 +14,7 @@ use super::{
     type_error,
 };
 use crate::intrinsics::builtins::bigint::{self, BigIntValue};
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable, IteratorFamily};
 use crate::{
     EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
 };
@@ -2193,7 +2193,7 @@ fn keys<H: Host>(
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         this,
-        IterationKind::Key,
+        IterationKind::Key(IteratorFamily::Array),
     )?))
 }
 
@@ -2555,7 +2555,7 @@ fn values<H: Host>(
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         this,
-        IterationKind::Value,
+        IterationKind::Value(IteratorFamily::Array),
     )?))
 }
 
@@ -2933,7 +2933,7 @@ fn entries<H: Host>(
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
         this,
-        IterationKind::Entry,
+        IterationKind::Entry(IteratorFamily::Array),
     )?))
 }
 fn join<H: Host>(

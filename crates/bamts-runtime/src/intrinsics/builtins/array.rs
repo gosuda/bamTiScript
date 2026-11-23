@@ -12,7 +12,7 @@ use super::{
     install_function, keep_root, length_of_array_like, number, range_error, to_integer_or_infinity,
     type_error, value_number, with_roots,
 };
-use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable, IteratorFamily};
 use crate::{
     ArrayElementKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
     PropertyMap, RuntimeErrorKind,
@@ -278,23 +278,6 @@ pub(super) fn elements<H: Host>(
     }
     Ok(values)
 }
-/// Validates that `this` is an Array receiver without materializing its
-/// elements. The iterator factories only need receiver validation — the
-/// actual elements are read lazily by `iterator_next` — so cloning the
-/// whole `Vec<Value>` (as `elements` does) is wasted allocation. Mirrors
-/// `collection_slot` in `collections.rs`.
-fn array_slot<H: Host>(machine: &Machine<'_, H>, object: Value) -> Result<(), EvalFailure> {
-    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
-        return Err(type_error("Array method called on incompatible receiver"));
-    };
-    if !matches!(
-        machine.heap[index],
-        HeapEntry::Array { .. } | HeapEntry::TypedArray { .. }
-    ) {
-        return Err(type_error("Array method called on incompatible receiver"));
-    }
-    Ok(())
-}
 fn to_string<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -425,11 +408,11 @@ fn keys_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    array_slot(machine, this)?;
+    let object = to_object(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
-        this,
-        IterationKind::Key,
+        object,
+        IterationKind::Key(IteratorFamily::Array),
     )?))
 }
 
@@ -439,11 +422,11 @@ fn values_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    array_slot(machine, this)?;
+    let object = to_object(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
-        this,
-        IterationKind::Value,
+        object,
+        IterationKind::Value(IteratorFamily::Array),
     )?))
 }
 
@@ -453,11 +436,11 @@ fn entries_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    array_slot(machine, this)?;
+    let object = to_object(machine, this)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
         machine,
-        this,
-        IterationKind::Entry,
+        object,
+        IterationKind::Entry(IteratorFamily::Array),
     )?))
 }
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -1533,7 +1516,7 @@ fn has_index<H: Host>(
     machine.internal_has_property(object, &key)
 }
 
-fn get_index<H: Host>(
+pub(super) fn get_index<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     index: usize,
@@ -4032,24 +4015,346 @@ mod tests {
     }
 
     #[test]
-    fn iterator_rejects_non_array_receiver() {
+    fn iterators_accept_array_like_receivers_and_read_live_length() {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
 
-        let obj = ordinary_object(&mut machine);
-        let proto = machine.intrinsics.array_prototype;
-        let method = machine.get_named_property(proto, "keys").unwrap();
-        let result = machine.call_value(method, obj, &[]);
-        assert!(result.is_err(), "keys() on a non-array must throw");
+        for method in ["keys", "values", "entries"] {
+            let source = ordinary_object(&mut machine);
+            machine
+                .set_data_property(source, "length", Value::int32(1))
+                .unwrap();
+            machine
+                .set_data_property(source, "0", Value::int32(7))
+                .unwrap();
+            let iterator = call_proto(&mut machine, method, source);
+            for (index, expected) in [(0, 7), (1, 9)] {
+                let (done, value) = iter_next(&mut machine, iterator);
+                assert!(!done, "{method} must visit index {index}");
+                match method {
+                    "keys" => assert_eq!(value, Value::int32(index)),
+                    "values" => assert_eq!(value, Value::int32(expected)),
+                    "entries" => assert_eq!(
+                        machine.array_elements(value).unwrap().unwrap(),
+                        [Value::int32(index), Value::int32(expected)]
+                    ),
+                    _ => unreachable!(),
+                }
+                machine
+                    .set_data_property(source, "length", Value::int32(2))
+                    .unwrap();
+                machine
+                    .set_data_property(source, "1", Value::int32(9))
+                    .unwrap();
+            }
+            assert!(iter_next(&mut machine, iterator).0);
+            machine
+                .set_data_property(source, "length", Value::int32(3))
+                .unwrap();
+            assert!(
+                iter_next(&mut machine, iterator).0,
+                "exhaustion is permanent"
+            );
+        }
     }
 
-    /// Spec: `%ArrayIteratorPrototype%.next` reads the source array live on
-    /// each call, so mutations between `next()` calls are visible. The
-    /// iterator captures the original length at creation time; elements
-    /// added beyond that length are not visited, but in-bounds mutations
-    /// are observed. Our `BuiltinIterator` reads `elements` by cursor each
-    /// step, so in-bounds replacement is visible immediately.
+    #[test]
+    fn iterators_box_primitives_and_reject_nullish_receivers() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        for method in ["keys", "values", "entries"] {
+            for receiver in [Value::NULL, Value::UNDEFINED] {
+                assert!(matches!(
+                    call_prototype(&mut machine, method, receiver, &[]),
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+                ));
+            }
+            let iterator = call_proto(&mut machine, method, Value::int32(7));
+            assert!(iter_next(&mut machine, iterator).0);
+        }
+
+        let string =
+            allocate_string(&mut machine, EcmaString::from_units(&[0xd83d, 0xde00])).unwrap();
+        let iterator = call_proto(&mut machine, "values", string);
+        for unit in [0xd83d, 0xde00] {
+            let (done, value) = iter_next(&mut machine, iterator);
+            assert!(!done);
+            assert_eq!(machine.string_value(value).unwrap().as_units(), [unit]);
+        }
+        assert!(iter_next(&mut machine, iterator).0);
+    }
+
+    #[test]
+    fn iterators_read_array_accessors_and_inherited_indices() {
+        fn getter(
+            _machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            log_event("index");
+            Ok(BuiltinOutcome::Value(Value::int32(9)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = allocate_array(&mut machine, vec![Value::HOLE; 2]).unwrap();
+        let prototype = ordinary_object(&mut machine);
+        machine
+            .set_data_property(prototype, "0", Value::int32(7))
+            .unwrap();
+        machine.set_prototype(source, prototype).unwrap();
+        let getter = native(&mut machine, "iterator index", getter);
+        let key = index_key(&mut machine.atoms, 1);
+        machine
+            .define_accessor(source, key, getter, crate::AccessorKind::Getter)
+            .unwrap();
+
+        clear_log();
+        let keys = call_proto(&mut machine, "keys", source);
+        assert_eq!(iter_next(&mut machine, keys), (false, Value::int32(0)));
+        assert_eq!(iter_next(&mut machine, keys), (false, Value::int32(1)));
+        assert!(
+            get_log().is_empty(),
+            "keys must not read an indexed property"
+        );
+        let values = call_proto(&mut machine, "values", source);
+        assert_eq!(iter_next(&mut machine, values), (false, Value::int32(7)));
+        assert_eq!(iter_next(&mut machine, values), (false, Value::int32(9)));
+        assert_eq!(get_log(), ["index"]);
+    }
+
+    #[test]
+    fn array_iterators_keep_their_brand_on_map_and_proxy_receivers() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map_constructor = machine.intrinsics.global("Map").unwrap();
+        let map = machine.construct_value(map_constructor, &[]).unwrap();
+        machine
+            .set_data_property(map, "length", Value::int32(1))
+            .unwrap();
+        machine
+            .set_data_property(map, "0", Value::int32(7))
+            .unwrap();
+        let handler = ordinary_object(&mut machine);
+        let proxy_constructor = machine.intrinsics.global("Proxy").unwrap();
+        let proxy = machine
+            .construct_value(proxy_constructor, &[map, handler])
+            .unwrap();
+        let array_prototype = machine
+            .intrinsics
+            .builtins
+            .iterator_family_prototype(crate::intrinsics::IteratorFamily::Array);
+        let array_next = machine.get_named_property(array_prototype, "next").unwrap();
+        for source in [map, proxy] {
+            let iterator = call_proto(&mut machine, "values", source);
+            assert_eq!(
+                machine.get_named_property(iterator, "next").unwrap(),
+                array_next
+            );
+            assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(7)));
+            assert!(iter_next(&mut machine, iterator).0);
+        }
+    }
+
+    #[test]
+    fn iterator_advances_before_an_index_getter_throws() {
+        fn getter(
+            _machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            Err(EvalFailure::ThrowValue(Value::int32(99)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = allocate_array(&mut machine, vec![Value::HOLE, Value::int32(7)]).unwrap();
+        let getter = native(&mut machine, "throwing iterator index", getter);
+        let key = index_key(&mut machine.atoms, 0);
+        machine
+            .define_accessor(source, key, getter, crate::AccessorKind::Getter)
+            .unwrap();
+        let iterator = call_proto(&mut machine, "values", source);
+        let next = machine.get_named_property(iterator, "next").unwrap();
+        assert!(matches!(
+            machine.call_value(next, iterator, &[]),
+            Err(EvalFailure::ThrowValue(value)) if value == Value::int32(99)
+        ));
+        assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(7)));
+        assert!(iter_next(&mut machine, iterator).0);
+    }
+
+    #[test]
+    fn iterator_retries_a_throwing_length_getter_without_advancing() {
+        fn length(
+            _machine: &mut Machine<'_, TestHost>,
+            _this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            log_event("length");
+            if get_log().len() == 1 {
+                return Err(EvalFailure::ThrowValue(Value::int32(99)));
+            }
+            Ok(BuiltinOutcome::Value(Value::int32(1)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = ordinary_object(&mut machine);
+        machine
+            .set_data_property(source, "0", Value::int32(7))
+            .unwrap();
+        let getter = native(&mut machine, "throwing iterator length", length);
+        let key = PropertyKey::Named(machine.intern_str("length"));
+        machine
+            .define_accessor(source, key, getter, crate::AccessorKind::Getter)
+            .unwrap();
+        clear_log();
+        let iterator = call_proto(&mut machine, "values", source);
+        assert!(
+            get_log().is_empty(),
+            "creating an iterator must not read length"
+        );
+        let next = machine.get_named_property(iterator, "next").unwrap();
+        assert!(matches!(
+            machine.call_value(next, iterator, &[]),
+            Err(EvalFailure::ThrowValue(value)) if value == Value::int32(99)
+        ));
+        assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(7)));
+        assert!(iter_next(&mut machine, iterator).0);
+        assert!(iter_next(&mut machine, iterator).0);
+        assert_eq!(get_log(), ["length", "length", "length"]);
+    }
+
+    #[test]
+    fn iterator_captures_the_cursor_before_a_reentrant_length_getter() {
+        fn length(
+            machine: &mut Machine<'_, TestHost>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "entered")? != Value::TRUE {
+                machine.set_data_property(this, "entered", Value::TRUE)?;
+                let iterator = machine.get_named_property(this, "iterator")?;
+                let next = machine.get_named_property(iterator, "next")?;
+                machine.call_value(next, iterator, &[])?;
+            }
+            Ok(BuiltinOutcome::Value(Value::int32(2)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = ordinary_object(&mut machine);
+        machine
+            .set_data_property(source, "0", Value::int32(7))
+            .unwrap();
+        machine
+            .set_data_property(source, "1", Value::int32(9))
+            .unwrap();
+        let getter = native(&mut machine, "reentrant iterator length", length);
+        let key = PropertyKey::Named(machine.intern_str("length"));
+        machine
+            .define_accessor(source, key, getter, crate::AccessorKind::Getter)
+            .unwrap();
+        let iterator = call_proto(&mut machine, "values", source);
+        machine
+            .set_data_property(source, "iterator", iterator)
+            .unwrap();
+        assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(7)));
+        assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(9)));
+        assert!(iter_next(&mut machine, iterator).0);
+    }
+
+    #[test]
+    fn iterator_preserves_reentrant_advancement_and_gc_roots() {
+        fn getter(
+            machine: &mut Machine<'_, TestHost>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            machine.collect_garbage();
+            let iterator = machine.get_named_property(this, "iterator")?;
+            let next = machine.get_named_property(iterator, "next")?;
+            let result = machine.call_value(next, iterator, &[])?;
+            Ok(BuiltinOutcome::Value(
+                machine.get_named_property(result, "value")?,
+            ))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = allocate_array(&mut machine, vec![Value::HOLE, Value::int32(7)]).unwrap();
+        let getter = native(&mut machine, "reentrant iterator index", getter);
+        let key = index_key(&mut machine.atoms, 0);
+        machine
+            .define_accessor(source, key, getter, crate::AccessorKind::Getter)
+            .unwrap();
+        let iterator = call_proto(&mut machine, "values", source);
+        machine
+            .set_data_property(source, "iterator", iterator)
+            .unwrap();
+        assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(7)));
+        assert!(
+            iter_next(&mut machine, iterator).0,
+            "the inner next consumed index 1"
+        );
+    }
+
+    #[test]
+    fn iterator_stays_exhausted_after_a_reentrant_length_getter() {
+        fn length(
+            machine: &mut Machine<'_, TestHost>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<BuiltinOutcome, EvalFailure> {
+            if machine.get_named_property(this, "entered")? == Value::TRUE {
+                return Ok(BuiltinOutcome::Value(Value::int32(0)));
+            }
+            machine.set_data_property(this, "entered", Value::TRUE)?;
+            let iterator = machine.get_named_property(this, "iterator")?;
+            let next = machine.get_named_property(iterator, "next")?;
+            let result = machine.call_value(next, iterator, &[])?;
+            assert_eq!(machine.get_named_property(result, "done")?, Value::TRUE);
+            machine.collect_garbage();
+            Ok(BuiltinOutcome::Value(Value::int32(2)))
+        }
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let source = ordinary_object(&mut machine);
+        machine
+            .set_data_property(source, "0", Value::int32(7))
+            .unwrap();
+        let getter = native(&mut machine, "exhausting iterator length", length);
+        let key = PropertyKey::Named(machine.intern_str("length"));
+        machine
+            .define_accessor(source, key, getter, crate::AccessorKind::Getter)
+            .unwrap();
+        let iterator = call_proto(&mut machine, "values", source);
+        machine
+            .set_data_property(source, "iterator", iterator)
+            .unwrap();
+        assert_eq!(iter_next(&mut machine, iterator), (false, Value::int32(7)));
+        assert!(iter_next(&mut machine, iterator).0);
+        assert!(iter_next(&mut machine, iterator).0);
+    }
+
     #[test]
     fn values_iterator_observes_mutation_during_iteration() {
         let module = blank_program("<test>");
