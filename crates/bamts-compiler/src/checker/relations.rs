@@ -1150,6 +1150,20 @@ impl<'table> TypeRelations<'table> {
                     _ => false,
                 }
             }
+            (_, Type::IndexedAccess { .. }) => {
+                if matches!(from, Type::Never)
+                    || (strictness == Strictness::Assignable
+                        && matches!(from, Type::Null | Type::Undefined))
+                {
+                    return true;
+                }
+                match self.table.indexed_access_target_constraint_view(target) {
+                    IndexedAccessConstraint::Reduced(expression) => {
+                        self.constraint_target_relates(source, &expression, strictness)
+                    }
+                    IndexedAccessConstraint::Invalid => false,
+                }
+            }
             // `unknown` is the top type: everything flows in, nothing flows out.
             (_, Type::Unknown) => true,
             (Type::Unknown, _) => false,
@@ -2256,6 +2270,24 @@ impl<'table> TypeRelations<'table> {
         strictness: Strictness,
     ) -> bool {
         self.constraint_clauses_relate(vec![expression], Vec::new(), target, strictness)
+    }
+
+    fn constraint_target_relates(
+        &self,
+        source: TypeId,
+        expression: &ConstraintTypeExpr,
+        strictness: Strictness,
+    ) -> bool {
+        match expression {
+            ConstraintTypeExpr::Id(target) => self.relates(source, *target, strictness),
+            ConstraintTypeExpr::Opaque => false,
+            ConstraintTypeExpr::Union(members) => members
+                .iter()
+                .any(|member| self.constraint_target_relates(source, member, strictness)),
+            ConstraintTypeExpr::Intersection(members) => members
+                .iter()
+                .all(|member| self.constraint_target_relates(source, member, strictness)),
+        }
     }
 
     fn constraint_clauses_relate<'expression>(

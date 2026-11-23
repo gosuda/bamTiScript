@@ -1573,6 +1573,12 @@ pub(super) enum IndexedAccessConstraint {
     Invalid,
 }
 
+#[derive(Clone, Copy)]
+enum IndexedAccessConstraintMode {
+    Read,
+    Write,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassState {
     Provisional,
@@ -3934,27 +3940,57 @@ impl TypeTable {
             return IndexedAccessConstraint::Invalid;
         };
         let mut active = HashSet::new();
-        self.indexed_access_constraint(*object, *index, &mut active)
+        self.indexed_access_constraint(
+            *object,
+            *index,
+            IndexedAccessConstraintMode::Read,
+            &mut active,
+        )
+    }
+
+    pub(super) fn indexed_access_target_constraint_view(
+        &self,
+        target: TypeId,
+    ) -> IndexedAccessConstraint {
+        let Type::IndexedAccess { object, index } = self.get(target) else {
+            return IndexedAccessConstraint::Invalid;
+        };
+        let mut active = HashSet::new();
+        self.indexed_access_constraint(
+            *object,
+            *index,
+            IndexedAccessConstraintMode::Write,
+            &mut active,
+        )
     }
 
     fn indexed_access_constraint(
         &self,
         object: TypeId,
         index: TypeId,
+        mode: IndexedAccessConstraintMode,
         active: &mut HashSet<(TypeId, TypeId)>,
     ) -> IndexedAccessConstraint {
         let Ok(index) = self.type_parameter_constraint_view(index) else {
             return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
         };
-        let Ok(object) = self.type_parameter_constraint_view(object) else {
-            return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
+        let object = match mode {
+            IndexedAccessConstraintMode::Read => {
+                let Ok(object) = self.type_parameter_constraint_view(object) else {
+                    return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
+                };
+                object
+            }
+            // A generic object can narrow its upper bound's properties. A
+            // writable value needs evidence from the actual object identity.
+            IndexedAccessConstraintMode::Write => object,
         };
         let pair = (object, index);
         if !active.insert(pair) {
             return IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque);
         }
 
-        let result = self.indexed_access_constraint_inner(object, index, active);
+        let result = self.indexed_access_constraint_inner(object, index, mode, active);
         active.remove(&pair);
         result
     }
@@ -3980,27 +4016,44 @@ impl TypeTable {
         &self,
         object: TypeId,
         index: TypeId,
+        mode: IndexedAccessConstraintMode,
         active: &mut HashSet<(TypeId, TypeId)>,
     ) -> IndexedAccessConstraint {
+        let index_view = match self.get(index) {
+            Type::AppliedAlias { .. } => self.applied_alias_view(index),
+            Type::TypeQuery { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(view) = index_view
+            && view != index
+        {
+            return self.indexed_access_constraint(object, view, mode, active);
+        }
         if let Type::Union(indexes) = self.get(index) {
             let mut members = Vec::with_capacity(indexes.len());
             for &index in indexes {
-                match self.indexed_access_constraint(object, index, active) {
+                match self.indexed_access_constraint(object, index, mode, active) {
                     IndexedAccessConstraint::Reduced(member) => members.push(member),
                     IndexedAccessConstraint::Invalid => {
                         return IndexedAccessConstraint::Invalid;
                     }
                 }
             }
-            return self.constraint_union(members);
+            return match mode {
+                IndexedAccessConstraintMode::Read => self.constraint_union(members),
+                IndexedAccessConstraintMode::Write => self.constraint_intersection(members),
+            };
         }
 
-        let object = self.constraint_structural_view(object);
+        let view = self.constraint_structural_view(object);
+        if view != object {
+            return self.indexed_access_constraint(view, index, mode, active);
+        }
         match self.get(object) {
             Type::Union(objects) => {
                 let mut members = Vec::with_capacity(objects.len());
                 for &object in objects {
-                    match self.indexed_access_constraint(object, index, active) {
+                    match self.indexed_access_constraint(object, index, mode, active) {
                         IndexedAccessConstraint::Reduced(member) => members.push(member),
                         IndexedAccessConstraint::Invalid => {
                             return IndexedAccessConstraint::Invalid;
@@ -4012,7 +4065,7 @@ impl TypeTable {
             Type::Intersection(objects) => {
                 let mut members = Vec::with_capacity(objects.len());
                 for &object in objects {
-                    match self.indexed_access_constraint(object, index, active) {
+                    match self.indexed_access_constraint(object, index, mode, active) {
                         IndexedAccessConstraint::Reduced(member) => members.push(member),
                         IndexedAccessConstraint::Invalid => {}
                     }
@@ -4034,6 +4087,7 @@ impl TypeTable {
         match self.get(type_id) {
             Type::AppliedClass { .. } => self.applied_class_view(type_id).unwrap_or(type_id),
             Type::AppliedAlias { .. } => self.applied_alias_view(type_id).unwrap_or(type_id),
+            Type::TypeQuery { target, .. } => *target,
             _ => type_id,
         }
     }
@@ -4311,14 +4365,23 @@ impl TypeTable {
                     return Some(self.error_type());
                 }
                 let mut found = Vec::with_capacity(members.len());
+                let mut deferred = false;
                 for &member in &members {
                     let reduced = self.indexed_access(member, index);
                     if reduced == self.error_type() {
                         return Some(reduced);
                     }
+                    deferred |= matches!(
+                        self.instantiation_type(reduced),
+                        Type::IndexedAccess { object, index: key }
+                            if *object == member && *key == index
+                    );
                     found.push(reduced);
                 }
-                Some(self.union(&found))
+                // Every member must validate, but a deferred key must retain
+                // the whole object union so write evidence sees each key's
+                // complete value union before intersecting possible keys.
+                (!deferred).then(|| self.union(&found))
             }
             Type::Intersection(members) => {
                 let mut found = Vec::new();
@@ -4422,9 +4485,14 @@ impl TypeTable {
             }
             Type::Any => Some(self.any()),
             Type::Never => Some(self.never()),
-            Type::Named(symbol) => self
-                .type_parameter_constraint(symbol)
-                .and_then(|constraint| self.resolve_concrete_index_key(view, constraint, visiting)),
+            Type::Named(symbol) => {
+                let constraint = self.type_parameter_constraint(symbol)?;
+                // A bound validates the available keys, but does not choose the
+                // caller's key. Keep the indexed-access head for substitution;
+                // relations derive its value constraint without replacing it.
+                self.resolve_concrete_index_key(view, constraint, visiting)
+                    .filter(|resolved| *resolved == self.error_type())
+            }
             Type::Union(members) => {
                 let error = self.error_type();
                 let mut found = Vec::with_capacity(members.len());
