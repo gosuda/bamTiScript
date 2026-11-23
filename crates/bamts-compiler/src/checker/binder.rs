@@ -16968,6 +16968,8 @@ impl<'src> Binder<'src> {
         if let Some(base_static) = base_static
             && !base_static.construct_signatures.is_empty()
         {
+            let (type_parameters, type_parameter_bounds) =
+                self.signature_type_parameters(class.type_parameters.as_ref(), scope);
             let mut inherited = Vec::with_capacity(base_static.construct_signatures.len());
             for entry in &base_static.construct_signatures {
                 let javascript = entry.signature.javascript;
@@ -16997,6 +16999,10 @@ impl<'src> Binder<'src> {
                         signature.clone()
                     };
                 signature.javascript = javascript;
+                signature.type_parameters.clone_from(&type_parameters);
+                signature
+                    .type_parameter_bounds
+                    .clone_from(&type_parameter_bounds);
                 signature.return_type = instance_type;
                 // The overwritten return is synthesized, not a written
                 // annotation, so no provenance survives the substitution.
