@@ -85,10 +85,12 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
+          validation_python="$RUNNER_TEMP/optimization-python/bin/python"
+          uv pip install --python "$validation_python" \
+            pytest==9.0.2 ruff==0.14.3 ty==0.0.52
           validation_arguments=(
             --no-project --no-python-downloads
-            --python "$RUNNER_TEMP/optimization-python/bin/python"
-            --with pytest==9.0.2 --with ruff==0.14.3 --with ty==0.0.52
+            --python "$validation_python"
           )
           validation_files=(
             tooling/perf/compare_optimization.py
@@ -97,6 +99,7 @@ jobs:
           uv run "${validation_arguments[@]}" ruff check --no-cache "${validation_files[@]}"
           uv run "${validation_arguments[@]}" ruff format --no-cache --diff "${validation_files[@]}"
           uv run "${validation_arguments[@]}" ty check \
+            --python "$validation_python" \
             --extra-search-path tooling/perf "${validation_files[@]}"
           uv run "${validation_arguments[@]}" python -m pytest \
             -q -p no:cacheprovider --import-mode=prepend \
