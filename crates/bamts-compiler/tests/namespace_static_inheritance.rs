@@ -130,12 +130,46 @@ fn an_early_constructor_alias_assigns_to_required_structural_type() {
 }
 
 #[test]
-#[ignore = "typeof-alias resolved before merge stays stale with and without the landed slot forward; tracks with representation fix"]
 fn a_type_alias_captured_before_merge_sees_later_exports() {
     assert_reads_clean(
         "class C {}\nclass D extends C {}\ntype A = typeof D;\nconst force: A = D;\n\
          namespace C { export const x: 1 = 1; }\nconst probe: A = D;\nconst v: 1 = probe.x;\n",
         "a type alias resolved before the merge shares later namespace exports",
+    );
+}
+
+#[test]
+fn nested_constructor_aliases_observe_successive_namespace_exports() {
+    assert_reads_clean(
+        "class C {}\nclass D extends C {}\ntype A = typeof D;\n\
+         type Box<T> = { value: T };\nconst captured: Box<A> = { value: D };\n\
+         namespace C { export const x: 1 = 1; }\nconst x: 1 = captured.value.x;\n\
+         namespace C { export const y: 2 = 2; }\n\
+         const stillX: 1 = captured.value[\"x\"];\nconst y: 2 = captured.value.y;\n",
+        "a materialized generic alias keeps the constructor's current static view",
+    );
+}
+
+#[test]
+fn a_captured_constructor_type_alias_keeps_its_construct_signature() {
+    assert_reads_clean(
+        "class C { constructor(public value: number) {} }\nclass D extends C {}\n\
+         type A = typeof D;\nconst captured: A = D;\n\
+         namespace C { export const x: 1 = 1; }\n\
+         const instance = new captured(2);\nconst value: number = instance.value;\n\
+         const x: 1 = captured.x;\n",
+        "a refreshed constructor type keeps both construction and namespace statics",
+    );
+}
+
+#[test]
+fn a_constructor_alias_captured_before_the_class_body_keeps_later_exports() {
+    assert_reads_clean(
+        "type A = typeof D;\ndeclare const captured: A;\n\
+         class C { static value() { return 1; } }\nclass D extends C {}\n\
+         namespace C { export const x: 1 = 1; }\n\
+         const value: number = captured.value();\nconst x: 1 = captured.x;\n",
+        "a provisional constructor capture follows class finalization and namespace merging",
     );
 }
 

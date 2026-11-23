@@ -1552,6 +1552,9 @@ struct ImportedTypeMap {
 pub struct TypeTable {
     types: Vec<Type>,
     index: HashMap<Type, TypeId>,
+    /// Captured constructor identities map directly to their current raw
+    /// namespace-augmented representation. Interned nodes and keys stay fixed.
+    constructor_revisions: HashMap<TypeId, TypeId>,
     error: TypeId,
     any: TypeId,
     unknown: TypeId,
@@ -1619,6 +1622,7 @@ impl TypeTable {
         let mut table = Self {
             types: Vec::new(),
             index: HashMap::new(),
+            constructor_revisions: HashMap::new(),
             error: TypeId(0),
             any: TypeId(0),
             unknown: TypeId(0),
@@ -1680,10 +1684,18 @@ impl TypeTable {
         id
     }
 
-    /// Returns the interned representation of a type identity.
+    /// Returns a type's semantic representation. Captured constructor identities
+    /// observe their latest namespace augmentation without rewriting interned nodes.
     #[must_use]
+    #[inline]
     pub fn get(&self, id: TypeId) -> &Type {
-        &self.types[id.0 as usize]
+        let ty = &self.types[id.0 as usize];
+        if matches!(ty, Type::ConstructorType { .. })
+            && let Some(current) = self.constructor_revisions.get(&id)
+        {
+            return &self.types[current.0 as usize];
+        }
+        ty
     }
 
     pub(crate) fn iterable_view(&self, source: TypeId) -> Option<TypeId> {
@@ -2704,6 +2716,47 @@ impl TypeTable {
             arguments,
             structural,
         })
+    }
+
+    /// Publishes a new static view for the same constructor application.
+    /// Every captured revision points directly to the current raw node, even
+    /// when interning reuses an older shape. No lookup follows a revision chain.
+    fn publish_constructor_revision(&mut self, previous: TypeId, current: TypeId) {
+        let previous = self
+            .constructor_revisions
+            .get(&previous)
+            .copied()
+            .unwrap_or(previous);
+        if previous == current {
+            return;
+        }
+        let (
+            Type::ConstructorType {
+                symbol: previous_symbol,
+                arguments: previous_arguments,
+                ..
+            },
+            Type::ConstructorType {
+                symbol: current_symbol,
+                arguments: current_arguments,
+                ..
+            },
+        ) = (
+            &self.types[previous.0 as usize],
+            &self.types[current.0 as usize],
+        )
+        else {
+            panic!("constructor revisions require constructor identities");
+        };
+        assert_eq!(previous_symbol, current_symbol);
+        assert_eq!(previous_arguments, current_arguments);
+        for view in self.constructor_revisions.values_mut() {
+            if *view == previous {
+                *view = current;
+            }
+        }
+        self.constructor_revisions.remove(&current);
+        self.constructor_revisions.insert(previous, current);
     }
 
     /// Returns the parameter-relative self head used inside a class declaration.
@@ -13978,19 +14031,16 @@ impl<'src> Binder<'src> {
         }
         let structural = self.types.object_type_with_members(object);
         let constructor = self.types.constructor_type(owner, arguments, structural);
-        self.class_constructor_types.insert(owner, constructor);
-        self.refresh_captured_constructor_views(existing, constructor);
+        self.publish_class_constructor(owner, constructor);
     }
 
-    /// Refresh views captured before a namespace augmentation.
-    /// `const alias = D` stores the pre-merge constructor id, so a later
-    /// export would stay invisible through the alias while `D` sees it.
-    /// Only top-level exact id matches move forward; reassigned variables
-    /// hold a different id and stay untouched. The baseline record advances
-    /// with the semantic slots so `.types` renders the same constructor.
-    /// Captures nested inside interned types need a representation fix
-    /// tracked separately.
-    fn refresh_captured_constructor_views(&mut self, existing: TypeId, current: TypeId) {
+    /// Publishes a class's static view and refreshes direct and nested captures.
+    /// Explicitly structural annotations retain their own interned shape.
+    fn publish_class_constructor(&mut self, owner: SymbolId, current: TypeId) {
+        let Some(existing) = self.class_constructor_types.insert(owner, current) else {
+            return;
+        };
+        self.types.publish_constructor_revision(existing, current);
         self.symbol_types
             .iter_mut()
             .chain(self.node_types.values_mut())
@@ -16133,7 +16183,7 @@ impl<'src> Binder<'src> {
             self.class_instance_types
                 .insert(owner, preliminary_instance);
             let static_type = self.class_static_type(class, scope, preliminary_instance);
-            self.class_constructor_types.insert(owner, static_type);
+            self.publish_class_constructor(owner, static_type);
             self.symbol_types[owner.get() as usize] = preliminary_instance;
         }
     }
@@ -16267,7 +16317,7 @@ impl<'src> Binder<'src> {
         let static_type = self.class_static_type(class, scope, instance_type);
         if let Some(owner) = owner {
             self.class_instance_types.insert(owner, instance_type);
-            self.class_constructor_types.insert(owner, static_type);
+            self.publish_class_constructor(owner, static_type);
             // Class declarations: the symbol's declared type is the instance
             // type (`>C : C` in .types baselines). Class expressions: the
             // symbol's type is the constructor type (`>C : typeof C`).
@@ -30186,6 +30236,68 @@ mod tests {
             source(text),
         ));
         bind_source(parsed.product())
+    }
+
+    #[test]
+    fn constructor_revisions_preserve_interning_and_captured_aliases() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let empty = table.object_type(Vec::new());
+        let empty_node = table.get(empty).clone();
+        let original = table.constructor_type(owner, Vec::new(), empty);
+        let original_node = table.get(original).clone();
+        let unrelated = table.constructor_type(SymbolId::new(2), Vec::new(), empty);
+        let query = table.type_query("C".into(), Vec::new(), original);
+        let alias_symbol = SymbolId::new(3);
+        table.declare_alias(alias_symbol, Vec::new());
+        table.publish_alias_template(alias_symbol, query);
+        let alias = table.applied_alias(alias_symbol, Vec::new());
+        let alias_view = table.applied_alias_view(alias).expect("cached alias view");
+        let captured = table
+            .type_query_target(alias_view)
+            .expect("constructor query");
+        assert_eq!(captured, original);
+
+        let number = table.number();
+        let with_x = table.object_type(vec![PropertyType::new("x", false, number)]);
+        let first = table.constructor_type(owner, Vec::new(), with_x);
+        table.publish_constructor_revision(original, first);
+        assert_eq!(table.get(captured), table.get(first));
+        assert_eq!(table.applied_alias_view(alias), Some(alias_view));
+        assert_eq!(
+            table.get(unrelated),
+            &Type::ConstructorType {
+                symbol: SymbolId::new(2),
+                arguments: Vec::new(),
+                structural: empty,
+            }
+        );
+        assert_eq!(table.get(empty), &empty_node);
+        assert_eq!(table.types[original.get() as usize], original_node);
+        assert_eq!(table.index.get(&original_node), Some(&original));
+        assert_eq!(table.constructor_type(owner, Vec::new(), empty), original);
+
+        let with_xy = table.object_type(vec![
+            PropertyType::new("x", false, number),
+            PropertyType::new("y", false, number),
+        ]);
+        let second = table.constructor_type(owner, Vec::new(), with_xy);
+        table.publish_constructor_revision(original, second);
+        for captured in [original, first] {
+            assert_eq!(table.get(captured), table.get(second));
+        }
+        table.publish_constructor_revision(second, original);
+        for captured in [original, first, second] {
+            assert_eq!(table.get(captured), &original_node);
+        }
+        assert!(!table.constructor_revisions.contains_key(&original));
+        assert!(
+            table
+                .constructor_revisions
+                .values()
+                .all(|view| *view == original)
+        );
+        assert_eq!(table.index.get(&original_node), Some(&original));
     }
 
     #[test]
