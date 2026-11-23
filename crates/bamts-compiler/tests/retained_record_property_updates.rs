@@ -157,3 +157,217 @@ const unsafe: number = unread.value;
         &["BAMTS-C004"; 4],
     );
 }
+
+#[test]
+fn guarded_optional_bigint_updates_keep_read_and_written_numeric_types() {
+    for fields in [
+        "Partial<Record<keyof typeof Keys, bigint>>",
+        "{ value?: bigint }",
+    ] {
+        let model = checked_model(
+            &format!(
+                r#"
+class Keys {{ static value = 0; }}
+declare const value: {fields};
+if (value.value !== undefined) {{
+    const post = value.value++;
+    const afterPost = value.value;
+    const prefix = ++value.value;
+    const postDecrement = value.value--;
+    const prefixDecrement = --value.value;
+    const indexed = value["value"]++;
+    const afterIndexed = value.value;
+    const accepted: bigint = prefixDecrement;
+    const rejected: number = post;
+    const rejectedAfter: number = afterIndexed;
+}}
+"#
+            ),
+            ScriptKind::TypeScript,
+            &["BAMTS-C004"; 2],
+        );
+        for name in [
+            "post",
+            "afterPost",
+            "prefix",
+            "postDecrement",
+            "prefixDecrement",
+            "indexed",
+            "afterIndexed",
+        ] {
+            assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn updates_preserve_guarded_roots_numeric_unions_and_literal_widening() {
+    let model = checked_model(
+        r#"
+declare let root: bigint | undefined;
+declare const numeric: { value?: number };
+declare let mixed: bigint | number;
+declare const expected: bigint | number;
+declare const literal: { value?: 1n };
+if (typeof root === "bigint") {
+    const rootPost = root++;
+    const rootAfter = root;
+    const rejectedRoot: number = rootPost;
+}
+if (numeric.value !== undefined) {
+    const numberPrefix = --numeric.value;
+    const numberPost = numeric.value++;
+    const numberAfter = numeric.value;
+    const rejectedNumber: bigint = numberPrefix;
+}
+const mixedPost = mixed++;
+const mixedAfter = mixed;
+const rejectedMixed: number = mixedPost;
+if (literal.value !== undefined) {
+    const literalPost = literal.value++;
+    const literalAfter = literal.value;
+    const accepted: bigint = literalAfter;
+    const rejectedLiteral: 1n = literalAfter;
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C004"; 4],
+    );
+    for name in ["rootPost", "rootAfter", "literalPost", "literalAfter"] {
+        assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
+    }
+    for name in ["numberPrefix", "numberPost", "numberAfter"] {
+        assert_eq!(binding_type(&model, name), model.types().number(), "{name}");
+    }
+    for name in ["mixedPost", "mixedAfter"] {
+        assert_eq!(
+            binding_type(&model, name),
+            binding_type(&model, "expected"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn nullable_updates_report_the_read_without_narrowing_an_unsafe_write() {
+    let model = checked_model(
+        r#"
+declare const optional: { value?: bigint };
+declare let nullable: bigint | null | undefined;
+declare const guarded: { value?: bigint };
+declare const required: { value: bigint };
+const unsafePost = optional.value++;
+const unsafeAfter: bigint = optional.value;
+const unsafePrefix = ++nullable;
+const unsafeRootAfter: bigint = nullable;
+if (guarded.value !== undefined) {
+    guarded["value"] = undefined;
+    const invalidated = guarded.value++;
+}
+optional.value = undefined;
+required.value = undefined;
+"#,
+        ScriptKind::TypeScript,
+        &[
+            "BAMTS-C062",
+            "BAMTS-C004",
+            "BAMTS-C062",
+            "BAMTS-C004",
+            "BAMTS-C062",
+            "BAMTS-C004",
+        ],
+    );
+    for name in ["unsafePost", "unsafePrefix"] {
+        assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
+    }
+}
+
+#[test]
+fn nullable_aliases_and_constraints_keep_unsafe_update_flow() {
+    let model = checked_model(
+        r#"
+type MaybeBigInt = bigint | undefined;
+declare let hidden: MaybeBigInt | number;
+declare const expected: bigint | number;
+const hiddenResult = hidden++;
+const hiddenAfter = hidden;
+const resultAccepted: bigint | number = hiddenResult;
+const afterRejected: bigint | number = hiddenAfter;
+function nullableConstraint<T extends MaybeBigInt>(nullable: T): T {
+    const constraintPost = nullable++;
+    const constraintAfter = nullable;
+    const resultAccepted: number = constraintPost;
+    const afterRejected: bigint = constraintAfter;
+    return nullable;
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C062", "BAMTS-C004", "BAMTS-C062", "BAMTS-C004"],
+    );
+    assert_eq!(
+        binding_type(&model, "hiddenResult"),
+        binding_type(&model, "expected"),
+    );
+    for (after, operand) in [("hiddenAfter", "hidden"), ("constraintAfter", "nullable")] {
+        assert_eq!(binding_type(&model, after), binding_type(&model, operand));
+    }
+    assert_eq!(
+        binding_type(&model, "constraintPost"),
+        model.types().number()
+    );
+}
+
+#[test]
+fn generic_numeric_updates_preserve_written_identity_and_expression_types() {
+    let model = checked_model(
+        r#"
+function updateBigInt<T extends bigint>(big: T): T {
+    const bigPost = big++;
+    const bigPrefix = --big;
+    const bigAfter = big;
+    const afterAccepted: bigint = bigAfter;
+    const afterRejected: number = bigAfter;
+    const resultAccepted: number = bigPrefix;
+    const resultRejected: bigint = bigPost;
+    return big;
+}
+function updateNumber<T extends number>(numeric: T): T {
+    const numberPost = numeric--;
+    const numberPrefix = ++numeric;
+    const numberAfter = numeric;
+    const afterAccepted: number = numberAfter;
+    const afterRejected: bigint = numberAfter;
+    const resultAccepted: number = numberPost;
+    const resultRejected: bigint = numberPrefix;
+    return numeric;
+}
+function updateConstrained<T extends bigint, U extends T>(constrained: U): U {
+    const chainedPost = constrained++;
+    const chainedAfter = constrained;
+    const afterAccepted: bigint = chainedAfter;
+    const afterRejected: number = chainedAfter;
+    const resultAccepted: number = chainedPost;
+    const resultRejected: bigint = chainedPost;
+    return constrained;
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C004"; 6],
+    );
+    for name in [
+        "bigPost",
+        "bigPrefix",
+        "numberPost",
+        "numberPrefix",
+        "chainedPost",
+    ] {
+        assert_eq!(binding_type(&model, name), model.types().number(), "{name}");
+    }
+    for (after, operand) in [
+        ("bigAfter", "big"),
+        ("numberAfter", "numeric"),
+        ("chainedAfter", "constrained"),
+    ] {
+        assert_eq!(binding_type(&model, after), binding_type(&model, operand));
+    }
+}
