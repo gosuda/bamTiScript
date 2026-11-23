@@ -190,38 +190,57 @@ test("real child output buffered until exit still resolves its request", { timeo
   }
 });
 
-test("process exit bounds draining even when a descendant inherits stdio", { timeout: 5000 }, async () => {
-  let closed = false;
-  let close;
-  const transport = new Transport({
-    binary: process.execPath,
-    disposeTimeoutMs: 20,
-    spawnChild(binary, _args, options) {
-      const script = `
-        import { spawn } from "node:child_process";
-        process.stdin.once("data", () => {
-          spawn(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], {
-            stdio: "inherit",
-          }).unref();
-          process.exit(0);
-        });
-      `;
-      const child = spawn(binary, ["--input-type=module", "-e", script], options);
-      close = new Promise((resolve) => child.once("close", () => {
-        closed = true;
-        resolve();
-      }));
-      return child;
-    },
+for (const mode of ["crash", "disposal"]) {
+  test(`${mode} releases inherited compiler pipes after process exit`, { timeout: 5000 }, async () => {
+    let close;
+    let exited;
+    let timer;
+    const transport = new Transport({
+      binary: process.execPath,
+      disposeTimeoutMs: 20,
+      spawnChild(binary, _args, options) {
+        const finish = mode === "disposal"
+          ? `const body = JSON.stringify({ id: 1, result: "ready" });
+             process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body,
+               () => process.exit(0));`
+          : "process.exit(0);";
+        const script = `
+          import { spawn } from "node:child_process";
+          process.stdin.once("data", () => {
+            spawn(process.execPath, ["-e", "setTimeout(() => {}, 2000)"], {
+              stdio: "inherit",
+            }).unref();
+            ${finish}
+          });
+        `;
+        const child = spawn(binary, ["--input-type=module", "-e", script], options);
+        close = new Promise((resolve) => child.once("close", resolve));
+        exited = new Promise((resolve) => child.once("exit", resolve));
+        return child;
+      },
+    });
+    try {
+      const request = transport.request("compiler/version");
+      if (mode === "disposal") {
+        assert.equal(await request, "ready");
+      } else {
+        await assert.rejects(request, { name: "TransportCrashError" });
+      }
+      await exited;
+      await transport.dispose();
+      await Promise.race([
+        close,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("compiler pipes stayed open")), 500);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      await transport.dispose();
+      await close;
+    }
   });
-  try {
-    await assert.rejects(transport.request("compiler/version"), { name: "TransportCrashError" });
-    assert.equal(closed, false, "the request must settle before inherited pipes close");
-  } finally {
-    await transport.dispose();
-    await close;
-  }
-});
+}
 
 test("clean stdout EOF rejects pending requests while the child remains alive", { timeout: 5000 }, async () => {
   let child;

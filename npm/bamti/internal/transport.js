@@ -24,6 +24,13 @@ function appendTail(tail, chunk, limit) {
   const next = Buffer.concat([tail, Buffer.from(chunk)]);
   return next.byteLength <= limit ? next : next.subarray(next.byteLength - limit);
 }
+
+function destroyChildStreams(child) {
+  child.stdin.destroy?.();
+  child.stdout.destroy?.();
+  child.stderr.destroy?.();
+}
+
 async function waitForExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) return true;
   let timer;
@@ -304,6 +311,7 @@ export class Transport {
         // The child may have exited before the termination signal arrived.
       }
     }
+    destroyChildStreams(child);
   }
 
   async dispose() {
@@ -319,20 +327,23 @@ export class Transport {
     this.#disposing = (async () => {
       if (!child) return;
       try {
-        child.stdin.end();
-      } catch {
-        // The process may have closed stdin before disposal began.
-      }
-      if (child.exitCode !== null || child.signalCode !== null) return;
+        try {
+          child.stdin.end();
+        } catch {
+          // The process may have closed stdin before disposal began.
+        }
+        if (child.exitCode !== null || child.signalCode !== null) return;
 
-      if (await waitForExit(child, this.options.disposeTimeoutMs)) return;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Windows and already-dead children can reject SIGKILL. No resources
-        // remain reachable from this disposed transport either way.
+        if (await waitForExit(child, this.options.disposeTimeoutMs)) return;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The child may have exited before the termination signal arrived.
+        }
+        await waitForExit(child, 100);
+      } finally {
+        destroyChildStreams(child);
       }
-      await waitForExit(child, 100);
     })();
     return this.#disposing;
   }

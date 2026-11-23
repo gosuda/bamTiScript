@@ -151,6 +151,7 @@ export interface SpawnOptions {
 }
 
 export interface ReadableStreamLike {
+  destroy?(): void;
   on(event: "data", listener: (chunk: Uint8Array) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
   on(event: "end", listener: () => void): this;
@@ -159,6 +160,7 @@ export interface ReadableStreamLike {
 export interface WritableStreamLike {
   write(chunk: Uint8Array): boolean;
   end(): void;
+  destroy?(): void;
   on(event: "error", listener: (error: Error) => void): this;
 }
 
