@@ -50,6 +50,7 @@ jobs:
           command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
       - name: Install dependencies (npm, cargo, Quint)
+        id: dependencies
         run: |
           npm ci
           cargo fetch --locked
@@ -73,6 +74,7 @@ jobs:
       - name: Test npm interfaces
         run: node --test --test-skip-pattern='staged cli-|clean consumer' npm/test/*.test.mjs
       - name: Test Linux native addon lifecycle
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           node --input-type=module <<'NODE'
