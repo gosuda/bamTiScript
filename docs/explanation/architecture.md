@@ -47,7 +47,7 @@ flowchart TD
 ```
 
 ### 1. Invocation and orchestration
-- CLI (`crates/bamts-cli`): Accepts the TypeScript 7.0.2 `tsc` argument model. [`src/main.rs`](../../crates/bamts-cli/src/main.rs) parses through [`src/cli/tsc_args.rs`](../../crates/bamts-cli/src/cli/tsc_args.rs). [`src/driver.rs`](../../crates/bamts-cli/src/driver.rs) loads configuration, compiles the module graph, and renders diagnostics. The legacy `check`, `run`, `compile`, `explain`, and `--target aot|jit` forms are not public commands; they remain only in the internal `--api` parser (`src/args.rs`).
+- CLI (`crates/bamts-cli`): Accepts the TypeScript 7.0.2 `tsc` argument model through [`src/cli/tsc_args.rs`](../../crates/bamts-cli/src/cli/tsc_args.rs). [`src/main.rs`](../../crates/bamts-cli/src/main.rs) routes `--run`, `--jit`, and `--aot` to the native execution parser in [`src/args.rs`](../../crates/bamts-cli/src/args.rs), and routes `--api` and `--lsp` to their persistent transports. [`src/driver.rs`](../../crates/bamts-cli/src/driver.rs) loads configuration, compiles the module graph, and renders diagnostics. `--target` names an ECMAScript target in the TypeScript interface and an execution target when `--run` selects native execution.
 - Facade (`crates/bamts`): Exposes Rust functions for compiling and running source entrypoints and, with the `aot` feature, producing native object files. It translates subsystem errors into [`bamts::Error`](../../crates/bamts/src/lib.rs).
 
 ### 2. Frontend compilation
@@ -73,11 +73,11 @@ flowchart TD
 - The host surface is a subset. It is not full Node.js or Node-API compatibility.
 - Exposes two distinct npm distribution surfaces:
   - `bamti-cli`: The standalone CLI transport package that resolves and executes the `bamts` binary executable on disk.
-  - `bamti`: The in-process Node.js interface for Node.js 24 or later, embedding the compiler directly via native Node-API bindings (`bamts-napi`).
+  - `bamti`: The Node.js 24 or later interface. `runNative()` uses the native Node-API addon (`bamts-napi`); `run()` starts the CLI through `bamti-cli`. `createSession()` and the unstable service/AST exports share a persistent `bamts --api` child process.
 - Target design and fail-closed loading:
   - `bamti` specifies five optional native platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`).
   - `native-loader.js` resolves the optional platform package matching the host OS and architecture, validating package manifests, binary SHA-256 digests, and release metadata.
-  - If the matching native package is missing or fails verification, artifact loading fails closed with an explicit error (`NativeArtifactNotFoundError` or `NativeArtifactLoadError`). It never falls back to downloading binaries or spawning the CLI.
+  - If the matching native package is missing or fails verification, native addon loading fails closed with an explicit error (`NativeArtifactNotFoundError` or `NativeArtifactLoadError`). `runNative()` does not fall back to downloading binaries or spawning the CLI. The CLI and persistent service exports select their process transports explicitly.
 - Cancellation and environment teardown ownership:
   - `bamts-cancel` owns atomic cancellation handles and execution interrupt triggers.
   - `bamts-platform` owns host facts and process observation: host triple, machine facts, process memory regions, and peak memory. OS-specific reads stay in this crate.
@@ -117,7 +117,7 @@ unsafe_code = "forbid"
 ## Implementation status
 
 - Version `0.2.0` is pre-release.
-- `bamti` provides an in-process Node 24+ interface backed by Node-API bindings (`bamts-napi`) and an atomic cancellation handle (`bamts-cancel`), while `bamti-cli` acts as the standalone CLI transport.
+- `bamti` provides native addon execution, CLI execution, and persistent compiler sessions on Node 24+. `bamts-cancel` owns native cancellation handles; the persistent service forwards request cancellation through the API protocol. `bamti-cli` resolves the standalone executable.
 - Loading optional platform packages is fail-closed.
 - Currently published 0.1.0 npm packages do not contain prebuilt native binary artifacts. The native Node-API implementation is present in the source repository but is not yet published to npm.
 - Real five-target release validation remains blocked by GitHub billing and is unverified.
