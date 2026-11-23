@@ -590,6 +590,12 @@ fn rename_property(
         .property_site(property_id)
         .ok_or(ServiceError::RenameUnavailable)?;
     let old_name = site.name.to_string();
+    if new_name == old_name {
+        return Ok(RenameResult {
+            symbol: old_name,
+            edit: RenameEdit { edits: Vec::new() },
+        });
+    }
     if model
         .property_sites()
         .iter()
@@ -801,6 +807,17 @@ mod tests {
                 "rename accepted a position inside a surrogate pair at {position:?}"
             );
         }
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_to_same_name_keeps_shorthand_unchanged() {
+        let source = "const value = 1; const a = { value }; a.value; a[\"value\"];";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "a.value", 2), "value")
+            .expect("unchanged property name does not conflict with itself");
+        assert!(rename.edit.edits.is_empty());
         fs::remove_dir_all(root).expect("remove root");
     }
 
