@@ -1,0 +1,82 @@
+name: Optimization comparison
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/optimization-performance.yml
+      - perf/compare_optimization.py
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline branch, tag, or commit in this repository
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: optimization-comparison-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compare:
+    name: Compare compiler and runtime workloads
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      UV_NO_PROGRESS: "1"
+      NO_COLOR: "1"
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Checkout baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.baseline_ref }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Assert candidate source
+        env:
+          EXPECTED_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git -C candidate rev-parse HEAD)" = "$EXPECTED_HEAD"
+
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Install pinned uv in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/optimization-python"
+          "$RUNNER_TEMP/optimization-python/bin/pip" install --disable-pip-version-check --no-input uv==0.13.9
+          echo "$RUNNER_TEMP/optimization-python/bin" >> "$GITHUB_PATH"
+
+      - name: Build and measure both revisions
+        run: |
+          uv run --no-project --no-python-downloads \
+            --python "$RUNNER_TEMP/optimization-python/bin/python" \
+            candidate/perf/compare_optimization.py \
+            --baseline "$GITHUB_WORKSPACE/baseline" \
+            --candidate "$GITHUB_WORKSPACE/candidate" \
+            --output "$GITHUB_WORKSPACE/optimization-results" \
+            --rounds 6
+
+      - name: Upload comparison and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: optimization-comparison-${{ github.run_attempt }}
+          path: optimization-results/
+          if-no-files-found: warn
+          retention-days: 14
