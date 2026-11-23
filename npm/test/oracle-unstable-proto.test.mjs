@@ -99,6 +99,7 @@ test("proto.Transport round-trips requests over the framed child protocol and en
   child.stdin.on("data", (chunk) => {
     for (const message of serverDecoder.push(chunk)) {
       requests.push(message);
+      if (message.method === "service/four") continue;
       const reply =
         message.id === 2
           ? { id: message.id, error: { code: "E_SERVICE", message: "boom" } }
@@ -128,7 +129,11 @@ test("proto.Transport round-trips requests over the framed child protocol and en
 
   child.stderr.write("compiler stderr tail\n");
   const fourth = transport.request("service/four");
+  child.signalCode = "SIGKILL";
   child.emit("exit", null, "SIGKILL");
+  child.stdout.end();
+  child.stderr.end();
+  child.emit("close", null, "SIGKILL");
   await assert.rejects(
     fourth,
     (error) =>

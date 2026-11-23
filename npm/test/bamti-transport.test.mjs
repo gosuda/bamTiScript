@@ -322,7 +322,15 @@ test("invalid frame limits fail before a child is spawned", async () => {
 });
 
 test("malformed error responses reject requests without escaping a stream listener", async () => {
-  for (const error of [null, false, "failure", [], { code: "bad", message: "bad" }]) {
+  for (const error of [
+    null,
+    false,
+    "failure",
+    [],
+    { code: false, message: "bad" },
+    { code: {}, message: "bad" },
+    { code: -32004, message: null },
+  ]) {
     const { transport, children, requests } = requestFixture();
     const outcome = transport.request("compiler/version").catch((failure) => failure);
     try {
@@ -330,6 +338,31 @@ test("malformed error responses reject requests without escaping a stream listen
         children[0].stdout.write(encodeFrame({ id: requests[0].id, error }));
       });
       assert.equal((await outcome).name, "ProtocolError");
+    } finally {
+      await transport.dispose();
+    }
+  }
+});
+
+test("service error codes preserve their public types and keep the transport usable", async () => {
+  for (const code of ["E_SERVICE", -32004, 1.5, null, undefined]) {
+    const { transport, children, requests } = requestFixture();
+    try {
+      const outcome = transport.request("compiler/version").catch((error) => error);
+      children[0].stdout.write(encodeFrame({
+        id: requests[0].id,
+        error: { code, message: "rejected", data: { retry: true } },
+      }));
+      const error = await outcome;
+      assert.ok(error instanceof api.ServiceRequestError);
+      assert.equal(error.code, code ?? null);
+      assert.equal(error.method, "compiler/version");
+      assert.deepEqual(error.data, { retry: true });
+
+      const next = transport.request("compiler/version");
+      children[0].stdout.write(encodeFrame({ id: requests[1].id, result: "ready" }));
+      assert.equal(await next, "ready");
+      assert.equal(children.length, 1);
     } finally {
       await transport.dispose();
     }

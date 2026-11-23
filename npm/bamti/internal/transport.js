@@ -247,7 +247,10 @@ export class Transport {
           error === null ||
           typeof error !== "object" ||
           Array.isArray(error) ||
-          !Number.isSafeInteger(error.code) ||
+          (error.code !== undefined &&
+            error.code !== null &&
+            typeof error.code !== "string" &&
+            !Number.isFinite(error.code)) ||
           typeof error.message !== "string" ||
           "result" in message
         ) {
