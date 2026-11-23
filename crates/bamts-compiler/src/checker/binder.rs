@@ -3101,9 +3101,8 @@ impl TypeTable {
                 properties.push(PropertyType::new(name, false, value));
             }
             Type::NumberLiteral(name) => {
-                properties.push(
-                    PropertyType::new(name.clone(), false, value).with_numeric_name(true),
-                );
+                properties
+                    .push(PropertyType::new(name.clone(), false, value).with_numeric_name(true));
             }
             Type::Any => index_keys.extend([self.string(), self.number(), self.symbol_type()]),
             Type::Never => {}
@@ -4841,7 +4840,9 @@ impl TypeTable {
             };
             imported.types.insert(source_id, type_id);
             if let Some(&current) = source.constructor_revisions.get(&source_id) {
-                imported.pending_constructor_revisions.push((source_id, current));
+                imported
+                    .pending_constructor_revisions
+                    .push((source_id, current));
             }
             type_id
         }
@@ -30354,8 +30355,7 @@ mod tests {
         let owner = value_symbol(&model, "Self");
         let constructor = model.constructor_type(owner);
         let mut table = model.types().clone();
-        let substitution =
-            super::InferredTypeArguments::for_this(owner, model.symbol_type(owner));
+        let substitution = super::InferredTypeArguments::for_this(owner, model.symbol_type(owner));
         let instantiated = substitution.instantiate(&mut table, constructor);
         let Type::ConstructorType {
             symbol, structural, ..
