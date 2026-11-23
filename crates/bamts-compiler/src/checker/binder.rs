@@ -903,6 +903,9 @@ pub struct ObjectType {
     pub(crate) construct_signatures: Vec<ConstructEntry>,
     pub(crate) index_signatures: Vec<IndexSignature>,
     pub(crate) generator_return: Option<TypeId>,
+    /// Retains the builtin AsyncIterator identity used by the pinned checker.
+    /// Fresh structural copies and interface compositions clear this provenance.
+    pub(crate) intrinsic_async_iterator: bool,
     pub(crate) iterator_property: Option<IteratorProperty>,
     pub(crate) async_iterator_property: Option<IteratorProperty>,
 }
@@ -3732,6 +3735,7 @@ impl TypeTable {
             construct_signatures: Vec::new(),
             index_signatures,
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         }
@@ -4736,6 +4740,7 @@ impl TypeTable {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: Some(property),
             async_iterator_property: None,
         })
@@ -4882,6 +4887,7 @@ impl TypeTable {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         })
@@ -4947,6 +4953,7 @@ impl TypeTable {
                             construct_signatures: Vec::new(),
                             index_signatures: Vec::new(),
                             generator_return: None,
+                            intrinsic_async_iterator: false,
                             iterator_property: None,
                             async_iterator_property: None,
                         }))
@@ -5206,6 +5213,7 @@ impl TypeTable {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         })
@@ -5538,6 +5546,7 @@ impl TypeTable {
                         construct_signatures,
                         index_signatures,
                         generator_return,
+                        intrinsic_async_iterator: object.intrinsic_async_iterator,
                         iterator_property,
                         async_iterator_property,
                     })
@@ -6963,6 +6972,7 @@ fn constructor_with_members_in(
         construct_signatures: Vec::new(),
         index_signatures: Vec::new(),
         generator_return: None,
+        intrinsic_async_iterator: false,
         iterator_property: None,
         async_iterator_property: None,
     };
@@ -10743,6 +10753,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: Some(
                 IteratorProperty::new(iterator_method, false)
                     .with_method(true)
@@ -10837,6 +10848,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: Some(
                 IteratorProperty::new(iterator_method, false)
                     .with_method(true)
@@ -10926,6 +10938,7 @@ impl<'src> Binder<'src> {
             }],
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         })
@@ -17778,6 +17791,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property,
             async_iterator_property,
         });
@@ -17879,6 +17893,7 @@ impl<'src> Binder<'src> {
             construct_signatures,
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property,
             async_iterator_property,
         });
@@ -19436,7 +19451,10 @@ impl<'src> Binder<'src> {
                             Some(argument) => {
                                 let iterable = self.legacy_type_of_expr(argument, scope);
                                 match self.iteration_element_type(iterable, protocol) {
-                                    Some(element) => element,
+                                    Some(element) => match protocol {
+                                        ForOfMode::Sync => element,
+                                        ForOfMode::Async => self.awaited_type(element),
+                                    },
                                     None => {
                                         self.emit(
                                             FOR_OF_ITERABLE_REQUIRED,
@@ -20828,10 +20846,71 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Only aliases, queries, and neutral intersection factors preserve the
+    /// builtin iterator identity. Named interfaces remain structural.
+    fn collect_intrinsic_async_iterator(
+        &mut self,
+        iterator: TypeId,
+        intrinsic: &mut Option<TypeId>,
+        path: &mut Vec<TypeId>,
+    ) -> bool {
+        if path.len() >= MAX_TYPE_DEPTH as usize || path.contains(&iterator) {
+            return false;
+        }
+        path.push(iterator);
+        let preserves_identity = match self.types.get(iterator) {
+            Type::Unknown => true,
+            Type::ObjectType(object) if object.intrinsic_async_iterator => match *intrinsic {
+                Some(previous) => previous == iterator,
+                None => {
+                    *intrinsic = Some(iterator);
+                    true
+                }
+            },
+            Type::ObjectType(object) => {
+                object.properties.is_empty()
+                    && object.call_signatures.is_empty()
+                    && object.call_candidate_order.is_empty()
+                    && object.construct_signatures.is_empty()
+                    && object.index_signatures.is_empty()
+                    && object.generator_return.is_none()
+                    && object.iterator_property.is_none()
+                    && object.async_iterator_property.is_none()
+            }
+            Type::AppliedAlias { .. } => self
+                .types
+                .prepare_applied_alias_view(iterator)
+                .is_some_and(|view| self.collect_intrinsic_async_iterator(view, intrinsic, path)),
+            Type::TypeQuery { target, .. } => {
+                let target = *target;
+                self.collect_intrinsic_async_iterator(target, intrinsic, path)
+            }
+            Type::Intersection(members) => {
+                let members = members.clone();
+                members
+                    .into_iter()
+                    .all(|member| self.collect_intrinsic_async_iterator(member, intrinsic, path))
+            }
+            _ => false,
+        };
+        let previous = path.pop();
+        debug_assert_eq!(previous, Some(iterator));
+        preserves_identity
+    }
+
     fn iterator_object_element_type(
         &mut self,
         iterator: TypeId,
         protocol: ForOfMode,
+    ) -> Option<TypeId> {
+        self.iterator_object_element_type_inner(iterator, protocol, true)
+    }
+
+    fn iterator_object_element_type_inner(
+        &mut self,
+        iterator: TypeId,
+        protocol: ForOfMode,
+        allow_intrinsic: bool,
     ) -> Option<TypeId> {
         match self.types.get(iterator).clone() {
             Type::Any | Type::Never | Type::Error => Some(iterator),
@@ -20841,7 +20920,8 @@ impl<'src> Binder<'src> {
                 let mut has_error = false;
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let element = self.iterator_object_element_type(member, protocol)?;
+                    let element =
+                        self.iterator_object_element_type_inner(member, protocol, allow_intrinsic)?;
                     has_error |= element == error;
                     elements.push(element);
                 }
@@ -20852,18 +20932,36 @@ impl<'src> Binder<'src> {
                 }
             }
             Type::Named(_) | Type::AppliedClass { .. } | Type::AppliedAlias { .. } => {
+                let allow_intrinsic = allow_intrinsic
+                    && matches!(self.types.get(iterator), Type::AppliedAlias { .. });
                 let view = self.types.named_structural_view(iterator);
                 let view = self.types.prepare_applied_alias_view(view).unwrap_or(view);
                 let view = self.types.prepare_applied_class_view(view).unwrap_or(view);
                 (view != iterator)
-                    .then(|| self.iterator_object_element_type(view, protocol))
+                    .then(|| {
+                        self.iterator_object_element_type_inner(view, protocol, allow_intrinsic)
+                    })
                     .flatten()
             }
             Type::Intersection(members) => {
+                let mut intrinsic = None;
+                if protocol == ForOfMode::Async
+                    && allow_intrinsic
+                    && self.collect_intrinsic_async_iterator(
+                        iterator,
+                        &mut intrinsic,
+                        &mut Vec::new(),
+                    )
+                    && let Some(intrinsic) = intrinsic
+                {
+                    return self.iterator_object_element_type_inner(intrinsic, protocol, true);
+                }
                 let error = self.types.error_type();
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let Some(element) = self.iterator_object_element_type(member, protocol) else {
+                    let Some(element) =
+                        self.iterator_object_element_type_inner(member, protocol, false)
+                    else {
                         continue;
                     };
                     if element == error {
@@ -20890,7 +20988,18 @@ impl<'src> Binder<'src> {
                 ) {
                     return Some(result);
                 }
-                self.iterator_result_yield_type(result)
+                let value = self.iterator_result_yield_type(result)?;
+                let awaits_value = protocol == ForOfMode::Async
+                    && allow_intrinsic
+                    && matches!(
+                        self.types.get(iterator),
+                        Type::ObjectType(object) if object.intrinsic_async_iterator
+                    );
+                Some(if awaits_value {
+                    self.awaited_type(value)
+                } else {
+                    value
+                })
             }
             _ => None,
         }
@@ -20945,11 +21054,7 @@ impl<'src> Binder<'src> {
     }
 
     fn iteration_element_type(&mut self, iterable: TypeId, mode: ForOfMode) -> Option<TypeId> {
-        let element = self.iteration_element_type_inner(iterable, mode, iterable)?;
-        Some(match mode {
-            ForOfMode::Sync => element,
-            ForOfMode::Async => self.awaited_type(element),
-        })
+        self.iteration_element_type_inner(iterable, mode, iterable)
     }
 
     fn iteration_element_type_inner(
@@ -20960,7 +21065,11 @@ impl<'src> Binder<'src> {
     ) -> Option<TypeId> {
         match self.types.get(iterable).clone() {
             Type::Array(_) | Type::Tuple(_) => {
-                self.types.array_or_tuple_iteration_element(iterable)
+                let element = self.types.array_or_tuple_iteration_element(iterable)?;
+                Some(match mode {
+                    ForOfMode::Sync => element,
+                    ForOfMode::Async => self.awaited_type(element),
+                })
             }
             Type::ObjectType(object) => {
                 if mode == ForOfMode::Async
@@ -20991,7 +21100,11 @@ impl<'src> Binder<'src> {
                     None,
                     receiver,
                 );
-                self.structural_iterator_element_type(method, ForOfMode::Sync)
+                let element = self.structural_iterator_element_type(method, ForOfMode::Sync)?;
+                Some(match mode {
+                    ForOfMode::Sync => element,
+                    ForOfMode::Async => self.awaited_type(element),
+                })
             }
             Type::String | Type::StringLiteral(_) => Some(self.types.string()),
             Type::Any | Type::Never | Type::Error => Some(iterable),
@@ -21039,13 +21152,16 @@ impl<'src> Binder<'src> {
                         None,
                         receiver,
                     );
-                    return self.structural_iterator_element_type(method, ForOfMode::Sync);
+                    let element = self.structural_iterator_element_type(method, ForOfMode::Sync)?;
+                    return Some(match mode {
+                        ForOfMode::Sync => element,
+                        ForOfMode::Async => self.awaited_type(element),
+                    });
                 }
                 let error = self.types.error_type();
                 let mut elements = Vec::with_capacity(members.len());
                 for member in members {
-                    let Some(element) =
-                        self.iteration_element_type_inner(member, ForOfMode::Sync, receiver)
+                    let Some(element) = self.iteration_element_type_inner(member, mode, receiver)
                     else {
                         continue;
                     };
@@ -22473,6 +22589,7 @@ impl<'src> Binder<'src> {
                     }],
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    intrinsic_async_iterator: false,
                     iterator_property: None,
                     async_iterator_property: None,
                 })
@@ -24132,6 +24249,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         };
@@ -24432,6 +24550,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         };
@@ -24884,6 +25003,7 @@ impl<'src> Binder<'src> {
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    intrinsic_async_iterator: false,
                     iterator_property: None,
                     async_iterator_property: None,
                 };
@@ -25120,9 +25240,17 @@ impl<'src> Binder<'src> {
                     )],
                     next_result,
                 );
-                self.types.object_type(vec![
-                    PropertyType::new("next", false, next).with_method(true),
-                ])
+                self.types.object_type_with_members(ObjectType {
+                    properties: vec![PropertyType::new("next", false, next).with_method(true)],
+                    call_signatures: Vec::new(),
+                    call_candidate_order: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures: Vec::new(),
+                    generator_return: None,
+                    intrinsic_async_iterator: true,
+                    iterator_property: None,
+                    async_iterator_property: None,
+                })
             }
         }
     }
@@ -25150,6 +25278,7 @@ impl<'src> Binder<'src> {
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    intrinsic_async_iterator: false,
                     iterator_property: None,
                     async_iterator_property: Some(property),
                 })
@@ -25166,7 +25295,19 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let iterator = self.intrinsic_iterator_type(yield_type, return_type, next_type, protocol);
         let iterable = self.intrinsic_iterable_type(yield_type, return_type, next_type, protocol);
-        self.types.intersection(vec![iterator, iterable])
+        match protocol {
+            ForOfMode::Sync => self.types.intersection(vec![iterator, iterable]),
+            ForOfMode::Async => {
+                let Type::ObjectType(mut object) = self.types.get(iterator).clone() else {
+                    unreachable!("an intrinsic async iterator has an object representation");
+                };
+                let Type::ObjectType(iterable) = self.types.get(iterable) else {
+                    unreachable!("an intrinsic async iterable has an object representation");
+                };
+                object.async_iterator_property = iterable.async_iterator_property.clone();
+                self.types.object_type_with_members(object)
+            }
+        }
     }
 
     fn intrinsic_generator_type(
@@ -25178,6 +25319,13 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let iterable =
             self.intrinsic_iterable_iterator_type(yield_type, return_type, next_type, protocol);
+        if protocol == ForOfMode::Async {
+            let Type::ObjectType(mut object) = self.types.get(iterable).clone() else {
+                unreachable!("an intrinsic async generator has an object representation");
+            };
+            object.generator_return = Some(return_type);
+            return self.types.object_type_with_members(object);
+        }
         let marker = self.types.object_type_with_members(ObjectType {
             properties: Vec::new(),
             call_signatures: Vec::new(),
@@ -25185,6 +25333,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: Some(return_type),
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -25885,6 +26034,7 @@ impl<'src> Binder<'src> {
             construct_signatures: Vec::new(),
             index_signatures,
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property,
             async_iterator_property,
         })
@@ -29257,6 +29407,7 @@ impl<'src> Binder<'src> {
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    intrinsic_async_iterator: false,
                     iterator_property: None,
                     async_iterator_property: None,
                 }));
@@ -35348,6 +35499,7 @@ namespace undefined { export var x = 42; }",
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -35379,6 +35531,7 @@ namespace undefined { export var x = 42; }",
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -35393,6 +35546,7 @@ namespace undefined { export var x = 42; }",
             }],
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -35460,6 +35614,7 @@ namespace undefined { export var x = 42; }",
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -35504,6 +35659,7 @@ namespace undefined { export var x = 42; }",
                 declaring_types: Vec::new(),
             }],
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -35675,6 +35831,7 @@ namespace undefined { export var x = 42; }",
                 declaring_types: Vec::new(),
             }],
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });

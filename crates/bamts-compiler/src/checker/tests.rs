@@ -7356,7 +7356,7 @@ fn for_of_structural_iterator_uses_next_value_type() {
 }
 
 #[test]
-fn for_await_prefers_async_protocol_and_awaits_next_and_value() {
+fn for_await_prefers_async_protocol_and_preserves_its_value() {
     let result = check_text(
         "const iterable = {\
                  [Symbol.asyncIterator](): {\
@@ -7368,15 +7368,12 @@ fn for_await_prefers_async_protocol_and_awaits_next_and_value() {
              };\
              async function consume(): Promise<void> {\
                  for await (const value of iterable) {\
-                     const text: string = value;\
+                     const text: Promise<string> = value;\
+                     const invalid: string = value;\
                  }\
              }",
     );
-    assert!(
-        checker_codes(&result).is_empty(),
-        "{:?}",
-        result.diagnostics()
-    );
+    assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
 }
 
 #[test]

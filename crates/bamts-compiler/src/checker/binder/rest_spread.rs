@@ -52,6 +52,7 @@ impl<'src> Binder<'src> {
                     construct_signatures: Vec::new(),
                     index_signatures: Vec::new(),
                     generator_return: None,
+                    intrinsic_async_iterator: false,
                     iterator_property: None,
                     async_iterator_property: None,
                 });

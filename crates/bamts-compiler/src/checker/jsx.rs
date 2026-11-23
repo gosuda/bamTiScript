@@ -1474,6 +1474,7 @@ fn jsx_props_object(binder: &mut Binder<'_>, branch: JsxSpreadBranch) -> TypeId 
         construct_signatures: Vec::new(),
         index_signatures: branch.index_signatures,
         generator_return: None,
+        intrinsic_async_iterator: false,
         iterator_property: None,
         async_iterator_property: None,
     })
