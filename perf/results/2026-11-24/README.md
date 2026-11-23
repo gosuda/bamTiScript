@@ -35,32 +35,43 @@ and complete certificate comparisons, and destruction occur outside the timed
 region. The dependency-free crate and runners were built directly with pinned
 Rust 1.97.1, edition 2024, optimization level 3, and forbidden unsafe code.
 
-[worklist-validated-comparison.json](worklist-validated-comparison.json) contains
-90 raw samples: five rounds for each of six workloads, always in the fixed order
-original, scratch, then worklist. This interleaves variants but does not
-counterbalance their order; changing host load or thermal conditions can bias
-the comparison. Every sample reports zero failures. For each workload, all 15
-samples have matching wire and complete-public-certificate digests across
-variants. The file retains binary hashes, CPU affinity, and host load.
+[worklist-counterbalanced-comparison.json](worklist-counterbalanced-comparison.json)
+is the primary timing evidence. It contains 72 raw samples: six workloads, six
+rounds, and two variants per round. Odd rounds run original then worklist; even
+rounds run worklist then original. Each variant runs first three times and
+second three times per workload. Every sample reports zero failures, and each
+workload has matching wire and complete-public-certificate digests across all
+12 samples. The file retains the actual sequence, binary hashes, CPU affinity,
+and host load. [COUNTERBALANCED.md](COUNTERBALANCED.md) records the detailed audit.
 
 The run used a busy local host with affinity to CPUs 0 through 8. The one-minute
-load average was 28.38 before and 25.86 after. **This is not BH1 evidence.** No
+load average was 44.43 before and 43.28 after. **This is not BH1 evidence.** No
 performance host requirements or official performance artifacts were changed.
+
+The historical [worklist-validated-comparison.json](worklist-validated-comparison.json)
+is preserved unchanged. Its 90 samples used five fixed-order rounds of original,
+scratch, then worklist for each workload. Its metadata incorrectly called that
+order alternating. The samples and digests remain valid records, but that
+description is superseded and the timing table below uses the new
+counterbalanced run. Order balancing reduces systematic order bias; it does
+not remove interference from the busy host.
 
 ## Bytecode verification timings
 
 Values are median microseconds per verification, with `[minimum, maximum]` over
-five samples per variant. Every table cell was recomputed from the raw JSON with
-`uv run --offline --no-project python` before this report was written.
+six samples per variant. Every table cell was recomputed from the raw JSON with
+`uv run --offline --no-project python` before this report was written. Displayed
+values use decimal half-up rounding to 0.001 microsecond; the JSON preserves the
+nanosecond summaries.
 
-| Workload | Original | Scratch only | Scratch and worklist |
-| --- | ---: | ---: | ---: |
-| 32 straight-line instructions | 3.960 [2.160, 5.778] | 3.019 [1.898, 3.128] | 2.355 [1.279, 4.646] |
-| 4,096 straight-line instructions, 64 registers | 423.140 [178.006, 930.128] | 235.308 [184.153, 465.400] | 238.470 [173.275, 350.314] |
-| 4,096 straight-line instructions, 512 registers | 619.842 [375.854, 745.458] | 498.792 [186.270, 650.658] | 307.287 [166.043, 395.105] |
-| 4,096 instructions with forward branches | 293.912 [200.959, 634.452] | 257.821 [216.723, 463.794] | 268.765 [119.215, 558.523] |
-| 2,048 instructions in a backward chain | 75,512.770 [73,439.043, 129,945.201] | 26,526.945 [21,593.892, 54,053.347] | 66.891 [63.441, 216.172] |
-| 1,024 backward instructions with 32 nested handlers | 66,720.704 [49,764.118, 147,654.657] | 46,815.066 [35,823.464, 51,828.927] | 93.387 [61.628, 113.922] |
+| Workload | Original | Scratch and worklist |
+| --- | ---: | ---: |
+| 32 straight-line instructions | 5.152 [3.739, 6.454] | 2.866 [1.932, 5.021] |
+| 4,096 straight-line instructions, 64 registers | 444.598 [197.134, 604.532] | 208.011 [126.572, 434.878] |
+| 4,096 straight-line instructions, 512 registers | 332.265 [275.151, 453.225] | 261.286 [155.872, 476.992] |
+| 4,096 instructions with forward branches | 611.178 [322.617, 758.787] | 450.253 [216.971, 759.553] |
+| 2,048 instructions in a backward chain | 147,586.490 [99,833.330, 271,872.325] | 107.906 [86.871, 519.350] |
+| 1,024 backward instructions with 32 nested handlers | 95,433.583 [60,623.311, 278,683.110] | 99.811 [61.392, 385.923] |
 
 The original and worklist ranges are disjoint for both backward-order stress
 fixtures on this host. All four ordinary fixtures have overlapping ranges, so
@@ -90,13 +101,88 @@ work. They are separate evidence from the elapsed-time samples.
 | Area | Status and evidence |
 | --- | --- |
 | Source bytecode tests | **138 passed** through pinned direct `rustc --test`, including a differential test over **280,893 exhaustive cases** comparing complete certificates or exact first errors with the original solver. |
-| Benchmark output agreement | **Checked:** zero failures and matching wire/certificate digests across the 90 timing samples; exact encoded bytes and complete certificates are checked by each runner outside timing. |
+| Benchmark output agreement | **Checked:** zero failures and matching wire/certificate digests across the 72 counterbalanced samples. Their binary hashes and workload digests match the historical run. Exact encoded bytes and complete certificates are checked by each runner outside timing. |
+| Integration formatting and whitespace | **PASS** at `602530a3bde07e47fd290e783133c48b095b0aea`: `cargo fmt --all --check` and `git diff --check`. |
 | Full workspace checks and root gates | **PENDING.** Leaf bytecode tests do not satisfy workspace or product gates. |
 | Compiler tests and performance | **PENDING.** Source changes are integrated; no compiler speed claim is made. |
 | Runtime tests and performance | **PENDING.** Source changes are integrated; no runtime speed claim is made. |
 | End-to-end compilation and execution | **PENDING.** |
 | BH1 performance qualification | **PENDING.** The recorded local host is not BH1. |
 
+Both baseline release-build attempts ended in SIGKILL without a Rust diagnostic,
+including the retry with 256 codegen units. The subsequent baseline
+`cargo check --locked -p bamts-compiler --examples -j 1` also ended in SIGKILL
+without a diagnostic. These attempts did not validate compiler or runtime
+changes. They do not relax any gate, and no CI result is claimed here.
+
 Append later validation with its exact revision, commands, host identity, and raw
 results. Preserve the distinction between these imported source-branch checks
 and checks run on the final integration revision.
+
+## Reproduce the verifier comparison
+
+Run these commands from the repository root on Linux with a rustup-managed
+Rust 1.97.1 installation, Python 3.11 or newer, and `uv`. The checkout must
+contain the pinned base commit and this change. If the checkout is shallow,
+fetch the base commit before running `git archive`.
+
+The dependency-free bytecode crate can be built directly with `rustc`. The
+commands extract the original production source from the pinned base and the
+candidate source from the current commit. Both binaries use the same candidate
+`verify_perf.rs`, so the original also performs the final wire and certificate
+checks. No prebuilt local benchmark binary or unpublished source branch is
+required. The commands leave the checkout unchanged and retain source revisions
+beside the new result.
+
+```bash
+set -euo pipefail
+export RUSTUP_TOOLCHAIN=1.97.1
+baseline_revision=37f76d4f68e5b9b1797f61c44d1893a7705f8389
+candidate_revision="$(git rev-parse HEAD)"
+verifier_tmp="$(mktemp -d "${TMPDIR:-/tmp}/bamts-verifier.XXXXXX")"
+mkdir -p "$verifier_tmp/base-src" "$verifier_tmp/candidate-src"
+mkdir -p "$verifier_tmp/base" "$verifier_tmp/candidate"
+
+git archive "$baseline_revision" crates/bamts-bytecode/src |
+  tar -x -C "$verifier_tmp/base-src"
+git archive "$candidate_revision" \
+  crates/bamts-bytecode/src \
+  crates/bamts-bytecode/examples/verify_perf.rs |
+  tar -x -C "$verifier_tmp/candidate-src"
+
+printf '%s\n' "baseline=$baseline_revision" "candidate=$candidate_revision" \
+  > "$verifier_tmp/revisions.txt"
+rustc --version >> "$verifier_tmp/revisions.txt"
+
+for variant in base candidate; do
+  rustc --edition=2024 -C opt-level=3 -F unsafe-code \
+    --crate-name bamts_bytecode --crate-type rlib \
+    "$verifier_tmp/$variant-src/crates/bamts-bytecode/src/lib.rs" \
+    -o "$verifier_tmp/$variant/libbamts_bytecode.rlib"
+  rustc --edition=2024 -C opt-level=3 -F unsafe-code \
+    "$verifier_tmp/candidate-src/crates/bamts-bytecode/examples/verify_perf.rs" \
+    --extern "bamts_bytecode=$verifier_tmp/$variant/libbamts_bytecode.rlib" \
+    -o "$verifier_tmp/$variant/verify_perf"
+done
+
+uv run --offline --no-project python perf/measure_verifier.py \
+  --baseline "$verifier_tmp/base/verify_perf" \
+  --candidate "$verifier_tmp/candidate/verify_perf" \
+  --output "$verifier_tmp/comparison.json" \
+  --rounds 6
+printf 'Results: %s\n' "$verifier_tmp"
+```
+
+The measurement script requires an even number of rounds of at least six and
+refuses to overwrite an existing result. It records `complete: false` until all
+samples pass output validation and every summary is present. Repeating the
+commands creates a fresh result directory. Compiler identity is read from
+`rustc` on `PATH`; keep the pinned toolchain selected for both compilation and
+measurement. Host conditions, rebuilt binary hashes, and elapsed times need not
+match the archived run.
+
+For one public-API workload, the built runner accepts
+`verify_perf <straight|reverse|branches|handlers> <instructions> <registers> <iterations>`.
+The committed [measurement script](../../measure_verifier.py) fixes all six
+workload dimensions for the reported comparison. Direct builds and local
+measurements do not establish workspace, end-to-end, or BH1 gate completion.
