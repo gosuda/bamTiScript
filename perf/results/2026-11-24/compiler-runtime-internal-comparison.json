@@ -1,0 +1,3182 @@
+{
+  "schema": "bamts.optimization-comparison/v1",
+  "scope": "Same-host development comparison; not BH1 or product-completion evidence.",
+  "status": "complete",
+  "revisions": {
+    "baseline": "37f76d4f68e5b9b1797f61c44d1893a7705f8389",
+    "candidate": "cef40437c4d698755af60b47b577f26971fd3432"
+  },
+  "host": {
+    "platform": "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "cpu_count": 4,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "load_before": [
+      0.5908203125,
+      0.21484375,
+      0.07763671875
+    ],
+    "load_after": [
+      0.93994140625,
+      0.984375,
+      0.7705078125
+    ]
+  },
+  "build_environment": {
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_RELEASE_OPT_LEVEL": "3",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+    "CARGO_PROFILE_RELEASE_DEBUG": "0",
+    "CARGO_PROFILE_RELEASE_LTO": "false"
+  },
+  "rounds": 6,
+  "instrumentation": {
+    "crates/bamts-compiler/examples/compiler_perf.rs": "43f813c5c85fc51816e137c4c79b00635c22cb85c0dc1c7d05b52f987cef7d05",
+    "crates/bamts-runtime/src/tests.rs": "c35abf037c9101115e0728b10a80e0a114a2d8d20f746f16dbb0e14e6c5fae73",
+    "crates/bamts/Cargo.toml": "d910b3c6b390d728870919ffc136efada605dfcd339d069e00ec77fd4380a483",
+    "crates/bamts/examples/run_perf.rs": "0204575a3690ce96a4a9661051d675a458b1f82f0e8e665fd132b97f9cec856c"
+  },
+  "fixture_sha256": {
+    "allocation_churn.stdout": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+    "allocation_churn.ts": "23805f74dc2ff2f5fa22720b5cd269b5d9c765ff99e66b92b89cc2de40cdc47f",
+    "graph/main.ts": "c8a4240a64af39a63a72774218a0dd1d9af5344c3c9850fe4857cbf8d94ca042",
+    "graph/module0.ts": "9a8f59dabe673091500a89dc678d6f8ca239ab74d79e14f8a5324791299d7f5e",
+    "graph/module1.ts": "37146ac92f8595e46de0af202bce94540fe796af23c47429db9af2197b46810c",
+    "graph/module10.ts": "4157e07d793033949da96527cad15d324f5ed9c25b96f7909aa58ad7cd9a6d56",
+    "graph/module11.ts": "572a4a2f0cbd583dd16d1d4083c171e95a5751c4d30dab5ed639ce13840d3f22",
+    "graph/module12.ts": "3a23403b392b2bf2bb2cc86ffb9f92dcfded51b7e3e7909e2d279ce19c80acc6",
+    "graph/module13.ts": "12ef230645d541719a4dda4e15cd3192376031e72a49d40244d420716b883e46",
+    "graph/module14.ts": "c5af9aea1313cc537855ed594818be19fec060538a1b7a05cdb82774490bd460",
+    "graph/module15.ts": "ba3fd18b3a246ba7f58b91f2f69c5a4a06a8643280c0856196c7aa6a31f20027",
+    "graph/module16.ts": "b167488c384a0e2023daf2b7151f32be102bb7f2778b742e3a98d6db87855318",
+    "graph/module17.ts": "ee7c566c3489fe5fe1c4242a2a71045cf7d19596ed44597bb1cb6d34d03df862",
+    "graph/module18.ts": "71910429ef6da9728a94a1546facf08d3f159a7daa3c73afa9a77fb965b8cf27",
+    "graph/module19.ts": "b3045352496ef605cf693d4346bcdb937e2cb4275958cd50e3637f8c406670f2",
+    "graph/module2.ts": "c8856e213af142bc347cac0c05738cbfc21689263ca65dbc57e42ffca6dc867d",
+    "graph/module20.ts": "05a27acd66c25c1b6803ea11394b467a1b7ba2f2ac32b80589b2f9d4186ccab4",
+    "graph/module21.ts": "0078dbeabaaafcf10d4d7cc049af997e608a2c9cdc74762955505331b9358d22",
+    "graph/module22.ts": "90a160cc4ad556b7455ede40576222b2b7e068a3563865d09d342f9e9eeeb034",
+    "graph/module23.ts": "6a5936915ba1d9105233979474b4cee5c4ab4313647ea56de165b0c1d32e6eb7",
+    "graph/module24.ts": "42f6cdfcc41e0416258ecbd05ad808290f00b5f827798e1cf6effa264e8664b3",
+    "graph/module25.ts": "5a11f2306cdb03de9698293a4e9d2f7648e40bc16eb8b87b851e5ed33f626cf3",
+    "graph/module26.ts": "dc30e3a28d01564227279d032212020813a99d4103728ee4f274d888dcee5335",
+    "graph/module27.ts": "e5d9a82a15d05adc874365f5c2cbfad9b77a0783b0ca1e22e930260a015b41df",
+    "graph/module28.ts": "271005f242963758d76ccc469785989e5f0e3678dce827479255a4679620b9cd",
+    "graph/module29.ts": "f2cfe68432cbb9ab14a207dfc999fca22fdcaca6b1d5c39697f3cbed27a1308c",
+    "graph/module3.ts": "e2259724f0cd7b20017756a5de9d9582587c9ed4da39215f6a4f64c5f73170c4",
+    "graph/module30.ts": "ba0bdfc68285ef20e77b20044504b13208623825e053b3cb55ed1e858613ea57",
+    "graph/module31.ts": "0a676e9781e482cf6cda5acc459e71332e96ee5ff058fb2bff5be66659333ee3",
+    "graph/module4.ts": "016a501bb4550c3f5d027c192a05cfae559da91c04069a3c0b1d8694f6ff4fac",
+    "graph/module5.ts": "445cc2a4aafbfe028573fbd3ea1df26af5d5684d79d19d23f264d559db027ea3",
+    "graph/module6.ts": "9d4fa33dee363bd35f504afc3c8194b01059f27c81a1a867c99bc324833680d1",
+    "graph/module7.ts": "af6566725d27ed9eb3a487b982a7c2c0e665897a5a4c4cc20b2d8723713be3b9",
+    "graph/module8.ts": "81442651c2df8596a1d611e93c59806627f5c792909b7f6e2e321c9336460f6e",
+    "graph/module9.ts": "72791659f55625ff4f9ec2d0601300a62d62d5432b4c9ddbdb34d5563afed16b",
+    "property_loop.stdout": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+    "property_loop.ts": "dfcf33bb29f84debb6d93a1788dbcbd12d249003f5d21cfd325fd6c1b3ec2070",
+    "wide_properties.ts": "6d219f0ad692597ffcaa16586ccb199755634bec30262e13a90c1a24ca1da3a1"
+  },
+  "binaries": [
+    {
+      "side": "baseline",
+      "name": "compiler_perf",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-8ip81li8/bin/baseline/compiler_perf",
+      "sha256": "b69ad7d25147a6ab2afef2009c87a21e6d68d1ffe06d981fe28a406c9f9f6303"
+    },
+    {
+      "side": "baseline",
+      "name": "run_perf",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-8ip81li8/bin/baseline/run_perf",
+      "sha256": "cd26cc119cbfac32c4cd449ac1916ddff183794a62e12e8cfe4b8c21ef5cf21a"
+    },
+    {
+      "side": "baseline",
+      "name": "bamts_runtime",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-8ip81li8/bin/baseline/bamts_runtime",
+      "sha256": "3cecb66e410f4d07a8ed0e766376e3ac7098e48c9cc6747b01a4ae6fa1b6f467"
+    },
+    {
+      "side": "candidate",
+      "name": "compiler_perf",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-8ip81li8/bin/candidate/compiler_perf",
+      "sha256": "6d0f619f17721071608d9fbc52b8d1bdde3dfdd9ffb75bb758a8a96803a0cf49"
+    },
+    {
+      "side": "candidate",
+      "name": "run_perf",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-8ip81li8/bin/candidate/run_perf",
+      "sha256": "1cb3cd7e06967717877cd5e18a1dbdb3ee177c31fe6d223358f71108abec065a"
+    },
+    {
+      "side": "candidate",
+      "name": "bamts_runtime",
+      "path": "/home/runner/work/bamTiScript/bamTiScript/bamts-optimization-8ip81li8/bin/candidate/bamts_runtime",
+      "sha256": "d5b7b6497e786a9975f2acb3ab70c8402a293deb0a74f557d38f86acf7916ffc"
+    }
+  ],
+  "samples": [
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 251404825,
+          "process_wall_ns": 264245218
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "bdcba004e60a5dfd57824138358f50d568dfb32184d13eb24d74c379536509fd",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-warmup-00-1-baseline"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1944806,
+          "process_wall_ns": 3751472
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "db6935232afe5f518c4f3149d07cd44c3cf6e07aeebb27328fbe0b3ec36ee124",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-warmup-00-2-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 250918222,
+          "process_wall_ns": 264159348
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "03aba714160b5748c9f8b531869c58993f72551d2383ba899ba6c262fcd8dbc2",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-01-1-baseline"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1904243,
+          "process_wall_ns": 3522433
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a9c5c44a6c2129df33ef1e784c1052662dcf12f9473294eab4f7c2903a39fcc4",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-01-2-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1962621,
+          "process_wall_ns": 3438133
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "bd81d206ccecefa5ad90ce120c04b00660aa45812b882e79e4a4290e9d17ba36",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-02-1-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 250226481,
+          "process_wall_ns": 264161937
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "9e47f696b621b1b2ca38248335aa59d679320cab521a26cb38193ff266e40eae",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-02-2-baseline"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 250854960,
+          "process_wall_ns": 264203692
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "57cc9b42d0a284711ec9f16aeca16541e45b5020eac7cd48af3ef3f17aaee1e3",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-03-1-baseline"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1932776,
+          "process_wall_ns": 3739405
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "d8d84285d60c852fde19e453184045e06aa21e802e98303c79aabf4555f043ae",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-03-2-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1919995,
+          "process_wall_ns": 3633758
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "06da1ccc135276050bbfd32edbb696e6fb455943f77da4603df7454191c67579",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-04-1-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 250769967,
+          "process_wall_ns": 264176529
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ad3b04f3af2823bf4b021930d871c32dccb7a52569c67129381d299c4714d986",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-04-2-baseline"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 250652084,
+          "process_wall_ns": 264307313
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "2650692347298419e666aa341f5e2c47e58e7519bd6e45d91596617804f9e2f5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-05-1-baseline"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1957226,
+          "process_wall_ns": 3726680
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "6a84e7484444e44d65103ecfed0d0044a1929ccd3812a7870745da750ba2d26c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-05-2-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1967117,
+          "process_wall_ns": 3572642
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ea52e2156a7e48e0c9d82555ea2f12d0376009d335ef2957918727cce3f63740",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-06-1-candidate"
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 255148033,
+          "process_wall_ns": 264157222
+        },
+        "invariants": {
+          "workload": "lookup",
+          "width": 256,
+          "operations": 40000,
+          "checksum": 9402542114664782525
+        },
+        "details": {}
+      },
+      "stdout_sha256": "f678e2c483cc813879a2d4615e7b103f1ba73f0c671629f781159af0929cb3f7",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_lookup-measurement-06-2-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 57129737,
+          "scan_ns": 16559433,
+          "parse_ns": 34089402,
+          "process_wall_ns": 63852697
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "7a042e43e2171e525956f3413d682ba4d774ee554372fb87a2bfe0287bbe766b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-warmup-00-1-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 48167886,
+          "scan_ns": 15818902,
+          "parse_ns": 27047778,
+          "process_wall_ns": 63832703
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "38b5554ec5846a7f58438bc33e6bd055d772338cba63868644bfde5595a71ad3",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-warmup-00-2-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 57262331,
+          "scan_ns": 16587998,
+          "parse_ns": 34133204,
+          "process_wall_ns": 63974138
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "58b852338fb13dd0bdbf4b9a659eb682f7b7857d7fb67b864b7e068b4452400b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-01-1-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 49182707,
+          "scan_ns": 15981447,
+          "parse_ns": 27762270,
+          "process_wall_ns": 63823871
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "7a53d511a9c5172e08715796ec57c933748675283f016d4f5048cab052f4d0d2",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-01-2-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 51648073,
+          "scan_ns": 16187840,
+          "parse_ns": 29805656,
+          "process_wall_ns": 63923970
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "db53f288b2672c18b5d47ae37ce53344d4e4bfabbcf2279db84aa47167e5bd42",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-02-1-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 53983636,
+          "scan_ns": 16141786,
+          "parse_ns": 32035373,
+          "process_wall_ns": 63829894
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "d21f1a5c75772a340322ca0d8b87e829ddeb97754a7610c1ef3caa1159854c6b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-02-2-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 52724045,
+          "scan_ns": 16113658,
+          "parse_ns": 31010063,
+          "process_wall_ns": 63891362
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "0845cae38b1e922a3e51a7e9012aa71efd6926d933271dd2bd2b8443f8e299ef",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-03-1-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 48396590,
+          "scan_ns": 15850976,
+          "parse_ns": 27196968,
+          "process_wall_ns": 63843784
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "4d7a8aaf8a1045155d67ffc992e7353311480d09b803d44414fc9226fb6c6d42",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-03-2-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 47880853,
+          "scan_ns": 15845946,
+          "parse_ns": 26671175,
+          "process_wall_ns": 63903897
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "6aeae23716711b57de65eea1aaf258cf123b5265f1541724a60cfd0032cd93b5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-04-1-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 53714149,
+          "scan_ns": 16075560,
+          "parse_ns": 31753926,
+          "process_wall_ns": 63901828
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e20f3860353ae3db982e4bd2e33ecfec5e2b1cf7cb8613b17037b92ed6681875",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-04-2-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 56724801,
+          "scan_ns": 16636446,
+          "parse_ns": 33735359,
+          "process_wall_ns": 63965063
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "46f0d311a5c472f7155df1c70c3d852e248087bc7963fd594a262642a7c224f2",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-05-1-baseline"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 48158228,
+          "scan_ns": 15840061,
+          "parse_ns": 26896799,
+          "process_wall_ns": 63791519
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a919ff38881d05f73d3f761fe981f73102c8e7e565e54548f3dca48bb5cf6b7d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-05-2-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 50740467,
+          "scan_ns": 16185383,
+          "parse_ns": 28719849,
+          "process_wall_ns": 63865242
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "225c8299e70e70187cdbde66e27fa17cf5535df2a658bef9334a8176102f0282",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-06-1-candidate"
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 53701955,
+          "scan_ns": 16109187,
+          "parse_ns": 31869504,
+          "process_wall_ns": 63899558
+        },
+        "invariants": {
+          "workload": "parse",
+          "bytes": 307780,
+          "operations": 5,
+          "tokens": 600000,
+          "checksum": 50000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ab71c8765fdd94ecf1cf79141379e4f5a3c3ca2525647569cebade4885cc35e2",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_parse-measurement-06-2-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2121823092,
+          "scan_ns": 11855469,
+          "parse_ns": 9889260,
+          "check_ns": 2015463002,
+          "total_ns": 2096086009,
+          "process_wall_ns": 2167593446
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "41233a9c19d02e5c2de8d5a9d2751d179dabdeacf9ad9a8ed0a0b5321b7ad012",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-warmup-00-1-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1969658446,
+          "scan_ns": 12700710,
+          "parse_ns": 8673633,
+          "check_ns": 1914274288,
+          "total_ns": 1936563505,
+          "process_wall_ns": 2018291751
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "60a3bed8c8106cccc137688d7ae67a2bd2a5a58251cb4564f509b36682a3d855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-warmup-00-2-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2080812380,
+          "scan_ns": 11899048,
+          "parse_ns": 9676434,
+          "check_ns": 1978430000,
+          "total_ns": 2056498842,
+          "process_wall_ns": 2118109616
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "181ffd15bc4e6a6ad38f1088d64e718eb909ae58e49f854b4490fce17061be5a",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-01-1-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1971231236,
+          "scan_ns": 12640649,
+          "parse_ns": 9318776,
+          "check_ns": 1916509373,
+          "total_ns": 1939434476,
+          "process_wall_ns": 2017509407
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "64b6f4c1dcf413be8640681437ca267a1f6aeabe2124c8f7c7847c8240d57a8c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-01-2-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1971848618,
+          "scan_ns": 12652458,
+          "parse_ns": 8603478,
+          "check_ns": 1916986345,
+          "total_ns": 1939163138,
+          "process_wall_ns": 2018144877
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "91df1fd43077d8154a3241460fff8b0a4c48eb205cdc3a4143bceaabf200fa1d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-02-1-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2096301422,
+          "scan_ns": 11952278,
+          "parse_ns": 9639846,
+          "check_ns": 1993771207,
+          "total_ns": 2072292880,
+          "process_wall_ns": 2118270000
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e2182be27587c7d927b6dab2e15564aeaa992b267eb4a732c4dab666a0887324",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-02-2-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2088906071,
+          "scan_ns": 11837606,
+          "parse_ns": 9831006,
+          "check_ns": 1986306978,
+          "total_ns": 2064605760,
+          "process_wall_ns": 2118249972
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "336693d78119ce564f682bc4ea4e32e668808981299765c9182d0e4177bae9c6",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-03-1-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1975334504,
+          "scan_ns": 12710032,
+          "parse_ns": 8777325,
+          "check_ns": 1920564427,
+          "total_ns": 1942958388,
+          "process_wall_ns": 2018141955
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "8c8939110abaff8f0b9ae54901710f85ebf654472211e6e07122d14de9b7d632",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-03-2-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1978327669,
+          "scan_ns": 12663466,
+          "parse_ns": 8723016,
+          "check_ns": 1923395388,
+          "total_ns": 1945699459,
+          "process_wall_ns": 2018168156
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e07a486567d295b732f34910f10ccff5e9fbb422dedefd46b8ea357e34bfdcca",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-04-1-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2088311637,
+          "scan_ns": 11810985,
+          "parse_ns": 9763997,
+          "check_ns": 1988104170,
+          "total_ns": 2065026355,
+          "process_wall_ns": 2118349438
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "44d9546966ab4d32b9dd03b91354e841f503213c5e3cef443d658269233fa069",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-04-2-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2087601687,
+          "scan_ns": 11802767,
+          "parse_ns": 9429511,
+          "check_ns": 1985598889,
+          "total_ns": 2063275687,
+          "process_wall_ns": 2118305415
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "f35c4baab5d09d095206d1fd6d58124f3c2f4662a24cc46c159f91749454375f",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-05-1-baseline"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1970938622,
+          "scan_ns": 12644642,
+          "parse_ns": 8475882,
+          "check_ns": 1915330861,
+          "total_ns": 1937413466,
+          "process_wall_ns": 2018374774
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "bff02e417371d84070727f5955d5d2658564b49864cff3632286fdec270c9fa7",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-05-2-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 1970395082,
+          "scan_ns": 12584523,
+          "parse_ns": 8690049,
+          "check_ns": 1914529525,
+          "total_ns": 1936763112,
+          "process_wall_ns": 2018193205
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "00f994e1ed97c8f8461dc24bfbabae1bb46222bf28e930fa7da3c0e414b0d580",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-06-1-candidate"
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "elapsed_ns": 2093853468,
+          "scan_ns": 11931470,
+          "parse_ns": 9814347,
+          "check_ns": 1986414175,
+          "total_ns": 2067596086,
+          "process_wall_ns": 2118463262
+        },
+        "invariants": {
+          "workload": "program",
+          "modules": 33,
+          "operations": 5,
+          "checksum": 125775
+        },
+        "details": {}
+      },
+      "stdout_sha256": "fe3ee3567107693751ecf0a6e82d691e1b9ac1ad1f9d24da4bf4a8f3433e9252",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/compiler_program-measurement-06-2-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42762838,
+          "property_cache_set_ns": 50740074,
+          "process_wall_ns": 114203788
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "01a3d211c1742d542261c08635b6f451bb7f55f7e39f2616a0c098ca6edf9913",
+      "log_prefix": "samples/runtime_cache-warmup-00-1-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21207210,
+          "property_cache_set_ns": 25075840,
+          "process_wall_ns": 64027176
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "bfcdacca9be1fae984270c966fce47ee5d81c464532ee9db909acc8f0b8236e2",
+      "log_prefix": "samples/runtime_cache-warmup-00-2-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42757306,
+          "property_cache_set_ns": 50836202,
+          "process_wall_ns": 113984426
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "a0a760d4e3555cea074b5ce312cba465a9ae5df14f1c9cefeff2c59c99a37424",
+      "log_prefix": "samples/runtime_cache-measurement-01-1-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21023594,
+          "property_cache_set_ns": 24974888,
+          "process_wall_ns": 63897804
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "66238aa46316fd75afe7635858388cc6d4ac3ac6510b2bc8edc5c3c93784d832",
+      "log_prefix": "samples/runtime_cache-measurement-01-2-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21100622,
+          "property_cache_set_ns": 24938478,
+          "process_wall_ns": 64073388
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "fcc65afb0f547b9bc3919e01531520f9790e08b29e6b8f3bb928a2bb06cb938d",
+      "log_prefix": "samples/runtime_cache-measurement-02-1-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42820686,
+          "property_cache_set_ns": 50705709,
+          "process_wall_ns": 114101918
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "b87f979b1e62ea9ad28bf152241dead24cfad9c8f9dd7c9073b257c1051ebace",
+      "log_prefix": "samples/runtime_cache-measurement-02-2-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42669811,
+          "property_cache_set_ns": 50839515,
+          "process_wall_ns": 114186529
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "8d6f4ad30ff22b78dfafd7120cc6fb2f8a5d974c69e34d8a5891721cf9f63878",
+      "log_prefix": "samples/runtime_cache-measurement-03-1-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21070168,
+          "property_cache_set_ns": 24903968,
+          "process_wall_ns": 63958401
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "dacfb0118241321b17dcd178700b05c3587b1e935d55cb1d740c33e69b2d9c30",
+      "log_prefix": "samples/runtime_cache-measurement-03-2-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21169364,
+          "property_cache_set_ns": 25167495,
+          "process_wall_ns": 63825816
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "65b1a69bebb813f07a980c31408c869eb15b63772ba273c096f5a6d8d34bd797",
+      "log_prefix": "samples/runtime_cache-measurement-04-1-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42744603,
+          "property_cache_set_ns": 50517070,
+          "process_wall_ns": 114023444
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "d3d50269d8eab90c83421e4bea08723303568d0cb13b6a26f4cf9d4850cbadf8",
+      "log_prefix": "samples/runtime_cache-measurement-04-2-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42845180,
+          "property_cache_set_ns": 50752200,
+          "process_wall_ns": 114089728
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "e47cc8daddcc5427cfcc255d9e9574c771dd5ae753b43f1a088a62619458ccee",
+      "log_prefix": "samples/runtime_cache-measurement-05-1-baseline"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21103322,
+          "property_cache_set_ns": 26168140,
+          "process_wall_ns": 63910474
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "f57625c15e21113f04d45ec5ff2ca8436111e3417d90497d3efcd692bd9a7ceb",
+      "log_prefix": "samples/runtime_cache-measurement-05-2-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 21112998,
+          "property_cache_set_ns": 25181372,
+          "process_wall_ns": 63847799
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "605267b6ee0f4b001465c7d3915b7ee6c486fce2271dd12b208a0eceb56adc1a",
+      "stderr_sha256": "e82e14f9bdff59b34419c34e742971d72e6758bbc70b28c62c1c8eb50920eb14",
+      "log_prefix": "samples/runtime_cache-measurement-06-1-candidate"
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "property_cache_get_ns": 42806432,
+          "property_cache_set_ns": 50872082,
+          "process_wall_ns": 114007484
+        },
+        "invariants": {
+          "property_cache_get_iterations": 2000000,
+          "property_cache_get_checksum": 16501189034687497344,
+          "property_cache_set_iterations": 2000000,
+          "property_cache_set_final_value": 1999999
+        },
+        "details": {}
+      },
+      "stdout_sha256": "df880eeeac76e6c2fc8f30a140ce37d20cef49388f38c772d676de69cbfb5d68",
+      "stderr_sha256": "cd1b772dca1c5c3e70fe3e63731303132903f6a1966eadde598078a95428d879",
+      "log_prefix": "samples/runtime_cache-measurement-06-2-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17466865,
+          "process_wall_ns": 113967441
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "3271f836f1460120f4b9ffc0b47fd2173d8c744b9f3d30eaf15de2ed71970cfa",
+      "log_prefix": "samples/runtime_gc-warmup-00-1-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 9171881,
+          "process_wall_ns": 114157619
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ba46d481f29bf369e300663c4925d05a2fc81f9a96d7b4de992d8042069f3eef",
+      "stderr_sha256": "a3384932f0b4358c7eed5126abe7f4b1799ca86a07bb7994af156f8dcc7fa8f8",
+      "log_prefix": "samples/runtime_gc-warmup-00-2-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17685299,
+          "process_wall_ns": 114140228
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "0673794f2d4affa89065191ae39a3357ca6ab31d2d05b26419f943ed5f39ea12",
+      "log_prefix": "samples/runtime_gc-measurement-01-1-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 9139401,
+          "process_wall_ns": 114078772
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ba46d481f29bf369e300663c4925d05a2fc81f9a96d7b4de992d8042069f3eef",
+      "stderr_sha256": "02f4713e9cbf9d5416699acff7f4443ada02de1067758099b1b198b4a513a107",
+      "log_prefix": "samples/runtime_gc-measurement-01-2-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 9045031,
+          "process_wall_ns": 114069297
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ba46d481f29bf369e300663c4925d05a2fc81f9a96d7b4de992d8042069f3eef",
+      "stderr_sha256": "7606475ce004bc27ebdd2d652503b86a414f41b309881b136ba1b4eb00091afc",
+      "log_prefix": "samples/runtime_gc-measurement-02-1-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17452317,
+          "process_wall_ns": 114191274
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "7b7a0caa157bd47abe8030308686eb9a5f81d7d4bf75d5c1fe3f649eb5c2a925",
+      "log_prefix": "samples/runtime_gc-measurement-02-2-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17521514,
+          "process_wall_ns": 114125599
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "f53544ff03f8a81d414272f3d53071817e252430faeb4ec76c86ef9cc635ccea",
+      "log_prefix": "samples/runtime_gc-measurement-03-1-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 8901978,
+          "process_wall_ns": 114070374
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ba46d481f29bf369e300663c4925d05a2fc81f9a96d7b4de992d8042069f3eef",
+      "stderr_sha256": "1dc21273628a907560cfb3d5f9af5f26b5f76261c306c805352da9a960f6e791",
+      "log_prefix": "samples/runtime_gc-measurement-03-2-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 10069624,
+          "process_wall_ns": 114031169
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "f83717e65d3f4b6a6c0162a10338a1a58afe1f4739f9e5ef0d9289b5a6449d85",
+      "stderr_sha256": "bfe72ddfcdc4fa1fa7a5e743e51aeb3c5a96b1e654c7d636b3f64b11e3e6d3c7",
+      "log_prefix": "samples/runtime_gc-measurement-04-1-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17456325,
+          "process_wall_ns": 113976387
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "df42aa7d73e39b952014f48f0063378f19b31f15c8068a1b8dbfc3c215efe782",
+      "log_prefix": "samples/runtime_gc-measurement-04-2-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17391251,
+          "process_wall_ns": 113965913
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "328a6fe004888f28236b588ccdf809245d91946a4161099818fd3fbe94639de2",
+      "log_prefix": "samples/runtime_gc-measurement-05-1-baseline"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 9029124,
+          "process_wall_ns": 113978988
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ba46d481f29bf369e300663c4925d05a2fc81f9a96d7b4de992d8042069f3eef",
+      "stderr_sha256": "4ccb9a50abf54151cb31232d0785d094fc8312575ef610ff2030472f3fa0828a",
+      "log_prefix": "samples/runtime_gc-measurement-05-2-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 9259751,
+          "process_wall_ns": 113952267
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "ba46d481f29bf369e300663c4925d05a2fc81f9a96d7b4de992d8042069f3eef",
+      "stderr_sha256": "d2e22f8554db62307035764c9ae74f8398de68392af6a20f5d0e1e8e84425f92",
+      "log_prefix": "samples/runtime_gc-measurement-06-1-candidate"
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "shaped_gc_ns": 17385124,
+          "process_wall_ns": 113996513
+        },
+        "invariants": {
+          "shaped_gc_objects": 10000,
+          "shaped_gc_collections": 20,
+          "shaped_gc_live_slots": 10000
+        },
+        "details": {}
+      },
+      "stdout_sha256": "394cb2df32595c82a3f1f6baad43d5e5bd6a755d3a51d3a467ea4d1e1e1216f3",
+      "stderr_sha256": "97b4a27d7a09429ba62565eee4a0a7ef6f177e0de26952edda4a60069912a0e0",
+      "log_prefix": "samples/runtime_gc-measurement-06-2-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 54249116,
+          "process_wall_ns": 113839044
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "e5f134d37ce05df3b0e78a96e44c277eb48e201c84bc70c47b952ea2506995e2",
+      "stderr_sha256": "4a6c73d7439eb67f64cd83c47064f0a24aa3eec21e14efa88f2efec62960530c",
+      "log_prefix": "samples/runtime_sites-warmup-00-1-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 6564507,
+          "process_wall_ns": 31769005
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "033acce5d9413328ddec831a255fd3e190bccb1230f966565e19e221e645e3b0",
+      "log_prefix": "samples/runtime_sites-warmup-00-2-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 54942878,
+          "process_wall_ns": 114055301
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "59116384d83b928032ed641dd4766c4afcb2334a79759971d8a0804d7e2641be",
+      "stderr_sha256": "c3574b4897c37e500a33d098daf3e22c19c6d9ca9f0da6387f8ea99c62376125",
+      "log_prefix": "samples/runtime_sites-measurement-01-1-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 6991435,
+          "process_wall_ns": 31872542
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "77b6c0b0f534d0143374d77e4b4b59ae7ad8e5d85dd261d847f8143792a38be7",
+      "log_prefix": "samples/runtime_sites-measurement-01-2-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 7885145,
+          "process_wall_ns": 31786189
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "8a466c60c86cc3ee6248fdd63cc2beb01dc3cbf9459dfa4b7debdb54f170efab",
+      "log_prefix": "samples/runtime_sites-measurement-02-1-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 54391390,
+          "process_wall_ns": 113951892
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "59116384d83b928032ed641dd4766c4afcb2334a79759971d8a0804d7e2641be",
+      "stderr_sha256": "2aa3cf04e3d7bb993b61dd70f3da714e7422547c139a5aefbd3fd39e49db9c9e",
+      "log_prefix": "samples/runtime_sites-measurement-02-2-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 54797998,
+          "process_wall_ns": 114202097
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "59116384d83b928032ed641dd4766c4afcb2334a79759971d8a0804d7e2641be",
+      "stderr_sha256": "f89d6846d9f7bde5872b38a623b9c2b03812c6d07761c32364f6550abb05de3b",
+      "log_prefix": "samples/runtime_sites-measurement-03-1-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 7043329,
+          "process_wall_ns": 31844380
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "ddbc004f28dd143e7a9489d76034843c506b0733af0524057a2e3778c891ad9a",
+      "log_prefix": "samples/runtime_sites-measurement-03-2-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 7091216,
+          "process_wall_ns": 31838655
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "785e44082e4612f63bfee447429ec685cd2167993b21ea390e91bf9d5d960bfd",
+      "log_prefix": "samples/runtime_sites-measurement-04-1-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 54825683,
+          "process_wall_ns": 114068345
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "59116384d83b928032ed641dd4766c4afcb2334a79759971d8a0804d7e2641be",
+      "stderr_sha256": "bd14c701f222d0862ac9e00af24b97d7053613b3cfd327b37fac2cb11b4fac50",
+      "log_prefix": "samples/runtime_sites-measurement-04-2-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 54336972,
+          "process_wall_ns": 114277348
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "59116384d83b928032ed641dd4766c4afcb2334a79759971d8a0804d7e2641be",
+      "stderr_sha256": "8c5a038da8ae04717353abdf6279fc2b06a6c42b0a780be3f7db445fe315284f",
+      "log_prefix": "samples/runtime_sites-measurement-05-1-baseline"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 6790678,
+          "process_wall_ns": 31839846
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "075cbfb7b230a4a6dc20f1b1bd64ac534d443a9c07840ea2bb00e30bab89ea65",
+      "log_prefix": "samples/runtime_sites-measurement-05-2-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 6646172,
+          "process_wall_ns": 31772243
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 68
+        }
+      },
+      "stdout_sha256": "061f725954d0e9a2c8414832267c726c485354f6f0240d1d148bc4300fbdc997",
+      "stderr_sha256": "fb5d72365d4deb0015b1cad10eaecfc094aa1b9fcb1ae9c41577cddfbed46b3d",
+      "log_prefix": "samples/runtime_sites-measurement-06-1-candidate"
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "function_sites_ns": 55151701,
+          "process_wall_ns": 114062633
+        },
+        "invariants": {
+          "function_sites_instructions": 100000,
+          "function_sites_iterations": 100,
+          "function_sites_sites_found": 200
+        },
+        "details": {
+          "site_bytes": 52
+        }
+      },
+      "stdout_sha256": "59116384d83b928032ed641dd4766c4afcb2334a79759971d8a0804d7e2641be",
+      "stderr_sha256": "c395f17e6a9a1745c317ce7e7a8a9dc14aaffe7934e657f6a1213821a3bd11fc",
+      "log_prefix": "samples/runtime_sites-measurement-06-2-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214331166
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-warmup-00-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214214148
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-warmup-00-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2340508,
+          "scan_ns": 6118,
+          "parse_ns": 11220,
+          "check_ns": 1734598,
+          "frontend_ns": 1924835,
+          "run_ns": 207607303,
+          "process_wall_ns": 214256310
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "2756aaf604f72b146d9aa4c2f7535e15cff23368382e61fab1b87b79b223d4a1",
+      "log_prefix": "samples/execution_properties-diagnostic-00-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2097892,
+          "scan_ns": 5101,
+          "parse_ns": 8288,
+          "check_ns": 1700373,
+          "frontend_ns": 1725892,
+          "run_ns": 188705577,
+          "process_wall_ns": 214322283
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "1e252615809f213f3f117277775b31bfc57c462cda70f0e3c920a9a162cb2811",
+      "log_prefix": "samples/execution_properties-diagnostic-00-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214402401
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-01-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214242859
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-01-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214259645
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-02-1-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214429486
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-02-2-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264278630
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-03-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214209846
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-03-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214192578
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-04-1-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214337177
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-04-2-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214363848
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-05-1-baseline"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214339826
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-05-2-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214377662
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-06-1-candidate"
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 214420391
+        },
+        "invariants": {
+          "stdout": "3600000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "e114f8c439b14b3a58634bb3083909325ddc071d1c6807fa5c33b180adda46ee",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_properties-measurement-06-2-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "warmup",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264228534
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-warmup-00-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "warmup",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264345581
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-warmup-00-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2279261,
+          "scan_ns": 6490,
+          "parse_ns": 13254,
+          "check_ns": 1745083,
+          "frontend_ns": 1928155,
+          "run_ns": 241482059,
+          "process_wall_ns": 264427575
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "9205439e601f82f778628890643237f71e7093f42a63a612ce2d84384017f289",
+      "log_prefix": "samples/execution_allocations-diagnostic-00-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "diagnostic",
+      "round": 0,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "compile_ns": 2154229,
+          "scan_ns": 6507,
+          "parse_ns": 10540,
+          "check_ns": 1698564,
+          "frontend_ns": 1727801,
+          "run_ns": 239648837,
+          "process_wall_ns": 264443834
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "cacdd822597d928651a892706163824114453b416abc63085ae60599d0ecdccd",
+      "log_prefix": "samples/execution_allocations-diagnostic-00-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 1,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264354327
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-01-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 1,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264399246
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-01-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 2,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264587384
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-02-1-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 2,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264607792
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-02-2-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 3,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264479996
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-03-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 3,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264585350
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-03-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 4,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264492252
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-04-1-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 4,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264482739
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-04-2-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 5,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264520329
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-05-1-baseline"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 5,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264330122
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-05-2-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "role": "measurement",
+      "round": 6,
+      "order": 1,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264357927
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-06-1-candidate"
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "role": "measurement",
+      "round": 6,
+      "order": 2,
+      "observation": {
+        "timings_ns": {
+          "process_wall_ns": 264465349
+        },
+        "invariants": {
+          "stdout": "5049901000\n"
+        },
+        "details": {}
+      },
+      "stdout_sha256": "a69958a949dc253a0115f892172d289cb664561cced172dea6e308e146f26722",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "log_prefix": "samples/execution_allocations-measurement-06-2-baseline"
+    }
+  ],
+  "summaries": [
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "metric": "elapsed_ns",
+      "count": 6,
+      "median_ns": 250812463.5,
+      "minimum_ns": 250226481,
+      "maximum_ns": 255148033
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 264169233.0,
+      "minimum_ns": 264157222,
+      "maximum_ns": 264307313
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "metric": "elapsed_ns",
+      "count": 6,
+      "median_ns": 1945001.0,
+      "minimum_ns": 1904243,
+      "maximum_ns": 1967117
+    },
+    {
+      "case": "compiler_lookup",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 3603200.0,
+      "minimum_ns": 3438133,
+      "maximum_ns": 3739405
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "metric": "elapsed_ns",
+      "count": 6,
+      "median_ns": 53848892.5,
+      "minimum_ns": 52724045,
+      "maximum_ns": 57262331
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "metric": "parse_ns",
+      "count": 6,
+      "median_ns": 31952438.5,
+      "minimum_ns": 31010063,
+      "maximum_ns": 34133204
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 63900693.0,
+      "minimum_ns": 63829894,
+      "maximum_ns": 63974138
+    },
+    {
+      "case": "compiler_parse",
+      "side": "baseline",
+      "metric": "scan_ns",
+      "count": 6,
+      "median_ns": 16127722.0,
+      "minimum_ns": 16075560,
+      "maximum_ns": 16636446
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "metric": "elapsed_ns",
+      "count": 6,
+      "median_ns": 48789648.5,
+      "minimum_ns": 47880853,
+      "maximum_ns": 51648073
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "metric": "parse_ns",
+      "count": 6,
+      "median_ns": 27479619.0,
+      "minimum_ns": 26671175,
+      "maximum_ns": 29805656
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 63854513.0,
+      "minimum_ns": 63791519,
+      "maximum_ns": 63923970
+    },
+    {
+      "case": "compiler_parse",
+      "side": "candidate",
+      "metric": "scan_ns",
+      "count": 6,
+      "median_ns": 15916211.5,
+      "minimum_ns": 15840061,
+      "maximum_ns": 16187840
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "metric": "check_ns",
+      "count": 6,
+      "median_ns": 1986360576.5,
+      "minimum_ns": 1978430000,
+      "maximum_ns": 1993771207
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "metric": "elapsed_ns",
+      "count": 6,
+      "median_ns": 2088608854.0,
+      "minimum_ns": 2080812380,
+      "maximum_ns": 2096301422
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "metric": "parse_ns",
+      "count": 6,
+      "median_ns": 9720215.5,
+      "minimum_ns": 9429511,
+      "maximum_ns": 9831006
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 2118287707.5,
+      "minimum_ns": 2118109616,
+      "maximum_ns": 2118463262
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "metric": "scan_ns",
+      "count": 6,
+      "median_ns": 11868327.0,
+      "minimum_ns": 11802767,
+      "maximum_ns": 11952278
+    },
+    {
+      "case": "compiler_program",
+      "side": "baseline",
+      "metric": "total_ns",
+      "count": 6,
+      "median_ns": 2064816057.5,
+      "minimum_ns": 2056498842,
+      "maximum_ns": 2072292880
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "metric": "check_ns",
+      "count": 6,
+      "median_ns": 1916747859.0,
+      "minimum_ns": 1914529525,
+      "maximum_ns": 1923395388
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "metric": "elapsed_ns",
+      "count": 6,
+      "median_ns": 1971539927.0,
+      "minimum_ns": 1970395082,
+      "maximum_ns": 1978327669
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "metric": "parse_ns",
+      "count": 6,
+      "median_ns": 8706532.5,
+      "minimum_ns": 8475882,
+      "maximum_ns": 9318776
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 2018156516.5,
+      "minimum_ns": 2017509407,
+      "maximum_ns": 2018374774
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "metric": "scan_ns",
+      "count": 6,
+      "median_ns": 12648550.0,
+      "minimum_ns": 12584523,
+      "maximum_ns": 12710032
+    },
+    {
+      "case": "compiler_program",
+      "side": "candidate",
+      "metric": "total_ns",
+      "count": 6,
+      "median_ns": 1939298807.0,
+      "minimum_ns": 1936763112,
+      "maximum_ns": 1945699459
+    },
+    {
+      "case": "execution_allocations",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 264481367.5,
+      "minimum_ns": 264354327,
+      "maximum_ns": 264607792
+    },
+    {
+      "case": "execution_allocations",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 264445749.0,
+      "minimum_ns": 264330122,
+      "maximum_ns": 264587384
+    },
+    {
+      "case": "execution_properties",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 214411396.0,
+      "minimum_ns": 214337177,
+      "maximum_ns": 264278630
+    },
+    {
+      "case": "execution_properties",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 214251252.0,
+      "minimum_ns": 214192578,
+      "maximum_ns": 214377662
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 114056586.0,
+      "minimum_ns": 113984426,
+      "maximum_ns": 114186529
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "metric": "property_cache_get_ns",
+      "count": 6,
+      "median_ns": 42781869.0,
+      "minimum_ns": 42669811,
+      "maximum_ns": 42845180
+    },
+    {
+      "case": "runtime_cache",
+      "side": "baseline",
+      "metric": "property_cache_set_ns",
+      "count": 6,
+      "median_ns": 50794201.0,
+      "minimum_ns": 50517070,
+      "maximum_ns": 50872082
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 63904139.0,
+      "minimum_ns": 63825816,
+      "maximum_ns": 64073388
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "metric": "property_cache_get_ns",
+      "count": 6,
+      "median_ns": 21101972.0,
+      "minimum_ns": 21023594,
+      "maximum_ns": 21169364
+    },
+    {
+      "case": "runtime_cache",
+      "side": "candidate",
+      "metric": "property_cache_set_ns",
+      "count": 6,
+      "median_ns": 25071191.5,
+      "minimum_ns": 24903968,
+      "maximum_ns": 26168140
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 114061056.0,
+      "minimum_ns": 113965913,
+      "maximum_ns": 114191274
+    },
+    {
+      "case": "runtime_gc",
+      "side": "baseline",
+      "metric": "shaped_gc_ns",
+      "count": 6,
+      "median_ns": 17454321.0,
+      "minimum_ns": 17385124,
+      "maximum_ns": 17685299
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 114050233.0,
+      "minimum_ns": 113952267,
+      "maximum_ns": 114078772
+    },
+    {
+      "case": "runtime_gc",
+      "side": "candidate",
+      "metric": "shaped_gc_ns",
+      "count": 6,
+      "median_ns": 9092216.0,
+      "minimum_ns": 8901978,
+      "maximum_ns": 10069624
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "metric": "function_sites_ns",
+      "count": 6,
+      "median_ns": 54811840.5,
+      "minimum_ns": 54336972,
+      "maximum_ns": 55151701
+    },
+    {
+      "case": "runtime_sites",
+      "side": "baseline",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 114065489.0,
+      "minimum_ns": 113951892,
+      "maximum_ns": 114277348
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "metric": "function_sites_ns",
+      "count": 6,
+      "median_ns": 7017382.0,
+      "minimum_ns": 6646172,
+      "maximum_ns": 7885145
+    },
+    {
+      "case": "runtime_sites",
+      "side": "candidate",
+      "metric": "process_wall_ns",
+      "count": 6,
+      "median_ns": 31839250.5,
+      "minimum_ns": 31772243,
+      "maximum_ns": 31872542
+    }
+  ],
+  "error": null
+}
