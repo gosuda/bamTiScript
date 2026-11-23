@@ -7019,7 +7019,11 @@ fn optional_property_reads_are_undefined_and_narrow_on_guard() {
     );
 
     let write = check_text_strict_null("const obj: { p?: number } = {}; obj.p = undefined;");
-    assert_eq!(checker_codes(&write), ["BAMTS-C004"]);
+    assert!(checker_codes(&write).is_empty());
+
+    let invalid_write =
+        check_text_strict_null("const obj: { p?: number } = {}; obj.p = \"wrong\";");
+    assert_eq!(checker_codes(&invalid_write), ["BAMTS-C004"]);
 }
 
 #[test]
