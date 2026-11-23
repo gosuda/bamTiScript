@@ -1625,17 +1625,20 @@ pub struct ConstructorProjection {
 struct KeyofReduction {
     types: HashSet<TypeId>,
     aliases: HashSet<SymbolId>,
+    cycle_detected: bool,
 }
 
 impl KeyofReduction {
     fn enter(&mut self, table: &TypeTable, ty: TypeId) -> bool {
         if !self.types.insert(ty) {
+            self.cycle_detected = true;
             return false;
         }
         if let Type::AppliedAlias { symbol, .. } = table.instantiation_type(ty)
             && !self.aliases.insert(*symbol)
         {
             self.types.remove(&ty);
+            self.cycle_detected = true;
             return false;
         }
         true
@@ -3356,7 +3359,7 @@ impl TypeTable {
         match self.instantiation_type(domain).clone() {
             Type::Keyof(operand) => self
                 .try_reduce_keyof(operand, visiting, constructors)
-                .or(Some(domain)),
+                .or_else(|| (!visiting.cycle_detected).then_some(domain)),
             Type::TypeQuery { target, .. } => self.keyof_domain(target, visiting, constructors),
             Type::Union(members) => {
                 let mut keys = Vec::with_capacity(members.len());
@@ -35007,6 +35010,60 @@ namespace undefined { export var x = 42; }",
         };
         assert_eq!(object.call_candidate_order, vec![2, 0, 1]);
         assert_eq!(object.call_signatures.len(), 3);
+    }
+
+    #[test]
+    fn recursive_constructor_key_domains_do_not_publish_a_cached_cycle() {
+        let mut table = TypeTable::new();
+        let owner = SymbolId::new(1);
+        let number = table.number();
+        let initial = table.object_type(Vec::new());
+        let constructor = table.constructor_type(owner, Vec::new(), initial);
+        let keys = table.keyof(constructor);
+        assert!(matches!(table.get(keys), Type::Never));
+
+        let recursive = table.object_type_with_members(ObjectType {
+            properties: vec![PropertyType::new("fixed", false, number)],
+            call_signatures: Vec::new(),
+            call_candidate_order: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: vec![super::IndexSignature {
+                readonly: false,
+                enum_reverse: false,
+                parameters: vec![FunctionParameter::new(
+                    "key".to_owned(),
+                    keys,
+                    false,
+                    false,
+                )],
+                value_type: number,
+                declaring_types: Vec::new(),
+            }],
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let revised = table.constructor_type(owner, Vec::new(), recursive);
+        table.publish_constructor_revision(constructor, revised);
+
+        assert!(table.keyof_projection_view(keys).is_none());
+        assert!(matches!(table.get(keys), Type::Keyof(_)));
+        assert!(table.record_structural_view(keys, number).is_none());
+        let record = table.record(keys, number);
+        let unrelated = table.string_literal("unrelated");
+        assert!(!table.assignable(unrelated, keys));
+        let fixed_shape = table.object_type(vec![PropertyType::new("fixed", false, number)]);
+        assert!(!table.assignable(record, fixed_shape));
+        assert!(!table.assignable(fixed_shape, record));
+
+        let finite = table.constructor_type(owner, Vec::new(), fixed_shape);
+        table.publish_constructor_revision(revised, finite);
+        let fixed = table.string_literal("fixed");
+        assert!(table.assignable(fixed, keys));
+        assert!(!table.assignable(unrelated, keys));
+        assert!(table.record_structural_view(keys, number).is_some());
+        assert!(table.assignable(record, fixed_shape));
+        assert!(table.assignable(fixed_shape, record));
     }
 
     #[test]
