@@ -367,6 +367,8 @@ impl<'table> TypeRelations<'table> {
     }
 
     fn relates(&self, source: TypeId, target: TypeId, strictness: Strictness) -> bool {
+        let source = self.table.keyof_projection_view(source).unwrap_or(source);
+        let target = self.table.keyof_projection_view(target).unwrap_or(target);
         if source == target {
             return true;
         }

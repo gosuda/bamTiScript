@@ -409,7 +409,7 @@ struct TypeInstantiation<'a> {
 
 impl TypeInstantiation<'_> {
     fn instantiate_inner(&mut self, table: &mut TypeTable, ty: TypeId) -> TypeId {
-        match table.get(ty).clone() {
+        match table.instantiation_type(ty).clone() {
             Type::Named(symbol) => self.substitution.get(symbol).unwrap_or(ty),
             Type::This { owner, constraint } => {
                 if let Some((expected, receiver)) = self.substitution.this_receiver
