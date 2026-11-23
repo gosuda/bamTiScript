@@ -570,6 +570,7 @@ impl<'a> TypeInstantiation<'a> {
                     construct_signatures,
                     index_signatures,
                     generator_return,
+                    intrinsic_async_iterator: object.intrinsic_async_iterator,
                     iterator_property,
                     async_iterator_property,
                 });
@@ -2730,6 +2731,7 @@ mod tests {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
@@ -2841,6 +2843,7 @@ mod tests {
             construct_signatures: Vec::new(),
             index_signatures: Vec::new(),
             generator_return: None,
+            intrinsic_async_iterator: false,
             iterator_property: None,
             async_iterator_property: None,
         });
