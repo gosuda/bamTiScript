@@ -266,12 +266,22 @@ fn render_annotated_into(
             render_annotated_into(out, model, *index, false, visiting_aliases);
             out.push("]");
         }
-        Type::Record { key, value } => {
+        Type::Record {
+            key,
+            value,
+            optional_value,
+        } => {
+            if optional_value.is_some() {
+                out.push("Partial<");
+            }
             out.push("Record<");
             render_annotated_into(out, model, *key, false, visiting_aliases);
             out.push(", ");
             render_annotated_into(out, model, *value, false, visiting_aliases);
             out.push(">");
+            if optional_value.is_some() {
+                out.push(">");
+            }
         }
         Type::This { .. } => out.push("this"),
         Type::EnumMember {

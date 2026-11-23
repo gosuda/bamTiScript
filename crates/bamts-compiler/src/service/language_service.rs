@@ -383,9 +383,9 @@ fn member_kind(property: &PropertyType) -> SymbolKind {
 }
 
 /// Enumerates the accessible member names of `receiver` without mutating
-/// the type table, so this runs on the immutable service snapshot. Object
-/// types contribute their properties; class heads contribute their
-/// template members; constructor types contribute their static side; a
+/// the type table, so this runs on the immutable service snapshot. Objects
+/// and concrete records contribute their properties. Class heads contribute
+/// template members and constructor types contribute their static side. A
 /// union keeps the members every part shares (the checker's own
 /// property-read rule); an intersection offers every part's members.
 /// `private` members never complete outside the declaring class.
@@ -393,13 +393,15 @@ fn member_kind(property: &PropertyType) -> SymbolKind {
 /// has not reduced) yields no entries and the slot keeps the symbol list.
 fn member_entries(table: &TypeTable, receiver: TypeId) -> Vec<(String, SymbolKind)> {
     let view = table.named_structural_view(receiver);
-    match table.get(view) {
-        Type::ObjectType(object) => object
+    if let Some(object) = table.current_object_view(view) {
+        return object
             .properties()
             .iter()
             .filter(|property| !matches!(property.access(), Accessibility::Private))
             .map(|property| (property.name().to_owned(), member_kind(property)))
-            .collect(),
+            .collect();
+    }
+    match table.get(view) {
         Type::Named(symbol) | Type::AppliedClass { symbol, .. } => table
             .class_template_properties(*symbol)
             .iter()
@@ -1631,6 +1633,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["value"]
         );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn completions_after_dot_include_later_namespace_keys_of_retained_records() {
+        let source = r#"class C { static initial = 1; }
+declare const row: Record<keyof typeof C, number>;
+namespace C { export const extra = 1; }
+const selected = row.extra;
+row."#;
+        let (root, mut state) = state(source);
+        let positions = SourceText::new(source).expect("source");
+        let completions = state
+            .completions(
+                "a.ts",
+                positions.byte_to_utf16(source.len()).expect("end position"),
+            )
+            .expect("completions");
+        assert_eq!(
+            completions
+                .iter()
+                .map(|item| (item.name.as_str(), item.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("extra", SymbolKind::Variable(VariableKind::Let)),
+                ("initial", SymbolKind::Variable(VariableKind::Let)),
+                ("prototype", SymbolKind::Variable(VariableKind::Let)),
+            ]
+        );
+        let position = positions
+            .byte_to_utf16(source.find("selected").expect("selected binding"))
+            .expect("binding position");
+        let selected = state
+            .quick_info("a.ts", position)
+            .expect("quick info")
+            .expect("selected binding info");
+        assert_eq!(selected.type_display, "number");
         fs::remove_dir_all(root).expect("remove root");
     }
 

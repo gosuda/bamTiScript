@@ -49,6 +49,7 @@
 //! constraint. Each outcome is recorded as [`InferenceProvenance`] so future
 //! diagnostics can attribute a type argument to its source.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use super::binder::{
@@ -622,10 +623,14 @@ impl<'a> TypeInstantiation<'a> {
                 let index = self.instantiate_inner(table, index);
                 table.indexed_access(object, index)
             }
-            Type::Record { key, value } => {
+            Type::Record {
+                key,
+                value,
+                optional_value,
+            } => {
                 let key = self.instantiate_inner(table, key);
                 let value = self.instantiate_inner(table, value);
-                table.record(key, value)
+                table.record_with_optional(key, value, optional_value.is_some())
             }
             Type::Error
             | Type::Any
@@ -781,7 +786,7 @@ impl<'a> TypeInstantiation<'a> {
                 self.affects_type(table, *object, visiting)
                     || self.affects_type(table, *index, visiting)
             }
-            Type::Record { key, value } => {
+            Type::Record { key, value, .. } => {
                 self.affects_type(table, *key, visiting)
                     || self.affects_type(table, *value, visiting)
             }
@@ -1200,7 +1205,11 @@ impl<'table> InferenceContext<'table> {
             .table
             .prepare_applied_alias_view(argument_type)
             .unwrap_or(argument_type);
-        let parameter = self.table.get(parameter_type).clone();
+        let parameter = self
+            .table
+            .current_object_view(parameter_type)
+            .map(|object| Type::ObjectType(object.into_owned()))
+            .unwrap_or_else(|| self.table.get(parameter_type).clone());
         match parameter {
             Type::Named(symbol) if self.is_inference_symbol(symbol) => {
                 let priority = match variance {
@@ -1359,7 +1368,11 @@ impl<'table> InferenceContext<'table> {
                         .unwrap_or(argument_type),
                     _ => argument_type,
                 };
-                if let Type::ObjectType(argument_object) = self.table.get(argument_type).clone() {
+                if let Some(argument_object) = self
+                    .table
+                    .current_object_view(argument_type)
+                    .map(Cow::into_owned)
+                {
                     for property in object.properties {
                         if let Some(argument_property) = argument_object
                             .properties

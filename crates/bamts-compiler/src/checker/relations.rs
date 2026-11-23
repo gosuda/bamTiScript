@@ -17,6 +17,7 @@
 //! applications with different arguments therefore remain distinct, while an
 //! exact repeated pair is a sound coinductive recursion boundary.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
@@ -765,7 +766,7 @@ impl<'table> TypeRelations<'table> {
             Type::IndexedAccess { object, index } => {
                 self.any_types_reach_free_symbol([*object, *index], symbol, search)
             }
-            Type::Record { key, value } => {
+            Type::Record { key, value, .. } => {
                 self.any_types_reach_free_symbol([*key, *value], symbol, search)
             }
             Type::This { constraint, .. } => {
@@ -1013,6 +1014,25 @@ impl<'table> TypeRelations<'table> {
         self.computed_relations
             .set(self.computed_relations.get() + 1);
         let (from, to) = (self.table.get(source), self.table.get(target));
+        let source_record = matches!(from, Type::Record { .. })
+            .then(|| self.table.current_object_view(source))
+            .flatten()
+            .map(|object| Type::ObjectType(object.into_owned()));
+        let target_record = matches!(to, Type::Record { .. })
+            .then(|| self.table.current_object_view(target))
+            .flatten()
+            .map(|object| Type::ObjectType(object.into_owned()));
+        let generic_record_pair = matches!(from, Type::Record { .. })
+            && matches!(to, Type::Record { .. })
+            && (source_record.is_none() || target_record.is_none());
+        let (from, to) = if generic_record_pair {
+            (from, to)
+        } else {
+            (
+                source_record.as_ref().unwrap_or(from),
+                target_record.as_ref().unwrap_or(to),
+            )
+        };
         match (from, to) {
             (Type::Error, _) | (_, Type::Error) => true,
             // `any` is the deliberate escape hatch in both directions for
@@ -1158,32 +1178,17 @@ impl<'table> TypeRelations<'table> {
                 Type::Record {
                     key: source_key,
                     value: source_value,
+                    optional_value: source_optional,
                 },
                 Type::Record {
                     key: target_key,
                     value: target_value,
+                    optional_value: target_optional,
                 },
             ) => {
-                self.relates(*target_key, *source_key, strictness)
+                (source_optional.is_none() || target_optional.is_some())
+                    && self.relates(*target_key, *source_key, strictness)
                     && self.relates(*source_value, *target_value, strictness)
-            }
-            (
-                Type::ObjectType(source_object),
-                Type::Record {
-                    key: target_key,
-                    value: target_value,
-                },
-            ) => {
-                self.object_satisfies_record(source_object, *target_key, *target_value, strictness)
-            }
-            (
-                Type::Record {
-                    key: source_key,
-                    value: source_value,
-                },
-                Type::ObjectType(target_object),
-            ) => {
-                self.record_satisfies_object(*source_key, *source_value, target_object, strictness)
             }
             (Type::Record { .. }, Type::Object) => true,
             (Type::Never, Type::Record { .. }) => true,
@@ -2128,7 +2133,21 @@ impl<'table> TypeRelations<'table> {
                 };
                 let signatures_relate = source_signature
                     .map(|have| self.relates(have.value_type, want.value_type, strictness))
-                    .unwrap_or_else(|| source.index_signatures.is_empty());
+                    .unwrap_or_else(|| {
+                        source.index_signatures.iter().all(|have| {
+                            let Some(have_parameter) = have.parameters.first() else {
+                                return false;
+                            };
+                            matches!(
+                                (
+                                    self.table.get(want_parameter.type_id()),
+                                    self.table.get(have_parameter.type_id()),
+                                ),
+                                (Type::Symbol, Type::String | Type::Number)
+                                    | (Type::String | Type::Number, Type::Symbol)
+                            )
+                        })
+                    });
                 properties_relate && signatures_relate
             })
     }
@@ -2212,30 +2231,6 @@ impl<'table> TypeRelations<'table> {
                 .iter()
                 .all(|&element| self.relates(element, value, strictness))
         })
-    }
-
-    fn object_satisfies_record(
-        &self,
-        source: &ObjectType,
-        key: TypeId,
-        value: TypeId,
-        strictness: Strictness,
-    ) -> bool {
-        self.table
-            .record_structural_view(key, value)
-            .is_some_and(|target| self.object_relates(source, &target, strictness))
-    }
-
-    fn record_satisfies_object(
-        &self,
-        key: TypeId,
-        value: TypeId,
-        target: &ObjectType,
-        strictness: Strictness,
-    ) -> bool {
-        self.table
-            .record_structural_view(key, value)
-            .is_some_and(|source| self.object_relates(&source, target, strictness))
     }
 
     fn property_type_relates(
@@ -2416,7 +2411,7 @@ impl<'table> TypeRelations<'table> {
             _ => None,
         }
     }
-    fn relation_object_view(&self, type_id: TypeId) -> Option<&ObjectType> {
+    fn relation_object_view(&self, type_id: TypeId) -> Option<Cow<'_, ObjectType>> {
         let type_id = self.relation_alias_view(type_id)?;
         let type_id = match self.table.get(type_id) {
             Type::AppliedClass { .. } => self.table.applied_class_view(type_id).unwrap_or(type_id),
@@ -2429,10 +2424,7 @@ impl<'table> TypeRelations<'table> {
         let type_id = self.relation_alias_view(type_id)?;
         let type_id = self.table.named_structural_view(type_id);
         let type_id = self.relation_alias_view(type_id)?;
-        match self.table.get(type_id) {
-            Type::ObjectType(object) => Some(object),
-            _ => None,
-        }
+        self.table.current_object_view(type_id)
     }
 
     fn intersection_object_relates(

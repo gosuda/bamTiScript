@@ -770,22 +770,33 @@ impl<'src> Binder<'src> {
     fn jsx_spread_branches(&mut self, spread_type: TypeId) -> Option<Vec<JsxSpreadBranch>> {
         let spread_type = self.jsx_spread_constraint_view(spread_type);
         let spread_type = self.types.indexed_access_view(spread_type);
+        if let Some(object) = self.types.current_object_view(spread_type) {
+            let ObjectType {
+                properties,
+                index_signatures,
+                ..
+            } = object.into_owned();
+            return Some(vec![JsxSpreadBranch {
+                properties,
+                index_signatures,
+            }]);
+        }
         match self.types.get(spread_type).clone() {
             // A truly opaque operand has no member list: nothing about the
             // merged object is knowable, and one opaque union or
             // intersection member absorbs its whole spread the same way.
             Type::Any | Type::Unknown | Type::Error => None,
-            Type::ObjectType(object) => Some(vec![JsxSpreadBranch {
-                properties: object.properties.clone(),
-                index_signatures: object.index_signatures.clone(),
-            }]),
-            Type::Record { key, value } => Some(vec![JsxSpreadBranch {
+            Type::Record {
+                key,
+                value,
+                optional_value,
+            } => Some(vec![JsxSpreadBranch {
                 properties: Vec::new(),
                 index_signatures: vec![IndexSignature {
                     readonly: false,
                     enum_reverse: false,
                     parameters: vec![FunctionParameter::new("key".to_owned(), key, false, false)],
-                    value_type: value,
+                    value_type: optional_value.unwrap_or(value),
                     declaring_types: Vec::new(),
                 }],
             }]),
