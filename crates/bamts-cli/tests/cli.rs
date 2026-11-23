@@ -2073,7 +2073,7 @@ fn tsc_native_root_dir_does_not_change_the_source_boundary() {
     project.write("outside.ts", "export const value = 42;\n");
     project.write(
         "src/main.ts",
-        "import { value } from '../outside';\nconsole.log(value);\n",
+        "import { value } from '../outside';\nprocess.stdout.write(String(value) + '\\n');\n",
     );
     let escaped = project
         .command()
@@ -2199,9 +2199,9 @@ fn tsc_removed_base_url_preserves_native_emission_policy() {
 #[test]
 fn tsc_removed_option_cannot_emit_native_code_with_unresolved_static_imports() {
     for source in [
-        "import './missing';\nconsole.log('must not execute');\n",
-        "import { value } from './missing';\nconsole.log(value);\n",
-        "import './dependency';\nconsole.log('must not execute');\n",
+        "import './missing';\nprocess.stdout.write('must not execute\\n');\n",
+        "import { value } from './missing';\nprocess.stdout.write(String(value) + '\\n');\n",
+        "import './dependency';\nprocess.stdout.write('must not execute\\n');\n",
     ] {
         let project = ScratchDirectory::new();
         project.write("main.ts", source);
@@ -2247,8 +2247,8 @@ fn tsc_removed_option_cannot_emit_native_code_with_unresolved_static_imports() {
 #[test]
 fn tsc_native_emission_keeps_erased_and_lazy_unresolved_imports() {
     for source in [
-        "import type { Missing } from './missing';\nconsole.log('ok');\n",
-        "const load = () => import('./missing');\nconsole.log('ok');\n",
+        "import type { Missing } from './missing';\nprocess.stdout.write('ok\\n');\n",
+        "const load = () => import('./missing');\nprocess.stdout.write('ok\\n');\n",
     ] {
         let project = ScratchDirectory::new();
         project.write("main.ts", source);
@@ -2275,13 +2275,13 @@ fn tsc_native_emission_keeps_erased_and_lazy_unresolved_imports() {
 fn tsc_native_emission_quarantines_unresolved_static_imports_in_lazy_modules() {
     for (source, expected) in [
         (
-            "const load = () => import('./lazy.js');\nconsole.log('ok');\n",
+            "const load = () => import('./lazy.js');\nprocess.stdout.write('ok\\n');\n",
             "ok\n",
         ),
         (
             "import('./lazy.js').then(\n\
-                 () => console.log('unexpected fulfillment'),\n\
-                 () => console.log('rejected'),\n\
+                 () => process.stdout.write('unexpected fulfillment\\n'),\n\
+                 () => process.stdout.write('rejected\\n'),\n\
              );\n",
             "rejected\n",
         ),
@@ -2290,7 +2290,7 @@ fn tsc_native_emission_quarantines_unresolved_static_imports_in_lazy_modules() {
         project.write("main.ts", source);
         project.write(
             "lazy.ts",
-            "import './missing.js';\nconsole.log('lazy body must not execute');\n",
+            "import './missing.js';\nprocess.stdout.write('lazy body must not execute\\n');\n",
         );
         let compiled = project
             .command()
@@ -2316,7 +2316,10 @@ fn tsc_native_emission_quarantines_unresolved_static_imports_in_lazy_modules() {
 #[test]
 fn tsc_artifact_emission_preserves_unresolved_static_imports() {
     let project = ScratchDirectory::new();
-    project.write("main.ts", "import './missing';\nconsole.log('ok');\n");
+    project.write(
+        "main.ts",
+        "import './missing';\nprocess.stdout.write('ok\\n');\n",
+    );
     let compiled = project
         .command()
         .args([
