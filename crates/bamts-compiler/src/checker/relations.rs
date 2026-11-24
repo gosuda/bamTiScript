@@ -1243,7 +1243,11 @@ impl<'table> TypeRelations<'table> {
             ) => {
                 (source_optional.is_none() || target_optional.is_some())
                     && self.relates(*target_key, *source_key, strictness)
-                    && self.relates(*source_value, *target_value, strictness)
+                    && self.relates(
+                        *source_value,
+                        target_optional.unwrap_or(*target_value),
+                        strictness,
+                    )
             }
             (Type::Record { .. }, Type::Object) => true,
             (Type::Never, Type::Record { .. }) => true,
