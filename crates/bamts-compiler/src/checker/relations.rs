@@ -1159,8 +1159,8 @@ impl<'table> TypeRelations<'table> {
                     object: target_object,
                     index: target_index,
                 },
-            ) if self.equivalent(*source_object, *target_object)
-                && self.equivalent(*source_index, *target_index) =>
+            ) if self.same_indexed_operand(*source_object, *target_object)
+                && self.same_indexed_operand(*source_index, *target_index) =>
             {
                 true
             }
@@ -1884,6 +1884,29 @@ impl<'table> TypeRelations<'table> {
                 | Type::This { .. }
                 | Type::Record { .. }
         )
+    }
+
+    fn same_indexed_operand(&self, source: TypeId, target: TypeId) -> bool {
+        if source == target {
+            return true;
+        }
+        let (Some(source), Some(target)) = (
+            self.relation_alias_view(source),
+            self.relation_alias_view(target),
+        ) else {
+            return false;
+        };
+        let source = self.table.constructor_identity(source);
+        let target = self.table.constructor_identity(target);
+        source == target
+            || matches!(
+                (self.table.get(source), self.table.get(target)),
+                (Type::Named(source_symbol), Type::Named(target_symbol))
+                    if self
+                        .parameter_aliases
+                        .borrow()
+                        .contains(&(*source_symbol, *target_symbol))
+            )
     }
 
     /// Follows transparent alias heads without classifying a missing or cyclic
