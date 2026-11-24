@@ -767,3 +767,29 @@ function wrongKey<K extends "x", P extends "y">(value: Record<K, number>): Recor
         assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
     }
 }
+
+#[test]
+fn indexed_identity_respects_inferred_generic_and_literal_key_mappings() {
+    let accepted = r#"
+type Row = { x: number; y: string };
+function specialize<P extends "x" | "y">(source: <K extends "x" | "y">(key: K) => Row[K]) {
+    const selected: (key: P) => Row[P] = source;
+    return selected;
+}
+function literal<T extends { x: number }>(source: <K extends "x">(value: T, key: K) => T[K]) {
+    const selected: (value: T, key: "x") => T["x"] = source;
+    return selected;
+}
+"#;
+    let errors = strict_checker_output(accepted).0;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let rejected = r#"
+type Optional = { x?: number };
+type Dict = { [key: string]: number };
+function specialize<P extends "x">(source: <K extends "x">(key: K) => Optional[K]) {
+    const selected: (key: P) => Dict[P] = source;
+}
+"#;
+    assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
+}

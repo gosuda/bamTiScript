@@ -1894,14 +1894,27 @@ impl<'table> TypeRelations<'table> {
         if source == target {
             return true;
         }
-        let (Some(source), Some(target)) = (
-            self.relation_alias_view(source),
-            self.relation_alias_view(target),
-        ) else {
+        let identity = |mut type_id: TypeId| {
+            let mut visiting = HashSet::new();
+            loop {
+                if !visiting.insert(type_id) {
+                    return None;
+                }
+                let view = self.relation_alias_view(type_id)?;
+                let view = self.table.constructor_identity(view);
+                if let Type::Named(symbol) = self.table.get(view)
+                    && let Some(&inferred) = self.inferred_type_arguments.borrow().get(symbol)
+                    && inferred != view
+                {
+                    type_id = inferred;
+                    continue;
+                }
+                return Some(view);
+            }
+        };
+        let (Some(source), Some(target)) = (identity(source), identity(target)) else {
             return false;
         };
-        let source = self.table.constructor_identity(source);
-        let target = self.table.constructor_identity(target);
         source == target
             || matches!(
                 (self.table.get(source), self.table.get(target)),
