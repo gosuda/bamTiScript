@@ -713,3 +713,57 @@ function independent<K extends "x" | "y", P extends "x" | "y">(value: Row[K]): R
         assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
     }
 }
+
+#[test]
+fn generic_record_relations_accept_optional_values_and_keep_requiredness() {
+    let accepted = r#"
+function copy<K extends string>(value: Record<K, undefined>): Partial<Record<K, number>> {
+    return value;
+}
+function optionalCopy<K extends string>(value: Partial<Record<K, undefined>>): Partial<Record<K, number>> {
+    return value;
+}
+function unionCopy<K extends string>(value: Record<K, number | undefined>): Partial<Record<K, number>> {
+    return value;
+}
+const copied = copy<"x">({ x: undefined });
+const copiedValue = copied.x;
+declare const expected: number | undefined;
+"#;
+    let (errors, model) = strict_checker_output(accepted);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        binding_type(&model, "copiedValue"),
+        binding_type(&model, "expected")
+    );
+
+    for rejected in [
+        r#"
+function wrongValue<K extends string>(value: Record<K, string>): Partial<Record<K, number>> {
+    return value;
+}
+"#,
+        r#"
+function required<K extends string>(value: Record<K, undefined>): Record<K, number> {
+    return value;
+}
+"#,
+        r#"
+function missing<K extends string>(value: Partial<Record<K, number>>): Record<K, number> {
+    return value;
+}
+"#,
+        r#"
+function requiredUndefined<K extends string>(value: Partial<Record<K, number>>): Record<K, number | undefined> {
+    return value;
+}
+"#,
+        r#"
+function wrongKey<K extends "x", P extends "y">(value: Record<K, number>): Record<P, number> {
+    return value;
+}
+"#,
+    ] {
+        assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
+    }
+}
