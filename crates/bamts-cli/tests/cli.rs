@@ -323,9 +323,24 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
         stdin
             .write_all(&framed(&payload))
             .expect("cancel request is written");
-        drop(stdin);
+        stdin.flush().expect("cancel request is flushed");
+        let shutdown = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "shutdown",
+        });
+        let payload = serde_json::to_vec(&shutdown).expect("shutdown request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("shutdown request is written");
+        stdin.flush().expect("shutdown request is flushed");
+        // Keep stdin open across the wait: cancellation runs `taskkill`
+        // while the transport still has a read pending on the protocol
+        // stream, so closing stdin first would let a `taskkill` that
+        // inherits stdin pass on Unix and start on Windows.
         let mut output =
             wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+        drop(stdin);
         output.stdout = stdout.join().expect("stdout reader");
         output.stderr = stderr.join().expect("stderr reader");
         (publication, output)
@@ -338,11 +353,20 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
     );
     assert_success(&output, "bamts --api");
     let responses = decode_frames(&output.stdout);
-    assert_eq!(responses.len(), 2, "initialize and execute both respond");
+    assert_eq!(
+        responses.len(),
+        3,
+        "initialize, cancelled execute, and shutdown all respond"
+    );
     let message = responses[1]["error"]["message"]
         .as_str()
         .expect("a cancelled AOT request is an API error");
     assert_eq!(message, "request was cancelled");
+    assert_eq!(
+        responses[2],
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": null}),
+        "shutdown responds after cancellation with stdin open"
+    );
     let mut remaining =
         fs::read_dir(&published).expect("AOT publication directory remains readable");
     assert!(
