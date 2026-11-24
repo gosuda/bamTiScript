@@ -139,16 +139,36 @@ test("actual addon exports structured truncation for capped JSON diagnostics", n
     const loadAddon = createRequire(import.meta.url);
     const addon = loadAddon(resolve(addonPath));
 
+    const complete = await addon.run(request(["check", "--json", entrypoint]));
+    assert.equal(complete.exitCode, 1);
+    assert.equal(complete.truncation, undefined);
+    const diagnostics = JSON.parse(Buffer.from(complete.stderr).toString("utf8"));
+    assert.ok(Array.isArray(diagnostics));
+    assert.ok(diagnostics.length > 1);
+
     const outcome = await addon.run(
       request(["check", "--json", "--error-limit", "1", entrypoint]),
     );
 
     assert.equal(outcome.exitCode, 1);
-    assert.equal(
-      JSON.parse(Buffer.from(outcome.stderr).toString("utf8")).length,
-      1,
+    assert.deepEqual(
+      JSON.parse(Buffer.from(outcome.stderr).toString("utf8")),
+      diagnostics.slice(0, 1),
     );
-    assert.deepEqual(outcome.truncation, { elided: 1, limit: 1 });
+    assert.deepEqual(outcome.truncation, {
+      elided: diagnostics.length - 1,
+      limit: 1,
+    });
+
+    const exact = await addon.run(
+      request(["check", "--json", "--error-limit", String(diagnostics.length), entrypoint]),
+    );
+    assert.equal(exact.exitCode, 1);
+    assert.deepEqual(
+      JSON.parse(Buffer.from(exact.stderr).toString("utf8")),
+      diagnostics,
+    );
+    assert.equal(exact.truncation, undefined);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
