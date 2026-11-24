@@ -667,3 +667,49 @@ const later: number = "still checked";
         ["BAMTS-C064", "BAMTS-C064", "BAMTS-C004"]
     );
 }
+
+#[test]
+fn indexed_identity_requires_canonical_objects_and_preserves_alias_renaming() {
+    let accepted = r#"
+type Optional = { x?: number };
+type Dict = { [key: string]: number };
+type Alias = Optional;
+function reverse<K extends "x">(value: Dict[K]): Optional[K] { return value; }
+function same<K extends "x">(value: Optional[K]): Optional[K] { return value; }
+function transparent<K extends "x">(value: Optional[K]): Alias[K] { return value; }
+type Present = { x: number };
+function required<K extends "x">(value: Present[K]): Dict[K] { return value; }
+type Row = { x: number; y: string };
+type RowAlias = Row;
+declare const original: <K extends "x" | "y">(key: K) => Row[K];
+const renamed: <P extends "x" | "y">(key: P) => RowAlias[P] = original;
+const selectedX = renamed("x");
+const selectedY = renamed<"y">("y");
+const optionalValue = transparent<"x">(undefined);
+declare const expectedOptional: number | undefined;
+"#;
+    let (errors, model) = strict_checker_output(accepted);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(binding_type(&model, "selectedX"), model.types().number());
+    assert_eq!(binding_type(&model, "selectedY"), model.types().string());
+    assert_eq!(
+        binding_type(&model, "optionalValue"),
+        binding_type(&model, "expectedOptional")
+    );
+
+    for rejected in [
+        r#"
+type Optional = { x?: number };
+type Dict = { [key: string]: number };
+function bad<K extends "x">(value: Optional[K]): Dict[K] { return value; }
+"#,
+        r#"
+type Row = { x: number; y: string };
+function independent<K extends "x" | "y", P extends "x" | "y">(value: Row[K]): Row[P] {
+    return value;
+}
+"#,
+    ] {
+        assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
+    }
+}
