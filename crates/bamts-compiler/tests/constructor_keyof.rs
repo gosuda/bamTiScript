@@ -915,3 +915,55 @@ const laterValue = later.extra;
         assert_value_type(&model, name, model.types().number());
     }
 }
+
+#[test]
+fn retained_records_infer_generic_signature_parameters_from_current_members() {
+    let model = checked_model(
+        r#"
+class C {}
+declare const fromObject: <T>(value: { prototype: T }) => T;
+declare const fromRecord: <T>(value: Record<keyof typeof C, T>) => T;
+const objectToRecord: (value: Record<keyof typeof C, number>) => number = fromObject;
+const recordToObject: (value: { prototype: number }) => number = fromRecord;
+const recordToRecord: (value: Record<keyof typeof C, number>) => number = fromRecord;
+declare const fields: Record<keyof typeof C, number>;
+const objectResult = objectToRecord(fields);
+const recordResult = recordToObject(fields);
+const bothResult = recordToRecord(fields);
+"#,
+    );
+    for name in ["objectResult", "recordResult", "bothResult"] {
+        assert_value_type(&model, name, model.types().number());
+    }
+}
+
+#[test]
+fn retained_record_signature_inference_reads_nested_and_merged_members() {
+    assert_checks(
+        r#"
+class C {}
+declare const fromNested: <T>(value: { fields: { extra: T } }) => T;
+declare const fromRecord: <T>(value: Record<keyof typeof C, T>) => T;
+namespace C { export const extra = 1; }
+const nested: (value: { fields: Record<keyof typeof C, number> }) => number = fromNested;
+const merged: (value: { prototype: number; extra: number }) => number = fromRecord;
+"#,
+    );
+}
+
+#[test]
+fn retained_record_signature_inference_rejects_wrong_returns_and_missing_members() {
+    assert_assignment_errors(
+        r#"
+class C {}
+declare const fromObject: <T>(value: { prototype: T }) => T;
+declare const fromRecord: <T>(value: Record<keyof typeof C, T>) => T;
+declare const fromMissing: <T>(value: { missing: T }) => T;
+const wrongObjectReturn: (value: Record<keyof typeof C, number>) => string = fromObject;
+const wrongRecordReturn: (value: { prototype: number }) => string = fromRecord;
+const missingObjectMember: (value: Record<keyof typeof C, number>) => number = fromMissing;
+const missingRecordMember: (value: { missing: number }) => number = fromRecord;
+"#,
+        4,
+    );
+}

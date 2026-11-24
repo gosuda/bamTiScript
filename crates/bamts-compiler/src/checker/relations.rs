@@ -1797,21 +1797,21 @@ impl<'table> TypeRelations<'table> {
                 }
                 None
             }
-            Type::ObjectType(obj) => {
-                if let Type::ObjectType(concrete_obj) = self.table.get(concrete) {
-                    for pattern_prop in &obj.properties {
-                        if let Some(concrete_prop) = concrete_obj
-                            .properties
-                            .iter()
-                            .find(|p| p.name() == pattern_prop.name())
-                            && let Some(inferred) = self.infer_from_type(
-                                tp,
-                                pattern_prop.type_id(),
-                                concrete_prop.type_id(),
-                            )
-                        {
-                            return Some(inferred);
-                        }
+            Type::ObjectType(_) | Type::Record { .. } => {
+                let object = self.table.current_object_view(pattern)?;
+                let concrete_object = self.table.current_object_view(concrete)?;
+                for pattern_prop in &object.properties {
+                    if let Some(concrete_prop) = concrete_object
+                        .properties
+                        .iter()
+                        .find(|property| property.name() == pattern_prop.name())
+                        && let Some(inferred) = self.infer_from_type(
+                            tp,
+                            pattern_prop.type_id(),
+                            concrete_prop.type_id(),
+                        )
+                    {
+                        return Some(inferred);
                     }
                 }
                 None
