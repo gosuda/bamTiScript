@@ -606,3 +606,122 @@ if (guarded.value !== undefined) {
     );
     assert_eq!(binding_type(&model, "after"), model.types().bigint());
 }
+
+#[test]
+fn branded_numeric_updates_preserve_guarded_roots_and_properties() {
+    for (primitive, rejected) in [("number", "bigint"), ("bigint", "number")] {
+        let model = checked_model(
+            &format!(
+                r#"
+type Brand = {primitive} & {{ readonly brand: 'numeric' }};
+declare let root: Brand | undefined;
+declare const property: {{ value?: Brand }};
+declare const expected: Brand;
+if (root !== undefined) {{
+    const rootPost = root++;
+    const rootPrefix = --root;
+    const rootAfter = root;
+    const accepted: Brand = rootAfter;
+    const wrong: {rejected} = rootAfter;
+}}
+if (property.value !== undefined) {{
+    const propertyPost = property.value--;
+    const propertyPrefix = ++property.value;
+    const propertyAfter = property.value;
+    const accepted: Brand = propertyAfter;
+    const wrong: {rejected} = propertyAfter;
+}}
+"#
+            ),
+            ScriptKind::TypeScript,
+            &["BAMTS-C004"; 2],
+        );
+        let primitive_type = if primitive == "number" {
+            model.types().number()
+        } else {
+            model.types().bigint()
+        };
+        for name in ["rootPost", "rootPrefix", "propertyPost", "propertyPrefix"] {
+            assert_eq!(binding_type(&model, name), primitive_type, "{name}");
+        }
+        for name in ["rootAfter", "propertyAfter"] {
+            assert_eq!(
+                binding_type(&model, name),
+                binding_type(&model, "expected"),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn branded_numeric_updates_keep_literal_identity_and_nullable_rejection() {
+    let model = checked_model(
+        r#"
+type Brand = number & { readonly brand: 'numeric' };
+type LiteralBrand = 1 & { readonly brand: 'literal' };
+declare let literal: LiteralBrand | undefined;
+declare const expected: LiteralBrand;
+declare const unsafe: { value?: Brand };
+if (literal !== undefined) {
+    const post = literal++;
+    const after = literal;
+    const accepted: 1 = after;
+    const branded: LiteralBrand = after;
+    const rejected: 1 = post;
+}
+unsafe.value++;
+const rejectedAfter: Brand = unsafe.value;
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C004", "BAMTS-C062", "BAMTS-C004"],
+    );
+    assert_eq!(binding_type(&model, "post"), model.types().number());
+    assert_eq!(
+        binding_type(&model, "after"),
+        binding_type(&model, "expected"),
+    );
+}
+
+#[test]
+fn nonnumeric_intersections_do_not_publish_successful_update_flow() {
+    checked_model(
+        r#"
+type Text = string & { readonly brand: 'text' };
+declare let value: Text | undefined;
+declare function takesText(value: Text): void;
+if (value !== undefined) {
+    value++;
+    takesText(value);
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C053"],
+    );
+}
+
+#[test]
+fn intersection_factors_preserve_only_shared_nullish_members() {
+    let model = checked_model(
+        r#"
+type MaybeNumber = (number | undefined) & ({ readonly brand: 'number' } | undefined);
+type MaybeBigInt = (bigint | undefined) & unknown;
+type PresentBigInt = (bigint | undefined) & { readonly brand: 'present' };
+declare let numeric: MaybeNumber;
+declare let bigint: MaybeBigInt;
+declare let present: PresentBigInt;
+const numericPost = numeric++;
+const unsafeNumber: number = numeric;
+const bigintPost = bigint++;
+const unsafeBigInt: bigint = bigint;
+const presentPost = present++;
+const accepted: bigint = presentPost;
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C062", "BAMTS-C004", "BAMTS-C062", "BAMTS-C004"],
+    );
+    assert_eq!(binding_type(&model, "numericPost"), model.types().number());
+    for name in ["bigintPost", "presentPost"] {
+        assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
+    }
+}

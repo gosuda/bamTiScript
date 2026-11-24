@@ -27140,11 +27140,10 @@ impl<'src> Binder<'src> {
     }
 
     /// Updates read the current numeric value before invalidating the target.
-    /// Cached aliases and constraints expose nullability without materializing
-    /// new types. Constraints do not change a generic update result's numeric
-    /// category, and each existing type is visited at most once per purpose.
-    /// The final flag permits a successful-write fact only for numeric operands;
-    /// unsupported operands retain invalidation-based error recovery.
+    /// Cached views keep this traversal finite. Union members must all support
+    /// arithmetic, while one numeric intersection factor can establish a brand's
+    /// numeric category. Generic constraints prove validity without changing the
+    /// generic expression result's number category.
     fn numeric_update_type(&mut self, operand: TypeId) -> (TypeId, bool, bool) {
         match self.types.get(operand) {
             Type::BigInt | Type::BigIntLiteral(_) => return (self.types.bigint(), false, true),
@@ -27161,65 +27160,198 @@ impl<'src> Binder<'src> {
             Type::AppliedAlias { .. }
             | Type::TypeQuery { .. }
             | Type::Union(_)
+            | Type::Intersection(_)
             | Type::Named(_) => {}
             _ => return (self.types.number(), false, false),
         }
-        let mut pending = vec![(operand, true)];
-        let mut visited = HashSet::new();
-        let mut bigint = false;
-        let mut number = false;
-        let mut nullable = false;
-        let mut numeric = true;
-        while let Some((member, classify_numeric)) = pending.pop() {
-            if !visited.insert((member, classify_numeric)) {
+
+        #[derive(Clone, Copy)]
+        struct UpdateFacts {
+            kinds: u8,
+            // Explicit nullish members trigger diagnostics; permissive types
+            // such as unknown must not erase them inside an intersection.
+            nullable: u8,
+            permits_nullish: u8,
+            numeric: bool,
+            any: bool,
+        }
+        const NUMBER: u8 = 1;
+        const BIGINT: u8 = 2;
+        const BOTH: u8 = NUMBER | BIGINT;
+        const NULL: u8 = 1;
+        const UNDEFINED: u8 = 2;
+        const NULLISH: u8 = NULL | UNDEFINED;
+        const UNSUPPORTED: UpdateFacts = UpdateFacts {
+            kinds: NUMBER,
+            nullable: 0,
+            permits_nullish: 0,
+            numeric: false,
+            any: false,
+        };
+        const UNRESOLVED: UpdateFacts = UpdateFacts {
+            permits_nullish: NULLISH,
+            ..UNSUPPORTED
+        };
+        const ANY: UpdateFacts = UpdateFacts {
+            kinds: NUMBER,
+            nullable: 0,
+            permits_nullish: NULLISH,
+            numeric: true,
+            any: true,
+        };
+
+        let mut pending = vec![(operand, false)];
+        let mut active = HashSet::new();
+        let mut resolved = HashMap::<TypeId, UpdateFacts>::new();
+        while let Some((type_id, expanded)) = pending.pop() {
+            if expanded {
+                active.remove(&type_id);
+                if resolved.contains_key(&type_id) {
+                    continue;
+                }
+                let child = |type_id| {
+                    resolved
+                        .get(&type_id)
+                        .copied()
+                        .expect("scheduled update type has classification")
+                };
+                let facts = match self.types.get(type_id) {
+                    Type::BigInt | Type::BigIntLiteral(_) => UpdateFacts {
+                        kinds: BIGINT,
+                        nullable: 0,
+                        permits_nullish: 0,
+                        numeric: true,
+                        any: false,
+                    },
+                    Type::Number
+                    | Type::NumberLiteral(_)
+                    | Type::NumericEnum(_)
+                    | Type::EnumMember {
+                        string_value: None, ..
+                    }
+                    | Type::Never => UpdateFacts {
+                        kinds: NUMBER,
+                        nullable: 0,
+                        permits_nullish: 0,
+                        numeric: true,
+                        any: false,
+                    },
+                    Type::Any | Type::Error => ANY,
+                    Type::Unknown => UNRESOLVED,
+                    Type::Null | Type::Undefined => {
+                        let nullish = if matches!(self.types.get(type_id), Type::Null) {
+                            NULL
+                        } else {
+                            UNDEFINED
+                        };
+                        UpdateFacts {
+                            kinds: 0,
+                            nullable: nullish,
+                            permits_nullish: nullish,
+                            numeric: true,
+                            any: false,
+                        }
+                    }
+                    Type::AppliedAlias { .. } => self
+                        .types
+                        .applied_alias_view(type_id)
+                        .map(child)
+                        .unwrap_or(UNRESOLVED),
+                    Type::TypeQuery { target, .. } => child(*target),
+                    Type::Named(symbol) => self
+                        .types
+                        .type_parameter_constraint(*symbol)
+                        .map(|constraint| UpdateFacts {
+                            kinds: NUMBER,
+                            ..child(constraint)
+                        })
+                        .unwrap_or(UNRESOLVED),
+                    Type::Union(members) => {
+                        let mut facts = UpdateFacts {
+                            kinds: 0,
+                            nullable: 0,
+                            permits_nullish: 0,
+                            numeric: true,
+                            any: false,
+                        };
+                        for member in members {
+                            let member = child(*member);
+                            facts.kinds |= member.kinds;
+                            facts.nullable |= member.nullable;
+                            facts.permits_nullish |= member.permits_nullish;
+                            facts.numeric &= member.numeric;
+                            facts.any |= member.any;
+                        }
+                        if facts.any { ANY } else { facts }
+                    }
+                    Type::Intersection(members) => {
+                        let mut kinds = BOTH;
+                        let mut nullable = 0;
+                        let mut permits_nullish = NULLISH;
+                        let mut numeric = false;
+                        let mut any = false;
+                        for member in members {
+                            let member = child(*member);
+                            nullable |= member.nullable;
+                            permits_nullish &= member.permits_nullish;
+                            any |= member.any;
+                            if member.numeric {
+                                kinds &= member.kinds;
+                                numeric |= member.kinds != 0;
+                            }
+                        }
+                        if any {
+                            ANY
+                        } else {
+                            UpdateFacts {
+                                kinds: if numeric { kinds } else { NUMBER },
+                                nullable: nullable & permits_nullish,
+                                permits_nullish,
+                                numeric,
+                                any: false,
+                            }
+                        }
+                    }
+                    _ => UNSUPPORTED,
+                };
+                resolved.insert(type_id, facts);
                 continue;
             }
-            match self.types.get(member) {
-                Type::BigInt | Type::BigIntLiteral(_) => bigint |= classify_numeric,
-                Type::Number
-                | Type::NumberLiteral(_)
-                | Type::NumericEnum(_)
-                | Type::EnumMember {
-                    string_value: None, ..
-                }
-                | Type::Any
-                | Type::Never
-                | Type::Error => number |= classify_numeric,
-                Type::Null | Type::Undefined => nullable = true,
-                Type::Union(members) => {
-                    pending.extend(members.iter().map(|member| (*member, classify_numeric)));
-                }
+
+            if resolved.contains_key(&type_id) {
+                continue;
+            }
+            if !active.insert(type_id) {
+                resolved.insert(type_id, UNRESOLVED);
+                continue;
+            }
+            pending.push((type_id, true));
+            match self.types.get(type_id) {
                 Type::AppliedAlias { .. } => {
-                    if let Some(view) = self.types.applied_alias_view(member) {
-                        pending.push((view, classify_numeric));
-                    } else {
-                        number |= classify_numeric;
-                        numeric = false;
+                    if let Some(view) = self.types.applied_alias_view(type_id) {
+                        pending.push((view, false));
                     }
                 }
-                Type::TypeQuery { target, .. } => pending.push((*target, classify_numeric)),
+                Type::TypeQuery { target, .. } => pending.push((*target, false)),
                 Type::Named(symbol) => {
-                    number |= classify_numeric;
                     if let Some(constraint) = self.types.type_parameter_constraint(*symbol) {
                         pending.push((constraint, false));
-                    } else {
-                        numeric = false;
                     }
                 }
-                _ => {
-                    number |= classify_numeric;
-                    numeric = false;
+                Type::Union(members) | Type::Intersection(members) => {
+                    pending.extend(members.iter().map(|member| (*member, false)));
                 }
+                _ => {}
             }
         }
-        let result = match (bigint, number) {
-            (true, false) => self.types.bigint(),
-            (true, true) => self
-                .types
-                .union(&[self.types.number(), self.types.bigint()]),
+
+        let facts = resolved[&operand];
+        let result = match facts.kinds {
+            BIGINT => self.types.bigint(),
+            BOTH => self.types.union(&[self.types.number(), self.types.bigint()]),
             _ => self.types.number(),
         };
-        (result, nullable, numeric)
+        (result, facts.nullable != 0, facts.numeric)
     }
 
     fn is_bigint_like(&self, type_id: TypeId) -> bool {
