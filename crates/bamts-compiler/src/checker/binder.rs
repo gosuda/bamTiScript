@@ -27263,6 +27263,7 @@ impl<'src> Binder<'src> {
                         .type_parameter_constraint(*symbol)
                         .map(|constraint| UpdateFacts {
                             kinds: NUMBER,
+                            any: false,
                             ..child(constraint)
                         })
                         .unwrap_or(UNRESOLVED),
