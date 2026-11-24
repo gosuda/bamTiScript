@@ -281,8 +281,9 @@ pub fn flow_key_of(expression: &Expr, resolver: &dyn GuardResolver) -> Option<Fl
             let MemberProperty::Named(property) = &member.property else {
                 return None;
             };
-            let name = resolver.token_text(property.data().token());
-            Some(key.child(name))
+            let name =
+                crate::syntax::cook_identifier_text(resolver.token_text(property.data().token()))?;
+            Some(key.child(name.as_ref()))
         }
 
         _ => None,

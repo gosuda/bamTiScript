@@ -725,3 +725,63 @@ const accepted: bigint = presentPost;
         assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
     }
 }
+
+#[test]
+fn escaped_property_paths_share_update_and_read_identity() {
+    for target in [
+        r"object.\u0069nner.v\u0061lue",
+        r"object.\u{69}nner.\u{76}alue",
+        r"object.inner.value",
+        r"\u006fbject.inner.value",
+    ] {
+        let model = checked_model(
+            &format!(
+                r#"
+declare const object: {{ inner: {{ value: 1n }}; u0069nner: {{ value: 2n }} }};
+const post = {target}++;
+const escapedAfter = object.\u0069nner.\u0076alue;
+const plainAfter = object.inner.value;
+const escapedRootAfter = \u006fbject.inner.value;
+const untouched: 2n = object.u0069nner.value;
+const rejectedEscaped: 1n = escapedAfter;
+const rejectedPlain: 1n = plainAfter;
+const rejectedRoot: 1n = escapedRootAfter;
+"#
+            ),
+            ScriptKind::TypeScript,
+            &["BAMTS-C004"; 3],
+        );
+        for name in ["post", "escapedAfter", "plainAfter", "escapedRootAfter"] {
+            assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn escaped_identifier_guards_and_writes_use_the_same_path() {
+    let model = checked_model(
+        r#"
+declare const \u006fbject: { inner: { value?: 1n } };
+declare let \u0072oot: bigint | undefined;
+if (object.\u0069nner.\u0076alue !== undefined) {
+    const post = object.inner.value++;
+    const after = object.\u0069nner.\u0076alue;
+    const accepted: bigint = after;
+    const rejected: 1n = after;
+    object.\u0069nner.\u0076alue = undefined;
+    object.inner.value++;
+}
+if (\u0072oot !== undefined) {
+    const rootPost = root++;
+    const rootAfter = \u0072oot;
+    const accepted: bigint = rootAfter;
+    const rejected: number = rootAfter;
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C004", "BAMTS-C062", "BAMTS-C004"],
+    );
+    for name in ["post", "after", "rootPost", "rootAfter"] {
+        assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
+    }
+}
