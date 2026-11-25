@@ -1633,7 +1633,9 @@ impl<'table> TypeRelations<'table> {
     /// parameters that cannot be inferred from any parameter position keep
     /// their declared constraint (or the implicit `unknown` when
     /// unconstrained), which is handled by the `known_type_parameters` arms
-    /// in `relates_uncached`.
+    /// in `relates_uncached`. The one exception is a non-generic source:
+    /// the generic target's parameters are erased to their constraints up
+    /// front, because the source must accept every permitted instantiation.
     fn with_inferred_parameters(
         &self,
         source: &FunctionSignature,
@@ -1659,6 +1661,25 @@ impl<'table> TypeRelations<'table> {
             candidates.push((symbol, argument));
         }
         for &symbol in target_parameters {
+            if source_parameters.is_empty() {
+                // A non-generic source is checked against the generic target
+                // with its parameters erased to their declared constraints
+                // (implicit `unknown` when unconstrained): the source must
+                // accept every permitted instantiation, so the bound — not the
+                // source's parameter type — is the input domain for
+                // contravariant parameter checks. Inferring the argument from
+                // the source would wrongly demand the source type satisfy the
+                // bound as a type argument (rejecting `(value: string)` for
+                candidates.push((
+                    symbol,
+                    smallvec::smallvec![
+                        self.table
+                            .type_parameter_constraint(symbol)
+                            .unwrap_or_else(|| self.table.unknown())
+                    ],
+                ));
+                continue;
+            }
             if let Some(argument) = self.infer_type_argument(symbol, target, source) {
                 candidates.push((symbol, argument));
             }
@@ -4762,7 +4783,7 @@ mod tests {
     /// is assignable to `<T>(x: T) => T` because `number` is assignable to
     /// the implicit `unknown` constraint.
     #[test]
-    fn non_generic_function_assignable_to_generic_target() {
+    fn non_generic_function_rejected_for_unconstrained_generic_target() {
         let mut table = TypeTable::new();
         let number = table.number();
         let t = SymbolId::new(620);
@@ -4781,9 +4802,12 @@ mod tests {
             false,
         );
         let relations = TypeRelations::new(&table);
+        // Oracle (tsc 5.9.3, --strict --noEmit): TS2322. The target's
+        // parameters erase to their constraints (`unknown` here), so a
+        // source that does not accept `unknown` cannot satisfy it.
         assert!(
-            relations.assignable(source, target),
-            "(x: number) => number should be assignable to <T>(x: T) => T"
+            !relations.assignable(source, target),
+            "(x: number) => number must not be assignable to <T>(x: T) => T"
         );
     }
 

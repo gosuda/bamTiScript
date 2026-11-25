@@ -12832,3 +12832,36 @@ fn element_access_enum_member_types_as_enum_dot_member() {
         "element access enum member should render as E.A"
     );
 }
+
+#[test]
+fn wider_source_parameter_satisfies_bounded_generic_target() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. Every call through
+    // `<T extends "x">` passes a `string`, so the non-generic source
+    // fulfills the generic target without instantiating `T` itself.
+    let checked = check_text(
+        "declare const log: (value: string) => void;\n\
+         const narrow: <T extends \"x\">(value: T) => void = log;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a source accepting the whole bound must satisfy a bounded generic target: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn narrower_source_parameter_rejects_wider_bounded_generic_target() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): TS2322. Erasing the target
+    // to its constraint shows the source only accepts `"x"`.
+    let checked = check_text(
+        "declare const only_x: (value: \"x\") => void;\n\
+         const either: <T extends \"x\" | \"y\">(value: T) => void = only_x;",
+    );
+    assert!(
+        checker_codes(&checked)
+            .iter()
+            .any(|code| *code == TYPE_NOT_ASSIGNABLE.as_str()),
+        "a source narrower than the bound must not satisfy a bounded generic target: {:?}",
+        checked.diagnostics()
+    );
+}
