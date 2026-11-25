@@ -11,12 +11,13 @@ use crate::{
     lint::{CompilerLintOptions, LintProfile, LintTable, SourceDialect, rule_by_code},
     source::{ScriptKind, SourceId, TextRange, Utf16Pos},
     syntax::{
-        ArrayElement, AssignmentArrayElement, AssignmentTarget, CallArgument, ClassDeclaration,
-        ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression, ForBinding,
-        ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
+        ArrayBindingElement, ArrayElement, AssignmentArrayElement, AssignmentTarget,
+        BindingPattern, CallArgument, ClassDeclaration, ClassMember, ExportDeclaration,
+        ExportDefaultValue, ExportNamedDeclaration, Expr, Expression, ForBinding, ForInitializer,
+        FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
         JsxAttributeItem, JsxChild, KeywordType, MemberProperty, ObjectMember, ParameterNode,
-        PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode, TypeMember,
-        TypeNode, TypeParameterList,
+        Pattern, PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode,
+        TypeMember, TypeNode, TypeParameterList,
     },
 };
 
@@ -109,7 +110,7 @@ pub fn analyze(source: &SourceFile, levels: &LintTable) -> Vec<Diagnostic> {
     find_class_fields(&tokens, &mut findings);
     find_enums(&tokens, &mut findings);
     find_declaration_merges(&tokens, &mut findings);
-    find_hygiene(&tokens, &mut findings);
+    find_hygiene(source, &tokens, &mut findings);
     find_syntactic_footguns(&tokens, &mut findings);
     find_catalog_completion(source, &tokens, &comments, &mut findings);
 
@@ -675,6 +676,7 @@ fn find_declaration_merges(
 }
 
 fn find_hygiene(
+    source: &SourceFile,
     tokens: &[SyntaxToken<'_>],
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
@@ -711,6 +713,7 @@ fn find_hygiene(
         }
     }
 
+    let exported = inline_exported_binding_names(source);
     for (index, token) in tokens.iter().copied().enumerate() {
         if matches!(
             token.kind,
@@ -720,7 +723,7 @@ fn find_hygiene(
             .copied()
             .filter(|next| next.identifier())
             && identifier_uses(tokens, name.text) == 1
-            && !is_exported_binding(tokens, index)
+            && !exported.contains(name.text)
         {
             push(findings, "BAMTS-W069", name, "local binding is never read");
         }
@@ -896,12 +899,79 @@ fn identifier_uses(tokens: &[SyntaxToken<'_>], name: &str) -> usize {
         .filter(|token| token.identifier() && token.text == name)
         .count()
 }
+/// Binding names published by inline `export` declarations (`export const
+/// x = ...`, `export function f ...`). A `.export` property read leaves a
+/// `KwExport` token immediately before the next declaration in semicolon-free
+/// code, so token adjacency cannot tell an inline export from member access:
+/// derive the exemption from parsed export declarations instead. The semantic
+/// unused-local pass exempts exports the same way.
+fn inline_exported_binding_names(source: &SourceFile) -> BTreeSet<String> {
+    let mut exported = BTreeSet::new();
+    for statement in source.statements() {
+        let Statement::Export(export) = statement.data() else {
+            continue;
+        };
+        let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) = export else {
+            continue;
+        };
+        collect_exported_binding_names(source, inner, &mut exported);
+    }
+    exported
+}
 
-/// An inline `export const` publishes its binding at the module boundary, so a
-/// use count of one is the declaration itself rather than a dead local. The
-/// semantic unused-local pass exempts exports the same way.
-fn is_exported_binding(tokens: &[SyntaxToken<'_>], index: usize) -> bool {
-    index > 0 && tokens[index - 1].kind == TokenKind::KwExport
+fn collect_exported_binding_names(
+    source: &SourceFile,
+    statement: &Stmt,
+    exported: &mut BTreeSet<String>,
+) {
+    match statement.data() {
+        Statement::Variable(declaration) => {
+            for declarator in &declaration.declarations {
+                collect_pattern_binding_names(source, &declarator.data().binding, exported);
+            }
+        }
+        Statement::Function(function) => {
+            if let Some(name) = function.function.name.as_ref()
+                && let Some(text) = source.identifier_text(name.data().token())
+            {
+                exported.insert(text.into_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_pattern_binding_names(
+    source: &SourceFile,
+    pattern: &Pattern,
+    exported: &mut BTreeSet<String>,
+) {
+    match pattern.data() {
+        BindingPattern::Identifier(identifier) => {
+            if let Some(text) = source.identifier_text(identifier.data().token()) {
+                exported.insert(text.into_owned());
+            }
+        }
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_pattern_binding_names(source, &property.binding, exported);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let ArrayBindingElement::Binding(inner) = element {
+                    collect_pattern_binding_names(source, inner, exported);
+                }
+            }
+        }
+        BindingPattern::Rest(rest) => {
+            collect_pattern_binding_names(source, &rest.argument, exported);
+        }
+        BindingPattern::Assignment(assignment) => {
+            collect_pattern_binding_names(source, &assignment.left, exported);
+        }
+        BindingPattern::Missing(_) => {}
+    }
 }
 
 fn find_catalog_completion(
@@ -2019,6 +2089,12 @@ mod tests {
         "BAMTS-W069",
         "const x = 1;",
         "export const x = 1;"
+    );
+    rule_test!(
+        w069_property_read_does_not_mark_next_binding_exported,
+        "BAMTS-W069",
+        "const settings = { export: true }\nconst enabled = settings.export\nconst unused = 1\nexport { enabled }",
+        "export const kept = 1;"
     );
     rule_test!(
         w070_unused_parameter,
