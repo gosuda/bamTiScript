@@ -967,3 +967,47 @@ const missingRecordMember: (value: { missing: number }) => number = fromRecord;
         4,
     );
 }
+
+#[test]
+fn retained_record_signature_inference_respects_value_bounds() {
+    assert_assignment_errors(
+        r#"
+class Keys {}
+declare const format: <T extends number>(value: Record<keyof typeof Keys, T>) => string;
+const rejected: (value: { prototype: string }) => string = format;
+declare const dependent: <T extends { n: unknown }, U extends T["n"]>(v: { base: T; value: U }) => U;
+const rejectedDependent: (v: { base: { n: number }; value: string }) => string = dependent;
+"#,
+        2,
+    );
+    assert_checks(
+        r#"
+class Keys {}
+declare const format: <T extends number>(value: Record<keyof typeof Keys, T>) => string;
+const accepted: (value: { prototype: number }) => string = format;
+declare const dependent: <T extends { n: unknown }, U extends T["n"]>(v: { base: T; value: U }) => U;
+const acceptedDependent: (v: { base: { n: number }; value: number }) => number = dependent;
+"#,
+    );
+}
+
+#[test]
+fn retained_record_signature_inference_considers_all_value_members() {
+    assert_checks(
+        r#"
+class Keys { static extra = 0; }
+declare const read: <T>(value: Record<keyof typeof Keys, T>) => T;
+const broaderLast: (value: { extra: 1; prototype: number }) => number = read;
+const broaderFirst: (value: { extra: number; prototype: 1 }) => number = read;
+const literalUnion: (value: { extra: 1; prototype: 2 }) => 1 | 2 = read;
+"#,
+    );
+    assert_assignment_errors(
+        r#"
+class Keys { static extra = 0; }
+declare const read: <T>(value: Record<keyof typeof Keys, T>) => T;
+const mixedValues: (value: { extra: number; prototype: string }) => number | string = read;
+"#,
+        1,
+    );
+}

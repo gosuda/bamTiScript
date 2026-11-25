@@ -769,6 +769,23 @@ function wrongKey<K extends "x", P extends "y">(value: Record<K, number>): Recor
 }
 
 #[test]
+fn making_a_constrained_record_optional_preserves_its_value_parameter() {
+    let accepted = r#"
+function optional<K extends string, V extends number>(value: Record<K, V>): Partial<Record<K, V>> {
+    return value;
+}
+"#;
+    assert!(strict_checker_output(accepted).0.is_empty());
+
+    let rejected = r#"
+function wrongValue<K extends string, V extends number>(value: Record<K, number>): Partial<Record<K, V>> {
+    return value;
+}
+"#;
+    assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
+}
+
+#[test]
 fn indexed_identity_respects_inferred_generic_and_literal_key_mappings() {
     let accepted = r#"
 type Row = { x: number; y: string };
@@ -792,4 +809,29 @@ function specialize<P extends "x">(source: <K extends "x">(key: K) => Optional[K
 }
 "#;
     assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"]);
+}
+
+#[test]
+fn shared_index_parameters_compare_matching_fields_instead_of_crossing_keys() {
+    let accepted = r#"
+type Left = { x: number; y: string };
+type Right = { x: number; y: string; extra?: boolean };
+function copy<K extends "x" | "y">(value: Left[K]): Right[K] { return value; }
+"#;
+    assert!(strict_checker_output(accepted).0.is_empty());
+
+    let rejected = r#"
+type Left = { x: number; y: string };
+type Right = { x: string; y: number; extra?: boolean };
+function copy<K extends "x" | "y">(value: Left[K]): Right[K] { return value; }
+type Compatible = { x: number; y: string };
+type RequiredExtra = { x: number; y: string; extra: boolean };
+type IncompatibleExtra = { x: number; y: string; extra: string };
+type OptionalExtra = { x: number; y: string; extra?: boolean };
+function absent<K extends "x" | "y">(value: Compatible[K]): RequiredExtra[K] { return value; }
+function incompatible<K extends "x" | "y">(value: IncompatibleExtra[K]): OptionalExtra[K] {
+    return value;
+}
+"#;
+    assert_eq!(strict_checker_output(rejected).0, ["BAMTS-C004"; 3]);
 }
