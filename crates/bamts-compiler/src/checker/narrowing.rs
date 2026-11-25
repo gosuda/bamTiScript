@@ -1294,7 +1294,7 @@ impl<'a> NarrowingContext<'a> {
     #[must_use]
     pub fn narrow_instanceof(&mut self, ty: TypeId, class_type: TypeId, negated: bool) -> TypeId {
         if negated {
-            return self.subtract(ty, class_type);
+            return self.subtract(ty, class_type, 0);
         }
         match self.constructor_instance(class_type) {
             Some((class, instance)) => self.narrow_to_instance(ty, class, instance),
@@ -1456,7 +1456,7 @@ impl<'a> NarrowingContext<'a> {
             return literal;
         }
         if negated {
-            self.subtract(ty, literal)
+            self.subtract(ty, literal, 0)
         } else {
             self.intersect(ty, literal)
         }
@@ -2162,18 +2162,32 @@ impl<'a> NarrowingContext<'a> {
         }
     }
 
+    /// Whether `excluded` covers `member` for subtraction. A nullish-only
+    /// exclusion uses strict-null assignment so an `undefined` guard removes
+    /// exactly the guarded constituent.
+    fn is_excluded(&self, member: TypeId, excluded: TypeId, nullish: bool) -> bool {
+        if nullish {
+            self.table.assignable_with_strict_null(member, excluded)
+        } else {
+            self.table.assignable(member, excluded)
+        }
+    }
+
     /// Removes the members of `ty` that `excluded` fully covers. Members
     /// wider than the exclusion (`string` minus `"a"`) survive, matching
     /// TypeScript's inability to subtract a value from a primitive. An
     /// opaque exclusion (`any`, `unknown`, `error`) covers nothing
     /// provably, so the input passes through unchanged, and `error` union
     /// members are never dropped.
-    fn subtract(&mut self, ty: TypeId, excluded: TypeId) -> TypeId {
+    fn subtract(&mut self, ty: TypeId, excluded: TypeId, depth: usize) -> TypeId {
+        if depth >= 128 {
+            return ty;
+        }
         if let Some(target) = self.table.type_query_target(ty) {
-            return self.subtract(target, excluded);
+            return self.subtract(target, excluded, depth + 1);
         }
         if let Some(target) = self.table.type_query_target(excluded) {
-            return self.subtract(ty, target);
+            return self.subtract(ty, target, depth + 1);
         }
         if matches!(self.table.get(excluded), Type::AppliedAlias { .. }) {
             let Some(view) = self.table.prepare_applied_alias_view(excluded) else {
@@ -2182,7 +2196,7 @@ impl<'a> NarrowingContext<'a> {
             if view == excluded {
                 return ty;
             }
-            return self.subtract(ty, view);
+            return self.subtract(ty, view, depth + 1);
         }
         if matches!(self.table.get(ty), Type::AppliedAlias { .. }) {
             let Some(view) = self.table.prepare_applied_alias_view(ty) else {
@@ -2191,7 +2205,11 @@ impl<'a> NarrowingContext<'a> {
             if view == ty {
                 return ty;
             }
-            return self.subtract(view, excluded);
+            let narrowed = self.subtract(view, excluded, depth + 1);
+            if narrowed == view {
+                return ty;
+            }
+            return narrowed;
         }
         match self.table.get(excluded) {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => return ty,
@@ -2226,20 +2244,56 @@ impl<'a> NarrowingContext<'a> {
             | Type::ConstructorType { .. }
             | Type::TypeQuery { .. } => {}
         }
+        let nullish = match self.table.get(excluded) {
+            Type::Union(parts) => parts
+                .iter()
+                .all(|part| self.table.is_exactly_nullish(*part)),
+            _ => self.table.is_exactly_nullish(excluded),
+        };
         match self.table.get(ty).clone() {
-            Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown | Type::Never => ty,
+            Type::Error | Type::Any | Type::Unknown | Type::Never => ty,
+            Type::Intersection(mut members) if nullish => {
+                if members.iter().any(|&member| {
+                    matches!(
+                        self.table.get(self.table.underlying_type(member)),
+                        Type::Any | Type::Error
+                    )
+                }) {
+                    return ty;
+                }
+                let mut narrowed = false;
+                for member in &mut members {
+                    let remaining = self.subtract(*member, excluded, depth + 1);
+                    if remaining == self.table.never() {
+                        return remaining;
+                    }
+                    narrowed |= remaining != *member;
+                    *member = remaining;
+                }
+                if narrowed {
+                    self.table.intersection(members)
+                } else {
+                    ty
+                }
+            }
+            Type::Intersection(_) => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
                 for member in members {
-                    if matches!(self.table.get(member), Type::Error)
-                        || !self.table.assignable(member, excluded)
+                    if nullish {
+                        let remaining = self.subtract(member, excluded, depth + 1);
+                        if remaining != self.table.never() {
+                            kept.push(remaining);
+                        }
+                    } else if matches!(self.table.get(member), Type::Error)
+                        || !self.is_excluded(member, excluded, nullish)
                     {
                         kept.push(member);
                     }
                 }
                 self.table.union(&kept)
             }
-            _ if self.table.assignable(ty, excluded) => self.table.never(),
+            _ if self.is_excluded(ty, excluded, nullish) => self.table.never(),
             Type::Void
             | Type::Null
             | Type::Undefined

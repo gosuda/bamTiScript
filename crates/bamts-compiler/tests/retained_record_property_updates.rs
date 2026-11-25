@@ -785,3 +785,26 @@ if (\u0072oot !== undefined) {
         assert_eq!(binding_type(&model, name), model.types().bigint(), "{name}");
     }
 }
+
+#[test]
+fn an_undefined_guard_refines_nullable_intersection_factors_before_update() {
+    let model = checked_model(
+        r#"
+function update(value: (number | undefined) & unknown) {
+    if (value !== undefined) {
+        const post = value++;
+        const accepted: number = value;
+    }
+    value++;
+}
+function wrongGuard(value: (number | undefined | null) & unknown) {
+    if (value !== undefined) {
+        value++;
+    }
+}
+"#,
+        ScriptKind::TypeScript,
+        &["BAMTS-C062"; 2],
+    );
+    assert_eq!(binding_type(&model, "post"), model.types().number());
+}

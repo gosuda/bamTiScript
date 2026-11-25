@@ -3993,10 +3993,18 @@ impl TypeTable {
         let Type::IndexedAccess { object, index } = self.get(target) else {
             return IndexedAccessConstraint::Invalid;
         };
+        self.indexed_access_write_constraint(*object, *index)
+    }
+
+    pub(super) fn indexed_access_write_constraint(
+        &self,
+        object: TypeId,
+        index: TypeId,
+    ) -> IndexedAccessConstraint {
         let mut active = HashSet::new();
         self.indexed_access_constraint(
-            *object,
-            *index,
+            object,
+            index,
             IndexedAccessConstraintMode::Write,
             &mut active,
         )
@@ -4384,7 +4392,21 @@ impl TypeTable {
                 Some(self.union(&found))
             }
             _ => {
-                let view = self.indexed_access_view(object);
+                let mut active = KeyReduction::default();
+                let mut view = object;
+                loop {
+                    if active.types.contains_key(&view) {
+                        return None;
+                    }
+                    let next = self.indexed_access_view(view);
+                    if next == view {
+                        break;
+                    }
+                    if !active.enter(self, view) {
+                        return None;
+                    }
+                    view = next;
+                }
                 self.try_reduce_indexed_access_by_view(view, object, index)
             }
         }
@@ -27349,7 +27371,9 @@ impl<'src> Binder<'src> {
         let facts = resolved[&operand];
         let result = match facts.kinds {
             BIGINT => self.types.bigint(),
-            BOTH => self.types.union(&[self.types.number(), self.types.bigint()]),
+            BOTH => self
+                .types
+                .union(&[self.types.number(), self.types.bigint()]),
             _ => self.types.number(),
         };
         (result, facts.nullable != 0, facts.numeric)

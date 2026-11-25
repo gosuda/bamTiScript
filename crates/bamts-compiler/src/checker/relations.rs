@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use bamts_bytecode::MAX_BIGINT_BYTES;
+use smallvec::SmallVec;
 
 use super::binder::{
     ConstraintTypeExpr, ConstructEntry, FunctionParameter, FunctionSignature,
@@ -34,6 +35,8 @@ use crate::syntax::Accessibility;
 /// results stay deterministic because the algebra never depends on cache state.
 const RELATION_CACHE_CAPACITY: usize = 4096;
 const ERASURE_VARIANTS_PER_RELATION: usize = 8;
+
+type SignatureArgument = SmallVec<[TypeId; 2]>;
 
 /// A compatibility decision plus the intentional TypeScript hazards that made
 /// the conversion possible.
@@ -111,6 +114,8 @@ struct RelationContext {
     parameter_aliases: Box<[(SymbolId, SymbolId)]>,
     alpha_aliases: usize,
     erasure_active: bool,
+    inferred_type_arguments: SmallVec<[(SymbolId, SignatureArgument); 4]>,
+    known_type_parameters: SmallVec<[SymbolId; 4]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -206,7 +211,7 @@ pub struct TypeRelations<'table> {
     /// Type parameters inferred from the non-generic signature during a
     /// generic-to-non-generic function comparison, mapped to their inferred
     /// concrete types. Non-empty only inside such a comparison.
-    inferred_type_arguments: RefCell<HashMap<SymbolId, TypeId>>,
+    inferred_type_arguments: RefCell<HashMap<SymbolId, SignatureArgument>>,
     /// All type-parameter symbols declared by the signatures currently being
     /// compared, so unconstrained parameters can be treated as `unknown`
     /// (their implicit constraint) without consulting the symbol table.
@@ -599,7 +604,14 @@ impl<'table> TypeRelations<'table> {
     ) -> usize {
         parameter_aliases.sort_unstable();
         parameter_aliases.dedup();
-        if parameter_aliases.is_empty() && alpha_aliases == 0 && !erasure_active {
+        let inferred_type_arguments = self.inferred_type_arguments.borrow();
+        let known_type_parameters = self.known_type_parameters.borrow();
+        if parameter_aliases.is_empty()
+            && alpha_aliases == 0
+            && !erasure_active
+            && inferred_type_arguments.is_empty()
+            && known_type_parameters.is_empty()
+        {
             return 0;
         }
 
@@ -607,6 +619,19 @@ impl<'table> TypeRelations<'table> {
             parameter_aliases: parameter_aliases.into_boxed_slice(),
             alpha_aliases,
             erasure_active,
+            inferred_type_arguments: {
+                let mut arguments: SmallVec<_> = inferred_type_arguments
+                    .iter()
+                    .map(|(&symbol, argument)| (symbol, argument.clone()))
+                    .collect();
+                arguments.sort_unstable_by_key(|(symbol, _)| *symbol);
+                arguments
+            },
+            known_type_parameters: {
+                let mut parameters: SmallVec<_> = known_type_parameters.iter().copied().collect();
+                parameters.sort_unstable();
+                parameters
+            },
         };
         let mut contexts = self.contexts.borrow_mut();
         let next = contexts.len() + 1;
@@ -1063,15 +1088,23 @@ impl<'table> TypeRelations<'table> {
             // Inferred type argument: a generic signature's type parameter
             // that was positionally inferred from the non-generic counterpart.
             // Substitute the inferred concrete type and continue.
-            (Type::Named(symbol), _)
-                if let Some(&inferred) = self.inferred_type_arguments.borrow().get(symbol) =>
-            {
-                inferred != source && self.relates(inferred, target, strictness)
+            (Type::Named(symbol), _) if let Some(inferred) = self.inferred_argument(*symbol) => {
+                inferred.iter().all(|&argument| {
+                    argument != source && self.relates(argument, target, strictness)
+                })
             }
-            (_, Type::Named(symbol))
-                if let Some(&inferred) = self.inferred_type_arguments.borrow().get(symbol) =>
-            {
-                inferred != target && self.relates(source, inferred, strictness)
+            (_, Type::Named(symbol)) if let Some(inferred) = self.inferred_argument(*symbol) => {
+                let accepts = |source| {
+                    inferred.iter().any(|&argument| {
+                        argument != target && self.relates(source, argument, strictness)
+                    })
+                };
+                match from {
+                    Type::Union(members) if inferred.len() > 1 => {
+                        members.iter().copied().all(accepts)
+                    }
+                    _ => accepts(source),
+                }
             }
             // Generic signatures compare their type parameters by position.
             // Resolve that temporary identity before consulting constraints;
@@ -1159,8 +1192,14 @@ impl<'table> TypeRelations<'table> {
                     object: target_object,
                     index: target_index,
                 },
-            ) if self.same_indexed_operand(*source_object, *target_object)
-                && self.same_indexed_operand(*source_index, *target_index) =>
+            ) if self.same_indexed_operand(*source_index, *target_index)
+                && (self.same_indexed_operand(*source_object, *target_object)
+                    || self.correlated_fields_relate(
+                        *source_object,
+                        *target_object,
+                        *target_index,
+                        strictness,
+                    )) =>
             {
                 true
             }
@@ -1243,11 +1282,10 @@ impl<'table> TypeRelations<'table> {
             ) => {
                 (source_optional.is_none() || target_optional.is_some())
                     && self.relates(*target_key, *source_key, strictness)
-                    && self.relates(
-                        *source_value,
-                        target_optional.unwrap_or(*target_value),
-                        strictness,
-                    )
+                    && (self.relates(*source_value, *target_value, strictness)
+                        || target_optional.is_some_and(|optional_value| {
+                            self.relates(*source_value, optional_value, strictness)
+                        }))
             }
             (Type::Record { .. }, Type::Object) => true,
             (Type::Never, Type::Record { .. }) => true,
@@ -1532,13 +1570,7 @@ impl<'table> TypeRelations<'table> {
         // inferred. Strict subtype keeps the nominal comparison.
         if source_parameters.len() != target_parameters.len() {
             if matches!(strictness, Strictness::Assignable | Strictness::StrictNull) {
-                return self.with_inferred_parameters(
-                    source,
-                    target,
-                    source_parameters,
-                    target_parameters,
-                    compare,
-                );
+                return self.with_inferred_parameters(source, target, strictness, compare);
             }
             return compare();
         }
@@ -1606,102 +1638,71 @@ impl<'table> TypeRelations<'table> {
         &self,
         source: &FunctionSignature,
         target: &FunctionSignature,
-        source_parameters: &[SymbolId],
-        target_parameters: &[SymbolId],
+        strictness: Strictness,
         compare: impl FnOnce() -> bool,
     ) -> bool {
         let previous_context = self.active_context.get();
 
-        // Register source type parameters as known so unconstrained ones
-        // are treated as `unknown` (their implicit constraint). Target TPs
-        // are only registered when the source is also generic — otherwise
-        // the target's unconstrained TPs should go through the normal
-        // constraint arms, not be collapsed to `unknown` (which would make
-        // everything assignable to them).
-        let mut known = self.known_type_parameters.borrow_mut();
-        known.extend(source_parameters.iter().copied());
-        if !source_parameters.is_empty() {
-            known.extend(target_parameters.iter().copied());
+        let source_parameters = source.type_parameters();
+        let target_parameters = target.type_parameters();
+        let mut candidates = SmallVec::<[(SymbolId, SignatureArgument); 4]>::new();
+        for &symbol in source_parameters {
+            let argument = self
+                .infer_type_argument(symbol, source, target)
+                .unwrap_or_else(|| {
+                    smallvec::smallvec![
+                        self.table
+                            .type_parameter_constraint(symbol)
+                            .unwrap_or_else(|| self.table.unknown())
+                    ]
+                });
+            candidates.push((symbol, argument));
         }
-        drop(known);
+        for &symbol in target_parameters {
+            if let Some(argument) = self.infer_type_argument(symbol, target, source) {
+                candidates.push((symbol, argument));
+            }
+        }
 
-        // Infer source type parameters from target parameter types.
+        let mut inferred_added = SmallVec::<[SymbolId; 4]>::new();
         let mut inferred = self.inferred_type_arguments.borrow_mut();
-        let inferred_added: Vec<SymbolId>;
-        if !source_parameters.is_empty() && target_parameters.is_empty() {
-            // Source is generic, target is not: infer source TPs from target params.
-            inferred_added = source_parameters.to_vec();
-            for &tp in source_parameters {
-                inferred
-                    .entry(tp)
-                    .or_insert_with(|| self.infer_type_argument(tp, source, target));
+        for (symbol, argument) in candidates {
+            if let std::collections::hash_map::Entry::Vacant(entry) = inferred.entry(symbol) {
+                entry.insert(argument);
+                inferred_added.push(symbol);
             }
-        } else if source_parameters.is_empty() && !target_parameters.is_empty() {
-            // Target is generic, source is not: infer target TPs from
-            // source parameter types so the comparison uses the concrete
-            // instantiations. Only infer when a real match is found —
-            // falling back to `unknown` would make everything assignable
-            // to the target, which is wrong.
-            let mut added: Vec<SymbolId> = Vec::new();
-            let target_params = target.parameters();
-            let source_params = source.parameters();
-            for &tp in target_parameters {
-                for (tp_param, src_param) in target_params.iter().zip(source_params.iter()) {
-                    if let Some(inferred_type) =
-                        self.infer_from_type(tp, tp_param.type_id(), src_param.type_id())
-                    {
-                        inferred.entry(tp).or_insert(inferred_type);
-                        added.push(tp);
-                        break;
-                    }
-                }
-            }
-            inferred_added = added;
-        } else {
-            // Both generic with different arities: infer source TPs from
-            // target params (with `unknown` fallback for unconstrained),
-            // and target TPs from source params (only on real match —
-            // `unknown` fallback would make everything assignable).
-            let mut added: Vec<SymbolId> = source_parameters.to_vec();
-            for &tp in source_parameters {
-                inferred
-                    .entry(tp)
-                    .or_insert_with(|| self.infer_type_argument(tp, source, target));
-            }
-            let target_params = target.parameters();
-            let source_params = source.parameters();
-            for &tp in target_parameters {
-                for (tp_param, src_param) in target_params.iter().zip(source_params.iter()) {
-                    if let Some(inferred_type) =
-                        self.infer_from_type(tp, tp_param.type_id(), src_param.type_id())
-                    {
-                        inferred.entry(tp).or_insert(inferred_type);
-                        added.push(tp);
-                        break;
-                    }
-                }
-            }
-            inferred_added = added;
         }
         drop(inferred);
+
+        let mut known = self.known_type_parameters.borrow_mut();
+        let mut known_added = SmallVec::<[SymbolId; 4]>::new();
+        let known_targets = if source_parameters.is_empty() {
+            &[]
+        } else {
+            target_parameters
+        };
+        for &symbol in source_parameters.iter().chain(known_targets) {
+            if known.insert(symbol) {
+                known_added.push(symbol);
+            }
+        }
+        drop(known);
 
         self.refresh_context();
-        let result = compare();
+        let result = self.signature_arguments_satisfy_bounds(source, strictness)
+            && self.signature_arguments_satisfy_bounds(target, strictness)
+            && compare();
 
-        // Clean up.
         let mut inferred = self.inferred_type_arguments.borrow_mut();
-        for tp in &inferred_added {
-            inferred.remove(tp);
+        for symbol in inferred_added {
+            inferred.remove(&symbol);
         }
         drop(inferred);
-
         let mut known = self.known_type_parameters.borrow_mut();
-        // Remove only the ones we added (they were not present before).
-        for tp in source_parameters.iter().chain(target_parameters.iter()) {
-            known.remove(tp);
+        for symbol in known_added {
+            known.remove(&symbol);
         }
         drop(known);
-
         self.active_context.set(previous_context);
         result
     }
@@ -1713,27 +1714,81 @@ impl<'table> TypeRelations<'table> {
         tp: SymbolId,
         generic: &FunctionSignature,
         concrete: &FunctionSignature,
-    ) -> TypeId {
-        let generic_params = generic.parameters();
-        let concrete_params = concrete.parameters();
-        for (generic_param, concrete_param) in generic_params.iter().zip(concrete_params.iter()) {
-            if let Some(inferred) =
-                self.infer_from_type(tp, generic_param.type_id(), concrete_param.type_id())
-            {
-                return inferred;
-            }
+    ) -> Option<SignatureArgument> {
+        generic
+            .parameters()
+            .iter()
+            .zip(concrete.parameters())
+            .find_map(|(pattern, concrete)| {
+                self.infer_from_type(tp, pattern.type_id(), concrete.type_id())
+            })
+    }
+
+    fn inferred_argument(&self, symbol: SymbolId) -> Option<SignatureArgument> {
+        self.inferred_type_arguments.borrow().get(&symbol).cloned()
+    }
+
+    fn signature_arguments_satisfy_bounds(
+        &self,
+        signature: &FunctionSignature,
+        strictness: Strictness,
+    ) -> bool {
+        signature
+            .type_parameters()
+            .iter()
+            .zip(signature.type_parameter_bounds())
+            .all(|(&symbol, bound)| {
+                let Some(constraint) = bound.constraint() else {
+                    return true;
+                };
+                self.inferred_argument(symbol).is_none_or(|argument| {
+                    argument.iter().all(|&candidate| {
+                        self.argument_satisfies_bound(candidate, constraint, strictness)
+                    })
+                })
+            })
+    }
+
+    fn argument_satisfies_bound(
+        &self,
+        argument: TypeId,
+        bound: TypeId,
+        strictness: Strictness,
+    ) -> bool {
+        if argument == bound {
+            return true;
         }
-        // Could not infer from parameters: use the constraint, or `unknown`.
-        self.table
-            .type_parameter_constraint(tp)
-            .unwrap_or_else(|| self.table.unknown())
+        if let Some(view) = self.relation_alias_view(bound)
+            && let Type::IndexedAccess { object, index } = self.table.get(view)
+            && let (Some(mapped_object), Some(mapped_index)) = (
+                self.indexed_operand_identity(*object),
+                self.indexed_operand_identity(*index),
+            )
+            && (mapped_object != *object || mapped_index != *index)
+        {
+            return match self
+                .table
+                .indexed_access_write_constraint(mapped_object, mapped_index)
+            {
+                IndexedAccessConstraint::Reduced(expression) => {
+                    self.constraint_target_relates(argument, &expression, strictness)
+                }
+                IndexedAccessConstraint::Invalid => false,
+            };
+        }
+        self.relates(argument, bound, strictness)
     }
 
     /// Recursively matches `pattern` (which may contain the type parameter
     /// `tp`) against `concrete` to infer `tp`'s type.
-    fn infer_from_type(&self, tp: SymbolId, pattern: TypeId, concrete: TypeId) -> Option<TypeId> {
+    fn infer_from_type(
+        &self,
+        tp: SymbolId,
+        pattern: TypeId,
+        concrete: TypeId,
+    ) -> Option<SignatureArgument> {
         match self.table.get(pattern) {
-            Type::Named(symbol) if *symbol == tp => Some(concrete),
+            Type::Named(symbol) if *symbol == tp => Some(smallvec::smallvec![concrete]),
             Type::Array(element) => {
                 if let Type::Array(concrete_element) = self.table.get(concrete) {
                     self.infer_from_type(tp, *element, *concrete_element)
@@ -1742,8 +1797,8 @@ impl<'table> TypeRelations<'table> {
                     let mut inferred = None;
                     for &elem in concrete_shape.all_element_types().iter() {
                         if let Some(elem_inferred) = self.infer_from_type(tp, *element, elem) {
-                            if let Some(existing) = inferred {
-                                if existing != elem_inferred {
+                            if let Some(existing) = &inferred {
+                                if *existing != elem_inferred {
                                     return None;
                                 }
                             } else {
@@ -1800,21 +1855,53 @@ impl<'table> TypeRelations<'table> {
             Type::ObjectType(_) | Type::Record { .. } => {
                 let object = self.table.current_object_view(pattern)?;
                 let concrete_object = self.table.current_object_view(concrete)?;
+                let record = matches!(self.table.get(pattern), Type::Record { .. });
+                let mut candidates = SignatureArgument::new();
                 for pattern_prop in &object.properties {
                     if let Some(concrete_prop) = concrete_object
                         .properties
-                        .iter()
-                        .find(|property| property.name() == pattern_prop.name())
+                        .binary_search_by(|property| property.name().cmp(pattern_prop.name()))
+                        .ok()
+                        .map(|index| &concrete_object.properties[index])
                         && let Some(inferred) = self.infer_from_type(
                             tp,
                             pattern_prop.type_id(),
                             concrete_prop.type_id(),
                         )
                     {
-                        return Some(inferred);
+                        if !record {
+                            return Some(inferred);
+                        }
+                        for candidate in inferred {
+                            if !candidates.contains(&candidate) {
+                                candidates.push(candidate);
+                            }
+                        }
                     }
                 }
-                None
+                if let Some(candidate) = candidates.iter().copied().find(|candidate| {
+                    candidates
+                        .iter()
+                        .all(|other| self.relates(*other, *candidate, Strictness::Strict))
+                }) {
+                    return Some(smallvec::smallvec![candidate]);
+                }
+                let &first = candidates.first()?;
+                let literal_domain = |value| match self.table.get(value) {
+                    Type::NumberLiteral(_) => Some(PrimitiveDomain::Number),
+                    Type::BigIntLiteral(_) => Some(PrimitiveDomain::BigInt),
+                    Type::StringLiteral(_) => Some(PrimitiveDomain::String),
+                    Type::BooleanLiteral(_) => Some(PrimitiveDomain::Boolean),
+                    _ => None,
+                };
+                if let Some(domain) = literal_domain(first)
+                    && candidates
+                        .iter()
+                        .all(|&value| literal_domain(value) == Some(domain))
+                {
+                    return Some(candidates);
+                }
+                Some(smallvec::smallvec![first])
             }
             _ => None,
         }
@@ -1894,25 +1981,11 @@ impl<'table> TypeRelations<'table> {
         if source == target {
             return true;
         }
-        let identity = |mut type_id: TypeId| {
-            let mut visiting = HashSet::new();
-            loop {
-                if !visiting.insert(type_id) {
-                    return None;
-                }
-                let view = self.relation_alias_view(type_id)?;
-                let view = self.table.constructor_identity(view);
-                if let Type::Named(symbol) = self.table.get(view)
-                    && let Some(&inferred) = self.inferred_type_arguments.borrow().get(symbol)
-                    && inferred != view
-                {
-                    type_id = inferred;
-                    continue;
-                }
-                return Some(view);
-            }
-        };
-        let (Some(source), Some(target)) = (identity(source), identity(target)) else {
+        let identities = (
+            self.indexed_operand_identity(source),
+            self.indexed_operand_identity(target),
+        );
+        let (Some(source), Some(target)) = identities else {
             return false;
         };
         source == target
@@ -1924,6 +1997,32 @@ impl<'table> TypeRelations<'table> {
                         .borrow()
                         .contains(&(*source_symbol, *target_symbol))
             )
+    }
+
+    fn indexed_operand_identity(&self, mut type_id: TypeId) -> Option<TypeId> {
+        let mut visiting = SmallVec::<[TypeId; 4]>::new();
+        loop {
+            let view = self
+                .table
+                .constructor_identity(self.relation_alias_view(type_id)?);
+            if let Type::Named(symbol) = self.table.get(view)
+                && let Some(inferred) = self.inferred_argument(*symbol)
+            {
+                let &[inferred] = inferred.as_slice() else {
+                    return None;
+                };
+                if inferred == view {
+                    return Some(view);
+                }
+                if visiting.contains(&type_id) {
+                    return None;
+                }
+                visiting.push(type_id);
+                type_id = inferred;
+                continue;
+            }
+            return Some(view);
+        }
     }
 
     /// Follows transparent alias heads without classifying a missing or cyclic
@@ -1947,6 +2046,58 @@ impl<'table> TypeRelations<'table> {
                 _ => return Some(type_id),
             }
         }
+    }
+
+    fn correlated_fields_relate(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        index: TypeId,
+        strictness: Strictness,
+    ) -> bool {
+        if strictness == Strictness::Comparable || !self.relates(source, target, strictness) {
+            return false;
+        }
+        let mut pending: SmallVec<[TypeId; 8]> = smallvec::smallvec![index];
+        let mut visiting = HashSet::new();
+        let mut has_key = false;
+        while let Some(index) = pending.pop() {
+            let Some(index) = self.indexed_operand_identity(index) else {
+                return false;
+            };
+            let index = self.table.keyof_projection_view(index).unwrap_or(index);
+            if !visiting.insert(index) {
+                continue;
+            }
+            match self.table.get(index) {
+                Type::Named(symbol) => {
+                    let Some(bound) = self.table.type_parameter_constraint(*symbol) else {
+                        return false;
+                    };
+                    pending.push(bound);
+                }
+                Type::Union(keys) => pending.extend(keys.iter().copied()),
+                Type::Never => {}
+                Type::StringLiteral(_) | Type::NumberLiteral(_) => {
+                    let (
+                        IndexedAccessConstraint::Reduced(source_field),
+                        IndexedAccessConstraint::Reduced(target_field),
+                    ) = (
+                        self.table.indexed_access_write_constraint(source, index),
+                        self.table.indexed_access_write_constraint(target, index),
+                    )
+                    else {
+                        return false;
+                    };
+                    if !self.constraint_views_relate(&source_field, &target_field, strictness) {
+                        return false;
+                    }
+                    has_key = true;
+                }
+                _ => return false,
+            }
+        }
+        has_key
     }
 
     fn contains_undefined(&self, type_id: TypeId) -> bool {
@@ -2351,6 +2502,29 @@ impl<'table> TypeRelations<'table> {
         strictness: Strictness,
     ) -> bool {
         self.constraint_clauses_relate(vec![expression], Vec::new(), target, strictness)
+    }
+
+    fn constraint_views_relate(
+        &self,
+        source: &ConstraintTypeExpr,
+        target: &ConstraintTypeExpr,
+        strictness: Strictness,
+    ) -> bool {
+        use ConstraintTypeExpr::{Id, Intersection, Opaque, Union};
+        match (source, target) {
+            (Opaque, _) | (_, Opaque) => false,
+            (Id(source), Id(target)) => self.relates(*source, *target, strictness),
+            (_, Id(target)) => self.constraint_source_relates(source, *target, strictness),
+            (Union(members), _) => members
+                .iter()
+                .all(|member| self.constraint_views_relate(member, target, strictness)),
+            (_, Intersection(members)) => members
+                .iter()
+                .all(|member| self.constraint_views_relate(source, member, strictness)),
+            (_, Union(members)) => members
+                .iter()
+                .any(|member| self.constraint_views_relate(source, member, strictness)),
+        }
     }
 
     fn constraint_target_relates(
