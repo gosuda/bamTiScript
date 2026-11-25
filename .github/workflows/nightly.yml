@@ -22,7 +22,7 @@ jobs:
   preflight:
     name: Preflight sync and audit
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.label.name == 's0-nightly-dry-run')
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -80,7 +80,7 @@ jobs:
   conformance-x64:
     name: Conformance x64 receipt shard ${{ matrix.shard }}/16
     needs: preflight
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -154,7 +154,7 @@ jobs:
     name: Nightly x64 receipt accounting
     needs: conformance-x64
     if: ${{ !cancelled() && needs.conformance-x64.result != 'skipped' }}
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -221,7 +221,7 @@ jobs:
   report-aarch64:
     name: AArch64 receipt ${{ matrix.backend }}
     needs: preflight
-    runs-on: ubuntu-24.04-arm
+    runs-on: depot-ubuntu-24.04-arm
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -272,7 +272,7 @@ jobs:
     name: AArch64 receipt accounting ${{ matrix.backend }}
     needs: report-aarch64
     if: ${{ !cancelled() && needs.report-aarch64.result != 'skipped' }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: depot-ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
@@ -321,7 +321,7 @@ jobs:
   corpus:
     name: Corpus
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.label.name == 's0-nightly-dry-run')
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 60
     env:
       TZ: UTC
@@ -366,7 +366,7 @@ jobs:
   formal:
     name: Formal
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.label.name == 's0-nightly-dry-run')
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout

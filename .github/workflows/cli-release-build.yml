@@ -9,7 +9,7 @@ permissions:
 jobs:
   plan:
     name: Derive CLI build set
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     outputs:
       build-set-id: ${{ steps.plan.outputs.build-set-id }}
       source-commit: ${{ steps.plan.outputs.source-commit }}
@@ -79,10 +79,10 @@ jobs:
         include:
           - label: linux-x64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: depot-ubuntu-24.04
           - label: linux-arm64
             target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: depot-ubuntu-24.04-arm
           - label: darwin-x64
             target: x86_64-apple-darwin
             runner: macos-15-intel
@@ -196,7 +196,7 @@ jobs:
   assemble:
     name: Assemble CLI facade
     needs: [plan, build]
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
