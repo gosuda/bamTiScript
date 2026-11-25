@@ -544,7 +544,7 @@ impl PropertyType {
     }
 
     #[must_use]
-    const fn string_name(&self) -> bool {
+    pub(crate) const fn string_name(&self) -> bool {
         matches!(
             self.name_kind,
             PropertyNameKind::String | PropertyNameKind::StringAndNumber
@@ -4006,6 +4006,24 @@ impl TypeTable {
             object,
             index,
             IndexedAccessConstraintMode::Write,
+            &mut active,
+        )
+    }
+
+    /// Read-mode constraint for an indexed access whose object and index are
+    /// already concrete: the value the read selects, unioned over possible
+    /// keys. Write mode (see `indexed_access_write_constraint`) intersects
+    /// instead, which is the wrong rule once both operands are concrete.
+    pub(super) fn indexed_access_read_constraint(
+        &self,
+        object: TypeId,
+        index: TypeId,
+    ) -> IndexedAccessConstraint {
+        let mut active = HashSet::new();
+        self.indexed_access_constraint(
+            object,
+            index,
+            IndexedAccessConstraintMode::Read,
             &mut active,
         )
     }

@@ -12865,3 +12865,83 @@ fn narrower_source_parameter_rejects_wider_bounded_generic_target() {
         checked.diagnostics()
     );
 }
+
+#[test]
+fn concrete_key_satisfies_deferred_keyof_bound() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. Specializing
+    // `K extends keyof T` against `({ x: number }, "x")` resolves the
+    // operand, and `"x"` belongs to its key domain.
+    let checked = check_text(
+        "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+         const get_x: (obj: { x: number }, key: \"x\") => \"x\" = get_key;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a key present on the inferred object must satisfy a deferred keyof bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn absent_key_rejects_deferred_keyof_bound() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): TS2322.
+    let checked = check_text(
+        "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+         const get_y: (obj: { x: number }, key: \"y\") => \"y\" = get_key;",
+    );
+    assert!(
+        checker_codes(&checked)
+            .iter()
+            .any(|code| *code == TYPE_NOT_ASSIGNABLE.as_str()),
+        "a key absent from the inferred object must not satisfy a deferred keyof bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn union_key_validates_indexed_bound_by_read_union() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. The read of
+    // `obj[key]` over `"a" | "b"` is `number | string`, which the
+    // candidate `number` satisfies.
+    let checked = check_text(
+        "declare const take: <T extends { a: unknown; b: unknown }, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+         const use_number: (obj: { a: number; b: string }, key: \"a\" | \"b\", value: number) => number = take;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a value from one selected property must satisfy a concrete indexed bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn unrelated_value_rejects_indexed_bound() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): TS2322 (`boolean` is not
+    // assignable to `string | number`).
+    let checked = check_text(
+        "declare const take: <T extends { a: unknown; b: unknown }, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+         const use_boolean: (obj: { a: number; b: string }, key: \"a\" | \"b\", value: boolean) => boolean = take;",
+    );
+    assert!(
+        checker_codes(&checked)
+            .iter()
+            .any(|code| *code == TYPE_NOT_ASSIGNABLE.as_str()),
+        "a value from no selected property must not satisfy a concrete indexed bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn single_key_with_union_property_accepts_member() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. `T["a"]` reads
+    // `number | string`, which the candidate `string` satisfies.
+    let checked = check_text(
+        "declare const take_one: <T extends { a: unknown }, K extends \"a\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+         const use_string: (obj: { a: number | string }, key: \"a\", value: string) => string = take_one;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a member of a union-typed property must satisfy a concrete indexed bound: {:?}",
+        checked.diagnostics()
+    );
+}

@@ -1779,25 +1779,104 @@ impl<'table> TypeRelations<'table> {
         if argument == bound {
             return true;
         }
-        if let Some(view) = self.relation_alias_view(bound)
-            && let Type::IndexedAccess { object, index } = self.table.get(view)
-            && let (Some(mapped_object), Some(mapped_index)) = (
-                self.indexed_operand_identity(*object),
-                self.indexed_operand_identity(*index),
-            )
-            && (mapped_object != *object || mapped_index != *index)
-        {
-            return match self
-                .table
-                .indexed_access_write_constraint(mapped_object, mapped_index)
+        if let Some(view) = self.relation_alias_view(bound) {
+            if let Type::Keyof(operand) = self.table.get(view)
+                && let Some(mapped) = self.indexed_operand_identity(*operand)
+                && mapped != *operand
+                && let Some(object) = self.table.current_object_view(mapped)
+                && object.index_signatures.is_empty()
+                && let Some(name) = self.candidate_key_name(argument)
             {
-                IndexedAccessConstraint::Reduced(expression) => {
-                    self.constraint_target_relates(argument, &expression, strictness)
+                // The inferred operand is concrete, so the deferred `keyof`
+                // bound has a fixed key domain: the object's own public
+                // string and numeric property names, exactly as `keyof`
+                // reduction computes them. Anything else keeps the general
+                // relation below.
+                let literal = self.table.get(argument);
+                return object.properties.iter().any(|property| {
+                    property.access() == Accessibility::Public
+                        && property.name() == name.as_str()
+                        && match literal {
+                            Type::StringLiteral(_) => property.string_name(),
+                            Type::NumberLiteral(_) => property.numeric_name(),
+                            _ => false,
+                        }
+                });
+            }
+            if let Type::IndexedAccess { object, index } = self.table.get(view)
+                && let (Some(mapped_object), Some(mapped_index)) = (
+                    self.indexed_operand_identity(*object),
+                    self.indexed_operand_identity(*index),
+                )
+                && (mapped_object != *object || mapped_index != *index)
+            {
+                if self.indexed_object_is_concrete(mapped_object) {
+                    // Both operands are already concrete, so the bound
+                    // describes the value the read selects: validate against
+                    // the read union, where one selected property suffices.
+                    return match self
+                        .table
+                        .indexed_access_read_constraint(mapped_object, mapped_index)
+                    {
+                        IndexedAccessConstraint::Reduced(expression) => {
+                            self.constraint_target_relates(argument, &expression, strictness)
+                        }
+                        IndexedAccessConstraint::Invalid => false,
+                    };
                 }
-                IndexedAccessConstraint::Invalid => false,
-            };
+                return match self
+                    .table
+                    .indexed_access_write_constraint(mapped_object, mapped_index)
+                {
+                    IndexedAccessConstraint::Reduced(expression) => {
+                        self.constraint_target_relates(argument, &expression, strictness)
+                    }
+                    IndexedAccessConstraint::Invalid => false,
+                };
+            }
         }
         self.relates(argument, bound, strictness)
+    }
+
+    /// The property key a bound candidate names, when it is a single
+    /// literal. String literals compare by strict UTF-8 decoding and numeric
+    /// literals by their canonical text, matching how `keyof` reduction
+    /// cooks property names.
+    fn candidate_key_name(&self, argument: TypeId) -> Option<String> {
+        match self.table.get(argument) {
+            Type::StringLiteral(name) => name.to_utf8_strict().ok(),
+            Type::NumberLiteral(name) => Some(name.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Whether read-mode reduction may touch this object: read mode
+    /// substitutes an unresolved generic object's upper bound, so it is only
+    /// valid once inference has produced a concrete operand. A named type
+    /// without a declared constraint is already concrete (an unconstrained
+    /// parameter keeps its identity through read mode).
+    fn indexed_object_is_concrete(&self, mut object: TypeId) -> bool {
+        let mut visiting = HashSet::new();
+        loop {
+            if !visiting.insert(object) {
+                return false;
+            }
+            match self.table.get(object) {
+                Type::AppliedAlias { .. } => {
+                    let Some(view) = self.table.applied_alias_view(object) else {
+                        return false;
+                    };
+                    object = view;
+                }
+                Type::TypeQuery { target, .. } => {
+                    object = *target;
+                }
+                Type::Named(symbol) => {
+                    return self.table.type_parameter_constraint(*symbol).is_none();
+                }
+                _ => return true,
+            }
+        }
     }
 
     /// Recursively matches `pattern` (which may contain the type parameter
