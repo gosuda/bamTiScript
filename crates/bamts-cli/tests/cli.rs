@@ -323,9 +323,24 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
         stdin
             .write_all(&framed(&payload))
             .expect("cancel request is written");
-        drop(stdin);
+        stdin.flush().expect("cancel request is flushed");
+        let shutdown = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "shutdown",
+        });
+        let payload = serde_json::to_vec(&shutdown).expect("shutdown request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("shutdown request is written");
+        stdin.flush().expect("shutdown request is flushed");
+        // Keep stdin open across the wait: cancellation runs `taskkill`
+        // while the transport still has a read pending on the protocol
+        // stream, so closing stdin first would let a `taskkill` that
+        // inherits stdin pass on Unix and start on Windows.
         let mut output =
             wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+        drop(stdin);
         output.stdout = stdout.join().expect("stdout reader");
         output.stderr = stderr.join().expect("stderr reader");
         (publication, output)
@@ -338,11 +353,20 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
     );
     assert_success(&output, "bamts --api");
     let responses = decode_frames(&output.stdout);
-    assert_eq!(responses.len(), 2, "initialize and execute both respond");
+    assert_eq!(
+        responses.len(),
+        3,
+        "initialize, cancelled execute, and shutdown all respond"
+    );
     let message = responses[1]["error"]["message"]
         .as_str()
         .expect("a cancelled AOT request is an API error");
     assert_eq!(message, "request was cancelled");
+    assert_eq!(
+        responses[2],
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": null}),
+        "shutdown responds after cancellation with stdin open"
+    );
     let mut remaining =
         fs::read_dir(&published).expect("AOT publication directory remains readable");
     assert!(
@@ -353,6 +377,80 @@ fn api_aot_execution_is_bounded_by_request_cancellation() {
             .is_none(),
         "the cancelled AOT image is removed"
     );
+}
+
+/// The protocol stream stays with the transport while a request runs: a child
+/// of `--api` that inherits it can take frames, and on Windows it cannot even
+/// start while the transport waits for the next frame.
+#[cfg(unix)]
+#[test]
+fn api_managed_children_do_not_read_the_protocol_stream() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "process.stdout.write(\"x\\n\");\n");
+    project.write(
+        "fake-cc",
+        "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > \"$0.stdin\"\nexit 9\n",
+    );
+    let compiler = project.path.join("fake-cc");
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))
+        .expect("fake compiler is executable");
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "root": project.path },
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "compiler/execute",
+            "params": { "args": ["run", "--target", "aot", "main.ts"] },
+        }),
+    ];
+    let mut child = project
+        .command()
+        .arg("--api")
+        .env("CC", &compiler)
+        .current_dir(&project.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bamts API child starts");
+    let mut stdin = child.stdin.take().expect("API child stdin is piped");
+    for request in requests {
+        let payload = serde_json::to_vec(&request).expect("API request serializes");
+        stdin
+            .write_all(&framed(&payload))
+            .expect("API request is written");
+    }
+    stdin.flush().expect("API requests are flushed");
+    let observed = project.path.join("fake-cc.stdin");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !observed.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the compiler probe waited on the protocol stream"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(stdin);
+    let output = wait_for_output_with_timeout(child, "bamts --api", Duration::from_secs(30));
+    assert_success(&output, "bamts --api");
+    assert_eq!(
+        fs::read(&observed).expect("the probe input is recorded"),
+        b"",
+        "the compiler probe read no protocol bytes"
+    );
+    let responses = decode_frames(&output.stdout);
+    assert_eq!(responses.len(), 2, "initialize and execute both respond");
+    let message = responses[1]["error"]["message"]
+        .as_str()
+        .expect("a rejected compiler is an API error");
+    assert!(message.contains("is unavailable"), "{message}");
 }
 
 /// Node spawns `--api` with `stdio: "pipe"`, which is a socket pair on Unix;
