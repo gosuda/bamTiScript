@@ -263,3 +263,14 @@ fn an_explicitly_structural_alias_does_not_gain_namespace_exports() {
         "a structural alias must not gain namespace exports"
     );
 }
+
+#[test]
+fn an_accessor_base_still_refreshes_a_captured_constructor_alias() {
+    assert_reads_clean(
+        "class C { static get y(): number { return 1; } }\n\
+         class D extends C {}\ntype A = typeof D;\nconst captured: A = D;\n\
+         namespace C { export const x: 1 = 1; }\n\
+         const y: number = captured.y;\nconst x: 1 = captured.x;\n",
+        "an accessor base keeps the alias view on the revisioned constructor",
+    );
+}

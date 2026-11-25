@@ -720,6 +720,7 @@ fn find_hygiene(
             .copied()
             .filter(|next| next.identifier())
             && identifier_uses(tokens, name.text) == 1
+            && !is_exported_binding(tokens, index)
         {
             push(findings, "BAMTS-W069", name, "local binding is never read");
         }
@@ -894,6 +895,13 @@ fn identifier_uses(tokens: &[SyntaxToken<'_>], name: &str) -> usize {
         .iter()
         .filter(|token| token.identifier() && token.text == name)
         .count()
+}
+
+/// An inline `export const` publishes its binding at the module boundary, so a
+/// use count of one is the declaration itself rather than a dead local. The
+/// semantic unused-local pass exempts exports the same way.
+fn is_exported_binding(tokens: &[SyntaxToken<'_>], index: usize) -> bool {
+    index > 0 && tokens[index - 1].kind == TokenKind::KwExport
 }
 
 fn find_catalog_completion(
@@ -2005,6 +2013,12 @@ mod tests {
         "BAMTS-W069",
         "function f() { const x = 1; } f();",
         "function f() { const x = 1; return x; } f();"
+    );
+    rule_test!(
+        w069_exported_binding_crosses_the_module_boundary,
+        "BAMTS-W069",
+        "const x = 1;",
+        "export const x = 1;"
     );
     rule_test!(
         w070_unused_parameter,
