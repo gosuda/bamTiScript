@@ -386,7 +386,8 @@ impl InferredTypeArguments {
     /// their original [`TypeId`].
     pub fn instantiate(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         let marker = table.substituted_alias_marker();
-        let instantiated = TypeInstantiation::new(self).instantiate_inner(table, ty);
+        let mut seen = HashSet::new();
+        let instantiated = TypeInstantiation::new(self).instantiate_inner(table, ty, &mut seen);
         table.prepare_substituted_aliases(marker);
         instantiated
     }
@@ -397,7 +398,9 @@ impl InferredTypeArguments {
         ty: TypeId,
     ) -> TypeId {
         let marker = table.substituted_alias_marker();
-        let instantiated = TypeInstantiation::new(self).instantiate_constructor(table, ty, true);
+        let mut seen = HashSet::new();
+        let instantiated =
+            TypeInstantiation::new(self).instantiate_constructor(table, ty, true, &mut seen);
         table.prepare_substituted_aliases(marker);
         instantiated
     }
@@ -411,7 +414,9 @@ impl InferredTypeArguments {
         signature: &FunctionSignature,
     ) -> TypeId {
         let marker = table.substituted_alias_marker();
-        let instantiated = TypeInstantiation::new(self).instantiate_function(table, &[], signature);
+        let mut seen = HashSet::new();
+        let instantiated =
+            TypeInstantiation::new(self).instantiate_function(table, &[], signature, &mut seen);
         table.prepare_substituted_aliases(marker);
         instantiated
     }
@@ -440,8 +445,24 @@ impl<'a> TypeInstantiation<'a> {
         }
     }
 
-    fn instantiate_inner(&mut self, table: &mut TypeTable, ty: TypeId) -> TypeId {
-        match table.instantiation_type(ty).clone() {
+    /// Re-entrancy guard: a self-referential type (a binding whose inferred
+    /// type names itself, e.g. `const arrow = () => arrow`) would otherwise
+    /// substitute forever and overflow the stack. A repeated `ty` returns
+    /// unchanged, as unmapped parameters already do. Constructor types skip
+    /// this set: their recursion is governed by `active_constructors`, which
+    /// must see a recursive reference to hand back the in-progress
+    /// projection identity.
+    fn instantiate_inner(
+        &mut self,
+        table: &mut TypeTable,
+        ty: TypeId,
+        seen: &mut HashSet<TypeId>,
+    ) -> TypeId {
+        let guarded = !matches!(table.instantiation_type(ty), Type::ConstructorType { .. });
+        if guarded && !seen.insert(ty) {
+            return ty;
+        }
+        let instantiated = match table.instantiation_type(ty).clone() {
             Type::Named(symbol) => self.substitution.get(symbol).unwrap_or(ty),
             Type::This { owner, constraint } => {
                 if let Some((expected, receiver)) = self.substitution.this_receiver
@@ -449,27 +470,27 @@ impl<'a> TypeInstantiation<'a> {
                 {
                     receiver
                 } else {
-                    let constraint = self.instantiate_inner(table, constraint);
+                    let constraint = self.instantiate_inner(table, constraint, seen);
                     table.this_type(owner, constraint)
                 }
             }
             Type::Array(element) => {
-                let element = self.instantiate_inner(table, element);
+                let element = self.instantiate_inner(table, element, seen);
                 table.array(element)
             }
             Type::Tuple(shape) => {
                 let prefix = shape
                     .prefix
                     .iter()
-                    .map(|&element| self.instantiate_inner(table, element))
+                    .map(|&element| self.instantiate_inner(table, element, seen))
                     .collect();
                 let rest = shape
                     .rest
-                    .map(|element| self.instantiate_inner(table, element));
+                    .map(|element| self.instantiate_inner(table, element, seen));
                 let suffix = shape
                     .suffix
                     .iter()
-                    .map(|&element| self.instantiate_inner(table, element))
+                    .map(|&element| self.instantiate_inner(table, element, seen))
                     .collect();
                 table.tuple_shape(TupleShape {
                     prefix,
@@ -481,14 +502,14 @@ impl<'a> TypeInstantiation<'a> {
             Type::Union(members) => {
                 let members: Vec<TypeId> = members
                     .iter()
-                    .map(|member| self.instantiate_inner(table, *member))
+                    .map(|member| self.instantiate_inner(table, *member, seen))
                     .collect();
                 table.union(&members)
             }
             Type::Intersection(members) => {
                 let members = members
                     .iter()
-                    .map(|member| self.instantiate_inner(table, *member))
+                    .map(|member| self.instantiate_inner(table, *member, seen))
                     .collect();
                 table.intersection_ordered(members)
             }
@@ -497,7 +518,11 @@ impl<'a> TypeInstantiation<'a> {
                     .properties
                     .iter()
                     .map(|property| {
-                        property.with_type_id(self.instantiate_inner(table, property.type_id()))
+                        property.with_type_id(self.instantiate_inner(
+                            table,
+                            property.type_id(),
+                            seen,
+                        ))
                     })
                     .collect();
                 let call_signatures: Vec<FunctionSignature> = object
@@ -508,6 +533,7 @@ impl<'a> TypeInstantiation<'a> {
                             table,
                             signature.type_parameters(),
                             signature,
+                            seen,
                         );
                         let Type::Function(signature) = table.get(type_id) else {
                             unreachable!("function instantiation returns a function type");
@@ -523,6 +549,7 @@ impl<'a> TypeInstantiation<'a> {
                             table,
                             entry.signature.type_parameters(),
                             &entry.signature,
+                            seen,
                         );
                         let Type::Function(signature) = table.get(type_id) else {
                             unreachable!("function instantiation returns a function type");
@@ -543,24 +570,30 @@ impl<'a> TypeInstantiation<'a> {
                             .parameters
                             .iter()
                             .map(|parameter| {
-                                parameter.with_type_id(
-                                    self.instantiate_inner(table, parameter.type_id()),
-                                )
+                                parameter.with_type_id(self.instantiate_inner(
+                                    table,
+                                    parameter.type_id(),
+                                    seen,
+                                ))
                             })
                             .collect(),
-                        value_type: self.instantiate_inner(table, signature.value_type),
+                        value_type: self.instantiate_inner(table, signature.value_type, seen),
                         declaring_types: signature.declaring_types.clone(),
                     })
                     .collect();
                 let generator_return = object
                     .generator_return
-                    .map(|return_type| self.instantiate_inner(table, return_type));
+                    .map(|return_type| self.instantiate_inner(table, return_type, seen));
                 let iterator_property = object.iterator_property.as_ref().map(|property| {
-                    property.with_type_id(self.instantiate_inner(table, property.type_id()))
+                    property.with_type_id(self.instantiate_inner(table, property.type_id(), seen))
                 });
                 let async_iterator_property =
                     object.async_iterator_property.as_ref().map(|property| {
-                        property.with_type_id(self.instantiate_inner(table, property.type_id()))
+                        property.with_type_id(self.instantiate_inner(
+                            table,
+                            property.type_id(),
+                            seen,
+                        ))
                     });
                 let call_signature_count = call_signatures.len();
                 let type_id = table.object_type_with_members(ObjectType {
@@ -586,20 +619,20 @@ impl<'a> TypeInstantiation<'a> {
                 }
             }
             Type::Function(signature) => {
-                self.instantiate_function(table, signature.type_parameters(), &signature)
+                self.instantiate_function(table, signature.type_parameters(), &signature, seen)
             }
             Type::AppliedClass { symbol, arguments } => {
                 let arguments = arguments
                     .iter()
-                    .map(|&argument| self.instantiate_inner(table, argument))
+                    .map(|&argument| self.instantiate_inner(table, argument, seen))
                     .collect();
                 table.applied_class(symbol, arguments)
             }
-            Type::ConstructorType { .. } => self.instantiate_constructor(table, ty, false),
+            Type::ConstructorType { .. } => self.instantiate_constructor(table, ty, false, seen),
             Type::AppliedAlias { symbol, arguments } => {
                 let arguments = arguments
                     .iter()
-                    .map(|&argument| self.instantiate_inner(table, argument))
+                    .map(|&argument| self.instantiate_inner(table, argument, seen))
                     .collect();
                 table.intern_substituted_alias(symbol, arguments)
             }
@@ -610,18 +643,18 @@ impl<'a> TypeInstantiation<'a> {
             } => {
                 let arguments = arguments
                     .iter()
-                    .map(|&argument| self.instantiate_inner(table, argument))
+                    .map(|&argument| self.instantiate_inner(table, argument, seen))
                     .collect();
-                let target = self.instantiate_inner(table, target);
+                let target = self.instantiate_inner(table, target, seen);
                 table.type_query(name, arguments, target)
             }
             Type::Keyof(operand) => {
-                let operand = self.instantiate_inner(table, operand);
+                let operand = self.instantiate_inner(table, operand, seen);
                 table.keyof(operand)
             }
             Type::IndexedAccess { object, index } => {
-                let object = self.instantiate_inner(table, object);
-                let index = self.instantiate_inner(table, index);
+                let object = self.instantiate_inner(table, object, seen);
+                let index = self.instantiate_inner(table, index, seen);
                 table.indexed_access(object, index)
             }
             Type::Record {
@@ -629,8 +662,8 @@ impl<'a> TypeInstantiation<'a> {
                 value,
                 optional_value,
             } => {
-                let key = self.instantiate_inner(table, key);
-                let value = self.instantiate_inner(table, value);
+                let key = self.instantiate_inner(table, key, seen);
+                let value = self.instantiate_inner(table, value, seen);
                 table.record_with_optional(key, value, optional_value.is_some())
             }
             Type::Error
@@ -652,7 +685,11 @@ impl<'a> TypeInstantiation<'a> {
             | Type::BigIntLiteral(_)
             | Type::NumericEnum(_)
             | Type::EnumMember { .. } => ty,
+        };
+        if guarded {
+            seen.remove(&ty);
         }
+        instantiated
     }
 
     fn instantiate_constructor(
@@ -660,6 +697,7 @@ impl<'a> TypeInstantiation<'a> {
         table: &mut TypeTable,
         ty: TypeId,
         preserve_projection: bool,
+        seen: &mut HashSet<TypeId>,
     ) -> TypeId {
         let source = table.constructor_identity(ty);
         if let Some(&identity) = self.active_constructors.get(&source) {
@@ -688,9 +726,9 @@ impl<'a> TypeInstantiation<'a> {
         self.active_constructors.insert(source, identity);
         let arguments = arguments
             .iter()
-            .map(|&argument| self.instantiate_inner(table, argument))
+            .map(|&argument| self.instantiate_inner(table, argument, seen))
             .collect();
-        let structural = self.instantiate_inner(table, structural);
+        let structural = self.instantiate_inner(table, structural, seen);
         let removed = self.active_constructors.remove(&source);
         debug_assert_eq!(removed, Some(identity));
         table.finish_constructor_projection(identity, arguments, structural)
@@ -841,12 +879,13 @@ impl<'a> TypeInstantiation<'a> {
         table: &mut TypeTable,
         type_parameters: &[SymbolId],
         signature: &FunctionSignature,
+        seen: &mut HashSet<TypeId>,
     ) -> TypeId {
         let parameters: Vec<FunctionParameter> = signature
             .parameters()
             .iter()
             .map(|parameter| {
-                parameter.with_type_id(self.instantiate_inner(table, parameter.type_id()))
+                parameter.with_type_id(self.instantiate_inner(table, parameter.type_id(), seen))
             })
             .collect();
         let mut bounds = Vec::with_capacity(type_parameters.len());
@@ -858,17 +897,17 @@ impl<'a> TypeInstantiation<'a> {
             for bound in signature.type_parameter_bounds() {
                 let constraint = bound
                     .constraint()
-                    .map(|constraint| self.instantiate_inner(table, constraint));
+                    .map(|constraint| self.instantiate_inner(table, constraint, seen));
                 let default = bound
                     .default()
-                    .map(|default| self.instantiate_inner(table, default));
+                    .map(|default| self.instantiate_inner(table, default, seen));
                 bounds.push(TypeParameterBounds::new(constraint, default));
             }
         }
-        let return_type = self.instantiate_inner(table, signature.return_type());
+        let return_type = self.instantiate_inner(table, signature.return_type(), seen);
         let declared_return = signature
             .declared_return()
-            .map(|declared| self.instantiate_inner(table, declared));
+            .map(|declared| self.instantiate_inner(table, declared, seen));
         let type_id = table.function_with_parameter_bounds(
             type_parameters.to_vec(),
             bounds,
