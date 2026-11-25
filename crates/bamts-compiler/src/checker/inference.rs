@@ -728,7 +728,14 @@ impl<'a> TypeInstantiation<'a> {
             .iter()
             .map(|&argument| self.instantiate_inner(table, argument, seen))
             .collect();
-        let structural = self.instantiate_inner(table, structural, seen);
+        // A constructor projection is a fresh identity governed by
+        // `active_constructors`: rebuild its structure with a fresh
+        // non-constructor recursion set, so the outer visit history cannot
+        // leak in and freeze a static method returning its own class with
+        // unsubstituted type parameters. Genuine cycles still terminate
+        // through `active_constructors`.
+        let mut projection_seen = HashSet::new();
+        let structural = self.instantiate_inner(table, structural, &mut projection_seen);
         let removed = self.active_constructors.remove(&source);
         debug_assert_eq!(removed, Some(identity));
         table.finish_constructor_projection(identity, arguments, structural)

@@ -32004,6 +32004,31 @@ mod tests {
         assert_eq!(model.types().get(text), &Type::String);
     }
 
+    #[test]
+    fn generic_factory_preserves_return_types_through_method_result_cycles() {
+        // The extracted method accepts `2`, and the class it returns
+        // must accept `3` once `T` is specialized to `number`.
+        // Oracle (tsc 5.9.3, --strict --noEmit): clean.
+        let (model, diagnostics) = bound(
+            r#"
+            function make<T extends number>(value: T) {
+                class C {
+                    static read(): T { return value; }
+                    static self(next: T) { return C; }
+                }
+                return C.self;
+            }
+            const first = make<number>(1)(2);
+            const second = make<number>(1)(2).self(3);
+            "#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let second = model.symbol_type(value_symbol(&model, "second"));
+        let Type::ConstructorType { .. } = model.types().get(second) else {
+            panic!("calling the returned self must produce the class");
+        };
+    }
+
     fn constructor_member(
         table: &mut TypeTable,
         constructor: TypeId,
