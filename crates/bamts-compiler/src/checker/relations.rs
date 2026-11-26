@@ -116,6 +116,7 @@ struct RelationContext {
     erasure_active: bool,
     inferred_type_arguments: SmallVec<[(SymbolId, SignatureArgument); 4]>,
     known_type_parameters: SmallVec<[SymbolId; 4]>,
+    rigid_type_parameter_bounds: SmallVec<[(SymbolId, TypeId); 4]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -216,6 +217,10 @@ pub struct TypeRelations<'table> {
     /// compared, so unconstrained parameters can be treated as `unknown`
     /// (their implicit constraint) without consulting the symbol table.
     known_type_parameters: RefCell<HashSet<SymbolId>>,
+    /// Caller-chosen target parameters remain distinct from their effective
+    /// bounds. Their values flow out through the bound, but a bound value
+    /// cannot fulfill an arbitrary caller-chosen subtype in a result.
+    rigid_type_parameter_bounds: RefCell<HashMap<SymbolId, TypeId>>,
     /// Cooperative cancellation signal. `None` for the non-cancellable path.
     cancel: Option<bamts_cancel::CancellationToken>,
     #[cfg(test)]
@@ -249,6 +254,7 @@ impl<'table> TypeRelations<'table> {
             erased_parameters: RefCell::new(Vec::new()),
             inferred_type_arguments: RefCell::new(HashMap::new()),
             known_type_parameters: RefCell::new(HashSet::new()),
+            rigid_type_parameter_bounds: RefCell::new(HashMap::new()),
             cancel,
             #[cfg(test)]
             computed_relations: Cell::new(0),
@@ -606,11 +612,13 @@ impl<'table> TypeRelations<'table> {
         parameter_aliases.dedup();
         let inferred_type_arguments = self.inferred_type_arguments.borrow();
         let known_type_parameters = self.known_type_parameters.borrow();
+        let rigid_type_parameter_bounds = self.rigid_type_parameter_bounds.borrow();
         if parameter_aliases.is_empty()
             && alpha_aliases == 0
             && !erasure_active
             && inferred_type_arguments.is_empty()
             && known_type_parameters.is_empty()
+            && rigid_type_parameter_bounds.is_empty()
         {
             return 0;
         }
@@ -631,6 +639,14 @@ impl<'table> TypeRelations<'table> {
                 let mut parameters: SmallVec<_> = known_type_parameters.iter().copied().collect();
                 parameters.sort_unstable();
                 parameters
+            },
+            rigid_type_parameter_bounds: {
+                let mut bounds: SmallVec<_> = rigid_type_parameter_bounds
+                    .iter()
+                    .map(|(&symbol, &bound)| (symbol, bound))
+                    .collect();
+                bounds.sort_unstable_by_key(|(symbol, _)| *symbol);
+                bounds
             },
         };
         let mut contexts = self.contexts.borrow_mut();
@@ -1117,6 +1133,39 @@ impl<'table> TypeRelations<'table> {
                     .contains(&(*source_symbol, *target_symbol)) =>
             {
                 true
+            }
+            // A universal target keeps its identity throughout nested variance
+            // checks. Only a value flowing out of the parameter may use its
+            // effective bound; accepting the bound as the parameter itself
+            // would promise a subtype chosen by a caller that we cannot return.
+            (Type::Named(symbol), _) if let Some(bound) = self.rigid_parameter_bound(*symbol) => {
+                bound != source && self.relates(bound, target, strictness)
+            }
+            (_, Type::Named(symbol)) if let Some(bound) = self.rigid_parameter_bound(*symbol) => {
+                if matches!(self.table.get(bound), Type::Error) {
+                    return true;
+                }
+                if let Some(view) = self.relation_alias_view(source)
+                    && view != source
+                {
+                    return self.relates(view, target, strictness);
+                }
+                match from {
+                    Type::Never => true,
+                    Type::Named(source_symbol) => self
+                        .table
+                        .type_parameter_constraint(*source_symbol)
+                        .is_some_and(|constraint| {
+                            constraint != source && self.relates(constraint, target, strictness)
+                        }),
+                    Type::Union(members) => members
+                        .iter()
+                        .all(|member| self.relates(*member, target, strictness)),
+                    Type::Intersection(members) => members
+                        .iter()
+                        .any(|member| self.relates(*member, target, strictness)),
+                    _ => false,
+                }
             }
             // A known type parameter without a declared constraint has an
             // implicit constraint of `unknown`: everything flows in, nothing
@@ -1633,9 +1682,10 @@ impl<'table> TypeRelations<'table> {
     /// parameters that cannot be inferred from any parameter position keep
     /// their declared constraint (or the implicit `unknown` when
     /// unconstrained), which is handled by the `known_type_parameters` arms
-    /// in `relates_uncached`. The one exception is a non-generic source:
-    /// the generic target's parameters are erased to their constraints up
-    /// front, because the source must accept every permitted instantiation.
+    /// in `relates_uncached`. For a non-generic source, target parameters
+    /// instead stay rigid under their effective signature bounds: the source
+    /// must accept every permitted input while preserving the caller's chosen
+    /// identity in all output positions.
     fn with_inferred_parameters(
         &self,
         source: &FunctionSignature,
@@ -1660,28 +1710,19 @@ impl<'table> TypeRelations<'table> {
                 });
             candidates.push((symbol, argument));
         }
-        for &symbol in target_parameters {
-            if source_parameters.is_empty() {
-                // A non-generic source is checked against the generic target
-                // with its parameters erased to their declared constraints
-                // (implicit `unknown` when unconstrained): the source must
-                // accept every permitted instantiation, so the bound — not the
-                // source's parameter type — is the input domain for
-                // contravariant parameter checks. Inferring the argument from
-                // the source would wrongly demand the source type satisfy the
-                // bound as a type argument (rejecting `(value: string)` for
-                candidates.push((
-                    symbol,
-                    smallvec::smallvec![
-                        self.table
-                            .type_parameter_constraint(symbol)
-                            .unwrap_or_else(|| self.table.unknown())
-                    ],
-                ));
-                continue;
+        if !source_parameters.is_empty() {
+            for &symbol in target_parameters {
+                if let Some(argument) = self.infer_type_argument(symbol, target, source) {
+                    candidates.push((symbol, argument));
+                }
             }
-            if let Some(argument) = self.infer_type_argument(symbol, target, source) {
-                candidates.push((symbol, argument));
+        }
+        let mut previous_rigid_bounds = SmallVec::<[(SymbolId, Option<TypeId>); 4]>::new();
+        if source_parameters.is_empty() {
+            let mut rigid = self.rigid_type_parameter_bounds.borrow_mut();
+            for (&symbol, bound) in target_parameters.iter().zip(target.type_parameter_bounds()) {
+                let constraint = bound.constraint().unwrap_or_else(|| self.table.unknown());
+                previous_rigid_bounds.push((symbol, rigid.insert(symbol, constraint)));
             }
         }
 
@@ -1724,6 +1765,18 @@ impl<'table> TypeRelations<'table> {
             known.remove(&symbol);
         }
         drop(known);
+        let mut rigid = self.rigid_type_parameter_bounds.borrow_mut();
+        for (symbol, previous) in previous_rigid_bounds {
+            match previous {
+                Some(bound) => {
+                    rigid.insert(symbol, bound);
+                }
+                None => {
+                    rigid.remove(&symbol);
+                }
+            }
+        }
+        drop(rigid);
         self.active_context.set(previous_context);
         result
     }
@@ -1747,6 +1800,13 @@ impl<'table> TypeRelations<'table> {
 
     fn inferred_argument(&self, symbol: SymbolId) -> Option<SignatureArgument> {
         self.inferred_type_arguments.borrow().get(&symbol).cloned()
+    }
+
+    fn rigid_parameter_bound(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.rigid_type_parameter_bounds
+            .borrow()
+            .get(&symbol)
+            .copied()
     }
 
     fn signature_arguments_satisfy_bounds(
@@ -4857,10 +4917,9 @@ mod tests {
         );
     }
 
-    /// A non-generic function is assignable to a generic target when the
-    /// source satisfies the type parameter's constraint. `(x: number) => number`
-    /// is assignable to `<T>(x: T) => T` because `number` is assignable to
-    /// the implicit `unknown` constraint.
+    /// A number-only function cannot implement a generic identity function:
+    /// it neither accepts every possible input nor returns the caller's chosen
+    /// type. An implicit `unknown` bound does not erase that identity.
     #[test]
     fn non_generic_function_rejected_for_unconstrained_generic_target() {
         let mut table = TypeTable::new();
@@ -4882,12 +4941,40 @@ mod tests {
         );
         let relations = TypeRelations::new(&table);
         // Oracle (tsc 5.9.3, --strict --noEmit): TS2322. The target's
-        // parameters erase to their constraints (`unknown` here), so a
-        // source that does not accept `unknown` cannot satisfy it.
+        // inputs may have any type under the implicit `unknown` bound, so a
+        // source that accepts only `number` cannot satisfy the contract.
         assert!(
             !relations.assignable(source, target),
             "(x: number) => number must not be assignable to <T>(x: T) => T"
         );
+    }
+
+    #[test]
+    fn rigid_signature_bounds_partition_relation_cache() {
+        let mut table = TypeTable::new();
+        let symbol = SymbolId::new(621);
+        let named = table.named(symbol);
+        let source = table.function(vec![table.string()], table.void());
+        let mut targets = Vec::new();
+        for bound in [table.string(), table.number()] {
+            targets.push(table.function_with_parameter_bounds(
+                vec![symbol],
+                vec![TypeParameterBounds::new(Some(bound), None)],
+                vec![FunctionParameter::new(
+                    "value".to_owned(),
+                    named,
+                    false,
+                    false,
+                )],
+                table.void(),
+                false,
+            ));
+        }
+        let relations = TypeRelations::new(&table);
+        assert!(relations.assignable(source, targets[0]));
+        assert!(!relations.assignable(source, targets[1]));
+        assert!(relations.assignable(source, targets[0]));
+        assert!(relations.rigid_type_parameter_bounds.borrow().is_empty());
     }
 
     // --- Function vs ObjectType with call signatures ---

@@ -12945,3 +12945,85 @@ fn single_key_with_union_property_accepts_member() {
         checked.diagnostics()
     );
 }
+
+#[test]
+fn generic_target_preserves_caller_chosen_results_in_nested_types() {
+    for (source_result, target_result) in [
+        ("\"x\" | \"y\"", "T"),
+        ("(\"x\" | \"y\")[]", "T[]"),
+        ("{ value: \"x\" | \"y\" }", "{ value: T }"),
+        ("() => \"x\" | \"y\"", "() => T"),
+    ] {
+        let text = format!(
+            "declare const source: (value: string) => {source_result};\n\
+             const target: <T extends \"x\" | \"y\">(value: T) => {target_result} = source;"
+        );
+        let checked = check_text(&text);
+        assert!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "a bound value cannot promise the caller's subtype in {target_result}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn generic_target_preserves_variance_inside_callbacks() {
+    let rejected = check_text(
+        "declare const call_any: (callback: (value: \"x\" | \"y\") => void) => void;\n\
+         const call_chosen: <T extends \"x\" | \"y\">(callback: (value: T) => void) => void = call_any;",
+    );
+    assert!(
+        checker_codes(&rejected).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "a callback for one chosen subtype cannot accept every bound value: {:?}",
+        rejected.diagnostics()
+    );
+    let accepted = check_text(
+        "declare const make_log: (value: string) => (item: string) => void;\n\
+         const make_chosen: <T extends \"x\" | \"y\">(value: T) => (item: T) => void = make_log;",
+    );
+    assert!(
+        checker_codes(&accepted).is_empty(),
+        "a returned callback accepting the whole bound accepts the chosen subtype: {:?}",
+        accepted.diagnostics()
+    );
+}
+
+#[test]
+fn generic_target_uses_effective_specialized_alias_bounds() {
+    let accepted = check_text(
+        "type Handler<Base> = <T extends Base>(value: T) => void;\n\
+         declare const log: (value: string) => void;\n\
+         const handler: Handler<string> = log;",
+    );
+    assert!(
+        checker_codes(&accepted).is_empty(),
+        "{:?}",
+        accepted.diagnostics()
+    );
+    let rejected = check_text(
+        "type Handler<Base> = <T extends Base>(value: T) => void;\n\
+         declare const log: (value: string) => void;\n\
+         const handler: Handler<number> = log;",
+    );
+    assert!(
+        checker_codes(&rejected).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "{:?}",
+        rejected.diagnostics()
+    );
+}
+
+#[test]
+fn generic_target_retains_never_and_any_return_concessions() {
+    for result in ["never", "any"] {
+        let checked = check_text(&format!(
+            "declare const source: (value: string) => {result};\n\
+             const target: <T extends \"x\" | \"y\">(value: T) => T = source;"
+        ));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+    }
+}
