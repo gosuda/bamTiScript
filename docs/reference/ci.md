@@ -31,8 +31,10 @@ The local benchmark tools, host fingerprint, and budgets remain intact.
 ## Release builds
 
 Manual CLI and native addon builds retain all five target artifacts.
-macOS x64 is cross-compiled on Apple silicon and smoke-tested through
-Rosetta using x64 Node. This proves translated execution on macOS, not
+macOS x64 uses an x86_64-hosted Rust toolchain and x64 Node under Rosetta
+on Apple silicon. Each build asserts that Rust's host equals its target;
+the packaged Intel CLI and addon must compile and run an AOT program.
+This proves translated execution on macOS, not
 execution on physical Intel hardware. The workflow fails if Rosetta is
 unavailable. ARM64 macOS and x64 Windows execute on their matching Depot
 hosts. Build records and preflight checks name the actual Depot labels.
