@@ -5542,8 +5542,7 @@ mod tests {
         // S0/T0 carry the leaf; each higher level fans out to four copies
         // of the previous level, so the leaves repeat 256 times while only
         // five distinct object levels exist.
-        let mut source_prev =
-            table.object_type(vec![PropertyType::new("value", false, string)]);
+        let mut source_prev = table.object_type(vec![PropertyType::new("value", false, string)]);
         let mut target_prev =
             table.object_type(vec![PropertyType::new("value", false, object_head)]);
         for _ in 1..=4 {
@@ -5559,8 +5558,7 @@ mod tests {
         let source_root = source_prev;
         let target_root = target_prev;
         let number = table.number();
-        let mut source_prev =
-            table.object_type(vec![PropertyType::new("value", false, number)]);
+        let mut source_prev = table.object_type(vec![PropertyType::new("value", false, number)]);
         let mut target_prev =
             table.object_type(vec![PropertyType::new("value", false, object_head)]);
         for _ in 1..=4 {
