@@ -19,11 +19,14 @@ Receipt interpretation follows the [verification evidence rules](../explanation/
 Direct pushes to main rely on the nightly workflow or manual dispatch;
 there is no immediate post-push pipeline.
 
-Every CI ref can save its own Rust dependency cache. The cache prefix
+PR, branch, and tag runs can save their own Rust dependency cache. Merge-group
+refs are temporary and do not save caches. The cache prefix
 includes the full ref, while the action retains its job and compiler keys,
 so a later run on the same PR can reuse dependencies without a separate
 cache-warming pipeline. Depot Cache is repository-scoped; these keys are
-ordinary reuse partitions, not an access-control boundary.
+ordinary reuse partitions, not an access-control boundary. A new ref deliberately
+starts cold instead of restoring compiler output from a different ref; later
+runs on that same PR or branch can reuse its dependencies.
 
 ## Extended verification
 

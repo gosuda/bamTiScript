@@ -15,4 +15,4 @@ runs:
           target/release
         cache-bin: false
         cache-on-failure: true
-        save-if: true
+        save-if: ${{ github.event_name != 'merge_group' }}
