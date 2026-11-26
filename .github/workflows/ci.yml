@@ -21,7 +21,7 @@ defaults:
 jobs:
   windows-native-guard:
     name: Windows native guard
-    runs-on: windows-2025
+    runs-on: depot-windows-2025
     timeout-minutes: 60
     defaults:
       run:
@@ -61,7 +61,7 @@ jobs:
 
   windows-native-linker:
     name: Windows native linker
-    runs-on: windows-2025
+    runs-on: depot-windows-2025
     timeout-minutes: 60
     defaults:
       run:
@@ -93,7 +93,7 @@ jobs:
 
   windows-native-exec:
     name: Windows native executables and lanes
-    runs-on: windows-2025
+    runs-on: depot-windows-2025
     timeout-minutes: 60
     defaults:
       run:
