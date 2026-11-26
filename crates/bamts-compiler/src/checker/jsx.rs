@@ -1298,7 +1298,7 @@ fn select_jsx_factory_signature(
         }
         let (target, result) = instantiate_jsx_factory_signature(binder, signature, props);
         let matches = match target {
-            Some(target) => binder.types.assignable(props, target),
+            Some(target) => binder.types_assignable(props, target),
             None => true,
         };
         if matches {
@@ -1589,6 +1589,38 @@ mod tests {
                 vec![]
             };
             assert_eq!(codes, expected, "strictNullChecks={strict}");
+        }
+    }
+
+    #[test]
+    fn jsx_overloads_select_the_applicable_nullable_props() {
+        for value in ["null", "\"text\""] {
+            let source = format!(
+                "declare function Widget(props: {{ value: string }}): {{}}; \
+                 declare function Widget(props: {{ value: null }}): {{}}; \
+                 const result = <Widget value={{{value}}} />;"
+            );
+            let parsed = [parser::parse(scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScriptReact,
+                Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
+            ))];
+            assert!(parsed[0].diagnostics().is_empty());
+            for strict in [false, true] {
+                let checked = check_program_with_options(
+                    ProgramCheckInput {
+                        files: &parsed,
+                        edges: &[],
+                    },
+                    &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+                    ProgramCheckOptions::standard().with_strict_null_checks(strict),
+                );
+                assert!(
+                    checked.diagnostics().is_empty(),
+                    "value={value}, strictNullChecks={strict}: {:?}",
+                    checked.diagnostics()
+                );
+            }
         }
     }
 
