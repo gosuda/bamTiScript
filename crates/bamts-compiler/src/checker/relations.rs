@@ -1152,6 +1152,9 @@ impl<'table> TypeRelations<'table> {
                 }
                 match from {
                     Type::Never => true,
+                    Type::Null | Type::Undefined if strictness == Strictness::Assignable => {
+                        bound != target && self.relates(source, bound, strictness)
+                    }
                     Type::Named(source_symbol) => self
                         .table
                         .type_parameter_constraint(*source_symbol)
@@ -4997,6 +5000,43 @@ mod tests {
             !relations.assignable(source, target),
             "(x: number) => number must not be assignable to <T>(x: T) => T"
         );
+    }
+
+    #[test]
+    fn generic_results_keep_non_strict_nullability_without_erasing_identity() {
+        let mut table = TypeTable::new();
+        let symbol = SymbolId::new(622);
+        let named = table.named(symbol);
+        let string = table.string();
+        let never = table.never();
+        let mut targets = Vec::new();
+        for bound in [string, never] {
+            targets.push(table.function_with_parameter_bounds(
+                vec![symbol],
+                vec![TypeParameterBounds::new(Some(bound), None)],
+                Vec::new(),
+                named,
+                false,
+            ));
+        }
+        let mut nullable_sources = Vec::new();
+        for result in [table.null_type(), table.undefined_type()] {
+            nullable_sources.push(table.function(Vec::new(), result));
+        }
+        let ordinary_source = table.function(Vec::new(), string);
+        let never_source = table.function(Vec::new(), never);
+        let relations = TypeRelations::new(&table);
+        for source in nullable_sources {
+            assert!(relations.assignable(source, targets[0]));
+            assert!(!relations.assignable_with_strict_null(source, targets[0]));
+            assert!(!relations.assignable(source, targets[1]));
+        }
+        assert!(!relations.assignable(ordinary_source, targets[0]));
+        assert!(!relations.assignable_with_strict_null(ordinary_source, targets[0]));
+        for target in targets {
+            assert!(relations.assignable(never_source, target));
+            assert!(relations.assignable_with_strict_null(never_source, target));
+        }
     }
 
     #[test]
