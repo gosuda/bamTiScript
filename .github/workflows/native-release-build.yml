@@ -1,7 +1,11 @@
 name: Native release build
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [ci/rosetta-release-validation-20261126]
+    paths:
+      - .github/workflows/cli-release-build.yml
+      - .github/workflows/native-release-build.yml
 
 permissions:
   contents: read
@@ -72,31 +76,16 @@ jobs:
 
   build:
     name: Build ${{ matrix.label }}
+    timeout-minutes: 90
     needs: plan
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: linux-x64-gnu
-            node_arch: x64
-            target: x86_64-unknown-linux-gnu
-            runner: depot-ubuntu-24.04
-          - label: linux-arm64-gnu
-            node_arch: arm64
-            target: aarch64-unknown-linux-gnu
-            runner: depot-ubuntu-24.04-arm
           - label: darwin-x64
             node_arch: x64
             target: x86_64-apple-darwin
             runner: depot-macos-latest
-          - label: darwin-arm64
-            node_arch: arm64
-            target: aarch64-apple-darwin
-            runner: depot-macos-latest
-          - label: win32-x64-msvc
-            node_arch: x64
-            target: x86_64-pc-windows-msvc
-            runner: depot-windows-2025-4
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -196,85 +185,3 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  assemble:
-    name: Assemble native facade
-    needs: [plan, build]
-    runs-on: depot-ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          package-manager-cache: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: native-leaf-*
-          path: downloaded-native
-      - name: Validate complete build set
-        id: records
-        shell: pwsh
-        env:
-          EXPECTED_BUILD_SET_ID: ${{ needs.plan.outputs.build-set-id }}
-          EXPECTED_SOURCE_COMMIT: ${{ needs.plan.outputs.source-commit }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $roots = @(Get-ChildItem downloaded-native -Directory)
-          $records = @(Get-ChildItem downloaded-native -Recurse -File -Filter '*.json' | Where-Object { $_.Directory.Name -eq 'records' })
-          $tarballs = @(Get-ChildItem downloaded-native -Recurse -File -Filter '*.tgz')
-          $leaves = @(Get-ChildItem downloaded-native -Recurse -Directory | Where-Object { $_.Name -eq 'leaf' })
-          $plans = @(Get-ChildItem downloaded-native -Recurse -File -Filter 'native-build-plan.json')
-          if ($roots.Count -ne 5 -or $records.Count -ne 5 -or $tarballs.Count -ne 5 -or $leaves.Count -ne 5 -or $plans.Count -ne 5) {
-            throw 'Downloaded native artifacts are incomplete'
-          }
-          $expectedTargets = @('aarch64-apple-darwin','aarch64-unknown-linux-gnu','x86_64-apple-darwin','x86_64-pc-windows-msvc','x86_64-unknown-linux-gnu')
-          $actualTargets = @()
-          foreach ($recordFile in $records) {
-            $record = Get-Content $recordFile.FullName -Raw | ConvertFrom-Json
-            if ($record.release.buildSetId -cne $env:EXPECTED_BUILD_SET_ID -or $record.release.sourceCommit -cne $env:EXPECTED_SOURCE_COMMIT) { throw "Mismatched release tuple in $($recordFile.FullName)" }
-            $actualTargets += $record.target
-          }
-          if (@(Compare-Object $expectedTargets ($actualTargets | Sort-Object)).Count -ne 0) { throw 'Build records do not contain the exact target set' }
-          $planHash = (Get-FileHash $plans[0].FullName -Algorithm SHA256).Hash
-          foreach ($plan in $plans) { if ((Get-FileHash $plan.FullName -Algorithm SHA256).Hash -cne $planHash) { throw 'Matrix build plans differ' } }
-          $records | ForEach-Object { $_.FullName } | Set-Content record-paths.txt
-      - name: Assemble facade and release table
-        shell: pwsh
-        env:
-          BAMTI_DIST_ROOT: ${{ github.workspace }}/assembled-dist
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $records = @(Get-Content record-paths.txt)
-          if ($records.Count -ne 5) { throw 'Expected five record paths' }
-          node npm/scripts/package-native-platform.mjs --assemble @records
-          if ($LASTEXITCODE -ne 0) { throw 'Facade assembly failed' }
-          $facades = @(Get-ChildItem assembled-dist -File -Filter 'bamti-*.tgz')
-          if ($facades.Count -ne 1) { throw "Expected one facade tarball, found $($facades.Count)" }
-          New-Item -ItemType Directory -Force assembled-release/facade | Out-Null
-          tar -xzf $facades[0].FullName -C assembled-release/facade
-          if ($LASTEXITCODE -ne 0) { throw 'Could not extract facade tarball' }
-          if (-not (Test-Path assembled-release/facade/package/native-release-table.json -PathType Leaf)) { throw 'Facade is missing native-release-table.json' }
-          Copy-Item downloaded-native assembled-release/native-leaves -Recurse
-          Copy-Item $facades[0].FullName assembled-release/
-          Copy-Item assembled-release/facade/package/native-release-table.json assembled-release/native-release-table.json
-          $planFile = (Get-ChildItem downloaded-native -Recurse -File -Filter native-build-plan.json | Select-Object -First 1).FullName
-          if (-not (Test-Path $planFile)) { throw 'Selected native-build-plan.json is missing' }
-          Copy-Item $planFile assembled-release/native-build-plan.json
-      - name: Verify native release preflight
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force preflight-dist | Out-Null
-          Copy-Item assembled-dist/*.tgz preflight-dist/
-          Get-ChildItem downloaded-native -Recurse -File -Filter '*.tgz' | ForEach-Object {
-            Copy-Item $_.FullName preflight-dist/
-          }
-          node -e "import('./npm/scripts/preflight.mjs').then(({ preflightNativeRelease }) => preflightNativeRelease('preflight-dist'))"
-          if ($LASTEXITCODE -ne 0) { throw 'Native release preflight failed' }
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: native-release-${{ needs.plan.outputs.build-set-id }}-${{ github.run_attempt }}
-          path: assembled-release
-          if-no-files-found: error
-          retention-days: 14
