@@ -27,11 +27,11 @@ const defaultNpmRoot = resolve(scriptDir, "..");
 const defaultRepositoryRoot = resolve(defaultNpmRoot, "..");
 
 const CARGO_OUTPUT_FOR_TARGET = new Map([
-  ["x86_64-unknown-linux-gnu", { file: "libbamts_napi.so", ext: ".so", runner: "ubuntu-24.04" }],
-  ["aarch64-unknown-linux-gnu", { file: "libbamts_napi.so", ext: ".so", runner: "ubuntu-24.04-arm" }],
-  ["x86_64-apple-darwin", { file: "libbamts_napi.dylib", ext: ".dylib", runner: "macos-15-intel" }],
-  ["aarch64-apple-darwin", { file: "libbamts_napi.dylib", ext: ".dylib", runner: "macos-15" }],
-  ["x86_64-pc-windows-msvc", { file: "bamts_napi.dll", ext: ".dll", runner: "windows-2025" }],
+  ["x86_64-unknown-linux-gnu", { file: "libbamts_napi.so", ext: ".so", runner: "depot-ubuntu-24.04" }],
+  ["aarch64-unknown-linux-gnu", { file: "libbamts_napi.so", ext: ".so", runner: "depot-ubuntu-24.04-arm" }],
+  ["x86_64-apple-darwin", { file: "libbamts_napi.dylib", ext: ".dylib", runner: "depot-macos-latest" }],
+  ["aarch64-apple-darwin", { file: "libbamts_napi.dylib", ext: ".dylib", runner: "depot-macos-latest" }],
+  ["x86_64-pc-windows-msvc", { file: "bamts_napi.dll", ext: ".dll", runner: "depot-windows-2025-4" }],
 ]);
 
 const RELEASE_STRING_KEYS = [

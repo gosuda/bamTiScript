@@ -1,11 +1,6 @@
 name: Optimization comparison
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/optimization-performance.yml
-      - perf/compare_optimization.py
-      - perf/test_compare_optimization.py
   workflow_dispatch:
     inputs:
       baseline_ref:
@@ -39,7 +34,7 @@ jobs:
   compare:
     name: Compare optimization workloads
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 60
     env:
       UV_NO_PROGRESS: "1"

@@ -137,7 +137,7 @@ test("packageCliTarget records staged binary hash after source mutation", async 
     assert.equal(manifest.bamtiCli.entry, "bin/bamts");
     assert.equal(manifest.bamtiCli.target, "x86_64-unknown-linux-gnu");
     assert.equal(manifest.bamtiCli.artifactKind, "cli-binary");
-    assert.equal(manifest.bamtiCli.runner, "ubuntu-24.04");
+    assert.equal(manifest.bamtiCli.runner, "depot-ubuntu-24.04");
     assert.equal(manifest.bamtiCli.release.packageVersion, "0.2.0");
     assert.equal(manifest.bamtiCli.release.sourceCommit, SOURCE_COMMIT);
     assert.equal(manifest.bamtiCli.release.nativeAbi, 1);

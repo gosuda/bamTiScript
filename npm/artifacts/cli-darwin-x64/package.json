@@ -25,7 +25,7 @@
     "workflowRevision": "__BAMTI_WORKFLOW_REVISION__",
     "toolchain": "__BAMTI_TOOLCHAIN__",
     "builderRevision": "__BAMTI_BUILDER_REVISION__",
-    "runner": "macos-15-intel",
+    "runner": "depot-macos-latest",
     "release": {
       "packageVersion": "0.2.0",
       "sourceCommit": "__BAMTI_SOURCE_COMMIT__",

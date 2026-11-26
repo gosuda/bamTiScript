@@ -1,10 +1,6 @@
 name: Native string oracle
 
 on:
-  push:
-    paths:
-      - .github/workflows/native-string-oracle.yml
-      - npm/scripts/native-string-oracle.mjs
   workflow_dispatch:
 
 permissions:
@@ -18,21 +14,31 @@ jobs:
       matrix:
         include:
           - label: linux-x64-gnu
+            node_arch: x64
             runner: depot-ubuntu-24.04
           - label: linux-arm64-gnu
+            node_arch: arm64
             runner: depot-ubuntu-24.04-arm
           - label: darwin-x64
-            runner: macos-15-intel
+            node_arch: x64
+            runner: depot-macos-latest
           - label: darwin-arm64
-            runner: macos-15
+            node_arch: arm64
+            runner: depot-macos-latest
           - label: win32-x64-msvc
-            runner: windows-2025
+            node_arch: x64
+            runner: depot-windows-2025-4
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require Rosetta for macOS x64 execution
+        if: matrix.label == 'darwin-x64'
+        shell: bash
+        run: arch -x86_64 /usr/bin/true
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
+          architecture: ${{ matrix.node_arch }}
           package-manager-cache: false
       - name: Record Node string behavior
         shell: pwsh
