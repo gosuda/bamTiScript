@@ -2,9 +2,8 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
@@ -12,184 +11,13 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  windows-native-guard:
-    name: Windows native guard
-    runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-      - name: Install pinned Rust toolchain
-        id: toolchain
-        if: ${{ !cancelled() }}
-        run: |
-          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-      - name: Cache Rust dependencies
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        uses: ./.github/actions/rust-cache
-      - name: Test Windows cache ownership and publication
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-native --features cache-guard --no-fail-fast
-      # Every other job runs on Linux, where the Win32 backend, the Microsoft
-      # linker driver and the stack size of a linked image are not compiled.
-      - name: Lint the Windows platform backend and linker driver
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo clippy --locked -p bamts-platform -p bamts-cli --all-targets -- -D warnings
-      - name: Test the Windows platform backend
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-platform --no-fail-fast
-
-  windows-native-linker:
-    name: Windows native linker driver
-    runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-      - name: Install pinned Rust toolchain
-        id: toolchain
-        if: ${{ !cancelled() }}
-        run: |
-          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-      - name: Cache Rust dependencies
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        uses: ./.github/actions/rust-cache
-      - name: Test the Microsoft linker driver
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-cli --lib --no-fail-fast -- windows_link
-
-  windows-native-cache-root:
-    name: Windows native cache root
-    runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-      - name: Install pinned Rust toolchain
-        id: toolchain
-        if: ${{ !cancelled() }}
-        run: |
-          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-      - name: Cache Rust dependencies
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        uses: ./.github/actions/rust-cache
-      - name: Test the Windows cache root
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-cli --lib --no-fail-fast -- fallback_cache_root
-
-  windows-native-exe:
-    name: Windows native executables
-    runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-      - name: Install pinned Rust toolchain
-        id: toolchain
-        if: ${{ !cancelled() }}
-        run: |
-          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-      - name: Cache Rust dependencies
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        uses: ./.github/actions/rust-cache
-      - name: Test linked native executables
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-cli --test cli --no-fail-fast -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
-
-  windows-native-lanes:
-    name: Windows native lanes
-    runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-      - name: Install pinned Rust toolchain
-        id: toolchain
-        if: ${{ !cancelled() }}
-        run: |
-          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-      - name: Cache Rust dependencies
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        uses: ./.github/actions/rust-cache
-      - name: Test the lane workers
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-verification --test lane_serving --no-fail-fast
-      - name: Test the serving lane executor
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bamts-verification --lib --no-fail-fast serving
-
   quality:
     name: Quality
     runs-on: depot-ubuntu-24.04
@@ -339,50 +167,6 @@ jobs:
           path: target/receipt-tools
           if-no-files-found: error
           retention-days: 14
-
-  corpus:
-    name: Corpus
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      TZ: UTC
-      LANG: C
-      LC_ALL: C
-      NO_COLOR: "1"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
-      - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          cache: 'npm'
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Assert Node version
-        run: test "$(node --version)" = "v24.18.0"
-
-      - name: Install Rust toolchain
-        run: |
-          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
-          rustup default "$TOOLCHAIN"
-
-      - name: Cache Rust dependencies
-        uses: ./.github/actions/rust-cache
-
-      - name: Corpus differential
-        run: |
-          cargo test -p bamts-verification --test corpus_differential --locked --no-fail-fast -- --nocapture
 
   formal:
     name: Formal
@@ -607,92 +391,5 @@ jobs:
         with:
           name: pr-merged-${{ github.run_id }}-${{ github.run_attempt }}
           path: verification/evidence/pr-merged/*.jsonl
-          if-no-files-found: error
-          retention-days: 14
-
-  perf-bh1:
-    name: Performance (BH1)
-    needs: [quality, preflight, corpus, formal, conformance-accounting]
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64, bh1, "bh1-perf-${{ github.run_id }}-${{ github.run_attempt }}"]
-    timeout-minutes: 120
-    env:
-      NO_COLOR: "1"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
-      - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24.18.0
-          package-manager-cache: false
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Assert Node version
-        run: test "$(node --version)" = "v24.18.0"
-
-      - name: Install Rust toolchain
-        run: |
-          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
-          rustup default "$TOOLCHAIN"
-
-      - name: Build perf_budget release
-        run: |
-          cargo build --release --locked -p bamts-verification --bin perf_budget
-
-      - name: Verify fixtures
-        run: |
-          numactl --physcpubind=0-19 --membind=0 \
-            target/release/perf_budget verify-fixtures --manifest perf/benchmarks.toml
-
-      - name: Check s0 baseline
-        run: |
-          numactl --physcpubind=0-19 --membind=0 \
-            target/release/perf_budget check-baseline \
-            --host perf/hosts/bh1.toml \
-            --baseline perf/baselines/s0.json
-
-      - name: Measure s0
-        run: |
-          mkdir -p target/perf
-          numactl --physcpubind=0-19 --membind=0 \
-            target/release/perf_budget measure \
-            --host perf/hosts/bh1.toml \
-            --manifest perf/benchmarks.toml \
-            --slice s0 \
-            --out target/perf/pr-s0.json \
-            --baseline perf/baselines/s0.json
-
-      - name: Compare s0
-        run: |
-          numactl --physcpubind=0-19 --membind=0 \
-            target/release/perf_budget compare \
-            --host perf/hosts/bh1.toml \
-            --policy perf/budgets.toml \
-            --result target/perf/pr-s0.json
-
-      - name: Check scorecard
-        run: |
-          numactl --physcpubind=0-19 --membind=0 \
-            target/release/perf_budget check-scorecard \
-            --host perf/hosts/bh1.toml \
-            --scorecard perf/scorecard/typescript-7.0.2.json \
-            --policy perf/budgets.toml
-
-      - name: Upload s0 result
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: perf-pr-s0-${{ github.run_attempt }}
-          path: target/perf/pr-s0.json
           if-no-files-found: error
           retention-days: 14

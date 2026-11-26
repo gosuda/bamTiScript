@@ -20,11 +20,11 @@ const RELEASE_STRING_KEYS = ["packageVersion", "sourceCommit", "buildSetId", "re
 const RELEASE_NUMBER_KEYS = ["nativeAbi", "cliProtocol"];
 
 export const CLI_TARGETS = Object.freeze([
-  Object.freeze({ selector: "linux-x64", target: "x86_64-unknown-linux-gnu", package: "@bamti/cli-linux-x64", entry: "bin/bamts", os: "linux", cpu: "x64", artifactKind: "cli-binary", runner: "ubuntu-24.04" }),
-  Object.freeze({ selector: "linux-arm64", target: "aarch64-unknown-linux-gnu", package: "@bamti/cli-linux-arm64", entry: "bin/bamts", os: "linux", cpu: "arm64", artifactKind: "cli-binary", runner: "ubuntu-24.04-arm" }),
-  Object.freeze({ selector: "darwin-x64", target: "x86_64-apple-darwin", package: "@bamti/cli-darwin-x64", entry: "bin/bamts", os: "darwin", cpu: "x64", artifactKind: "cli-binary", runner: "macos-15-intel" }),
-  Object.freeze({ selector: "darwin-arm64", target: "aarch64-apple-darwin", package: "@bamti/cli-darwin-arm64", entry: "bin/bamts", os: "darwin", cpu: "arm64", artifactKind: "cli-binary", runner: "macos-15" }),
-  Object.freeze({ selector: "win32-x64", target: "x86_64-pc-windows-msvc", package: "@bamti/cli-win32-x64", entry: "bin/bamts.exe", os: "win32", cpu: "x64", artifactKind: "cli-binary", runner: "windows-2025" }),
+  Object.freeze({ selector: "linux-x64", target: "x86_64-unknown-linux-gnu", package: "@bamti/cli-linux-x64", entry: "bin/bamts", os: "linux", cpu: "x64", artifactKind: "cli-binary", runner: "depot-ubuntu-24.04" }),
+  Object.freeze({ selector: "linux-arm64", target: "aarch64-unknown-linux-gnu", package: "@bamti/cli-linux-arm64", entry: "bin/bamts", os: "linux", cpu: "arm64", artifactKind: "cli-binary", runner: "depot-ubuntu-24.04-arm" }),
+  Object.freeze({ selector: "darwin-x64", target: "x86_64-apple-darwin", package: "@bamti/cli-darwin-x64", entry: "bin/bamts", os: "darwin", cpu: "x64", artifactKind: "cli-binary", runner: "depot-macos-latest" }),
+  Object.freeze({ selector: "darwin-arm64", target: "aarch64-apple-darwin", package: "@bamti/cli-darwin-arm64", entry: "bin/bamts", os: "darwin", cpu: "arm64", artifactKind: "cli-binary", runner: "depot-macos-latest" }),
+  Object.freeze({ selector: "win32-x64", target: "x86_64-pc-windows-msvc", package: "@bamti/cli-win32-x64", entry: "bin/bamts.exe", os: "win32", cpu: "x64", artifactKind: "cli-binary", runner: "depot-windows-2025-4" }),
 ]);
 
 export const ARTIFACTS = new Map(

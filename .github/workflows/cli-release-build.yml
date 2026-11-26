@@ -78,28 +78,38 @@ jobs:
       matrix:
         include:
           - label: linux-x64
+            node_arch: x64
             target: x86_64-unknown-linux-gnu
             runner: depot-ubuntu-24.04
           - label: linux-arm64
+            node_arch: arm64
             target: aarch64-unknown-linux-gnu
             runner: depot-ubuntu-24.04-arm
           - label: darwin-x64
+            node_arch: x64
             target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: depot-macos-latest
           - label: darwin-arm64
+            node_arch: arm64
             target: aarch64-apple-darwin
-            runner: macos-15
+            runner: depot-macos-latest
           - label: win32-x64
+            node_arch: x64
             target: x86_64-pc-windows-msvc
-            runner: windows-2025
+            runner: depot-windows-2025-4
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Require Rosetta for macOS x64 execution
+        if: matrix.label == 'darwin-x64'
+        shell: bash
+        run: arch -x86_64 /usr/bin/true
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+          architecture: ${{ matrix.node_arch }}
           cache: 'npm'
       - name: Install pinned Rust toolchain
         shell: pwsh
