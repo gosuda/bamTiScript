@@ -1844,24 +1844,8 @@ impl<'table> TypeRelations<'table> {
                 && let Some(mapped) = self.indexed_operand_identity(*operand)
                 && mapped != *operand
                 && let Some(object) = self.table.current_object_view(mapped)
-                && object.index_signatures.is_empty()
-                && let Some(name) = self.candidate_key_name(argument)
             {
-                // The inferred operand is concrete, so the deferred `keyof`
-                // bound has a fixed key domain: the object's own public
-                // string and numeric property names, exactly as `keyof`
-                // reduction computes them. Anything else keeps the general
-                // relation below.
-                let literal = self.table.get(argument);
-                return object.properties.iter().any(|property| {
-                    property.access() == Accessibility::Public
-                        && property.name() == name.as_str()
-                        && match literal {
-                            Type::StringLiteral(_) => property.string_name(),
-                            Type::NumberLiteral(_) => property.numeric_name(),
-                            _ => false,
-                        }
-                });
+                return self.argument_satisfies_object_keys(argument, &object, strictness);
             }
             if let Type::IndexedAccess { object, index } = self.table.get(view)
                 && let (Some(mapped_object), Some(mapped_index)) = (
@@ -1896,6 +1880,52 @@ impl<'table> TypeRelations<'table> {
             }
         }
         self.relates(argument, bound, strictness)
+    }
+
+    fn argument_satisfies_object_keys(
+        &self,
+        argument: TypeId,
+        object: &ObjectType,
+        strictness: Strictness,
+    ) -> bool {
+        let Some(argument) = self.indexed_operand_identity(argument) else {
+            return false;
+        };
+        match self.table.get(argument) {
+            Type::Union(members) => {
+                return members
+                    .iter()
+                    .all(|&member| self.argument_satisfies_object_keys(member, object, strictness));
+            }
+            Type::Intersection(members) => {
+                return members
+                    .iter()
+                    .any(|&member| self.argument_satisfies_object_keys(member, object, strictness));
+            }
+            Type::Never => return true,
+            Type::Any => return strictness != Strictness::Strict,
+            _ => {}
+        }
+        if object.index_signatures.iter().any(|signature| {
+            !signature.enum_reverse
+                && signature.parameters.first().is_some_and(|parameter| {
+                    self.relates(argument, parameter.type_id(), strictness)
+                })
+        }) {
+            return true;
+        }
+        let Some(name) = self.candidate_key_name(argument) else {
+            return false;
+        };
+        object.properties.iter().any(|property| {
+            property.access() == Accessibility::Public
+                && property.name() == name.as_str()
+                && match self.table.get(argument) {
+                    Type::StringLiteral(_) => property.string_name(),
+                    Type::NumberLiteral(_) => property.numeric_name(),
+                    _ => false,
+                }
+        })
     }
 
     /// The property key a bound candidate names, when it is a single

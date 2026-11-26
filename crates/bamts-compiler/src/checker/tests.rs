@@ -13051,3 +13051,42 @@ fn deferred_keyof_bound_canonicalizes_numeric_literals() {
         rejected.diagnostics()
     );
 }
+
+#[test]
+fn deferred_keyof_bound_checks_every_union_member() {
+    for (keys, valid) in [("\"a\" | \"b\"", true), ("\"a\" | \"missing\"", false)] {
+        let checked = check_text(&format!(
+            "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+             const use_key: (obj: {{ a: number; b: string }}, key: {keys}) => {keys} = get_key;"
+        ));
+        assert_eq!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            !valid,
+            "{keys}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn deferred_keyof_bound_accepts_declared_dictionary_domains() {
+    for (domain, key, valid) in [
+        ("string", "string", true),
+        ("string", "\"a\" | \"b\"", true),
+        ("number", "number", true),
+        ("number", "0x1 | 2", true),
+        ("number", "\"missing\"", false),
+        ("string", "boolean", false),
+    ] {
+        let checked = check_text(&format!(
+            "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+             const use_key: (obj: {{ [key: {domain}]: number }}, key: {key}) => {key} = get_key;"
+        ));
+        assert_eq!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            !valid,
+            "{domain} / {key}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
