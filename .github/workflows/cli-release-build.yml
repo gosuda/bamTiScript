@@ -117,9 +117,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          if ('${{ matrix.label }}' -eq 'darwin-x64') { $toolchain += '-x86_64-apple-darwin' }
-          rustup toolchain install $toolchain --profile minimal
-          rustup default $toolchain
+          $hostArgs = @()
+          if ('${{ matrix.label }}' -eq 'darwin-x64') {
+            $toolchain += '-x86_64-apple-darwin'
+            $hostArgs = @('--force-non-host')
+          }
+          rustup toolchain install $toolchain --profile minimal @hostArgs
           rustup override set $toolchain
           $hostTriple = ((rustc -vV) | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
           if ($hostTriple -cne '${{ matrix.target }}') { throw "Rust host $hostTriple differs from the release target" }
@@ -176,7 +179,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'CLI leaf --version smoke failed' }
           if ('${{ matrix.label }}' -eq 'darwin-x64') {
             'console.log(40 + 2);' | Set-Content cli-smoke/main.ts -Encoding utf8NoBOM
-            $output = & $bamts run --target aot cli-smoke/main.ts
+            $output = & $bamts --run --aot cli-smoke/main.ts
             if ($LASTEXITCODE -ne 0 -or $output -cne '42') { throw 'Intel macOS CLI leaf AOT smoke failed' }
           }
           $stage = 'cli-leaf-${{ matrix.label }}'

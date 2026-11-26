@@ -117,9 +117,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          if ('${{ matrix.label }}' -eq 'darwin-x64') { $toolchain += '-x86_64-apple-darwin' }
-          rustup toolchain install $toolchain --profile minimal
-          rustup default $toolchain
+          $hostArgs = @()
+          if ('${{ matrix.label }}' -eq 'darwin-x64') {
+            $toolchain += '-x86_64-apple-darwin'
+            $hostArgs = @('--force-non-host')
+          }
+          rustup toolchain install $toolchain --profile minimal @hostArgs
           rustup override set $toolchain
           $hostTriple = ((rustc -vV) | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
           if ($hostTriple -cne '${{ matrix.target }}') { throw "Rust host $hostTriple differs from the release target" }
