@@ -115,9 +115,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain
+          if ('${{ matrix.label }}' -eq 'darwin-x64') { $toolchain += '-x86_64-apple-darwin' }
+          rustup toolchain install $toolchain --profile minimal
           rustup default $toolchain
+          rustup override set $toolchain
+          $hostTriple = ((rustc -vV) | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
+          if ($hostTriple -cne '${{ matrix.target }}') { throw "Rust host $hostTriple differs from the release target" }
       - name: Install Rust target
         shell: pwsh
         run: rustup target add '${{ matrix.target }}'
