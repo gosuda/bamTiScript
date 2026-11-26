@@ -205,9 +205,9 @@ pub struct TypeRelations<'table> {
     /// query's own endpoints and strictness alone. A hit returns the
     /// stored answer with no assumption bookkeeping. Entries are stored
     /// only for frames with no environment-sensitive consultation, erasure
-    /// requirements, or unresolved coinductive assumptions. This lets
-    /// independent structural comparisons recur under hundreds of inference
-    /// environments without recomputing.
+    /// requirements, unresolved coinductive assumptions, or alias-cycle
+    /// approximations. This lets independent structural comparisons recur
+    /// under hundreds of inference environments without recomputing.
     clean: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
     /// Pairs currently being compared, to break recursive structural types.
@@ -603,10 +603,14 @@ impl<'table> TypeRelations<'table> {
         // A clean hit has no dependency bookkeeping, so only completed
         // proofs may enter it. Nested coinductive results keep their active
         // assumptions in the contextual cache until the root discharges them.
+        // Alias-cycle approximations rest on an unrecorded hypothesis about a
+        // still-active comparison, so they stay out even with no recorded
+        // assumptions, exactly like the context-sensitive cache.
         if cacheable
             && !frame.env_sensitive
             && frame.erasure_requirements.is_empty()
             && frame.assumptions.is_empty()
+            && !frame.approximate_alias
         {
             self.clean
                 .borrow_mut()
@@ -5596,6 +5600,67 @@ mod tests {
         assert!(
             delta < 50,
             "number-leaf 4-ary depth-4 graph recomputed {delta} pairs; expected the same clean-memo scaling"
+        );
+    }
+    /// Regression for transformed-alias clean admission (review A): when a
+    /// recursive alias changes type arguments, the re-entrant frame marks
+    /// `approximate_alias` without recording an assumption. That provisional
+    /// result must stay out of the dependency-free clean memo; a repeated
+    /// query must recompute instead of reusing it.
+    #[test]
+    fn transformed_alias_approximation_stays_out_of_clean_memo() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        // A<T> = { x: A<T[]> }: recursion transforms the argument.
+        let alias = SymbolId::new(9400);
+        let param = SymbolId::new(9401);
+        let named_param = table.named(param);
+        table.declare_alias(alias, vec![param]);
+        let array_of_param = table.array(named_param);
+        let inner = table.applied_alias(alias, vec![array_of_param]);
+        let raw = table.object_type(vec![PropertyType::new("x", false, inner)]);
+        table.publish_alias_template(alias, raw);
+        let source = table.applied_alias(alias, vec![number]);
+        let target = table.applied_alias(alias, vec![string]);
+        let relations = TypeRelations::new(&table);
+        assert!(relations.assignable(source, target));
+        let before = relations.computed_relations();
+        assert!(relations.assignable(source, target));
+        assert!(
+            relations.computed_relations() > before,
+            "transformed-alias approximation must not be served from the clean memo"
+        );
+    }
+    /// Second variant: the same transformed-alias shape with a genuinely
+    /// incompatible leaf still refutes, and the refutation also stays out
+    /// of the clean memo while it rests on an alias approximation.
+    #[test]
+    fn transformed_alias_refutation_stays_out_of_clean_memo() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        // B<T> = { x: B<T[]>; y: T }: transformed recursion plus a leaf.
+        let alias = SymbolId::new(9410);
+        let param = SymbolId::new(9411);
+        let named_param = table.named(param);
+        table.declare_alias(alias, vec![param]);
+        let array_of_param = table.array(named_param);
+        let inner = table.applied_alias(alias, vec![array_of_param]);
+        let raw = table.object_type(vec![
+            PropertyType::new("x", false, inner),
+            PropertyType::new("y", false, named_param),
+        ]);
+        table.publish_alias_template(alias, raw);
+        let source = table.applied_alias(alias, vec![string]);
+        let target = table.applied_alias(alias, vec![number]);
+        let relations = TypeRelations::new(&table);
+        assert!(!relations.assignable(source, target));
+        let before = relations.computed_relations();
+        assert!(!relations.assignable(source, target));
+        assert!(
+            relations.computed_relations() > before,
+            "approximate refutation must not be served from the clean memo"
         );
     }
     /// Regression for nested contextual hits: warming `null -> T` then
