@@ -188,6 +188,10 @@ struct CachedRelation {
     compatible: bool,
     assumptions: Box<[RelationKey]>,
     erasure_requirements: Box<[ErasureRequirement]>,
+    /// Whether the cached proof consulted environment state. A hit must
+    /// carry this into the enclosing frame, otherwise the parent would look
+    /// environment-independent and pollute the clean memo.
+    env_sensitive: bool,
 }
 
 /// Relation queries over one interned [`TypeTable`].
@@ -466,6 +470,11 @@ impl<'table> TypeRelations<'table> {
                     for requirement in cached.erasure_requirements.iter().copied() {
                         self.record_erasure_requirement(parent, requirement);
                     }
+                    // A contextual hit reuses a proof computed under the same
+                    // environment. If that proof consulted the environment,
+                    // the enclosing comparison does too and must stay out of
+                    // the clean memo.
+                    parent.env_sensitive |= cached.env_sensitive;
                 }
                 return cached.compatible;
             }
@@ -615,6 +624,7 @@ impl<'table> TypeRelations<'table> {
                 .insert((source, target, strictness), result);
         }
         if cacheable && !frame.approximate_alias && (result || frame.assumptions.is_empty()) {
+            let env_sensitive = frame.env_sensitive;
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
             assumptions.sort_unstable();
             let mut erasure_requirements: Vec<_> = frame
@@ -627,12 +637,14 @@ impl<'table> TypeRelations<'table> {
                 compatible: result,
                 assumptions: assumptions.into_boxed_slice(),
                 erasure_requirements: erasure_requirements.into_boxed_slice(),
+                env_sensitive,
             };
             let mut cache = self.cache.borrow_mut();
             if cache.len() < RELATION_CACHE_CAPACITY || cache.contains_key(&relation) {
                 let entries = cache.entry(relation).or_default();
                 let dominates = |left: &CachedRelation, right: &CachedRelation| {
                     left.compatible == right.compatible
+                        && (!left.env_sensitive || right.env_sensitive)
                         && left
                             .assumptions
                             .iter()
@@ -5597,6 +5609,66 @@ mod tests {
         assert!(
             delta < 50,
             "number-leaf 4-ary depth-4 graph recomputed {delta} pairs; expected the same clean-memo scaling"
+        );
+    }
+    /// Regression for nested contextual hits: warming `null -> T` then
+    /// comparing object returns containing that pair under both bounds must
+    /// partition by bound. A contextual hit must carry environment
+    /// sensitivity into the enclosing comparison; otherwise the first bound
+    /// pollutes the clean memo and the second bound reuses it.
+    #[test]
+    fn nested_contextual_hit_carries_environment_sensitivity() {
+        let mut table = TypeTable::new();
+        let symbol = SymbolId::new(9100);
+        let named = table.named(symbol);
+        let null = table.null_type();
+        let undefined = table.undefined_type();
+        let string = table.string();
+        let never = table.never();
+        let source_obj = table.object_type(vec![PropertyType::new("value", false, null)]);
+        let source_obj_undefined =
+            table.object_type(vec![PropertyType::new("value", false, undefined)]);
+        let target_obj = table.object_type(vec![PropertyType::new("value", false, named)]);
+        let source_fn = table.function(Vec::new(), source_obj);
+        let source_fn_undefined = table.function(Vec::new(), source_obj_undefined);
+        let target_string = table.function_with_parameter_bounds(
+            vec![symbol],
+            vec![TypeParameterBounds::new(Some(string), None)],
+            Vec::new(),
+            target_obj,
+            false,
+        );
+        let target_never = table.function_with_parameter_bounds(
+            vec![symbol],
+            vec![TypeParameterBounds::new(Some(never), None)],
+            Vec::new(),
+            target_obj,
+            false,
+        );
+        let relations = TypeRelations::new(&table);
+        // Warm the leaf directly under the empty environment.
+        assert!(relations.assignable(null, named));
+        // Direct object comparison hits the warmed leaf. It must stay
+        // environment-sensitive and out of the clean memo.
+        assert!(relations.assignable(source_obj, target_obj));
+        // Partition by bound: the string bound accepts the nullable source,
+        // the never bound rejects it.
+        assert!(relations.assignable(source_fn, target_string));
+        assert!(
+            !relations.assignable(source_fn, target_never),
+            "never-bound object return must not reuse the string-bound clean entry"
+        );
+        // Second shape: `undefined` takes the same rigid path through a
+        // different nullable leaf and must partition identically.
+        // Note: `target_obj` still carries `named`, so the warmed `null -> T`
+        // entry does not cover `undefined -> T`; warm it explicitly under the
+        // empty environment before the partitioned comparison.
+        assert!(relations.assignable(undefined, named));
+        assert!(relations.assignable(source_obj_undefined, target_obj));
+        assert!(relations.assignable(source_fn_undefined, target_string));
+        assert!(
+            !relations.assignable(source_fn_undefined, target_never),
+            "never-bound undefined return must not reuse the string-bound clean entry"
         );
     }
 }
