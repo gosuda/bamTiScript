@@ -178,7 +178,7 @@ jobs:
           & $bamts --version
           if ($LASTEXITCODE -ne 0) { throw 'CLI leaf --version smoke failed' }
           if ('${{ matrix.label }}' -eq 'darwin-x64') {
-            'console.log(40 + 2);' | Set-Content cli-smoke/main.ts -Encoding utf8NoBOM
+            'process.stdout.write("42\n");' | Set-Content cli-smoke/main.ts -Encoding utf8NoBOM
             $output = & $bamts --run --aot cli-smoke/main.ts
             if ($LASTEXITCODE -ne 0 -or $output -cne '42') { throw 'Intel macOS CLI leaf AOT smoke failed' }
           }
