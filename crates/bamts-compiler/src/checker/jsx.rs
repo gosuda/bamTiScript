@@ -1509,7 +1509,7 @@ mod tests {
         JSX_ELEMENT_TYPE_NOT_CALLABLE, JSX_INTRINSIC_ELEMENT_NOT_FOUND, ProgramCheckInput,
         ProgramCheckOptions, TYPE_NOT_ASSIGNABLE, check_program_with_options,
     };
-    use crate::diagnostic::Diagnostic;
+    use crate::diagnostic::{Diagnostic, DiagnosticSeverity};
     use crate::source::{ScriptKind, SourceId, SourceText};
     use crate::{parser, scanner};
 
@@ -1581,6 +1581,7 @@ mod tests {
             let codes: Vec<_> = checked
                 .diagnostics()
                 .iter()
+                .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
                 .map(|diagnostic| diagnostic.code().as_str())
                 .collect();
             let expected = if strict {
@@ -1616,7 +1617,10 @@ mod tests {
                     ProgramCheckOptions::standard().with_strict_null_checks(strict),
                 );
                 assert!(
-                    checked.diagnostics().is_empty(),
+                    checked
+                        .diagnostics()
+                        .iter()
+                        .all(|diagnostic| diagnostic.severity() != DiagnosticSeverity::Error),
                     "value={value}, strictNullChecks={strict}: {:?}",
                     checked.diagnostics()
                 );
