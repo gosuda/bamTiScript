@@ -1905,7 +1905,7 @@ impl<'table> TypeRelations<'table> {
     fn candidate_key_name(&self, argument: TypeId) -> Option<String> {
         match self.table.get(argument) {
             Type::StringLiteral(name) => name.to_utf8_strict().ok(),
-            Type::NumberLiteral(name) => Some(name.to_string()),
+            Type::NumberLiteral(name) => number_value(name).map(bamts_bytecode::format_number),
             _ => None,
         }
     }

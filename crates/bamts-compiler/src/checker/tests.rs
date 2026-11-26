@@ -13027,3 +13027,27 @@ fn generic_target_retains_never_and_any_return_concessions() {
         );
     }
 }
+
+#[test]
+fn deferred_keyof_bound_canonicalizes_numeric_literals() {
+    for literal in ["0x1", "1.0", "1e3"] {
+        let checked = check_text(&format!(
+            "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+             const use_key: (obj: {{ 1: number; 1000: number }}, key: {literal}) => {literal} = get_key;"
+        ));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{literal}: {:?}",
+            checked.diagnostics()
+        );
+    }
+    let rejected = check_text(
+        "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+         const use_key: (obj: { 1: number }, key: 0x2) => 0x2 = get_key;",
+    );
+    assert!(
+        checker_codes(&rejected).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "a different numeric value must remain outside the key domain: {:?}",
+        rejected.diagnostics()
+    );
+}
