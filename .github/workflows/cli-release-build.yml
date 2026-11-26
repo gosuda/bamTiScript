@@ -100,7 +100,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
@@ -111,6 +111,8 @@ jobs:
       - name: Install Rust target
         shell: pwsh
         run: rustup target add '${{ matrix.target }}'
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Install pinned TypeScript oracle
         if: matrix.label == 'win32-x64'
         shell: pwsh

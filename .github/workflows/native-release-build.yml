@@ -111,6 +111,8 @@ jobs:
       - name: Install Rust target
         shell: pwsh
         run: rustup target add '${{ matrix.target }}'
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Package native leaf
         shell: pwsh
         env:
