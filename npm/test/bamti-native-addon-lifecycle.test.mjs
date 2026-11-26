@@ -134,7 +134,7 @@ test("actual Intel macOS addon compiles and executes AOT", {
   const directory = await mkdtemp(join(tmpdir(), "bamti-napi-aot-"));
   try {
     const entrypoint = join(directory, "main.ts");
-    await writeFile(entrypoint, "console.log(40 + 2);\n");
+    await writeFile(entrypoint, 'process.stdout.write("42\\n");\n');
     const addon = createRequire(import.meta.url)(resolve(addonPath));
     const outcome = await addon.run(request(["run", "--target", "aot", entrypoint]));
     assert.equal(outcome.exitCode, 0, Buffer.from(outcome.stderr).toString("utf8"));

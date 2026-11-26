@@ -15,14 +15,18 @@ job does not run on the same commit. Main pushes do not repeat the PR
 and merge queue pipeline. Superseded PR runs are cancelled.
 PR jobs check out GitHub's merge commit and bind every receipt to that
 same SHA, so they test the proposed change together with its current base.
+Receipt interpretation follows the [verification evidence rules](../explanation/verification.md).
 Direct pushes to main rely on the nightly workflow or manual dispatch;
 there is no immediate post-push pipeline.
 
-Every CI ref can save its own Rust dependency cache. The cache prefix
+PR, branch, and tag runs can save their own Rust dependency cache. Merge-group
+refs are temporary and do not save caches. The cache prefix
 includes the full ref, while the action retains its job and compiler keys,
 so a later run on the same PR can reuse dependencies without a separate
 cache-warming pipeline. Depot Cache is repository-scoped; these keys are
-ordinary reuse partitions, not an access-control boundary.
+ordinary reuse partitions, not an access-control boundary. A new ref deliberately
+starts cold instead of restoring compiler output from a different ref; later
+runs on that same PR or branch can reuse its dependencies.
 
 ## Extended verification
 
@@ -44,9 +48,10 @@ Manual CLI and native addon builds retain all five target artifacts.
 macOS x64 uses an x86_64-hosted Rust toolchain and x64 Node under Rosetta
 on Apple silicon. Each build asserts that Rust's host equals its target;
 the packaged Intel CLI and addon must compile and run an AOT program.
-This proves translated execution on macOS, not
-execution on physical Intel hardware. The workflow fails if Rosetta is
-unavailable. ARM64 macOS and x64 Windows execute on their matching Depot
+A passing release smoke is evidence of translated execution on macOS;
+it does not establish execution on physical Intel hardware. Follow the
+[verification evidence rules](../explanation/verification.md) when reporting
+those results. The workflow fails if Rosetta is unavailable. ARM64 macOS and x64 Windows execute on their matching Depot
 hosts. Build records and preflight checks name the actual Depot labels.
 
 Release packaging omits the shared CI Rust cache. Its infrequent builds
