@@ -2242,7 +2242,12 @@ impl<'table> TypeRelations<'table> {
                         }
                     }
                 }
-                if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
+                // Empty inference has no choice to make, and a single candidate
+                // only compares with itself. Neither consumes a provisional
+                // relation answer.
+                if candidates.len() > 1
+                    && let Some(frame) = self.dependency_stack.borrow_mut().last_mut()
+                {
                     frame.inference_sensitive = true;
                 }
                 if let Some(candidate) = candidates.iter().copied().find(|candidate| {
@@ -6151,5 +6156,74 @@ mod tests {
             !relations.assignable(source_fn_undefined, target_never),
             "never-bound undefined return must not reuse the string-bound clean entry"
         );
+    }
+
+    #[test]
+    fn inference_misses_do_not_recompute_shared_recursive_refutations() {
+        for compatible in [false, true] {
+            let mut table = TypeTable::new();
+            let string = table.string();
+            let number = table.number();
+            let empty = table.object_type(Vec::new());
+            let unused = SymbolId::new(10004);
+            let inferred_result = table.named(unused);
+            let generic = table.function_with_parameters(
+                vec![unused],
+                vec![FunctionParameter::new(
+                    "value".to_owned(),
+                    empty,
+                    false,
+                    false,
+                )],
+                inferred_result,
+            );
+            let concrete = table.function(vec![empty], table.unknown());
+            let left = SymbolId::new(10000);
+            let left_parameter = SymbolId::new(10001);
+            let right = SymbolId::new(10002);
+            let right_parameter = SymbolId::new(10003);
+            table.declare_alias(left, vec![left_parameter]);
+            table.declare_alias(right, vec![right_parameter]);
+            let left_value = table.named(left_parameter);
+            let right_value = table.named(right_parameter);
+            let left_back = table.applied_alias(left, vec![left_value]);
+            let right_back = table.applied_alias(right, vec![right_value]);
+            let mut source_body = table.object_type(vec![
+                PropertyType::new("back", false, left_back),
+                PropertyType::new("infer", false, generic),
+                PropertyType::new("value", false, string),
+            ]);
+            let mut target_body = table.object_type(vec![
+                PropertyType::new("back", false, right_back),
+                PropertyType::new("infer", false, concrete),
+                PropertyType::new("value", false, if compatible { string } else { number }),
+            ]);
+            let first = table.string_literal("first");
+            let second = table.string_literal("second");
+            for _ in 0..12 {
+                source_body =
+                    table.object_type(vec![PropertyType::new("child", false, source_body)]);
+                let first_branch = table.object_type(vec![
+                    PropertyType::new("child", false, target_body),
+                    PropertyType::new("tag", true, first),
+                ]);
+                let second_branch = table.object_type(vec![
+                    PropertyType::new("child", false, target_body),
+                    PropertyType::new("tag", true, second),
+                ]);
+                target_body = table.union(&[first_branch, second_branch]);
+            }
+            table.publish_alias_template(left, source_body);
+            table.publish_alias_template(right, target_body);
+            let source = table.applied_alias(left, vec![string]);
+            let target = table.applied_alias(right, vec![string]);
+            let relations = TypeRelations::new(&table);
+            assert_eq!(relations.assignable(source, target), compatible);
+            let computed = relations.computed_relations();
+            assert!(
+                computed < 128,
+                "inference miss recomputed {computed} shared recursive relations"
+            );
+        }
     }
 }
