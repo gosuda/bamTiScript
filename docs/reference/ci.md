@@ -13,6 +13,16 @@ and four conformance receipt shards with complete receipt accounting.
 The workspace suite includes `corpus_differential`, so a second corpus
 job does not run on the same commit. Main pushes do not repeat the PR
 and merge queue pipeline. Superseded PR runs are cancelled.
+PR jobs check out GitHub's merge commit and bind every receipt to that
+same SHA, so they test the proposed change together with its current base.
+Direct pushes to main rely on the nightly workflow or manual dispatch;
+there is no immediate post-push pipeline.
+
+Every CI ref can save its own Rust dependency cache. The cache prefix
+includes the full ref, while the action retains its job and compiler keys,
+so a later run on the same PR can reuse dependencies without a separate
+cache-warming pipeline. Depot Cache is repository-scoped; these keys are
+ordinary reuse partitions, not an access-control boundary.
 
 ## Extended verification
 
@@ -38,6 +48,10 @@ This proves translated execution on macOS, not
 execution on physical Intel hardware. The workflow fails if Rosetta is
 unavailable. ARM64 macOS and x64 Windows execute on their matching Depot
 hosts. Build records and preflight checks name the actual Depot labels.
+
+Release packaging omits the shared CI Rust cache. Its infrequent builds
+compile dependencies from source rather than trust build artifacts written
+by PR workflows. The release jobs do not claim warm compiled dependencies.
 
 Release publication remains disabled by the existing U11.7 gate.
 

@@ -26,11 +26,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+        run: test "$(git rev-parse HEAD)" = "${{ github.sha }}"
 
       - name: Install Rust toolchain
         id: toolchain
@@ -119,11 +119,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+        run: test "$(git rev-parse HEAD)" = "${{ github.sha }}"
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -176,11 +176,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+        run: test "$(git rev-parse HEAD)" = "${{ github.sha }}"
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -261,10 +261,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+        run: test "$(git rev-parse HEAD)" = "${{ github.sha }}"
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -310,7 +310,7 @@ jobs:
             --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu \
             --workflow .github/workflows/ci.yml --run-id "${{ github.run_id }}" \
             --run-attempt "${{ github.run_attempt }}" \
-            --source-sha "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" \
+            --source-sha "${{ github.sha }}" \
             --job conformance --host ubuntu-24.04-x64 \
             --runtime "node-v24.18.0;rust-$(rustc --version)"
       - name: Upload strict conformance receipt
@@ -331,10 +331,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Assert source commit
-        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+        run: test "$(git rev-parse HEAD)" = "${{ github.sha }}"
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

@@ -360,10 +360,12 @@ jobs:
         uses: ./.github/actions/rust-cache
 
       - name: Corpus differential
+        id: corpus
         run: |
           cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
 
       - name: Test Linux native addon lifecycle
+        if: ${{ !cancelled() && (steps.corpus.outcome == 'success' || steps.corpus.outcome == 'failure') }}
         timeout-minutes: 15
         run: |
           node --input-type=module <<'NODE'
