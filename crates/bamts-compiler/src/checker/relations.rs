@@ -1851,11 +1851,27 @@ impl<'table> TypeRelations<'table> {
             })
     }
 
+    /// Whether `symbol` can ever appear in a signature environment (inferred
+    /// arguments, rigid bounds, aliases, known or erased parameters). The
+    /// intrinsic `Object` is a nominal top type, never a type parameter, so
+    /// consulting the environment for it always misses and needlessly
+    /// withholds the frame from the clean memo. Bypass both lookup and
+    /// poisoning for it. All environment readers must apply this gate
+    /// consistently, otherwise a later guard re-poisons the same pair.
+    fn is_env_eligible(&self, symbol: SymbolId) -> bool {
+        !self.table.is_object_symbol(symbol)
+    }
+
     fn inferred_argument(&self, symbol: SymbolId) -> Option<SignatureArgument> {
         // Every environment read withholds the frame from the clean memo
         // (see `poison_env_memo`): the clean key cannot see inference
         // state, so a result computed under one argument state must never
-        // answer a query under another.
+        // answer a query under another. Statically ineligible symbols such
+        // as the intrinsic `Object` can never hold inference state, so skip
+        // both the lookup and the poisoning for them.
+        if !self.is_env_eligible(symbol) {
+            return None;
+        }
         self.poison_env_memo();
         self.inferred_type_arguments.borrow().get(&symbol).cloned()
     }
@@ -1863,6 +1879,10 @@ impl<'table> TypeRelations<'table> {
     fn rigid_parameter_bound(&self, symbol: SymbolId) -> Option<TypeId> {
         // Same withholding as `inferred_argument`: the bound is
         // per-comparison caller-chosen state, invisible to the clean key.
+        // Ineligible symbols never carry such a bound.
+        if !self.is_env_eligible(symbol) {
+            return None;
+        }
         self.poison_env_memo();
         self.rigid_type_parameter_bounds
             .borrow()
@@ -1873,8 +1893,11 @@ impl<'table> TypeRelations<'table> {
     /// Whether two type parameters are currently paired as the same
     /// generic identity. Pairings are per-comparison inference state, so
     /// consulting them withholds the frame exactly like the other
-    /// environment reads above.
+    /// environment reads above. Ineligible symbols never participate.
     fn aliases_pair(&self, source: SymbolId, target: SymbolId) -> bool {
+        if !self.is_env_eligible(source) || !self.is_env_eligible(target) {
+            return false;
+        }
         self.poison_env_memo();
         self.parameter_aliases.borrow().contains(&(source, target))
     }
@@ -1882,8 +1905,11 @@ impl<'table> TypeRelations<'table> {
     /// Whether a type parameter is currently treated under its implicit
     /// `unknown` constraint. Known-parameter state is per-comparison, so
     /// consulting it withholds the frame exactly like the other
-    /// environment reads above.
+    /// environment reads above. Ineligible symbols never enter it.
     fn is_known_type_parameter(&self, symbol: SymbolId) -> bool {
+        if !self.is_env_eligible(symbol) {
+            return false;
+        }
         self.poison_env_memo();
         self.known_type_parameters.borrow().contains(&symbol)
     }
@@ -2220,7 +2246,12 @@ impl<'table> TypeRelations<'table> {
         // Erasure membership is per-comparison state invisible to the clean
         // key; consulting it withholds the frame even when the matching
         // erasure requirement already withholds the entry, so a future arm
-        // cannot leak across erasure states by omission.
+        // cannot leak across erasure states by omission. Ineligible symbols
+        // never enter erasure, so skip both the lookup and the poisoning
+        // (and record no requirement) for them.
+        if !self.is_env_eligible(symbol) {
+            return false;
+        }
         self.poison_env_memo();
         let erased = self.erased_parameters.borrow().contains(&symbol);
         if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
@@ -5475,6 +5506,97 @@ mod tests {
             relations.computed_relations(),
             before,
             "a settled alias comparison must come straight from the memo"
+        );
+    }
+    /// Regression for context-cache saturation: after filling the bounded
+    /// cache, a shared non-generic object graph whose leaf is `string` vs
+    /// the intrinsic `Object` must still scale with its distinct pairs via
+    /// the clean memo instead of recomputing the leaf along every branch.
+    #[test]
+    fn shared_object_graph_with_intrinsic_object_scales_after_cache_saturation() {
+        let mut table = TypeTable::new();
+        let object_symbol = SymbolId::new(9000);
+        table.set_object_symbol_for_test(object_symbol);
+        let object_head = table.named(object_symbol);
+        let string = table.string();
+        // Distinct filler pairs to saturate the bounded context cache.
+        let arrays: Vec<TypeId> = (0..100)
+            .map(|index| {
+                let literal = table.number_literal(&index.to_string());
+                table.array(literal)
+            })
+            .collect();
+        // Shared 4-ary tree of depth 4 over a `string` vs `Object` leaf.
+        // S0/T0 carry the leaf; each higher level fans out to four copies
+        // of the previous level, so the leaves repeat 256 times while only
+        // five distinct object levels exist.
+        let mut source_prev =
+            table.object_type(vec![PropertyType::new("value", false, string)]);
+        let mut target_prev =
+            table.object_type(vec![PropertyType::new("value", false, object_head)]);
+        for _ in 1..=4 {
+            let mut source_props = Vec::new();
+            let mut target_props = Vec::new();
+            for branch in 0..4 {
+                source_props.push(PropertyType::new(format!("p{branch}"), false, source_prev));
+                target_props.push(PropertyType::new(format!("p{branch}"), false, target_prev));
+            }
+            source_prev = table.object_type(source_props);
+            target_prev = table.object_type(target_props);
+        }
+        let source_root = source_prev;
+        let target_root = target_prev;
+        let number = table.number();
+        let mut source_prev =
+            table.object_type(vec![PropertyType::new("value", false, number)]);
+        let mut target_prev =
+            table.object_type(vec![PropertyType::new("value", false, object_head)]);
+        for _ in 1..=4 {
+            let mut source_props = Vec::new();
+            let mut target_props = Vec::new();
+            for branch in 0..4 {
+                source_props.push(PropertyType::new(format!("q{branch}"), false, source_prev));
+                target_props.push(PropertyType::new(format!("q{branch}"), false, target_prev));
+            }
+            source_prev = table.object_type(source_props);
+            target_prev = table.object_type(target_props);
+        }
+        let source_root_number = source_prev;
+        let target_root_number = target_prev;
+        let relations = TypeRelations::new(&table);
+        // Saturate the context-sensitive cache with distinct pairs first, so
+        // the shared graph below cannot rely on per-context memoization and
+        // must scale via the clean memo. Filling first is essential: a leaf
+        // cached before saturation would hide the blowup behind a hit.
+        for &source in &arrays {
+            for &target in &arrays {
+                let expected = source == target;
+                assert_eq!(relations.assignable(source, target), expected);
+            }
+        }
+        assert!(relations.cached_pairs() <= RELATION_CACHE_CAPACITY);
+        // Sanity: primitives flow into capital-`Object`. After saturation this
+        // single leaf cannot enter the context cache; with the fix it enters
+        // the clean memo and warms the shared graph below.
+        assert!(relations.assignable(string, object_head));
+        // The shared graph must scale with its distinct levels, not with the
+        // 256 repeated leaf visits.
+        let before = relations.computed_relations();
+        assert!(relations.assignable(source_root, target_root));
+        let delta = relations.computed_relations() - before;
+        assert!(
+            delta < 50,
+            "shared 4-ary depth-4 graph recomputed {delta} pairs; expected scaling with distinct levels via the clean memo"
+        );
+        // Second shape: `number` vs `Object` takes the same guards through a
+        // different primitive and must scale identically.
+        assert!(relations.assignable(number, object_head));
+        let before = relations.computed_relations();
+        assert!(relations.assignable(source_root_number, target_root_number));
+        let delta = relations.computed_relations() - before;
+        assert!(
+            delta < 50,
+            "number-leaf 4-ary depth-4 graph recomputed {delta} pairs; expected the same clean-memo scaling"
         );
     }
 }

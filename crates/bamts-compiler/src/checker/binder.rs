@@ -2457,6 +2457,15 @@ impl TypeTable {
         self.object_symbol == Some(symbol)
     }
 
+    /// Test-only hook to model the intrinsic `Object` nominal head without
+    /// binding the full intrinsic environment. Production binds it in
+    /// `bind_intrinsic_environment`; unit tests use this to exercise the
+    /// `Object` top-type arms and the environment-eligibility gate.
+    #[cfg(test)]
+    pub fn set_object_symbol_for_test(&mut self, symbol: SymbolId) {
+        self.object_symbol = Some(symbol);
+    }
+
     pub(super) fn concat_array_element(&self, type_id: TypeId) -> Option<TypeId> {
         let Type::AppliedClass { symbol, arguments } = self.get(type_id) else {
             return None;
