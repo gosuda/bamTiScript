@@ -116,16 +116,23 @@ struct RelationKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AliasScope {
+    outer_aliases: Box<[(SymbolId, SymbolId)]>,
+    local_arity: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RelationContext {
     parameter_aliases: Box<[(SymbolId, SymbolId)]>,
     alpha_aliases: usize,
+    alias_scope: Option<AliasScope>,
     erasure_active: bool,
     inferred_type_arguments: SmallVec<[(SymbolId, SignatureArgument); 4]>,
     known_type_parameters: SmallVec<[SymbolId; 4]>,
     rigid_type_parameter_bounds: SmallVec<[(SymbolId, TypeId); 4]>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum RelationEndpoint {
     Alias(SymbolId),
     Class(SymbolId),
@@ -144,7 +151,7 @@ struct FreeSymbolSearch {
     templates: HashSet<TemplateHead>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct AliasRelationKey {
     source: RelationEndpoint,
     target: RelationEndpoint,
@@ -161,11 +168,15 @@ struct ErasureRequirement {
 #[derive(Debug)]
 struct DependencyFrame {
     assumptions: HashSet<RelationKey>,
+    /// An incomplete view refutes only outside an active semantic alias pair.
+    absent_aliases: HashSet<AliasRelationKey>,
     erasure_requirements: HashMap<SymbolId, bool>,
     erased_base: usize,
     /// An inferred-argument choice may change when a provisional answer does.
     /// Keep its assumptions even when the enclosing comparison fails.
     inference_sensitive: bool,
+    /// An incomplete-view success depends on the current alias dispatch scope.
+    alias_sensitive: bool,
     /// Set when the comparison consults environment facts the memo keys
     /// cannot see (parameter pairings, inferred arguments, known or erased
     /// parameters). Withheld results stay out of the clean memo only; the
@@ -177,9 +188,11 @@ impl DependencyFrame {
     fn new(erased_base: usize) -> Self {
         Self {
             assumptions: HashSet::new(),
+            absent_aliases: HashSet::new(),
             erasure_requirements: HashMap::new(),
             erased_base,
             inference_sensitive: false,
+            alias_sensitive: false,
             env_sensitive: false,
         }
     }
@@ -189,12 +202,14 @@ impl DependencyFrame {
 struct CachedRelation {
     compatible: bool,
     assumptions: Box<[RelationKey]>,
+    absent_aliases: Box<[AliasRelationKey]>,
     erasure_requirements: Box<[ErasureRequirement]>,
     /// Whether the cached proof consulted environment state. A hit must
     /// carry this into the enclosing frame, otherwise the parent would look
     /// environment-independent and pollute the clean memo.
     env_sensitive: bool,
     inference_sensitive: bool,
+    alias_sensitive: bool,
 }
 
 /// Relation queries over one interned [`TypeTable`].
@@ -443,6 +458,7 @@ impl<'table> TypeRelations<'table> {
             }
             let cached = {
                 let visiting = self.visiting.borrow();
+                let active_aliases = self.active_alias_relations.borrow();
                 let erased = self.erased_parameters.borrow();
                 self.cache.borrow().get(&relation).and_then(|entries| {
                     let mut matched: Option<&CachedRelation> = None;
@@ -452,6 +468,10 @@ impl<'table> TypeRelations<'table> {
                             .assumptions
                             .iter()
                             .all(|assumption| visiting.contains(assumption))
+                            && entry
+                                .absent_aliases
+                                .iter()
+                                .all(|alias| !active_aliases.contains_key(alias))
                             && entry.erasure_requirements.iter().all(|requirement| {
                                 erased.contains(&requirement.symbol) == requirement.erased
                             })
@@ -484,6 +504,9 @@ impl<'table> TypeRelations<'table> {
                     parent
                         .assumptions
                         .extend(cached.assumptions.iter().copied());
+                    parent
+                        .absent_aliases
+                        .extend(cached.absent_aliases.iter().copied());
                     for requirement in cached.erasure_requirements.iter().copied() {
                         self.record_erasure_requirement(parent, requirement);
                     }
@@ -493,6 +516,7 @@ impl<'table> TypeRelations<'table> {
                     // the clean memo.
                     parent.env_sensitive |= cached.env_sensitive;
                     parent.inference_sensitive |= cached.inference_sensitive;
+                    parent.alias_sensitive |= cached.alias_sensitive;
                 }
                 return cached.compatible;
             }
@@ -564,35 +588,57 @@ impl<'table> TypeRelations<'table> {
                 None
             }
         });
-        if let Some(assumption) = alias_assumption {
+        let source_view = if source_class {
+            self.table.applied_class_view(source)
+        } else if source_alias {
+            self.relation_alias_view(source)
+        } else {
+            None
+        };
+        let target_view = if target_class {
+            self.table.applied_class_view(target)
+        } else if target_alias {
+            self.relation_alias_view(target)
+        } else {
+            None
+        };
+        // Prepared alias views form a finite graph. Inspect those views
+        // before approximating a changed-argument edge: a shared declaration
+        // alone cannot prove its materialized leaves. Class applications keep
+        // their existing recursion boundary.
+        let expands_view = (source_view.is_some() || target_view.is_some())
+            && (!source_alias || source_view.is_some())
+            && (!target_alias || target_view.is_some());
+        let alias_shortcut =
+            alias_assumption.filter(|_| !expands_view || source_class || target_class);
+        if let Some(assumption) = alias_shortcut {
+            let mut frames = self.dependency_stack.borrow_mut();
+            let frame = frames
+                .last_mut()
+                .expect("active relation owns a dependency frame");
+            frame.assumptions.insert(assumption);
+            frame.alias_sensitive = true;
+        } else if !expands_view
+            && alias_assumption.is_none()
+            && let Some(alias) = alias_relation
+        {
+            // Absence describes the state before this frame installed its
+            // owner. A later active owner can permit the incomplete backedge,
+            // so this fallback must not become an unconditional refutation.
             self.dependency_stack
                 .borrow_mut()
                 .last_mut()
                 .expect("active relation owns a dependency frame")
-                .assumptions
-                .insert(assumption);
+                .absent_aliases
+                .insert(alias);
         }
-        let result = if alias_assumption.is_some() || identical_application {
+        let result = if alias_shortcut.is_some() || identical_application {
             true
         } else if target_class
             && let Some(compatible) = self.array_relates_to_concat_array(source, target, strictness)
         {
             compatible
         } else if source_applied || target_applied {
-            let source_view = if source_class {
-                self.table.applied_class_view(source)
-            } else if source_alias {
-                self.relation_alias_view(source)
-            } else {
-                None
-            };
-            let target_view = if target_class {
-                self.table.applied_class_view(target)
-            } else if target_alias {
-                self.relation_alias_view(target)
-            } else {
-                None
-            };
             if (source_alias && source_view.is_none()) || (target_alias && target_view.is_none()) {
                 false
             } else if source_view.is_some() || target_view.is_some() {
@@ -630,12 +676,17 @@ impl<'table> TypeRelations<'table> {
             // refutation remains false when those assumptions are removed.
             // Preserve dependencies that affected an inferred-argument choice.
             frame.assumptions.clear();
+            frame.alias_sensitive = false;
         }
         if is_root {
             frame.assumptions.clear();
         } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
             parent.assumptions.extend(frame.assumptions.iter().copied());
+            parent
+                .absent_aliases
+                .extend(frame.absent_aliases.iter().copied());
             parent.inference_sensitive |= frame.inference_sensitive;
+            parent.alias_sensitive |= frame.alias_sensitive;
             parent.env_sensitive |= frame.env_sensitive;
             for (&symbol, &erased) in &frame.erasure_requirements {
                 self.record_erasure_requirement(parent, ErasureRequirement { symbol, erased });
@@ -646,8 +697,10 @@ impl<'table> TypeRelations<'table> {
         // provisional alias answers remain tied to their active comparison.
         if cacheable
             && !frame.env_sensitive
+            && !frame.alias_sensitive
             && frame.erasure_requirements.is_empty()
             && frame.assumptions.is_empty()
+            && frame.absent_aliases.is_empty()
         {
             self.clean
                 .borrow_mut()
@@ -656,8 +709,11 @@ impl<'table> TypeRelations<'table> {
         if cacheable && (result || frame.assumptions.is_empty()) {
             let env_sensitive = frame.env_sensitive;
             let inference_sensitive = frame.inference_sensitive;
+            let alias_sensitive = frame.alias_sensitive;
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
             assumptions.sort_unstable();
+            let mut absent_aliases: Vec<_> = frame.absent_aliases.into_iter().collect();
+            absent_aliases.sort_unstable();
             let mut erasure_requirements: Vec<_> = frame
                 .erasure_requirements
                 .into_iter()
@@ -667,9 +723,11 @@ impl<'table> TypeRelations<'table> {
             let cached = CachedRelation {
                 compatible: result,
                 assumptions: assumptions.into_boxed_slice(),
+                absent_aliases: absent_aliases.into_boxed_slice(),
                 erasure_requirements: erasure_requirements.into_boxed_slice(),
                 env_sensitive,
                 inference_sensitive,
+                alias_sensitive,
             };
             let mut cache = self.cache.borrow_mut();
             if cache.len() >= RELATION_CACHE_CAPACITY && !cache.contains_key(&relation) {
@@ -680,10 +738,15 @@ impl<'table> TypeRelations<'table> {
                 left.compatible == right.compatible
                     && (!left.env_sensitive || right.env_sensitive)
                     && (!left.inference_sensitive || right.inference_sensitive)
+                    && (!left.alias_sensitive || right.alias_sensitive)
                     && left
                         .assumptions
                         .iter()
                         .all(|assumption| right.assumptions.binary_search(assumption).is_ok())
+                    && left
+                        .absent_aliases
+                        .iter()
+                        .all(|alias| right.absent_aliases.binary_search(alias).is_ok())
                     && left.erasure_requirements.iter().all(|requirement| {
                         right
                             .erasure_requirements
@@ -712,6 +775,7 @@ impl<'table> TypeRelations<'table> {
         mut parameter_aliases: Vec<(SymbolId, SymbolId)>,
         alpha_aliases: usize,
         erasure_active: bool,
+        alias_scope: Option<AliasScope>,
     ) -> usize {
         parameter_aliases.sort_unstable();
         parameter_aliases.dedup();
@@ -720,6 +784,7 @@ impl<'table> TypeRelations<'table> {
         let rigid_type_parameter_bounds = self.rigid_type_parameter_bounds.borrow();
         if parameter_aliases.is_empty()
             && alpha_aliases == 0
+            && alias_scope.is_none()
             && !erasure_active
             && inferred_type_arguments.is_empty()
             && known_type_parameters.is_empty()
@@ -731,6 +796,7 @@ impl<'table> TypeRelations<'table> {
         let context = RelationContext {
             parameter_aliases: parameter_aliases.into_boxed_slice(),
             alpha_aliases,
+            alias_scope,
             erasure_active,
             inferred_type_arguments: {
                 let mut arguments: SmallVec<_> = inferred_type_arguments
@@ -761,9 +827,32 @@ impl<'table> TypeRelations<'table> {
 
     fn refresh_context(&self) {
         let parameter_aliases = self.parameter_aliases.borrow().clone();
+        let current_frame = self
+            .parameter_alias_frames
+            .borrow()
+            .last()
+            .copied()
+            .unwrap_or(0);
+        debug_assert_eq!(current_frame % 2, 0);
+        debug_assert!(current_frame <= parameter_aliases.len());
+        let mut outer_aliases =
+            parameter_aliases[..parameter_aliases.len() - current_frame].to_vec();
+        outer_aliases.sort_unstable();
+        outer_aliases.dedup();
+        // Effective parameter pairings do not retain a signature boundary.
+        // Alias dispatch also reads the outer prefix and current arity, so
+        // contextual proofs must distinguish those finite canonical facts.
+        let alias_scope = (current_frame != 0 || !outer_aliases.is_empty()).then(|| AliasScope {
+            outer_aliases: outer_aliases.into_boxed_slice(),
+            local_arity: current_frame / 2,
+        });
         let erasure_active = !self.erased_parameters.borrow().is_empty();
-        self.active_context
-            .set(self.intern_context(parameter_aliases, 0, erasure_active));
+        self.active_context.set(self.intern_context(
+            parameter_aliases,
+            0,
+            erasure_active,
+            alias_scope,
+        ));
     }
 
     fn alias_relation_context(&self, source: TypeId, target: TypeId) -> usize {
@@ -784,7 +873,7 @@ impl<'table> TypeRelations<'table> {
         aliases.dedup();
         let erasure_active = !self.erased_parameters.borrow().is_empty();
         if aliases.is_empty() {
-            return self.intern_context(Vec::new(), alpha_aliases, erasure_active);
+            return self.intern_context(Vec::new(), alpha_aliases, erasure_active, None);
         }
         let mut projected = Vec::with_capacity(aliases.len());
 
@@ -804,7 +893,7 @@ impl<'table> TypeRelations<'table> {
             }
         }
 
-        self.intern_context(projected, alpha_aliases, erasure_active)
+        self.intern_context(projected, alpha_aliases, erasure_active, None)
     }
 
     fn both_reachable(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -6225,5 +6314,214 @@ mod tests {
                 "inference miss recomputed {computed} shared recursive relations"
             );
         }
+    }
+
+    #[test]
+    fn transformed_alias_union_order_is_stable() {
+        let mut verdicts = Vec::new();
+        for reversed in [false, true] {
+            let mut table = TypeTable::new();
+            let string = table.string();
+            let strings = table.array(string);
+            let left = SymbolId::new(9900);
+            let left_parameter = SymbolId::new(9901);
+            let right = SymbolId::new(9902);
+            let right_parameter = SymbolId::new(9903);
+            for (alias, parameter) in [(left, left_parameter), (right, right_parameter)] {
+                table.declare_alias(alias, vec![parameter]);
+                let value = table.named(parameter);
+                let array = table.array(value);
+                let recursive = table.applied_alias(alias, vec![array]);
+                let body = table.object_type(vec![
+                    PropertyType::new("next", false, recursive),
+                    PropertyType::new("value", false, if alias == left { value } else { string }),
+                ]);
+                table.publish_alias_template(alias, body);
+            }
+            let source_alias = table.applied_alias(left, vec![string]);
+            let target_alias = table.applied_alias(right, vec![string]);
+            let nested_source = table.applied_alias(left, vec![strings]);
+            let nested_target = table.applied_alias(right, vec![strings]);
+            let source = table.object_type(vec![PropertyType::new("root", false, source_alias)]);
+            let shallow = table.object_type(vec![PropertyType::new("next", false, nested_target)]);
+            let (first, second) = if reversed {
+                let second =
+                    table.object_type(vec![PropertyType::new("root", false, target_alias)]);
+                let first = table.object_type(vec![PropertyType::new("root", false, shallow)]);
+                (first, second)
+            } else {
+                let first = table.object_type(vec![PropertyType::new("root", false, shallow)]);
+                let second =
+                    table.object_type(vec![PropertyType::new("root", false, target_alias)]);
+                (first, second)
+            };
+            let target = if reversed {
+                table.union(&[second, first])
+            } else {
+                table.union(&[first, second])
+            };
+            let Type::Union(members) = table.get(target) else {
+                panic!("distinct union members must be retained");
+            };
+            assert_eq!(members[0], if reversed { second } else { first });
+            let direct = TypeRelations::new(&table).assignable(source_alias, target_alias);
+            let primed = TypeRelations::new(&table);
+            assert!(!primed.assignable(nested_source, nested_target));
+            let after_refutation = primed.assignable(source_alias, target_alias);
+            let verdict = TypeRelations::new(&table).assignable(source, target);
+            println!(
+                "ALIAS_ORDER reversed={reversed} direct={direct} primed={after_refutation} union={verdict}"
+            );
+            assert!(
+                !direct,
+                "available changed-argument leaf must refute the root"
+            );
+            assert!(!after_refutation);
+            assert!(!verdict);
+            verdicts.push(verdict);
+        }
+        assert_eq!(
+            verdicts[0], verdicts[1],
+            "transformed alias union order changed compatibility"
+        );
+    }
+
+    #[test]
+    fn incomplete_alias_refutation_does_not_suppress_an_active_backedge() {
+        let mut table = TypeTable::new();
+        let alias = SymbolId::new(10100);
+        let parameter = SymbolId::new(10101);
+        table.declare_alias(alias, vec![parameter]);
+        let value = table.named(parameter);
+        let array = table.array(value);
+        let recursive = table.applied_alias(alias, vec![array]);
+        let body = table.object_type(vec![
+            PropertyType::new("next", false, recursive),
+            PropertyType::new("value", false, value),
+        ]);
+        table.publish_alias_template(alias, body);
+        let literal = table.string_literal("value");
+        let string = table.string();
+        let source = table.applied_alias(alias, vec![literal]);
+        let target = table.applied_alias(alias, vec![string]);
+        let mut missing_source = source;
+        let mut missing_target = target;
+        while let (Some(source_view), Some(target_view)) = (
+            table.applied_alias_view(missing_source),
+            table.applied_alias_view(missing_target),
+        ) {
+            let (Type::ObjectType(source_object), Type::ObjectType(target_object)) =
+                (table.get(source_view), table.get(target_view))
+            else {
+                panic!("recursive alias has an object view");
+            };
+            missing_source = source_object
+                .properties
+                .iter()
+                .find(|property| property.name() == "next")
+                .expect("recursive source edge")
+                .type_id();
+            missing_target = target_object
+                .properties
+                .iter()
+                .find(|property| property.name() == "next")
+                .expect("recursive target edge")
+                .type_id();
+        }
+        assert_ne!(missing_source, missing_target);
+        let relations = TypeRelations::new(&table);
+        assert!(!relations.assignable(missing_source, missing_target));
+        assert!(
+            relations.assignable(source, target),
+            "incomplete fallback suppressed a permitted recursive backedge"
+        );
+        let before = relations.computed_relations();
+        assert!(!relations.assignable(missing_source, missing_target));
+        assert_eq!(relations.computed_relations(), before);
+    }
+
+    #[test]
+    fn incomplete_alias_refutations_share_across_union_branches() {
+        let mut table = TypeTable::new();
+        let left = SymbolId::new(10200);
+        let right = SymbolId::new(10201);
+        table.declare_alias(left, Vec::new());
+        table.declare_alias(right, Vec::new());
+        let mut source = table.intern_applied_alias(left, Vec::new());
+        let mut target = table.intern_applied_alias(right, Vec::new());
+        let first = table.string_literal("first");
+        let second = table.string_literal("second");
+        for _ in 0..12 {
+            source = table.object_type(vec![PropertyType::new("child", false, source)]);
+            let first_branch = table.object_type(vec![
+                PropertyType::new("child", false, target),
+                PropertyType::new("tag", true, first),
+            ]);
+            let second_branch = table.object_type(vec![
+                PropertyType::new("child", false, target),
+                PropertyType::new("tag", true, second),
+            ]);
+            target = table.union(&[first_branch, second_branch]);
+        }
+        let relations = TypeRelations::new(&table);
+        assert!(!relations.assignable(source, target));
+        let computed = relations.computed_relations();
+        assert!(
+            computed < 64,
+            "incomplete alias fallback recomputed {computed} relations"
+        );
+    }
+
+    #[test]
+    fn incomplete_alias_cache_respects_generic_frame_boundaries() {
+        let mut table = TypeTable::new();
+        let source_parameter = SymbolId::new(10300);
+        let target_parameter = SymbolId::new(10301);
+        let source_type = table.named(source_parameter);
+        let target_type = table.named(target_parameter);
+        let source_array = table.array(source_type);
+        let target_array = table.array(target_type);
+        let left = SymbolId::new(10302);
+        let right = SymbolId::new(10303);
+        table.declare_alias(left, vec![SymbolId::new(10304)]);
+        table.declare_alias(right, vec![SymbolId::new(10305)]);
+        let missing_source = table.intern_applied_alias(left, vec![source_type]);
+        let missing_target = table.intern_applied_alias(right, vec![target_type]);
+        let source = table.intern_applied_alias(left, vec![source_array]);
+        let target = table.intern_applied_alias(right, vec![target_array]);
+        let source_view = table.object_type(vec![PropertyType::new("next", false, missing_source)]);
+        let target_view = table.object_type(vec![PropertyType::new("next", false, missing_target)]);
+        table.set_applied_alias_view(source, source_view);
+        table.set_applied_alias_view(target, target_view);
+        let source_signature =
+            table.function_with_parameters(vec![source_parameter], Vec::new(), table.void());
+        let target_signature =
+            table.function_with_parameters(vec![target_parameter], Vec::new(), table.void());
+        let signature = |type_id| match table.get(type_id) {
+            Type::Function(signature) => signature.clone(),
+            _ => panic!("test fixture must be a function"),
+        };
+        let source_signature = signature(source_signature);
+        let target_signature = signature(target_signature);
+        let relations = TypeRelations::new(&table);
+        assert!(
+            relations.with_parameter_aliases(
+                &source_signature,
+                &target_signature,
+                Strictness::Assignable,
+                ParameterVariance::Contravariant,
+                || {
+                    assert!(!relations.assignable(missing_source, missing_target));
+                    relations.with_parameter_aliases(
+                        &source_signature,
+                        &target_signature,
+                        Strictness::Assignable,
+                        ParameterVariance::Contravariant,
+                        || relations.assignable(source, target),
+                    )
+                },
+            ),
+            "an absence proof crossed a generic alias frame boundary"
+        );
     }
 }
