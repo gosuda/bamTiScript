@@ -204,10 +204,9 @@ pub struct TypeRelations<'table> {
     /// Results proven independent of the relation environment, keyed by the
     /// query's own endpoints and strictness alone. A hit returns the
     /// stored answer with no assumption bookkeeping. Entries are stored
-    /// only for frames with no environment-sensitive consultation and no
-    /// erasure requirements; a `true` proved with coinductive hypotheses is
-    /// admitted, a `false` under hypotheses is withheld. This is what lets
-    /// the same structural comparison recur under hundreds of inference
+    /// only for frames with no environment-sensitive consultation, erasure
+    /// requirements, or unresolved coinductive assumptions. This lets
+    /// independent structural comparisons recur under hundreds of inference
     /// environments without recomputing.
     clean: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
@@ -601,23 +600,13 @@ impl<'table> TypeRelations<'table> {
                 self.record_erasure_requirement(parent, ErasureRequirement { symbol, erased });
             }
         }
-        // Environment-independent results additionally enter the clean memo
-        // keyed without the context. A hit returns the answer in every
-        // environment with no bookkeeping. Withheld are comparisons that
-        // consulted the environment and anything carrying erasure
-        // requirements. A `true` proved with coinductive hypotheses is
-        // admitted, including results that passed through an alias-cycle
-        // re-entry: every guard re-entry is guarded by a structural
-        // destructor step in `relates_uncached` (object property, signature
-        // parameter or return, member, or constraint), so the hypotheses are
-        // contractive and the coinductive reading is sound. The
-        // context-sensitive cache stays conservative via `approximate_alias`.
-        // A `false` proved under hypotheses is withheld instead: refuting
-        // under an unproven hypothesis refutes nothing.
+        // A clean hit has no dependency bookkeeping, so only completed
+        // proofs may enter it. Nested coinductive results keep their active
+        // assumptions in the contextual cache until the root discharges them.
         if cacheable
             && !frame.env_sensitive
             && frame.erasure_requirements.is_empty()
-            && (result || frame.assumptions.is_empty())
+            && frame.assumptions.is_empty()
         {
             self.clean
                 .borrow_mut()

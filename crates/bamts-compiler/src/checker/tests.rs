@@ -13186,3 +13186,44 @@ fn indexed_bound_distributes_union_candidates_over_read_union() {
         );
     }
 }
+
+#[test]
+fn recursive_union_rejects_failed_coinductive_branch() {
+    for target in [
+        r#"{ root: B<number> } | { root: { a: B<number>["a"] } }"#,
+        r#"{ root: { a: B<number>["a"] } } | { root: B<number> }"#,
+    ] {
+        let checked = check_text(&format!(
+            "type A<T> = {{ a: {{ back: A<T>; leaf: string }}; z: T }};\n\
+             type B<T> = {{ a: {{ back: B<T>; leaf: Object }}; z: T }};\n\
+             declare const value: {{ root: A<string> }};\n\
+             const result: {target} = value;"
+        ));
+        assert_eq!(
+            checker_codes(&checked),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "recursive branch must not reuse a disproven cycle: {target}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn recursive_union_accepts_completed_coinductive_branch() {
+    for target in [
+        r#"{ root: B<string> } | { root: { a: B<string>["a"] } }"#,
+        r#"{ root: { a: B<string>["a"] } } | { root: B<string> }"#,
+    ] {
+        let checked = check_text(&format!(
+            "type A<T> = {{ a: {{ back: A<T>; leaf: string }}; z: T }};\n\
+             type B<T> = {{ a: {{ back: B<T>; leaf: Object }}; z: T }};\n\
+             declare const value: {{ root: A<string> }};\n\
+             const result: {target} = value;"
+        ));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "completed recursive branches remain assignable: {target}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
