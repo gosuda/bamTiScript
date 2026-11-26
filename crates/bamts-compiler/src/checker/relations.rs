@@ -1158,13 +1158,11 @@ impl<'table> TypeRelations<'table> {
             // that was positionally inferred from the non-generic counterpart.
             // Substitute the inferred concrete type and continue.
             (Type::Named(symbol), _) if let Some(inferred) = self.inferred_argument(*symbol) => {
-                self.poison_env_memo();
                 inferred.iter().all(|&argument| {
                     argument != source && self.relates(argument, target, strictness)
                 })
             }
             (_, Type::Named(symbol)) if let Some(inferred) = self.inferred_argument(*symbol) => {
-                self.poison_env_memo();
                 let accepts = |source| {
                     inferred.iter().any(|&argument| {
                         argument != target && self.relates(source, argument, strictness)
@@ -1182,12 +1180,8 @@ impl<'table> TypeRelations<'table> {
             // otherwise two renamed constrained parameters decay to their
             // bounds and can never match each other.
             (Type::Named(source_symbol), Type::Named(target_symbol))
-                if self
-                    .parameter_aliases
-                    .borrow()
-                    .contains(&(*source_symbol, *target_symbol)) =>
+                if self.aliases_pair(*source_symbol, *target_symbol) =>
             {
-                self.poison_env_memo();
                 true
             }
             // A universal target keeps its identity throughout nested variance
@@ -1230,29 +1224,25 @@ impl<'table> TypeRelations<'table> {
             // implicit constraint of `unknown`: everything flows in, nothing
             // flows out — exactly the `unknown` arms below.
             (Type::Named(symbol), _)
-                if self.known_type_parameters.borrow().contains(symbol)
+                if self.is_known_type_parameter(*symbol)
                     && self.table.type_parameter_constraint(*symbol).is_none() =>
             {
-                self.poison_env_memo();
                 false
             }
             (_, Type::Named(symbol))
-                if self.known_type_parameters.borrow().contains(symbol)
+                if self.is_known_type_parameter(*symbol)
                     && self.table.type_parameter_constraint(*symbol).is_none() =>
             {
-                self.poison_env_memo();
                 true
             }
             (Type::Named(symbol), _)
                 if strictness == Strictness::Comparable && self.is_erased_parameter(*symbol) =>
             {
-                self.poison_env_memo();
                 true
             }
             (_, Type::Named(symbol))
                 if strictness == Strictness::Comparable && self.is_erased_parameter(*symbol) =>
             {
-                self.poison_env_memo();
                 true
             }
             // An unresolved constraint is already represented by `Error`.
@@ -1862,14 +1852,40 @@ impl<'table> TypeRelations<'table> {
     }
 
     fn inferred_argument(&self, symbol: SymbolId) -> Option<SignatureArgument> {
+        // Every environment read withholds the frame from the clean memo
+        // (see `poison_env_memo`): the clean key cannot see inference
+        // state, so a result computed under one argument state must never
+        // answer a query under another.
+        self.poison_env_memo();
         self.inferred_type_arguments.borrow().get(&symbol).cloned()
     }
 
     fn rigid_parameter_bound(&self, symbol: SymbolId) -> Option<TypeId> {
+        // Same withholding as `inferred_argument`: the bound is
+        // per-comparison caller-chosen state, invisible to the clean key.
+        self.poison_env_memo();
         self.rigid_type_parameter_bounds
             .borrow()
             .get(&symbol)
             .copied()
+    }
+
+    /// Whether two type parameters are currently paired as the same
+    /// generic identity. Pairings are per-comparison inference state, so
+    /// consulting them withholds the frame exactly like the other
+    /// environment reads above.
+    fn aliases_pair(&self, source: SymbolId, target: SymbolId) -> bool {
+        self.poison_env_memo();
+        self.parameter_aliases.borrow().contains(&(source, target))
+    }
+
+    /// Whether a type parameter is currently treated under its implicit
+    /// `unknown` constraint. Known-parameter state is per-comparison, so
+    /// consulting it withholds the frame exactly like the other
+    /// environment reads above.
+    fn is_known_type_parameter(&self, symbol: SymbolId) -> bool {
+        self.poison_env_memo();
+        self.known_type_parameters.borrow().contains(&symbol)
     }
 
     fn signature_arguments_satisfy_bounds(
@@ -2201,6 +2217,11 @@ impl<'table> TypeRelations<'table> {
     }
 
     fn is_erased_parameter(&self, symbol: SymbolId) -> bool {
+        // Erasure membership is per-comparison state invisible to the clean
+        // key; consulting it withholds the frame even when the matching
+        // erasure requirement already withholds the entry, so a future arm
+        // cannot leak across erasure states by omission.
+        self.poison_env_memo();
         let erased = self.erased_parameters.borrow().contains(&symbol);
         if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
             self.record_erasure_requirement(frame, ErasureRequirement { symbol, erased });
@@ -2319,11 +2340,15 @@ impl<'table> TypeRelations<'table> {
     }
 
     /// Marks the active frame environment-sensitive so its result never
-    /// enters the clean memo. Callers are the arms that consult facts the
-    /// keys cannot see: parameter pairings, inferred arguments, and known
-    /// or erased parameters. The context-sensitive cache keeps working
-    /// as before, so identical environments still share; only
-    /// cross-environment reuse is withheld, which is always sound.
+    /// enters the clean memo. The environment readers poison on read
+    /// (`inferred_argument`, `rigid_parameter_bound`, `aliases_pair`,
+    /// `is_known_type_parameter`, `is_erased_parameter`), so an arm
+    /// withholds by consulting them — including when a guard reads them
+    /// and falls through to a later arm. Arms need no explicit call, and
+    /// a future arm cannot leak across environments by omission. The
+    /// context-sensitive cache keeps working as before, so identical
+    /// environments still share; only cross-environment reuse is
+    /// withheld, which is always sound.
     fn poison_env_memo(&self) {
         if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
             frame.env_sensitive = true;
@@ -5181,6 +5206,75 @@ mod tests {
                     false,
                     false,
                 )],
+                table.void(),
+                false,
+            ));
+        }
+        let relations = TypeRelations::new(&table);
+        assert!(relations.assignable(source, targets[0]));
+        assert!(!relations.assignable(source, targets[1]));
+        assert!(relations.assignable(source, targets[0]));
+        assert!(relations.rigid_type_parameter_bounds.borrow().is_empty());
+    }
+    /// The never-bound target rejects the same nullable sources even when
+    /// it is queried first: the clean memo must not answer the later
+    /// string-bound query with the never-bound result, nor the reverse.
+    /// (Order-flipped variant of
+    /// `generic_results_keep_non_strict_nullability_without_erasing_identity`.)
+    #[test]
+    fn generic_results_reject_never_bound_first_without_identity_loss() {
+        let mut table = TypeTable::new();
+        let symbol = SymbolId::new(624);
+        let named = table.named(symbol);
+        let string = table.string();
+        let never = table.never();
+        let mut targets = Vec::new();
+        for bound in [never, string] {
+            targets.push(table.function_with_parameter_bounds(
+                vec![symbol],
+                vec![TypeParameterBounds::new(Some(bound), None)],
+                Vec::new(),
+                named,
+                false,
+            ));
+        }
+        let mut nullable_sources = Vec::new();
+        for result in [table.null_type(), table.undefined_type()] {
+            nullable_sources.push(table.function(Vec::new(), result));
+        }
+        let relations = TypeRelations::new(&table);
+        for source in nullable_sources {
+            assert!(!relations.assignable(source, targets[0]));
+            assert!(!relations.assignable_with_strict_null(source, targets[0]));
+            assert!(relations.assignable(source, targets[1]));
+            assert!(!relations.assignable_with_strict_null(source, targets[1]));
+        }
+    }
+
+    /// A different bound pair partitions the cache per bound state even
+    /// with a third uninvolved type parameter in the signature: the
+    /// boolean-bound target accepts, the string-bound target rejects, and
+    /// no per-comparison state leaks into the relation cache.
+    #[test]
+    fn rigid_signature_bounds_partition_second_pair_with_third_parameter() {
+        let mut table = TypeTable::new();
+        let symbol = SymbolId::new(625);
+        let other = SymbolId::new(626);
+        let named = table.named(symbol);
+        let other_named = table.named(other);
+        let source = table.function(vec![table.boolean()], table.void());
+        let mut targets = Vec::new();
+        for bound in [table.boolean(), table.string()] {
+            targets.push(table.function_with_parameter_bounds(
+                vec![symbol, other],
+                vec![
+                    TypeParameterBounds::new(Some(bound), None),
+                    TypeParameterBounds::NONE,
+                ],
+                vec![
+                    FunctionParameter::new("value".to_owned(), named, false, false),
+                    FunctionParameter::new("other".to_owned(), other_named, false, false),
+                ],
                 table.void(),
                 false,
             ));
