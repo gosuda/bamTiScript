@@ -31,8 +31,8 @@ use super::binder::{
 };
 use crate::literal::{MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, number_value};
 use crate::syntax::Accessibility;
-/// Completed structural relations are memoized up to this bound; beyond it,
-/// results stay deterministic because the algebra never depends on cache state.
+/// Retained contextual pairs between root queries. A query keeps its own
+/// overflow until completion so shared recursive proofs remain memoized.
 const RELATION_CACHE_CAPACITY: usize = 4096;
 const ERASURE_VARIANTS_PER_RELATION: usize = 8;
 
@@ -163,7 +163,9 @@ struct DependencyFrame {
     assumptions: HashSet<RelationKey>,
     erasure_requirements: HashMap<SymbolId, bool>,
     erased_base: usize,
-    approximate_alias: bool,
+    /// An inferred-argument choice may change when a provisional answer does.
+    /// Keep its assumptions even when the enclosing comparison fails.
+    inference_sensitive: bool,
     /// Set when the comparison consults environment facts the memo keys
     /// cannot see (parameter pairings, inferred arguments, known or erased
     /// parameters). Withheld results stay out of the clean memo only; the
@@ -177,7 +179,7 @@ impl DependencyFrame {
             assumptions: HashSet::new(),
             erasure_requirements: HashMap::new(),
             erased_base,
-            approximate_alias: false,
+            inference_sensitive: false,
             env_sensitive: false,
         }
     }
@@ -192,6 +194,7 @@ struct CachedRelation {
     /// carry this into the enclosing frame, otherwise the parent would look
     /// environment-independent and pollute the clean memo.
     env_sensitive: bool,
+    inference_sensitive: bool,
 }
 
 /// Relation queries over one interned [`TypeTable`].
@@ -205,15 +208,19 @@ pub struct TypeRelations<'table> {
     /// query's own endpoints and strictness alone. A hit returns the
     /// stored answer with no assumption bookkeeping. Entries are stored
     /// only for frames with no environment-sensitive consultation, erasure
-    /// requirements, unresolved coinductive assumptions, or alias-cycle
-    /// approximations. This lets independent structural comparisons recur
-    /// under hundreds of inference environments without recomputing.
+    /// requirements, or unresolved coinductive assumptions. This lets
+    /// independent structural comparisons recur under hundreds of inference
+    /// environments without recomputing.
     clean: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
+    /// Overflow entries belong to the active root query and are removed when
+    /// it finishes, preserving the retained contextual cache bound.
+    transient_cache_keys: RefCell<Vec<RelationKey>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<RelationKey>>,
-    /// Semantic alias pairs active on the current structural path.
-    active_alias_relations: RefCell<HashSet<AliasRelationKey>>,
+    /// Semantic alias pairs and the exact active comparisons that justify
+    /// their provisional recursive answers.
+    active_alias_relations: RefCell<HashMap<AliasRelationKey, RelationKey>>,
     /// Coinductive assumptions and erased-membership predicates consumed by
     /// each active relation frame.
     dependency_stack: RefCell<Vec<DependencyFrame>>,
@@ -266,9 +273,10 @@ impl<'table> TypeRelations<'table> {
         Self {
             table,
             cache: RefCell::new(HashMap::new()),
+            transient_cache_keys: RefCell::new(Vec::new()),
             clean: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
-            active_alias_relations: RefCell::new(HashSet::new()),
+            active_alias_relations: RefCell::new(HashMap::new()),
             dependency_stack: RefCell::new(Vec::new()),
             contexts: RefCell::new(HashMap::new()),
             template_capture_reachability: RefCell::new(HashMap::new()),
@@ -448,15 +456,25 @@ impl<'table> TypeRelations<'table> {
                                 erased.contains(&requirement.symbol) == requirement.erased
                             })
                     }) {
-                        if matched.is_some_and(|current| current.compatible != entry.compatible) {
+                        // Completed proofs take precedence over hypothetical
+                        // successes. Contradictory completed proofs are a bug.
+                        if let Some(current) = matched
+                            && current.compatible != entry.compatible
+                            && current.assumptions.is_empty()
+                            && entry.assumptions.is_empty()
+                        {
                             conflict = true;
                             break;
                         }
-                        matched.get_or_insert(entry);
+                        if matched.is_none_or(|current| {
+                            !current.assumptions.is_empty() && entry.assumptions.is_empty()
+                        }) {
+                            matched = Some(entry);
+                        }
                     }
                     debug_assert!(
                         !conflict,
-                        "matching relation cache variants disagree on compatibility"
+                        "completed relation cache variants disagree on compatibility"
                     );
                     (!conflict).then(|| matched.cloned()).flatten()
                 })
@@ -474,6 +492,7 @@ impl<'table> TypeRelations<'table> {
                     // the enclosing comparison does too and must stay out of
                     // the clean memo.
                     parent.env_sensitive |= cached.env_sensitive;
+                    parent.inference_sensitive |= cached.inference_sensitive;
                 }
                 return cached.compatible;
             }
@@ -536,16 +555,24 @@ impl<'table> TypeRelations<'table> {
             strictness,
             context: self.alias_relation_context(source, target),
         });
-        let alias_relation_inserted =
-            alias_relation.is_none_or(|key| self.active_alias_relations.borrow_mut().insert(key));
-        if !alias_relation_inserted {
+        let alias_assumption = alias_relation.and_then(|key| {
+            let mut active = self.active_alias_relations.borrow_mut();
+            if let Some(assumption) = active.get(&key) {
+                Some(*assumption)
+            } else {
+                active.insert(key, relation);
+                None
+            }
+        });
+        if let Some(assumption) = alias_assumption {
             self.dependency_stack
                 .borrow_mut()
                 .last_mut()
                 .expect("active relation owns a dependency frame")
-                .approximate_alias = true;
+                .assumptions
+                .insert(assumption);
         }
-        let result = if !alias_relation_inserted || identical_application {
+        let result = if alias_assumption.is_some() || identical_application {
             true
         } else if target_class
             && let Some(compatible) = self.array_relates_to_concat_array(source, target, strictness)
@@ -580,7 +607,9 @@ impl<'table> TypeRelations<'table> {
         } else {
             self.relates_uncached(source, target, strictness)
         };
-        if alias_relation_inserted && let Some(key) = alias_relation {
+        if alias_assumption.is_none()
+            && let Some(key) = alias_relation
+        {
             self.active_alias_relations.borrow_mut().remove(&key);
         }
 
@@ -596,35 +625,37 @@ impl<'table> TypeRelations<'table> {
             // recursion guard recorded for it is settled. Assumptions on
             // other still-active comparisons propagate untouched.
             frame.assumptions.remove(&relation);
+        } else if !frame.inference_sensitive {
+            // Recursion guards provisionally answer true. A structural
+            // refutation remains false when those assumptions are removed.
+            // Preserve dependencies that affected an inferred-argument choice.
+            frame.assumptions.clear();
         }
         if is_root {
             frame.assumptions.clear();
         } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
             parent.assumptions.extend(frame.assumptions.iter().copied());
-            parent.approximate_alias |= frame.approximate_alias;
+            parent.inference_sensitive |= frame.inference_sensitive;
             parent.env_sensitive |= frame.env_sensitive;
             for (&symbol, &erased) in &frame.erasure_requirements {
                 self.record_erasure_requirement(parent, ErasureRequirement { symbol, erased });
             }
         }
         // A clean hit has no dependency bookkeeping, so only completed
-        // proofs may enter it. Nested coinductive results keep their active
-        // assumptions in the contextual cache until the root discharges them.
-        // Alias-cycle approximations rest on an unrecorded hypothesis about a
-        // still-active comparison, so they stay out even with no recorded
-        // assumptions, exactly like the context-sensitive cache.
+        // proofs may enter it. Successful exact cycles discharge themselves;
+        // provisional alias answers remain tied to their active comparison.
         if cacheable
             && !frame.env_sensitive
             && frame.erasure_requirements.is_empty()
             && frame.assumptions.is_empty()
-            && !frame.approximate_alias
         {
             self.clean
                 .borrow_mut()
                 .insert((source, target, strictness), result);
         }
-        if cacheable && !frame.approximate_alias && (result || frame.assumptions.is_empty()) {
+        if cacheable && (result || frame.assumptions.is_empty()) {
             let env_sensitive = frame.env_sensitive;
+            let inference_sensitive = frame.inference_sensitive;
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
             assumptions.sort_unstable();
             let mut erasure_requirements: Vec<_> = frame
@@ -638,30 +669,39 @@ impl<'table> TypeRelations<'table> {
                 assumptions: assumptions.into_boxed_slice(),
                 erasure_requirements: erasure_requirements.into_boxed_slice(),
                 env_sensitive,
+                inference_sensitive,
             };
             let mut cache = self.cache.borrow_mut();
-            if cache.len() < RELATION_CACHE_CAPACITY || cache.contains_key(&relation) {
-                let entries = cache.entry(relation).or_default();
-                let dominates = |left: &CachedRelation, right: &CachedRelation| {
-                    left.compatible == right.compatible
-                        && (!left.env_sensitive || right.env_sensitive)
-                        && left
-                            .assumptions
-                            .iter()
-                            .all(|assumption| right.assumptions.binary_search(assumption).is_ok())
-                        && left.erasure_requirements.iter().all(|requirement| {
-                            right
-                                .erasure_requirements
-                                .binary_search(requirement)
-                                .is_ok()
-                        })
-                };
-                if !entries.iter().any(|entry| dominates(entry, &cached)) {
-                    entries.retain(|entry| !dominates(&cached, entry));
-                    if entries.len() < ERASURE_VARIANTS_PER_RELATION {
-                        entries.push(cached);
-                    }
+            if cache.len() >= RELATION_CACHE_CAPACITY && !cache.contains_key(&relation) {
+                self.transient_cache_keys.borrow_mut().push(relation);
+            }
+            let entries = cache.entry(relation).or_default();
+            let dominates = |left: &CachedRelation, right: &CachedRelation| {
+                left.compatible == right.compatible
+                    && (!left.env_sensitive || right.env_sensitive)
+                    && (!left.inference_sensitive || right.inference_sensitive)
+                    && left
+                        .assumptions
+                        .iter()
+                        .all(|assumption| right.assumptions.binary_search(assumption).is_ok())
+                    && left.erasure_requirements.iter().all(|requirement| {
+                        right
+                            .erasure_requirements
+                            .binary_search(requirement)
+                            .is_ok()
+                    })
+            };
+            if !entries.iter().any(|entry| dominates(entry, &cached)) {
+                entries.retain(|entry| !dominates(&cached, entry));
+                if entries.len() < ERASURE_VARIANTS_PER_RELATION {
+                    entries.push(cached);
                 }
+            }
+        }
+        if is_root {
+            let mut cache = self.cache.borrow_mut();
+            for key in self.transient_cache_keys.borrow_mut().drain(..) {
+                cache.remove(&key);
             }
         }
         result
@@ -2201,6 +2241,9 @@ impl<'table> TypeRelations<'table> {
                             }
                         }
                     }
+                }
+                if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
+                    frame.inference_sensitive = true;
                 }
                 if let Some(candidate) = candidates.iter().copied().find(|candidate| {
                     candidates
@@ -5013,12 +5056,6 @@ mod tests {
             relations.computed_relations()
         );
 
-        let parent_relation = RelationKey {
-            source: parent_source,
-            target: parent_target,
-            strictness: Strictness::Assignable,
-            context: 0,
-        };
         let child_relation = RelationKey {
             source: source_bound,
             target: target_bound,
@@ -5039,17 +5076,17 @@ mod tests {
         assert!(!relations.assignable(parent_source, parent_target));
         relations.dependency_stack.borrow_mut().pop();
         relations.visiting.borrow_mut().remove(&dummy_relation);
-        assert!(
-            !relations.cache.borrow().contains_key(&parent_relation),
-            "a cycle-dependent false nested result must not become universal"
-        );
+        assert!(!relations.assignable(parent_source, parent_target));
 
         relations.visiting.borrow_mut().insert(child_relation);
         relations
             .dependency_stack
             .borrow_mut()
             .push(DependencyFrame::new(0));
-        assert!(relations.assignable(parent_source, parent_target));
+        assert!(
+            !relations.assignable(parent_source, parent_target),
+            "a completed refutation must override a hypothetical backedge"
+        );
         relations.dependency_stack.borrow_mut().pop();
         relations.visiting.borrow_mut().remove(&child_relation);
     }
@@ -5703,13 +5740,11 @@ mod tests {
             "depth-12 comparison added {deep} pairs over depth-6 ({shallow}); expected linear growth with depth"
         );
     }
-    /// Regression for transformed-alias clean admission (review A): when a
-    /// recursive alias changes type arguments, the re-entrant frame marks
-    /// `approximate_alias` without recording an assumption. That provisional
-    /// result must stay out of the dependency-free clean memo; a repeated
-    /// query must recompute instead of reusing it.
+    /// A completed outer comparison can be reused after discharging its own
+    /// hypothesis. Changed-argument descendants still require that exact
+    /// comparison to remain active.
     #[test]
-    fn transformed_alias_approximation_stays_out_of_clean_memo() {
+    fn completed_transformed_alias_cycle_is_reused() {
         let mut table = TypeTable::new();
         let number = table.number();
         let string = table.string();
@@ -5728,16 +5763,12 @@ mod tests {
         assert!(relations.assignable(source, target));
         let before = relations.computed_relations();
         assert!(relations.assignable(source, target));
-        assert!(
-            relations.computed_relations() > before,
-            "transformed-alias approximation must not be served from the clean memo"
-        );
+        assert_eq!(relations.computed_relations(), before);
     }
-    /// Second variant: the same transformed-alias shape with a genuinely
-    /// incompatible leaf still refutes, and the refutation also stays out
-    /// of the clean memo while it rests on an alias approximation.
+    /// A mismatched leaf refutes the pair despite optimistic recursive
+    /// answers, so repeating the completed query reuses that refutation.
     #[test]
-    fn transformed_alias_refutation_stays_out_of_clean_memo() {
+    fn completed_transformed_alias_refutation_is_reused() {
         let mut table = TypeTable::new();
         let number = table.number();
         let string = table.string();
@@ -5759,11 +5790,308 @@ mod tests {
         assert!(!relations.assignable(source, target));
         let before = relations.computed_relations();
         assert!(!relations.assignable(source, target));
+        assert_eq!(relations.computed_relations(), before);
+    }
+    #[test]
+    fn shared_recursive_graph_reuses_completed_exact_cycles() {
+        let mut table = TypeTable::new();
+        let alias = SymbolId::new(9200);
+        let parameter = SymbolId::new(9201);
+        table.declare_alias(alias, vec![parameter]);
+        let value = table.named(parameter);
+        let recursive = table.applied_alias(alias, vec![value]);
+        let body = table.object_type(vec![
+            PropertyType::new("next", false, recursive),
+            PropertyType::new("value", false, value),
+        ]);
+        table.publish_alias_template(alias, body);
+        let literal = table.string_literal("value");
+        let string = table.string();
+        let mut source = table.applied_alias(alias, vec![literal]);
+        let mut target = table.applied_alias(alias, vec![string]);
+        for _ in 0..12 {
+            source = table.object_type(vec![
+                PropertyType::new("left", false, source),
+                PropertyType::new("right", false, source),
+            ]);
+            target = table.object_type(vec![
+                PropertyType::new("left", false, target),
+                PropertyType::new("right", false, target),
+            ]);
+        }
+        let relations = TypeRelations::new(&table);
+        assert!(relations.assignable(source, target));
+        let computed = relations.computed_relations();
         assert!(
-            relations.computed_relations() > before,
-            "approximate refutation must not be served from the clean memo"
+            computed < 64,
+            "shared recursive graph recomputed {computed} relations"
+        );
+        assert!(relations.assignable(source, target));
+        assert_eq!(relations.computed_relations(), computed);
+    }
+
+    #[test]
+    fn shared_transformed_recursive_graph_reuses_completed_cycles() {
+        let mut table = TypeTable::new();
+        let alias = SymbolId::new(9200);
+        let parameter = SymbolId::new(9201);
+        table.declare_alias(alias, vec![parameter]);
+        let value = table.named(parameter);
+        let array = table.array(value);
+        let recursive = table.applied_alias(alias, vec![array]);
+        let body = table.object_type(vec![
+            PropertyType::new("next", false, recursive),
+            PropertyType::new("value", false, value),
+        ]);
+        table.publish_alias_template(alias, body);
+        let literal = table.string_literal("value");
+        let string = table.string();
+        let mut source = table.applied_alias(alias, vec![literal]);
+        let mut target = table.applied_alias(alias, vec![string]);
+        for _ in 0..12 {
+            source = table.object_type(vec![
+                PropertyType::new("left", false, source),
+                PropertyType::new("right", false, source),
+            ]);
+            target = table.object_type(vec![
+                PropertyType::new("left", false, target),
+                PropertyType::new("right", false, target),
+            ]);
+        }
+        let relations = TypeRelations::new(&table);
+        assert!(relations.assignable(source, target));
+        let computed = relations.computed_relations();
+        assert!(
+            computed < 64,
+            "shared transformed recursive graph recomputed {computed} relations"
+        );
+        assert!(relations.assignable(source, target));
+        assert_eq!(relations.computed_relations(), computed);
+    }
+
+    #[test]
+    fn transformed_recursive_aliases_do_not_reuse_provisional_success() {
+        let mut table = TypeTable::new();
+        let left = SymbolId::new(9210);
+        let left_parameter = SymbolId::new(9211);
+        let right = SymbolId::new(9212);
+        let right_parameter = SymbolId::new(9213);
+        for (alias, parameter) in [(left, left_parameter), (right, right_parameter)] {
+            table.declare_alias(alias, vec![parameter]);
+            let value = table.named(parameter);
+            let array = table.array(value);
+            let recursive = table.applied_alias(alias, vec![array]);
+            let body = table.object_type(vec![
+                PropertyType::new("a", false, recursive),
+                PropertyType::new("z", false, value),
+            ]);
+            table.publish_alias_template(alias, body);
+        }
+        let string = table.string();
+        let number = table.number();
+        let strings = table.array(string);
+        let numbers = table.array(number);
+        let source = table.applied_alias(left, vec![string]);
+        let target = table.applied_alias(right, vec![number]);
+        let nested_source = table.applied_alias(left, vec![strings]);
+        let nested_target = table.applied_alias(right, vec![numbers]);
+        let valid = table.applied_alias(right, vec![string]);
+        let relations = TypeRelations::new(&table);
+        assert!(!relations.assignable(source, target));
+        assert!(
+            !relations.assignable(nested_source, nested_target),
+            "failed transformed alias branch left a provisional success"
+        );
+        assert!(!TypeRelations::new(&table).assignable(nested_source, nested_target));
+        assert!(relations.assignable(source, valid));
+    }
+
+    #[test]
+    fn completed_alias_approximations_do_not_prove_changed_arguments() {
+        let mut table = TypeTable::new();
+        let string = table.string();
+        let strings = table.array(string);
+        let left = SymbolId::new(9600);
+        let left_parameter = SymbolId::new(9601);
+        let right = SymbolId::new(9602);
+        let right_parameter = SymbolId::new(9603);
+        for (alias, parameter) in [(left, left_parameter), (right, right_parameter)] {
+            table.declare_alias(alias, vec![parameter]);
+            let value = table.named(parameter);
+            let array = table.array(value);
+            let recursive = table.applied_alias(alias, vec![array]);
+            let body = table.object_type(vec![
+                PropertyType::new("next", false, recursive),
+                PropertyType::new("value", false, if alias == left { value } else { string }),
+            ]);
+            table.publish_alias_template(alias, body);
+        }
+        let source = table.applied_alias(left, vec![string]);
+        let target = table.applied_alias(right, vec![string]);
+        let nested_source = table.applied_alias(left, vec![strings]);
+        let nested_target = table.applied_alias(right, vec![strings]);
+        let relations = TypeRelations::new(&table);
+        let _ = relations.assignable(source, target);
+        assert!(!TypeRelations::new(&table).assignable(nested_source, nested_target));
+        assert!(
+            !relations.assignable(nested_source, nested_target),
+            "a completed outer comparison promoted an unproved changed-argument alias"
         );
     }
+
+    #[test]
+    fn shared_recursive_refutations_do_not_recompute_union_branches() {
+        for compatible in [false, true] {
+            let mut table = TypeTable::new();
+            let string = table.string();
+            let number = table.number();
+            let left = SymbolId::new(9700);
+            let left_parameter = SymbolId::new(9701);
+            let right = SymbolId::new(9702);
+            let right_parameter = SymbolId::new(9703);
+            table.declare_alias(left, vec![left_parameter]);
+            table.declare_alias(right, vec![right_parameter]);
+            let left_value = table.named(left_parameter);
+            let right_value = table.named(right_parameter);
+            let left_back = table.applied_alias(left, vec![left_value]);
+            let right_back = table.applied_alias(right, vec![right_value]);
+            let mut source_body = table.object_type(vec![
+                PropertyType::new("back", false, left_back),
+                PropertyType::new("value", false, string),
+            ]);
+            let mut target_body = table.object_type(vec![
+                PropertyType::new("back", false, right_back),
+                PropertyType::new("value", false, if compatible { string } else { number }),
+            ]);
+            let first = table.string_literal("first");
+            let second = table.string_literal("second");
+            for _ in 0..12 {
+                source_body =
+                    table.object_type(vec![PropertyType::new("child", false, source_body)]);
+                let first_branch = table.object_type(vec![
+                    PropertyType::new("child", false, target_body),
+                    PropertyType::new("tag", true, first),
+                ]);
+                let second_branch = table.object_type(vec![
+                    PropertyType::new("child", false, target_body),
+                    PropertyType::new("tag", true, second),
+                ]);
+                target_body = table.union(&[first_branch, second_branch]);
+            }
+            table.publish_alias_template(left, source_body);
+            table.publish_alias_template(right, target_body);
+            let source = table.applied_alias(left, vec![string]);
+            let target = table.applied_alias(right, vec![string]);
+            let relations = TypeRelations::new(&table);
+            assert_eq!(relations.assignable(source, target), compatible);
+            let computed = relations.computed_relations();
+            assert!(
+                computed < 128,
+                "shared recursive refutation recomputed {computed} relations"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_active_cycle_scales_after_context_cache_saturation() {
+        let mut table = TypeTable::new();
+        let arrays: Vec<_> = (0..100)
+            .map(|index| {
+                let literal = table.number_literal(&index.to_string());
+                table.array(literal)
+            })
+            .collect();
+        let alias = SymbolId::new(9500);
+        let parameter = SymbolId::new(9501);
+        table.declare_alias(alias, vec![parameter]);
+        let value = table.named(parameter);
+        let back = table.applied_alias(alias, vec![value]);
+        let mut body = table.object_type(vec![
+            PropertyType::new("back", false, back),
+            PropertyType::new("value", false, value),
+        ]);
+        for _ in 0..12 {
+            body = table.object_type(vec![
+                PropertyType::new("left", false, body),
+                PropertyType::new("right", false, body),
+            ]);
+        }
+        table.publish_alias_template(alias, body);
+        let literal = table.string_literal("value");
+        let string = table.string();
+        let source = table.applied_alias(alias, vec![literal]);
+        let target = table.applied_alias(alias, vec![string]);
+        let relations = TypeRelations::new(&table);
+        'saturate: for &source in &arrays {
+            for &target in &arrays {
+                assert_eq!(relations.assignable(source, target), source == target);
+                if relations.cached_pairs() == 4096 {
+                    break 'saturate;
+                }
+            }
+        }
+        assert_eq!(relations.cached_pairs(), 4096);
+        let before = relations.computed_relations();
+        assert!(relations.assignable(source, target));
+        let computed = relations.computed_relations() - before;
+        assert!(
+            computed < 64,
+            "shared active cycle recomputed {computed} relations after saturation"
+        );
+        assert_eq!(relations.cached_pairs(), RELATION_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn completed_refutation_dominates_retained_alias_assumption_after_saturation() {
+        let mut table = TypeTable::new();
+        let marker_symbol = SymbolId::new(9814);
+        let number = table.number();
+        let marker_body = table.object_type(vec![PropertyType::new("marker", false, number)]);
+        table.set_interface_structure(marker_symbol, marker_body);
+        let marker = table.named(marker_symbol);
+        let left = SymbolId::new(9810);
+        let left_parameter = SymbolId::new(9811);
+        let right = SymbolId::new(9812);
+        let right_parameter = SymbolId::new(9813);
+        for (alias, parameter) in [(left, left_parameter), (right, right_parameter)] {
+            table.declare_alias(alias, vec![parameter]);
+            let value = table.named(parameter);
+            let array = table.array(value);
+            let recursive = table.applied_alias(alias, vec![array]);
+            let body = table.object_type(vec![
+                PropertyType::new("a", false, recursive),
+                PropertyType::new("z", false, if alias == left { value } else { marker }),
+            ]);
+            table.publish_alias_template(alias, body);
+        }
+        let string = table.string();
+        let strings = table.array(string);
+        let source = table.applied_alias(left, vec![string]);
+        let target = table.applied_alias(right, vec![string]);
+        let nested_source = table.applied_alias(left, vec![strings]);
+        let nested_target = table.applied_alias(right, vec![strings]);
+        let arrays: Vec<_> = (0..100)
+            .map(|index| {
+                let literal = table.number_literal(&index.to_string());
+                table.array(literal)
+            })
+            .collect();
+        let relations = TypeRelations::new(&table);
+        'saturate: for &from in &arrays {
+            for &to in &arrays {
+                assert_eq!(relations.assignable(from, to), from == to);
+                if relations.cached_pairs() == RELATION_CACHE_CAPACITY - 1 {
+                    break 'saturate;
+                }
+            }
+        }
+        assert_eq!(relations.cached_pairs(), RELATION_CACHE_CAPACITY - 1);
+        assert!(!relations.assignable(source, target));
+        assert_eq!(relations.cached_pairs(), RELATION_CACHE_CAPACITY);
+        assert!(!relations.assignable(nested_source, nested_target));
+        assert!(!relations.assignable(source, target));
+    }
+
     /// Regression for nested contextual hits: warming `null -> T` then
     /// comparing object returns containing that pair under both bounds must
     /// partition by bound. A contextual hit must carry environment
