@@ -13069,6 +13069,42 @@ fn deferred_keyof_bound_checks_every_union_member() {
 }
 
 #[test]
+fn deferred_keyof_bound_respects_nullability_of_nonempty_domains() {
+    for strict in [false, true] {
+        for key in ["null", "undefined"] {
+            for (shape, nonempty) in [
+                ("{ a: number }", true),
+                ("{ 1: number }", true),
+                ("{ [name: string]: number }", true),
+                ("{ [index: number]: number }", true),
+                ("{}", false),
+            ] {
+                let text = format!(
+                    "declare const get: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+                     const nullable: (obj: {shape}, key: {key}) => {key} = get;"
+                );
+                let checked = check_text_with(
+                    &text,
+                    ProgramCheckOptions::standard().with_strict_null_checks(strict),
+                );
+                let codes = checker_codes_of(&checked);
+                if nonempty && !strict {
+                    assert!(codes.is_empty(), "{text}: {:?}", checked.diagnostics());
+                } else {
+                    assert!(
+                        codes
+                            .iter()
+                            .any(|code| code == TYPE_NOT_ASSIGNABLE.as_str()),
+                        "strict={strict}, {text}: {:?}",
+                        checked.diagnostics()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn deferred_keyof_bound_accepts_declared_dictionary_domains() {
     for (domain, key, valid) in [
         ("string", "string", true),

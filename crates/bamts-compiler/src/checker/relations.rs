@@ -1924,6 +1924,14 @@ impl<'table> TypeRelations<'table> {
         }) {
             return true;
         }
+        if strictness == Strictness::Assignable
+            && matches!(self.table.get(argument), Type::Null | Type::Undefined)
+        {
+            return object
+                .properties
+                .iter()
+                .any(|property| property.access() == Accessibility::Public);
+        }
         let Some(name) = self.candidate_key_name(argument) else {
             return false;
         };
@@ -5000,6 +5008,50 @@ mod tests {
             !relations.assignable(source, target),
             "(x: number) => number must not be assignable to <T>(x: T) => T"
         );
+    }
+
+    #[test]
+    fn deferred_keyof_nullish_candidates_require_public_properties() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let hidden = PropertyType::new("hidden", false, number)
+            .with_accessibility(Accessibility::Private, Some(SymbolId::new(623)));
+        let domains = [
+            (table.object_type(Vec::new()), false),
+            (table.object_type(vec![hidden]), false),
+            (
+                table.object_type(vec![PropertyType::new("public", false, number)]),
+                true,
+            ),
+        ];
+        let relations = TypeRelations::new(&table);
+        for (domain, nonempty) in domains {
+            let object = table
+                .current_object_view(domain)
+                .expect("object key domain");
+            for source in [table.null_type(), table.undefined_type()] {
+                assert_eq!(
+                    relations.argument_satisfies_object_keys(
+                        source,
+                        &object,
+                        Strictness::Assignable
+                    ),
+                    nonempty
+                );
+                assert!(!relations.argument_satisfies_object_keys(
+                    source,
+                    &object,
+                    Strictness::StrictNull
+                ));
+            }
+            for strictness in [Strictness::Assignable, Strictness::StrictNull] {
+                assert!(relations.argument_satisfies_object_keys(
+                    table.never(),
+                    &object,
+                    strictness
+                ));
+            }
+        }
     }
 
     #[test]
