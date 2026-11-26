@@ -2731,6 +2731,18 @@ impl<'table> TypeRelations<'table> {
         expression: &ConstraintTypeExpr,
         strictness: Strictness,
     ) -> bool {
+        if matches!(expression, ConstraintTypeExpr::Union(_))
+            && let Some(view) = self.indexed_operand_identity(source)
+            && let Type::Union(sources) = self.table.get(view)
+        {
+            let relates =
+                |member: &TypeId| self.constraint_target_relates(*member, expression, strictness);
+            return if strictness == Strictness::Comparable {
+                sources.iter().any(relates)
+            } else {
+                sources.iter().all(relates)
+            };
+        }
         match expression {
             ConstraintTypeExpr::Id(target) => self.relates(source, *target, strictness),
             ConstraintTypeExpr::Opaque => false,

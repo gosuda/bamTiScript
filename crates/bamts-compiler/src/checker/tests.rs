@@ -13133,3 +13133,20 @@ fn indexed_bound_keeps_generic_object_union_members_conservative() {
         checked.diagnostics()
     );
 }
+
+#[test]
+fn indexed_bound_distributes_union_candidates_over_read_union() {
+    for (value, valid) in [("number | string", true), ("number | boolean", false)] {
+        let checked = check_text(&format!(
+            "type Value = {value};\n\
+             declare const take: <T extends {{ a: unknown; b: unknown }}, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+             const use_value: (obj: {{ a: number; b: string }}, key: \"a\" | \"b\", value: Value) => Value = take;"
+        ));
+        assert_eq!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            !valid,
+            "each member of {value} must satisfy the selected read union: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
