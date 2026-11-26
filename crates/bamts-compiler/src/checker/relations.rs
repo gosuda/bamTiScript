@@ -101,6 +101,12 @@ enum ParameterVariance {
     Bivariant,
 }
 
+/// Memo key for one relation query under one environment.
+///
+/// Endpoints are the query's own type identities (live key projections are
+/// resolved first, exactly as before). The context keeps
+/// environment-sensitive comparisons apart; results proven independent of
+/// the environment additionally enter the clean memo keyed without it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct RelationKey {
     source: TypeId,
@@ -158,6 +164,11 @@ struct DependencyFrame {
     erasure_requirements: HashMap<SymbolId, bool>,
     erased_base: usize,
     approximate_alias: bool,
+    /// Set when the comparison consults environment facts the memo keys
+    /// cannot see (parameter pairings, inferred arguments, known or erased
+    /// parameters). Withheld results stay out of the clean memo only; the
+    /// context-sensitive cache keeps working as before.
+    env_sensitive: bool,
 }
 
 impl DependencyFrame {
@@ -167,6 +178,7 @@ impl DependencyFrame {
             erasure_requirements: HashMap::new(),
             erased_base,
             approximate_alias: false,
+            env_sensitive: false,
         }
     }
 }
@@ -185,6 +197,15 @@ struct CachedRelation {
 /// short-lived instance per call.
 pub struct TypeRelations<'table> {
     table: &'table TypeTable,
+    /// Results proven independent of the relation environment, keyed by the
+    /// query's own endpoints and strictness alone. A hit returns the
+    /// stored answer with no assumption bookkeeping. Entries are stored
+    /// only for frames with no environment-sensitive consultation and no
+    /// erasure requirements; a `true` proved with coinductive hypotheses is
+    /// admitted, a `false` under hypotheses is withheld. This is what lets
+    /// the same structural comparison recur under hundreds of inference
+    /// environments without recomputing.
+    clean: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<RelationKey>>,
@@ -242,6 +263,7 @@ impl<'table> TypeRelations<'table> {
         Self {
             table,
             cache: RefCell::new(HashMap::new()),
+            clean: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
             active_alias_relations: RefCell::new(HashSet::new()),
             dependency_stack: RefCell::new(Vec::new()),
@@ -392,6 +414,11 @@ impl<'table> TypeRelations<'table> {
         {
             return false;
         }
+        // The memo and the in-progress guard share this key, so a true
+        // structural cycle terminates coinductively however it is reached.
+        // Environment-independent results additionally enter the clean memo
+        // keyed without the context (see `clean`); environment-sensitive
+        // comparisons poison their frame instead (see `poison_env_memo`).
         let relation = RelationKey {
             source,
             target,
@@ -400,6 +427,9 @@ impl<'table> TypeRelations<'table> {
         };
         let cacheable = self.is_structural(source) || self.is_structural(target);
         if cacheable {
+            if let Some(clean) = self.clean.borrow().get(&(source, target, strictness)) {
+                return *clean;
+            }
             let cached = {
                 let visiting = self.visiting.borrow();
                 let erased = self.erased_parameters.borrow();
@@ -557,9 +587,32 @@ impl<'table> TypeRelations<'table> {
         } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
             parent.assumptions.extend(frame.assumptions.iter().copied());
             parent.approximate_alias |= frame.approximate_alias;
+            parent.env_sensitive |= frame.env_sensitive;
             for (&symbol, &erased) in &frame.erasure_requirements {
                 self.record_erasure_requirement(parent, ErasureRequirement { symbol, erased });
             }
+        }
+        // Environment-independent results additionally enter the clean memo
+        // keyed without the context. A hit returns the answer in every
+        // environment with no bookkeeping. Withheld are comparisons that
+        // consulted the environment and anything carrying erasure
+        // requirements. A `true` proved with coinductive hypotheses is
+        // admitted, including results that passed through an alias-cycle
+        // re-entry: every guard re-entry is guarded by a structural
+        // destructor step in `relates_uncached` (object property, signature
+        // parameter or return, member, or constraint), so the hypotheses are
+        // contractive and the coinductive reading is sound. The
+        // context-sensitive cache stays conservative via `approximate_alias`.
+        // A `false` proved under hypotheses is withheld instead: refuting
+        // under an unproven hypothesis refutes nothing.
+        if cacheable
+            && !frame.env_sensitive
+            && frame.erasure_requirements.is_empty()
+            && (result || frame.assumptions.is_empty())
+        {
+            self.clean
+                .borrow_mut()
+                .insert((source, target, strictness), result);
         }
         if cacheable && !frame.approximate_alias && (result || frame.assumptions.is_empty()) {
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
@@ -1105,11 +1158,13 @@ impl<'table> TypeRelations<'table> {
             // that was positionally inferred from the non-generic counterpart.
             // Substitute the inferred concrete type and continue.
             (Type::Named(symbol), _) if let Some(inferred) = self.inferred_argument(*symbol) => {
+                self.poison_env_memo();
                 inferred.iter().all(|&argument| {
                     argument != source && self.relates(argument, target, strictness)
                 })
             }
             (_, Type::Named(symbol)) if let Some(inferred) = self.inferred_argument(*symbol) => {
+                self.poison_env_memo();
                 let accepts = |source| {
                     inferred.iter().any(|&argument| {
                         argument != target && self.relates(source, argument, strictness)
@@ -1132,6 +1187,7 @@ impl<'table> TypeRelations<'table> {
                     .borrow()
                     .contains(&(*source_symbol, *target_symbol)) =>
             {
+                self.poison_env_memo();
                 true
             }
             // A universal target keeps its identity throughout nested variance
@@ -1177,22 +1233,26 @@ impl<'table> TypeRelations<'table> {
                 if self.known_type_parameters.borrow().contains(symbol)
                     && self.table.type_parameter_constraint(*symbol).is_none() =>
             {
+                self.poison_env_memo();
                 false
             }
             (_, Type::Named(symbol))
                 if self.known_type_parameters.borrow().contains(symbol)
                     && self.table.type_parameter_constraint(*symbol).is_none() =>
             {
+                self.poison_env_memo();
                 true
             }
             (Type::Named(symbol), _)
                 if strictness == Strictness::Comparable && self.is_erased_parameter(*symbol) =>
             {
+                self.poison_env_memo();
                 true
             }
             (_, Type::Named(symbol))
                 if strictness == Strictness::Comparable && self.is_erased_parameter(*symbol) =>
             {
+                self.poison_env_memo();
                 true
             }
             // An unresolved constraint is already represented by `Error`.
@@ -2228,6 +2288,7 @@ impl<'table> TypeRelations<'table> {
                 }
                 visiting.push(type_id);
                 type_id = inferred;
+                self.poison_env_memo();
                 continue;
             }
             return Some(view);
@@ -2254,6 +2315,18 @@ impl<'table> TypeRelations<'table> {
                 }
                 _ => return Some(type_id),
             }
+        }
+    }
+
+    /// Marks the active frame environment-sensitive so its result never
+    /// enters the clean memo. Callers are the arms that consult facts the
+    /// keys cannot see: parameter pairings, inferred arguments, and known
+    /// or erased parameters. The context-sensitive cache keeps working
+    /// as before, so identical environments still share; only
+    /// cross-environment reuse is withheld, which is always sound.
+    fn poison_env_memo(&self) {
+        if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
+            frame.env_sensitive = true;
         }
     }
 
@@ -5243,5 +5316,71 @@ mod tests {
         assert!(!table.assignable(different, value));
         assert!(!table.assignable(quoted, value));
         assert!(!table.assignable(value, quoted));
+    }
+    #[test]
+    fn memo_keeps_distinct_recursive_class_shapes_apart() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let a = SymbolId::new(600);
+        let a_t = SymbolId::new(601);
+        let named_a = table.named(a_t);
+        let a_app = table.applied_class(a, vec![named_a]);
+        let a_kind = table.string_literal("a");
+        let a_raw = table.object_type(vec![
+            PropertyType::new("kind", false, a_kind),
+            PropertyType::new("value", false, named_a),
+            PropertyType::new("next", false, a_app),
+        ]);
+        declare_generic_class(&mut table, a, a_t, a_raw);
+        let b = SymbolId::new(602);
+        let b_t = SymbolId::new(603);
+        let named_b = table.named(b_t);
+        let b_app = table.applied_class(b, vec![named_b]);
+        let b_kind = table.string_literal("b");
+        let b_raw = table.object_type(vec![
+            PropertyType::new("kind", false, b_kind),
+            PropertyType::new("value", false, named_b),
+            PropertyType::new("next", false, b_app),
+        ]);
+        declare_generic_class(&mut table, b, b_t, b_raw);
+        let a_number = table.applied_class(a, vec![number]);
+        let b_string = table.applied_class(b, vec![string]);
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.assignable(a_number, a_number));
+        assert!(!relations.assignable(a_number, b_string));
+        assert!(!relations.assignable(b_string, a_number));
+    }
+
+    #[test]
+    fn memo_shares_alias_views_of_one_recursive_type() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let a = SymbolId::new(610);
+        let a_t = SymbolId::new(611);
+        let named_a = table.named(a_t);
+        let a_app = table.applied_class(a, vec![named_a]);
+        let a_raw = table.object_type(vec![
+            PropertyType::new("value", false, named_a),
+            PropertyType::new("next", false, a_app),
+        ]);
+        declare_generic_class(&mut table, a, a_t, a_raw);
+        let a_number = table.applied_class(a, vec![number]);
+        let x = SymbolId::new(612);
+        table.declare_alias(x, Vec::new());
+        table.publish_alias_template(x, a_number);
+        let alias_head = table.applied_alias(x, Vec::new());
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.assignable(alias_head, a_number));
+        assert!(relations.assignable(a_number, alias_head));
+        let before = relations.computed_relations();
+        assert!(relations.assignable(alias_head, a_number));
+        assert_eq!(
+            relations.computed_relations(),
+            before,
+            "a settled alias comparison must come straight from the memo"
+        );
     }
 }

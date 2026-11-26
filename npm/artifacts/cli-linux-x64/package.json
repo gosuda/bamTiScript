@@ -25,7 +25,7 @@
     "workflowRevision": "__BAMTI_WORKFLOW_REVISION__",
     "toolchain": "__BAMTI_TOOLCHAIN__",
     "builderRevision": "__BAMTI_BUILDER_REVISION__",
-    "runner": "ubuntu-24.04",
+    "runner": "depot-ubuntu-24.04",
     "release": {
       "packageVersion": "0.2.0",
       "sourceCommit": "__BAMTI_SOURCE_COMMIT__",

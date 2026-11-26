@@ -78,36 +78,51 @@ jobs:
       matrix:
         include:
           - label: linux-x64
+            node_arch: x64
             target: x86_64-unknown-linux-gnu
             runner: depot-ubuntu-24.04
           - label: linux-arm64
+            node_arch: arm64
             target: aarch64-unknown-linux-gnu
             runner: depot-ubuntu-24.04-arm
           - label: darwin-x64
+            node_arch: x64
             target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: depot-macos-latest
           - label: darwin-arm64
+            node_arch: arm64
             target: aarch64-apple-darwin
-            runner: macos-15
+            runner: depot-macos-latest
           - label: win32-x64
+            node_arch: x64
             target: x86_64-pc-windows-msvc
-            runner: windows-2025
+            runner: depot-windows-2025-4
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Require Rosetta for macOS x64 execution
+        if: matrix.label == 'darwin-x64'
+        shell: bash
+        run: arch -x86_64 /usr/bin/true
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          architecture: ${{ matrix.node_arch }}
+          cache: 'npm'
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          rustup toolchain install $toolchain
+          if ('${{ matrix.label }}' -eq 'darwin-x64') { $toolchain += '-x86_64-apple-darwin' }
+          rustup toolchain install $toolchain --profile minimal
           rustup default $toolchain
+          rustup override set $toolchain
+          $hostTriple = ((rustc -vV) | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
+          if ($hostTriple -cne '${{ matrix.target }}') { throw "Rust host $hostTriple differs from the release target" }
       - name: Install Rust target
         shell: pwsh
         run: rustup target add '${{ matrix.target }}'
@@ -159,6 +174,11 @@ jobs:
           $bamts = if ($IsWindows) { 'cli-smoke/package/bin/bamts.exe' } else { 'cli-smoke/package/bin/bamts' }
           & $bamts --version
           if ($LASTEXITCODE -ne 0) { throw 'CLI leaf --version smoke failed' }
+          if ('${{ matrix.label }}' -eq 'darwin-x64') {
+            'console.log(40 + 2);' | Set-Content cli-smoke/main.ts -Encoding utf8NoBOM
+            $output = & $bamts run --target aot cli-smoke/main.ts
+            if ($LASTEXITCODE -ne 0 -or $output -cne '42') { throw 'Intel macOS CLI leaf AOT smoke failed' }
+          }
           $stage = 'cli-leaf-${{ matrix.label }}'
           New-Item -ItemType Directory -Force "$stage/records", "$stage/tarballs", "$stage/leaf" | Out-Null
           Copy-Item $records[0].FullName "$stage/records/"

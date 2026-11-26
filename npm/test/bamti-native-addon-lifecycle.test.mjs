@@ -128,6 +128,22 @@ test("actual addon exposes the closed API and executes the buffered CLI", native
   );
 });
 
+test("actual Intel macOS addon compiles and executes AOT", {
+  skip: addonPath === undefined || process.platform !== "darwin" || process.arch !== "x64",
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "bamti-napi-aot-"));
+  try {
+    const entrypoint = join(directory, "main.ts");
+    await writeFile(entrypoint, "console.log(40 + 2);\n");
+    const addon = createRequire(import.meta.url)(resolve(addonPath));
+    const outcome = await addon.run(request(["run", "--target", "aot", entrypoint]));
+    assert.equal(outcome.exitCode, 0, Buffer.from(outcome.stderr).toString("utf8"));
+    assert.equal(Buffer.from(outcome.stdout).toString("utf8"), "42\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("actual addon exports structured truncation for capped JSON diagnostics", nativeTest, async () => {
   const directory = await mkdtemp(join(tmpdir(), "bamti-napi-truncation-"));
   try {
