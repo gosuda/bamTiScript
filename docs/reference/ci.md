@@ -14,6 +14,12 @@ The workspace suite includes `corpus_differential`, so a second corpus
 job does not run on the same commit. Main pushes do not repeat the PR
 and merge queue pipeline. Superseded PR runs are cancelled.
 
+Every CI ref can save its own Rust dependency cache. The cache prefix
+includes the full ref, while the action retains its job and compiler keys,
+so a later run on the same PR can reuse dependencies without a separate
+cache-warming pipeline. Depot Cache is repository-scoped; these keys are
+ordinary reuse partitions, not an access-control boundary.
+
 ## Extended verification
 
 `nightly.yml` remains the daily and manual full conformance pipeline.
@@ -38,6 +44,10 @@ This proves translated execution on macOS, not
 execution on physical Intel hardware. The workflow fails if Rosetta is
 unavailable. ARM64 macOS and x64 Windows execute on their matching Depot
 hosts. Build records and preflight checks name the actual Depot labels.
+
+Release packaging omits the shared CI Rust cache. Its infrequent builds
+compile dependencies from source rather than trust build artifacts written
+by PR workflows. The release jobs do not claim warm compiled dependencies.
 
 Release publication remains disabled by the existing U11.7 gate.
 

@@ -126,8 +126,6 @@ jobs:
       - name: Install Rust target
         shell: pwsh
         run: rustup target add '${{ matrix.target }}'
-      - name: Cache Rust dependencies
-        uses: ./.github/actions/rust-cache
       - name: Install pinned TypeScript oracle
         if: matrix.label == 'win32-x64'
         shell: pwsh
