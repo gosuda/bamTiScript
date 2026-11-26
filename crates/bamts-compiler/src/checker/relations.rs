@@ -590,6 +590,13 @@ impl<'table> TypeRelations<'table> {
             .pop()
             .expect("active relation owns a dependency frame");
         self.visiting.borrow_mut().remove(&relation);
+        if result {
+            // A successful frame discharges its own coinductive hypothesis:
+            // the frame just proved this exact pair, so the assumption the
+            // recursion guard recorded for it is settled. Assumptions on
+            // other still-active comparisons propagate untouched.
+            frame.assumptions.remove(&relation);
+        }
         if is_root {
             frame.assumptions.clear();
         } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
@@ -5600,6 +5607,100 @@ mod tests {
         assert!(
             delta < 50,
             "number-leaf 4-ary depth-4 graph recomputed {delta} pairs; expected the same clean-memo scaling"
+        );
+    }
+    /// Regression for exponential shared-pair revisits (review B): sibling
+    /// properties sharing one compatible recursive pair must reuse the
+    /// completed comparison instead of recomputing it per branch. Builds
+    /// `Loop<T> = { next: Loop<T>; value: T }` with `L1..L12<T>`, each level
+    /// holding two properties of the previous level, then assigns
+    /// `L12<1>` to `L12<number>`. Distinct pairs are linear in depth;
+    /// recomputing shared pairs doubles work per level.
+    #[test]
+    fn shared_recursive_pairs_scale_linearly_not_exponentially() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let one = table.number_literal("1");
+        let loop_symbol = SymbolId::new(9200);
+        let loop_param = SymbolId::new(9201);
+        let named_loop_param = table.named(loop_param);
+        let loop_recursion = table.applied_class(loop_symbol, vec![named_loop_param]);
+        let loop_raw = table.object_type(vec![
+            PropertyType::new("next", false, loop_recursion),
+            PropertyType::new("value", false, named_loop_param),
+        ]);
+        declare_generic_class(&mut table, loop_symbol, loop_param, loop_raw);
+        let mut child = loop_symbol;
+        for level in 0..12 {
+            let class = SymbolId::new(9210 + level * 2);
+            let param = SymbolId::new(9211 + level * 2);
+            let named_param = table.named(param);
+            let child_app = table.applied_class(child, vec![named_param]);
+            let raw = table.object_type(vec![
+                PropertyType::new("left", false, child_app),
+                PropertyType::new("right", false, child_app),
+            ]);
+            declare_generic_class(&mut table, class, param, raw);
+            child = class;
+        }
+        let source_root = table.applied_class(child, vec![one]);
+        let target_root = table.applied_class(child, vec![number]);
+        let relations = TypeRelations::new(&table);
+        let before = relations.computed_relations();
+        assert!(relations.assignable(source_root, target_root));
+        let delta = relations.computed_relations() - before;
+        assert!(
+            delta < 200,
+            "shared binary depth-12 graph recomputed {delta} pairs; expected linear scaling with distinct pairs"
+        );
+    }
+    /// Second variant: growth across depths must stay linear. Two chains
+    /// sharing one `Loop` (depths 6 and 12) are compared over one memo; the
+    /// deeper comparison may only add work proportional to its extra levels,
+    /// not multiply the shared work exponentially.
+    #[test]
+    fn shared_recursive_pairs_grow_linearly_with_depth() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let one = table.number_literal("1");
+        let loop_symbol = SymbolId::new(9300);
+        let loop_param = SymbolId::new(9301);
+        let named_loop_param = table.named(loop_param);
+        let loop_recursion = table.applied_class(loop_symbol, vec![named_loop_param]);
+        let loop_raw = table.object_type(vec![
+            PropertyType::new("next", false, loop_recursion),
+            PropertyType::new("value", false, named_loop_param),
+        ]);
+        declare_generic_class(&mut table, loop_symbol, loop_param, loop_raw);
+        let mut roots = Vec::new();
+        for (base, depth) in [(9310, 6), (9410, 12)] {
+            let mut child = loop_symbol;
+            for level in 0..depth {
+                let class = SymbolId::new(base + level * 2);
+                let param = SymbolId::new(base + level * 2 + 1);
+                let named_param = table.named(param);
+                let child_app = table.applied_class(child, vec![named_param]);
+                let raw = table.object_type(vec![
+                    PropertyType::new("left", false, child_app),
+                    PropertyType::new("right", false, child_app),
+                ]);
+                declare_generic_class(&mut table, class, param, raw);
+                child = class;
+            }
+            roots.push((
+                table.applied_class(child, vec![one]),
+                table.applied_class(child, vec![number]),
+            ));
+        }
+        let relations = TypeRelations::new(&table);
+        let before = relations.computed_relations();
+        assert!(relations.assignable(roots[0].0, roots[0].1));
+        let shallow = relations.computed_relations() - before;
+        assert!(relations.assignable(roots[1].0, roots[1].1));
+        let deep = relations.computed_relations() - before - shallow;
+        assert!(
+            deep < shallow + 200,
+            "depth-12 comparison added {deep} pairs over depth-6 ({shallow}); expected linear growth with depth"
         );
     }
     /// Regression for transformed-alias clean admission (review A): when a
