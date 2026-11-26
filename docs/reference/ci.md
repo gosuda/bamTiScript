@@ -13,6 +13,10 @@ and four conformance receipt shards with complete receipt accounting.
 The workspace suite includes `corpus_differential`, so a second corpus
 job does not run on the same commit. Main pushes do not repeat the PR
 and merge queue pipeline. Superseded PR runs are cancelled.
+PR jobs check out GitHub's merge commit and bind every receipt to that
+same SHA, so they test the proposed change together with its current base.
+Direct pushes to main rely on the nightly workflow or manual dispatch;
+there is no immediate post-push pipeline.
 
 Every CI ref can save its own Rust dependency cache. The cache prefix
 includes the full ref, while the action retains its job and compiler keys,
