@@ -1079,7 +1079,7 @@ impl<'src> Binder<'src> {
         ) {
             return Ok(());
         }
-        if !self.types.assignable(props, target) {
+        if !self.types_assignable(props, target) {
             self.queue_diagnostic(
                 Diagnostic::error(
                     JSX_ATTRIBUTES_NOT_ASSIGNABLE,
@@ -1298,7 +1298,7 @@ fn select_jsx_factory_signature(
         }
         let (target, result) = instantiate_jsx_factory_signature(binder, signature, props);
         let matches = match target {
-            Some(target) => binder.types.assignable(props, target),
+            Some(target) => binder.types_assignable(props, target),
             None => true,
         };
         if matches {
@@ -1506,9 +1506,10 @@ mod tests {
     use super::super::binder::{SemanticModel, bind_source};
     use super::super::{
         CANNOT_FIND_NAME, EXPRESSION_NOT_CALLABLE, JSX_ATTRIBUTES_NOT_ASSIGNABLE,
-        JSX_ELEMENT_TYPE_NOT_CALLABLE, JSX_INTRINSIC_ELEMENT_NOT_FOUND, TYPE_NOT_ASSIGNABLE,
+        JSX_ELEMENT_TYPE_NOT_CALLABLE, JSX_INTRINSIC_ELEMENT_NOT_FOUND, ProgramCheckInput,
+        ProgramCheckOptions, TYPE_NOT_ASSIGNABLE, check_program_with_options,
     };
-    use crate::diagnostic::Diagnostic;
+    use crate::diagnostic::{Diagnostic, DiagnosticSeverity};
     use crate::source::{ScriptKind, SourceId, SourceText};
     use crate::{parser, scanner};
 
@@ -1547,6 +1548,85 @@ mod tests {
     } ";
 
     // -- intrinsic vs value-based elements ---------------------------------------
+
+    #[test]
+    fn jsx_null_key_callback_respects_project_nullability() {
+        let source = "declare namespace JSX { \
+            interface Element {} \
+            interface IntrinsicElements { \
+                custom: { get: (obj: { a: number }, key: null) => null } \
+            } \
+        } \
+        declare const get: <T, K extends keyof T>(obj: T, key: K) => K; \
+        const result = <custom get={get} />;";
+        let parsed = [parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScriptReact,
+            Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
+        ))];
+        assert!(
+            parsed[0].diagnostics().is_empty(),
+            "{:?}",
+            parsed[0].diagnostics()
+        );
+        for strict in [false, true] {
+            let checked = check_program_with_options(
+                ProgramCheckInput {
+                    files: &parsed,
+                    edges: &[],
+                },
+                &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+                ProgramCheckOptions::standard().with_strict_null_checks(strict),
+            );
+            let codes: Vec<_> = checked
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error)
+                .map(|diagnostic| diagnostic.code().as_str())
+                .collect();
+            let expected = if strict {
+                vec![JSX_ATTRIBUTES_NOT_ASSIGNABLE.as_str()]
+            } else {
+                vec![]
+            };
+            assert_eq!(codes, expected, "strictNullChecks={strict}");
+        }
+    }
+
+    #[test]
+    fn jsx_overloads_select_the_applicable_nullable_props() {
+        for value in ["null", "\"text\""] {
+            let source = format!(
+                "declare function Widget(props: {{ value: string }}): {{}}; \
+                 declare function Widget(props: {{ value: null }}): {{}}; \
+                 const result = <Widget value={{{value}}} />;"
+            );
+            let parsed = [parser::parse(scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScriptReact,
+                Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
+            ))];
+            assert!(parsed[0].diagnostics().is_empty());
+            for strict in [false, true] {
+                let checked = check_program_with_options(
+                    ProgramCheckInput {
+                        files: &parsed,
+                        edges: &[],
+                    },
+                    &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+                    ProgramCheckOptions::standard().with_strict_null_checks(strict),
+                );
+                assert!(
+                    checked
+                        .diagnostics()
+                        .iter()
+                        .all(|diagnostic| diagnostic.severity() != DiagnosticSeverity::Error),
+                    "value={value}, strictNullChecks={strict}: {:?}",
+                    checked.diagnostics()
+                );
+            }
+        }
+    }
 
     #[test]
     fn known_intrinsic_element_with_valid_attributes_is_clean() {

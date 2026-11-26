@@ -544,7 +544,7 @@ impl PropertyType {
     }
 
     #[must_use]
-    const fn string_name(&self) -> bool {
+    pub(crate) const fn string_name(&self) -> bool {
         matches!(
             self.name_kind,
             PropertyNameKind::String | PropertyNameKind::StringAndNumber
@@ -2457,6 +2457,15 @@ impl TypeTable {
         self.object_symbol == Some(symbol)
     }
 
+    /// Test-only hook to model the intrinsic `Object` nominal head without
+    /// binding the full intrinsic environment. Production binds it in
+    /// `bind_intrinsic_environment`; unit tests use this to exercise the
+    /// `Object` top-type arms and the environment-eligibility gate.
+    #[cfg(test)]
+    pub fn set_object_symbol_for_test(&mut self, symbol: SymbolId) {
+        self.object_symbol = Some(symbol);
+    }
+
     pub(super) fn concat_array_element(&self, type_id: TypeId) -> Option<TypeId> {
         let Type::AppliedClass { symbol, arguments } = self.get(type_id) else {
             return None;
@@ -4006,6 +4015,24 @@ impl TypeTable {
             object,
             index,
             IndexedAccessConstraintMode::Write,
+            &mut active,
+        )
+    }
+
+    /// Read-mode constraint for an indexed access whose object and index are
+    /// already concrete: the value the read selects, unioned over possible
+    /// keys. Write mode (see `indexed_access_write_constraint`) intersects
+    /// instead, which is the wrong rule once both operands are concrete.
+    pub(super) fn indexed_access_read_constraint(
+        &self,
+        object: TypeId,
+        index: TypeId,
+    ) -> IndexedAccessConstraint {
+        let mut active = HashSet::new();
+        self.indexed_access_constraint(
+            object,
+            index,
+            IndexedAccessConstraintMode::Read,
             &mut active,
         )
     }
@@ -10512,7 +10539,7 @@ impl<'src> Binder<'src> {
         None
     }
 
-    fn types_assignable(&self, source: TypeId, target: TypeId) -> bool {
+    pub(super) fn types_assignable(&self, source: TypeId, target: TypeId) -> bool {
         if self.strict_null_checks {
             self.types.assignable_with_strict_null(source, target)
         } else {

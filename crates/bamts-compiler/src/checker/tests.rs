@@ -11590,6 +11590,56 @@ fn inference_through_transformed_recursive_alias_terminates() {
 }
 
 #[test]
+fn transformed_alias_source_assignments_preserve_union_order() {
+    let mut observed = Vec::new();
+    for (kind, leaf, rejected) in [("incompatible", "string", true), ("compatible", "T", false)] {
+        for (order, target) in [
+            (
+                "shallow-first",
+                "{ root: { next: B<string[]> } } | { root: B<string> }",
+            ),
+            (
+                "root-first",
+                "{ root: B<string> } | { root: { next: B<string[]> } }",
+            ),
+        ] {
+            let name = format!("{kind}-{order}");
+            let text = format!(
+                "type A<T> = {{ next: A<T[]>; value: T }};\n\
+                 type B<T> = {{ next: B<T[]>; value: {leaf} }};\n\
+                 declare const value: {{ root: A<string> }};\n\
+                 const result: {target} = value;\n"
+            );
+            println!("BINDING_ALIAS_SOURCE_BEGIN {name}\n{text}BINDING_ALIAS_SOURCE_END");
+            let parsed = parsed(0, &text);
+            assert!(
+                parsed.diagnostics().is_empty(),
+                "{name}: {:?}",
+                parsed.diagnostics()
+            );
+            let checked = check_program_with_options(
+                ProgramCheckInput {
+                    files: std::slice::from_ref(&parsed),
+                    edges: &[],
+                },
+                &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+                ProgramCheckOptions::standard().with_strict_null_checks(true),
+            );
+            let codes = checker_codes_of(&checked);
+            println!("BINDING_ALIAS_VERDICT {name} {codes:?}");
+            observed.push((name, codes, rejected));
+        }
+    }
+    for (name, codes, rejected) in observed {
+        if rejected {
+            assert_eq!(codes, [TYPE_NOT_ASSIGNABLE.as_str()], "{name}");
+        } else {
+            assert!(codes.is_empty(), "{name}: {codes:?}");
+        }
+    }
+}
+
+#[test]
 fn relations_through_transformed_recursive_aliases_terminate() {
     let result = check_text(
         "type Recursive<T> = { value: T; next: Recursive<T[]> };
@@ -12831,4 +12881,399 @@ fn element_access_enum_member_types_as_enum_dot_member() {
         "E.A",
         "element access enum member should render as E.A"
     );
+}
+
+#[test]
+fn wider_source_parameter_satisfies_bounded_generic_target() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. Every call through
+    // `<T extends "x">` passes a `string`, so the non-generic source
+    // fulfills the generic target without instantiating `T` itself.
+    let checked = check_text(
+        "declare const log: (value: string) => void;\n\
+         const narrow: <T extends \"x\">(value: T) => void = log;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a source accepting the whole bound must satisfy a bounded generic target: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn narrower_source_parameter_rejects_wider_bounded_generic_target() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): TS2322. Erasing the target
+    // to its constraint shows the source only accepts `"x"`.
+    let checked = check_text(
+        "declare const only_x: (value: \"x\") => void;\n\
+         const either: <T extends \"x\" | \"y\">(value: T) => void = only_x;",
+    );
+    assert!(
+        checker_codes(&checked)
+            .iter()
+            .any(|code| *code == TYPE_NOT_ASSIGNABLE.as_str()),
+        "a source narrower than the bound must not satisfy a bounded generic target: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn concrete_key_satisfies_deferred_keyof_bound() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. Specializing
+    // `K extends keyof T` against `({ x: number }, "x")` resolves the
+    // operand, and `"x"` belongs to its key domain.
+    let checked = check_text(
+        "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+         const get_x: (obj: { x: number }, key: \"x\") => \"x\" = get_key;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a key present on the inferred object must satisfy a deferred keyof bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn absent_key_rejects_deferred_keyof_bound() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): TS2322.
+    let checked = check_text(
+        "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+         const get_y: (obj: { x: number }, key: \"y\") => \"y\" = get_key;",
+    );
+    assert!(
+        checker_codes(&checked)
+            .iter()
+            .any(|code| *code == TYPE_NOT_ASSIGNABLE.as_str()),
+        "a key absent from the inferred object must not satisfy a deferred keyof bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn union_key_validates_indexed_bound_by_read_union() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. The read of
+    // `obj[key]` over `"a" | "b"` is `number | string`, which the
+    // candidate `number` satisfies.
+    let checked = check_text(
+        "declare const take: <T extends { a: unknown; b: unknown }, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+         const use_number: (obj: { a: number; b: string }, key: \"a\" | \"b\", value: number) => number = take;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a value from one selected property must satisfy a concrete indexed bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn unrelated_value_rejects_indexed_bound() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): TS2322 (`boolean` is not
+    // assignable to `string | number`).
+    let checked = check_text(
+        "declare const take: <T extends { a: unknown; b: unknown }, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+         const use_boolean: (obj: { a: number; b: string }, key: \"a\" | \"b\", value: boolean) => boolean = take;",
+    );
+    assert!(
+        checker_codes(&checked)
+            .iter()
+            .any(|code| *code == TYPE_NOT_ASSIGNABLE.as_str()),
+        "a value from no selected property must not satisfy a concrete indexed bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn single_key_with_union_property_accepts_member() {
+    // Oracle (tsc 5.9.3, --strict --noEmit): clean. `T["a"]` reads
+    // `number | string`, which the candidate `string` satisfies.
+    let checked = check_text(
+        "declare const take_one: <T extends { a: unknown }, K extends \"a\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+         const use_string: (obj: { a: number | string }, key: \"a\", value: string) => string = take_one;",
+    );
+    assert!(
+        checker_codes(&checked).is_empty(),
+        "a member of a union-typed property must satisfy a concrete indexed bound: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn generic_target_preserves_caller_chosen_results_in_nested_types() {
+    for (source_result, target_result) in [
+        ("\"x\" | \"y\"", "T"),
+        ("(\"x\" | \"y\")[]", "T[]"),
+        ("{ value: \"x\" | \"y\" }", "{ value: T }"),
+        ("() => \"x\" | \"y\"", "() => T"),
+    ] {
+        let text = format!(
+            "declare const source: (value: string) => {source_result};\n\
+             const target: <T extends \"x\" | \"y\">(value: T) => {target_result} = source;"
+        );
+        let checked = check_text(&text);
+        assert!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "a bound value cannot promise the caller's subtype in {target_result}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn generic_target_preserves_variance_inside_callbacks() {
+    let rejected = check_text(
+        "declare const call_any: (callback: (value: \"x\" | \"y\") => void) => void;\n\
+         const call_chosen: <T extends \"x\" | \"y\">(callback: (value: T) => void) => void = call_any;",
+    );
+    assert!(
+        checker_codes(&rejected).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "a callback for one chosen subtype cannot accept every bound value: {:?}",
+        rejected.diagnostics()
+    );
+    let accepted = check_text(
+        "declare const make_log: (value: string) => (item: string) => void;\n\
+         const make_chosen: <T extends \"x\" | \"y\">(value: T) => (item: T) => void = make_log;",
+    );
+    assert!(
+        checker_codes(&accepted).is_empty(),
+        "a returned callback accepting the whole bound accepts the chosen subtype: {:?}",
+        accepted.diagnostics()
+    );
+}
+
+#[test]
+fn generic_target_uses_effective_specialized_alias_bounds() {
+    let accepted = check_text(
+        "type Handler<Base> = <T extends Base>(value: T) => void;\n\
+         declare const log: (value: string) => void;\n\
+         const handler: Handler<string> = log;",
+    );
+    assert!(
+        checker_codes(&accepted).is_empty(),
+        "{:?}",
+        accepted.diagnostics()
+    );
+    let rejected = check_text(
+        "type Handler<Base> = <T extends Base>(value: T) => void;\n\
+         declare const log: (value: string) => void;\n\
+         const handler: Handler<number> = log;",
+    );
+    assert!(
+        checker_codes(&rejected).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "{:?}",
+        rejected.diagnostics()
+    );
+}
+
+#[test]
+fn generic_target_retains_never_and_any_return_concessions() {
+    for result in ["never", "any"] {
+        let checked = check_text(&format!(
+            "declare const source: (value: string) => {result};\n\
+             const target: <T extends \"x\" | \"y\">(value: T) => T = source;"
+        ));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn deferred_keyof_bound_canonicalizes_numeric_literals() {
+    for literal in ["0x1", "1.0", "1e3"] {
+        let checked = check_text(&format!(
+            "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+             const use_key: (obj: {{ 1: number; 1000: number }}, key: {literal}) => {literal} = get_key;"
+        ));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "{literal}: {:?}",
+            checked.diagnostics()
+        );
+    }
+    let rejected = check_text(
+        "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+         const use_key: (obj: { 1: number }, key: 0x2) => 0x2 = get_key;",
+    );
+    assert!(
+        checker_codes(&rejected).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "a different numeric value must remain outside the key domain: {:?}",
+        rejected.diagnostics()
+    );
+}
+
+#[test]
+fn deferred_keyof_bound_checks_every_union_member() {
+    for (keys, valid) in [("\"a\" | \"b\"", true), ("\"a\" | \"missing\"", false)] {
+        let checked = check_text(&format!(
+            "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+             const use_key: (obj: {{ a: number; b: string }}, key: {keys}) => {keys} = get_key;"
+        ));
+        assert_eq!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            !valid,
+            "{keys}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn deferred_keyof_bound_respects_nullability_of_nonempty_domains() {
+    for strict in [false, true] {
+        for key in ["null", "undefined"] {
+            for (shape, nonempty) in [
+                ("{ a: number }", true),
+                ("{ 1: number }", true),
+                ("{ [name: string]: number }", true),
+                ("{ [index: number]: number }", true),
+                ("{}", false),
+            ] {
+                let text = format!(
+                    "declare const get: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+                     const nullable: (obj: {shape}, key: {key}) => {key} = get;"
+                );
+                let checked = check_text_with(
+                    &text,
+                    ProgramCheckOptions::standard().with_strict_null_checks(strict),
+                );
+                let codes = checker_codes_of(&checked);
+                if nonempty && !strict {
+                    assert!(codes.is_empty(), "{text}: {:?}", checked.diagnostics());
+                } else {
+                    assert!(
+                        codes
+                            .iter()
+                            .any(|code| code == TYPE_NOT_ASSIGNABLE.as_str()),
+                        "strict={strict}, {text}: {:?}",
+                        checked.diagnostics()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_keyof_bound_accepts_declared_dictionary_domains() {
+    for (domain, key, valid) in [
+        ("string", "string", true),
+        ("string", "\"a\" | \"b\"", true),
+        ("number", "number", true),
+        ("number", "0x1 | 2", true),
+        ("number", "\"missing\"", false),
+        ("string", "boolean", false),
+    ] {
+        let checked = check_text(&format!(
+            "declare const get_key: <T, K extends keyof T>(obj: T, key: K) => K;\n\
+             const use_key: (obj: {{ [key: {domain}]: number }}, key: {key}) => {key} = get_key;"
+        ));
+        assert_eq!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            !valid,
+            "{domain} / {key}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn indexed_bound_keeps_unresolved_generic_keys_conservative() {
+    for key in ["P", "P | \"a\"", "P & (\"a\" | \"b\")"] {
+        let checked = check_text(&format!(
+            "declare const take: <T extends {{ a: unknown; b: unknown }}, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => K;\n\
+             function bind<P extends \"a\" | \"b\">() {{\n\
+               const use_number: (obj: {{ a: number; b: string }}, key: {key}, value: number) => {key} = take;\n\
+             }}"
+        ));
+        assert!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "a value must satisfy the caller-chosen key {key}: {:?}",
+            checked.diagnostics()
+        );
+    }
+    let accepted = check_text(
+        "declare const take: <T extends { a: unknown; b: unknown }, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => K;\n\
+         function bind<P extends \"a\" | \"b\">() {\n\
+           const use_number: (obj: { a: number; b: number }, key: P, value: number) => P = take;\n\
+         }",
+    );
+    assert!(
+        checker_codes(&accepted).is_empty(),
+        "a value valid for every selected property remains valid: {:?}",
+        accepted.diagnostics()
+    );
+}
+
+#[test]
+fn indexed_bound_keeps_generic_object_union_members_conservative() {
+    let checked = check_text(
+        "declare const take: <T extends { a: unknown }, U extends T[\"a\"]>(obj: T, value: U) => T;\n\
+         function bind<P extends { a: number | string }>() {\n\
+           const use_number: (obj: P | { a: number }, value: number) => P | { a: number } = take;\n\
+         }",
+    );
+    assert!(
+        checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "a concrete union member cannot prove a generic member's property type: {:?}",
+        checked.diagnostics()
+    );
+}
+
+#[test]
+fn indexed_bound_distributes_union_candidates_over_read_union() {
+    for (value, valid) in [("number | string", true), ("number | boolean", false)] {
+        let checked = check_text(&format!(
+            "type Value = {value};\n\
+             declare const take: <T extends {{ a: unknown; b: unknown }}, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => U;\n\
+             const use_value: (obj: {{ a: number; b: string }}, key: \"a\" | \"b\", value: Value) => Value = take;"
+        ));
+        assert_eq!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            !valid,
+            "each member of {value} must satisfy the selected read union: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn recursive_union_rejects_failed_coinductive_branch() {
+    for target in [
+        r#"{ root: B<number> } | { root: { a: B<number>["a"] } }"#,
+        r#"{ root: { a: B<number>["a"] } } | { root: B<number> }"#,
+    ] {
+        let checked = check_text(&format!(
+            "type A<T> = {{ a: {{ back: A<T>; leaf: string }}; z: T }};\n\
+             type B<T> = {{ a: {{ back: B<T>; leaf: Object }}; z: T }};\n\
+             declare const value: {{ root: A<string> }};\n\
+             const result: {target} = value;"
+        ));
+        assert_eq!(
+            checker_codes(&checked),
+            [TYPE_NOT_ASSIGNABLE.as_str()],
+            "recursive branch must not reuse a disproven cycle: {target}: {:?}",
+            checked.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn recursive_union_accepts_completed_coinductive_branch() {
+    for target in [
+        r#"{ root: B<string> } | { root: { a: B<string>["a"] } }"#,
+        r#"{ root: { a: B<string>["a"] } } | { root: B<string> }"#,
+    ] {
+        let checked = check_text(&format!(
+            "type A<T> = {{ a: {{ back: A<T>; leaf: string }}; z: T }};\n\
+             type B<T> = {{ a: {{ back: B<T>; leaf: Object }}; z: T }};\n\
+             declare const value: {{ root: A<string> }};\n\
+             const result: {target} = value;"
+        ));
+        assert!(
+            checker_codes(&checked).is_empty(),
+            "completed recursive branches remain assignable: {target}: {:?}",
+            checked.diagnostics()
+        );
+    }
 }
