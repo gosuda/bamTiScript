@@ -10530,7 +10530,7 @@ impl<'src> Binder<'src> {
         None
     }
 
-    fn types_assignable(&self, source: TypeId, target: TypeId) -> bool {
+    pub(super) fn types_assignable(&self, source: TypeId, target: TypeId) -> bool {
         if self.strict_null_checks {
             self.types.assignable_with_strict_null(source, target)
         } else {
