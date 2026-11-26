@@ -713,7 +713,7 @@ fn find_hygiene(
         }
     }
 
-    let exported = inline_exported_binding_names(source);
+    let exported = inline_exported_binding_ranges(source);
     for (index, token) in tokens.iter().copied().enumerate() {
         if matches!(
             token.kind,
@@ -723,7 +723,7 @@ fn find_hygiene(
             .copied()
             .filter(|next| next.identifier())
             && identifier_uses(tokens, name.text) == 1
-            && !exported.contains(name.text)
+            && !exported.contains(&(name.range.start(), name.range.end()))
         {
             push(findings, "BAMTS-W069", name, "local binding is never read");
         }
@@ -899,76 +899,58 @@ fn identifier_uses(tokens: &[SyntaxToken<'_>], name: &str) -> usize {
         .filter(|token| token.identifier() && token.text == name)
         .count()
 }
-/// Binding names published by inline `export` declarations (`export const
-/// x = ...`, `export function f ...`). A `.export` property read leaves a
-/// `KwExport` token immediately before the next declaration in semicolon-free
-/// code, so token adjacency cannot tell an inline export from member access:
-/// derive the exemption from parsed export declarations instead. The semantic
-/// unused-local pass exempts exports the same way.
-fn inline_exported_binding_names(source: &SourceFile) -> BTreeSet<String> {
+/// Inline exports are identified by their parsed binding ranges. A property
+/// named export cannot export an adjacent declaration, and namespace exports
+/// belong to their own statement lists.
+fn inline_exported_binding_ranges(source: &SourceFile) -> BTreeSet<(Utf16Pos, Utf16Pos)> {
     let mut exported = BTreeSet::new();
-    for statement in source.statements() {
-        let Statement::Export(export) = statement.data() else {
-            continue;
+    let mut pending: Vec<_> = source.statements().iter().collect();
+    while let Some(statement) = pending.pop() {
+        let statement = match statement.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => {
+                if let Statement::Variable(declaration) = inner.data() {
+                    for declarator in &declaration.declarations {
+                        collect_exported_binding_ranges(&declarator.data().binding, &mut exported);
+                    }
+                }
+                inner
+            }
+            _ => statement,
         };
-        let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) = export else {
-            continue;
-        };
-        collect_exported_binding_names(source, inner, &mut exported);
+        if let Statement::Namespace(namespace) = statement.data() {
+            pending.extend(&namespace.body.data().statements);
+        }
     }
     exported
 }
 
-fn collect_exported_binding_names(
-    source: &SourceFile,
-    statement: &Stmt,
-    exported: &mut BTreeSet<String>,
-) {
-    match statement.data() {
-        Statement::Variable(declaration) => {
-            for declarator in &declaration.declarations {
-                collect_pattern_binding_names(source, &declarator.data().binding, exported);
-            }
-        }
-        Statement::Function(function) => {
-            if let Some(name) = function.function.name.as_ref()
-                && let Some(text) = source.identifier_text(name.data().token())
-            {
-                exported.insert(text.into_owned());
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_pattern_binding_names(
-    source: &SourceFile,
+fn collect_exported_binding_ranges(
     pattern: &Pattern,
-    exported: &mut BTreeSet<String>,
+    exported: &mut BTreeSet<(Utf16Pos, Utf16Pos)>,
 ) {
     match pattern.data() {
         BindingPattern::Identifier(identifier) => {
-            if let Some(text) = source.identifier_text(identifier.data().token()) {
-                exported.insert(text.into_owned());
-            }
+            exported.insert((identifier.range().start(), identifier.range().end()));
         }
         BindingPattern::Object(object) => {
             for property in &object.properties {
-                collect_pattern_binding_names(source, &property.binding, exported);
+                collect_exported_binding_ranges(&property.binding, exported);
             }
         }
         BindingPattern::Array(array) => {
             for element in &array.elements {
                 if let ArrayBindingElement::Binding(inner) = element {
-                    collect_pattern_binding_names(source, inner, exported);
+                    collect_exported_binding_ranges(inner, exported);
                 }
             }
         }
         BindingPattern::Rest(rest) => {
-            collect_pattern_binding_names(source, &rest.argument, exported);
+            collect_exported_binding_ranges(&rest.argument, exported);
         }
         BindingPattern::Assignment(assignment) => {
-            collect_pattern_binding_names(source, &assignment.left, exported);
+            collect_exported_binding_ranges(&assignment.left, exported);
         }
         BindingPattern::Missing(_) => {}
     }
@@ -2095,6 +2077,18 @@ mod tests {
         "BAMTS-W069",
         "const settings = { export: true }\nconst enabled = settings.export\nconst unused = 1\nexport { enabled }",
         "export const kept = 1;"
+    );
+    rule_test!(
+        w069_namespace_exports_cross_the_module_boundary,
+        "BAMTS-W069",
+        "export namespace Settings { const unused = true; }",
+        "export namespace Settings { export const enabled = true; }"
+    );
+    rule_test!(
+        w069_nested_namespace_exports_cross_the_module_boundary,
+        "BAMTS-W069",
+        "namespace Settings { namespace Flags { const unused = true; } }",
+        "namespace Settings { export namespace Flags { export const enabled = true; } }"
     );
     rule_test!(
         w070_unused_parameter,
