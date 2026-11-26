@@ -1854,7 +1854,8 @@ impl<'table> TypeRelations<'table> {
                 )
                 && (mapped_object != *object || mapped_index != *index)
             {
-                if self.indexed_object_is_concrete(mapped_object) {
+                let object_is_concrete = self.indexed_operand_is_concrete(mapped_object);
+                if object_is_concrete && self.indexed_operand_is_concrete(mapped_index) {
                     // Both operands are already concrete, so the bound
                     // describes the value the read selects: validate against
                     // the read union, where one selected property suffices.
@@ -1867,6 +1868,12 @@ impl<'table> TypeRelations<'table> {
                         }
                         IndexedAccessConstraint::Invalid => false,
                     };
+                }
+                if !object_is_concrete {
+                    // Preserve the original generic identity. A mapped object
+                    // union may contain a generic member whose writable view is
+                    // opaque; its concrete siblings cannot prove that member.
+                    return self.relates(argument, bound, strictness);
                 }
                 return match self
                     .table
@@ -1893,14 +1900,14 @@ impl<'table> TypeRelations<'table> {
         };
         match self.table.get(argument) {
             Type::Union(members) => {
-                return members
-                    .iter()
-                    .all(|&member| self.argument_satisfies_object_keys(member, object, strictness));
+                return members.iter().all(|&member| {
+                    self.argument_satisfies_object_keys(member, object, strictness)
+                });
             }
             Type::Intersection(members) => {
-                return members
-                    .iter()
-                    .any(|&member| self.argument_satisfies_object_keys(member, object, strictness));
+                return members.iter().any(|&member| {
+                    self.argument_satisfies_object_keys(member, object, strictness)
+                });
             }
             Type::Never => return true,
             Type::Any => return strictness != Strictness::Strict,
@@ -1940,33 +1947,34 @@ impl<'table> TypeRelations<'table> {
         }
     }
 
-    /// Whether read-mode reduction may touch this object: read mode
-    /// substitutes an unresolved generic object's upper bound, so it is only
-    /// valid once inference has produced a concrete operand. A named type
-    /// without a declared constraint is already concrete (an unconstrained
-    /// parameter keeps its identity through read mode).
-    fn indexed_object_is_concrete(&self, mut object: TypeId) -> bool {
-        let mut visiting = HashSet::new();
-        loop {
-            if !visiting.insert(object) {
+    /// Read reduction must not replace any remaining caller-chosen operand
+    /// with an upper bound, including inside aliases, unions and intersections.
+    /// Inspect exactly those branches the indexed constraint reducer follows;
+    /// selected property values retain their own relation checks.
+    fn indexed_operand_is_concrete(&self, operand: TypeId) -> bool {
+        let mut pending = SmallVec::<[TypeId; 4]>::from_slice(&[operand]);
+        let mut visited = HashSet::new();
+        while let Some(operand) = pending.pop() {
+            let Some(view) = self.indexed_operand_identity(operand) else {
                 return false;
+            };
+            if !visited.insert(view) {
+                continue;
             }
-            match self.table.get(object) {
-                Type::AppliedAlias { .. } => {
-                    let Some(view) = self.table.applied_alias_view(object) else {
-                        return false;
-                    };
-                    object = view;
+            match self.table.get(view) {
+                Type::Named(symbol)
+                    if self.table.type_parameter_constraint(*symbol).is_some()
+                        || self.rigid_parameter_bound(*symbol).is_some() =>
+                {
+                    return false;
                 }
-                Type::TypeQuery { target, .. } => {
-                    object = *target;
+                Type::Union(members) | Type::Intersection(members) => {
+                    pending.extend(members.iter().copied());
                 }
-                Type::Named(symbol) => {
-                    return self.table.type_parameter_constraint(*symbol).is_none();
-                }
-                _ => return true,
+                _ => {}
             }
         }
+        true
     }
 
     /// Recursively matches `pattern` (which may contain the type parameter

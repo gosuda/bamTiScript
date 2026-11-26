@@ -13090,3 +13090,46 @@ fn deferred_keyof_bound_accepts_declared_dictionary_domains() {
         );
     }
 }
+
+#[test]
+fn indexed_bound_keeps_unresolved_generic_keys_conservative() {
+    for key in ["P", "P | \"a\"", "P & (\"a\" | \"b\")"] {
+        let checked = check_text(&format!(
+            "declare const take: <T extends {{ a: unknown; b: unknown }}, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => K;\n\
+             function bind<P extends \"a\" | \"b\">() {{\n\
+               const use_number: (obj: {{ a: number; b: string }}, key: {key}, value: number) => {key} = take;\n\
+             }}"
+        ));
+        assert!(
+            checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+            "a value must satisfy the caller-chosen key {key}: {:?}",
+            checked.diagnostics()
+        );
+    }
+    let accepted = check_text(
+        "declare const take: <T extends { a: unknown; b: unknown }, K extends \"a\" | \"b\", U extends T[K]>(obj: T, key: K, value: U) => K;\n\
+         function bind<P extends \"a\" | \"b\">() {\n\
+           const use_number: (obj: { a: number; b: number }, key: P, value: number) => P = take;\n\
+         }",
+    );
+    assert!(
+        checker_codes(&accepted).is_empty(),
+        "a value valid for every selected property remains valid: {:?}",
+        accepted.diagnostics()
+    );
+}
+
+#[test]
+fn indexed_bound_keeps_generic_object_union_members_conservative() {
+    let checked = check_text(
+        "declare const take: <T extends { a: unknown }, U extends T[\"a\"]>(obj: T, value: U) => T;\n\
+         function bind<P extends { a: number | string }>() {\n\
+           const use_number: (obj: P | { a: number }, value: number) => P | { a: number } = take;\n\
+         }",
+    );
+    assert!(
+        checker_codes(&checked).contains(&TYPE_NOT_ASSIGNABLE.as_str()),
+        "a concrete union member cannot prove a generic member's property type: {:?}",
+        checked.diagnostics()
+    );
+}
