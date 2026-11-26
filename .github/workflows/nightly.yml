@@ -360,8 +360,58 @@ jobs:
         uses: ./.github/actions/rust-cache
 
       - name: Corpus differential
+        id: corpus
         run: |
           cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
+
+      - name: Test Linux native addon lifecycle
+        if: ${{ !cancelled() && (steps.corpus.outcome == 'success' || steps.corpus.outcome == 'failure') }}
+        timeout-minutes: 15
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { execFileSync } from "node:child_process";
+          import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+          import { join, resolve } from "node:path";
+          import { createNativeBuildPlan, NATIVE_RELEASE_TARGETS } from "./npm/scripts/native-build-plan.mjs";
+          import { packageNativeTarget } from "./npm/scripts/package-native-platform.mjs";
+
+          const hashFile = async (path) =>
+            createHash("sha256").update(await readFile(path)).digest("hex");
+          const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+          const { version } = JSON.parse(await readFile("npm/bamti/package.json", "utf8"));
+          const toolchainSource = await readFile("rust-toolchain.toml", "utf8");
+          const toolchain = /channel\s*=\s*"([^"]+)"/.exec(toolchainSource)?.[1];
+          if (toolchain === undefined) throw new Error("rust-toolchain.toml has no pinned channel");
+          const cargoLockSha256 = await hashFile("Cargo.lock");
+          const workflowRevision = await hashFile(".github/workflows/nightly.yml");
+          const builderRevision = await hashFile("npm/scripts/package-native-platform.mjs");
+          const { canonicalPlan, buildSetId } = createNativeBuildPlan({
+            sourceCommit, sourceVersion: version, cargoLockSha256,
+            workflowRevision, toolchain, builderRevision, targets: NATIVE_RELEASE_TARGETS,
+          });
+          const smokeRoot = resolve("target/native-smoke");
+          await rm(smokeRoot, { recursive: true, force: true });
+          await mkdir(smokeRoot, { recursive: true });
+          await writeFile(join(smokeRoot, "native-build-plan.json"), canonicalPlan);
+          const { record, tarballPath } = await packageNativeTarget("x86_64-unknown-linux-gnu", {
+            outputDirectory: join(smokeRoot, "dist"),
+            sourceCommit, buildSetId, cargoLockSha256,
+            workflowRevision, toolchain, builderRevision,
+          });
+          const stage = join(smokeRoot, "stage");
+          await mkdir(stage);
+          execFileSync("tar", ["-xzf", tarballPath, "-C", stage], { stdio: "inherit" });
+          execFileSync(process.execPath, ["--test", "npm/test/bamti-native-addon-lifecycle.test.mjs"], {
+            stdio: "inherit",
+            env: {
+              ...process.env,
+              BAMTI_NATIVE_ADDON_PATH: join(stage, "package", record.entry),
+              BAMTI_EXPECTED_SOURCE_COMMIT: sourceCommit,
+              BAMTI_EXPECTED_BUILD_SET_ID: buildSetId,
+            },
+          });
+          NODE
 
   formal:
     name: Formal
@@ -437,3 +487,63 @@ jobs:
 
       - name: Formal gates G1,G2,G5,G3,G4
         run: cargo run --locked -p bamts-verification --bin bamts-verification -- formal audit --gates G1,G2,G5,G3,G4
+
+  windows-native:
+    name: Windows native boundary
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.label.name == 's0-nightly-dry-run')
+    runs-on: depot-windows-2025-4
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install pinned Rust toolchain
+        id: toolchain
+        if: ${{ !cancelled() }}
+        run: |
+          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $toolchain
+      - name: Cache Rust dependencies
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        uses: ./.github/actions/rust-cache
+      - name: Test Windows cache ownership and publication
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-native --features cache-guard --no-fail-fast
+      # Every other job runs on Linux, where the Win32 backend, the Microsoft
+      # linker driver and the stack size of a linked image are not compiled.
+      - name: Lint the Windows platform backend and linker driver
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo clippy --locked -p bamts-platform -p bamts-cli --all-targets -- -D warnings
+      - name: Test the Windows platform backend
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-platform --no-fail-fast
+
+      - name: Test the Microsoft linker driver
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-cli --lib --no-fail-fast -- windows_link
+
+      - name: Test the Windows cache root
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-cli --lib --no-fail-fast -- fallback_cache_root
+
+      - name: Test linked native executables
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-cli --test cli --no-fail-fast -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
+
+      - name: Test the lane workers
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-verification --test lane_serving --no-fail-fast
+      - name: Test the serving lane executor
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --locked -p bamts-verification --lib --no-fail-fast serving

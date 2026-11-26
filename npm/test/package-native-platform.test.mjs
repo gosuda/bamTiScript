@@ -43,11 +43,11 @@ const BUILD_SET_ID = createNativeBuildPlan({
   targets: NATIVE_RELEASE_TARGETS,
 }).buildSetId;
 const RUNNERS = new Map([
-  ["linux-x64-gnu", "ubuntu-24.04"],
-  ["linux-arm64-gnu", "ubuntu-24.04-arm"],
-  ["darwin-x64", "macos-15-intel"],
-  ["darwin-arm64", "macos-15"],
-  ["win32-x64-msvc", "windows-2025"],
+  ["linux-x64-gnu", "depot-ubuntu-24.04"],
+  ["linux-arm64-gnu", "depot-ubuntu-24.04-arm"],
+  ["darwin-x64", "depot-macos-latest"],
+  ["darwin-arm64", "depot-macos-latest"],
+  ["win32-x64-msvc", "depot-windows-2025-4"],
 ]);
 
 function packageOptions(overrides = {}) {
@@ -173,7 +173,7 @@ test("packageNativeTarget builds the target once", async () => {
     assert.equal(npmCalls, 1);
     assert.equal(record.version, "0.2.0");
     assert.equal(record.package, "@bamti/bamti-linux-x64-gnu");
-    assert.equal(record.runner, "ubuntu-24.04");
+    assert.equal(record.runner, "depot-ubuntu-24.04");
   });
 });
 
@@ -216,7 +216,7 @@ test("packageNativeTarget emits correct record and artifact metadata", async () 
     assert.equal(record.cpu, "x64");
     assert.equal(record.libc, "glibc");
     assert.equal(record.artifactKind, "native-addon");
-    assert.equal(record.runner, "ubuntu-24.04");
+    assert.equal(record.runner, "depot-ubuntu-24.04");
     assert.equal(record.release.packageVersion, "0.2.0");
     assert.equal(record.release.sourceCommit, SOURCE_COMMIT);
     assert.equal(record.release.nativeAbi, 1);
@@ -337,7 +337,7 @@ test("packageNativeTarget handles a darwin target without libc", async () => {
 
     assert.equal(record.package, "@bamti/bamti-darwin-x64");
     assert.equal(record.libc, undefined);
-    assert.equal(record.runner, "macos-15-intel");
+    assert.equal(record.runner, "depot-macos-latest");
 
     const manifest = await readJson(join(inspectDir, "package.json"));
     assert.equal(manifest.name, "@bamti/bamti-darwin-x64");

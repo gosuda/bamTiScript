@@ -31,7 +31,7 @@ const CLI_TARGETS = Object.freeze([
     os: "linux",
     cpu: "x64",
     artifactKind: "cli-binary",
-    runner: "ubuntu-24.04",
+    runner: "depot-ubuntu-24.04",
   }),
   Object.freeze({
     selector: "linux-arm64",
@@ -41,7 +41,7 @@ const CLI_TARGETS = Object.freeze([
     os: "linux",
     cpu: "arm64",
     artifactKind: "cli-binary",
-    runner: "ubuntu-24.04-arm",
+    runner: "depot-ubuntu-24.04-arm",
   }),
   Object.freeze({
     selector: "darwin-x64",
@@ -51,7 +51,7 @@ const CLI_TARGETS = Object.freeze([
     os: "darwin",
     cpu: "x64",
     artifactKind: "cli-binary",
-    runner: "macos-15-intel",
+    runner: "depot-macos-latest",
   }),
   Object.freeze({
     selector: "darwin-arm64",
@@ -61,7 +61,7 @@ const CLI_TARGETS = Object.freeze([
     os: "darwin",
     cpu: "arm64",
     artifactKind: "cli-binary",
-    runner: "macos-15",
+    runner: "depot-macos-latest",
   }),
   Object.freeze({
     selector: "win32-x64",
@@ -71,7 +71,7 @@ const CLI_TARGETS = Object.freeze([
     os: "win32",
     cpu: "x64",
     artifactKind: "cli-binary",
-    runner: "windows-2025",
+    runner: "depot-windows-2025-4",
   }),
 ]);
 
