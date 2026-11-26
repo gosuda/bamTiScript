@@ -11,12 +11,13 @@ use crate::{
     lint::{CompilerLintOptions, LintProfile, LintTable, SourceDialect, rule_by_code},
     source::{ScriptKind, SourceId, TextRange, Utf16Pos},
     syntax::{
-        ArrayElement, AssignmentArrayElement, AssignmentTarget, CallArgument, ClassDeclaration,
-        ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression, ForBinding,
-        ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
+        ArrayBindingElement, ArrayElement, AssignmentArrayElement, AssignmentTarget,
+        BindingPattern, CallArgument, ClassDeclaration, ClassMember, ExportDeclaration,
+        ExportDefaultValue, ExportNamedDeclaration, Expr, Expression, ForBinding, ForInitializer,
+        FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
         JsxAttributeItem, JsxChild, KeywordType, MemberProperty, ObjectMember, ParameterNode,
-        PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode, TypeMember,
-        TypeNode, TypeParameterList,
+        Pattern, PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode,
+        TypeMember, TypeNode, TypeParameterList,
     },
 };
 
@@ -109,7 +110,7 @@ pub fn analyze(source: &SourceFile, levels: &LintTable) -> Vec<Diagnostic> {
     find_class_fields(&tokens, &mut findings);
     find_enums(&tokens, &mut findings);
     find_declaration_merges(&tokens, &mut findings);
-    find_hygiene(&tokens, &mut findings);
+    find_hygiene(source, &tokens, &mut findings);
     find_syntactic_footguns(&tokens, &mut findings);
     find_catalog_completion(source, &tokens, &comments, &mut findings);
 
@@ -675,6 +676,7 @@ fn find_declaration_merges(
 }
 
 fn find_hygiene(
+    source: &SourceFile,
     tokens: &[SyntaxToken<'_>],
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
@@ -711,6 +713,7 @@ fn find_hygiene(
         }
     }
 
+    let exported = inline_exported_binding_ranges(source);
     for (index, token) in tokens.iter().copied().enumerate() {
         if matches!(
             token.kind,
@@ -720,7 +723,7 @@ fn find_hygiene(
             .copied()
             .filter(|next| next.identifier())
             && identifier_uses(tokens, name.text) == 1
-            && !is_exported_binding(tokens, index)
+            && !exported.contains(&(name.range.start(), name.range.end()))
         {
             push(findings, "BAMTS-W069", name, "local binding is never read");
         }
@@ -896,12 +899,61 @@ fn identifier_uses(tokens: &[SyntaxToken<'_>], name: &str) -> usize {
         .filter(|token| token.identifier() && token.text == name)
         .count()
 }
+/// Inline exports are identified by their parsed binding ranges. A property
+/// named export cannot export an adjacent declaration, and namespace exports
+/// belong to their own statement lists.
+fn inline_exported_binding_ranges(source: &SourceFile) -> BTreeSet<(Utf16Pos, Utf16Pos)> {
+    let mut exported = BTreeSet::new();
+    let mut pending: Vec<_> = source.statements().iter().collect();
+    while let Some(statement) = pending.pop() {
+        let statement = match statement.data() {
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => {
+                if let Statement::Variable(declaration) = inner.data() {
+                    for declarator in &declaration.declarations {
+                        collect_exported_binding_ranges(&declarator.data().binding, &mut exported);
+                    }
+                }
+                inner
+            }
+            _ => statement,
+        };
+        if let Statement::Namespace(namespace) = statement.data() {
+            pending.extend(&namespace.body.data().statements);
+        }
+    }
+    exported
+}
 
-/// An inline `export const` publishes its binding at the module boundary, so a
-/// use count of one is the declaration itself rather than a dead local. The
-/// semantic unused-local pass exempts exports the same way.
-fn is_exported_binding(tokens: &[SyntaxToken<'_>], index: usize) -> bool {
-    index > 0 && tokens[index - 1].kind == TokenKind::KwExport
+fn collect_exported_binding_ranges(
+    pattern: &Pattern,
+    exported: &mut BTreeSet<(Utf16Pos, Utf16Pos)>,
+) {
+    match pattern.data() {
+        BindingPattern::Identifier(identifier) => {
+            exported.insert((identifier.range().start(), identifier.range().end()));
+        }
+        BindingPattern::Object(object) => {
+            for property in &object.properties {
+                collect_exported_binding_ranges(&property.binding, exported);
+            }
+        }
+        BindingPattern::Array(array) => {
+            for element in &array.elements {
+                if let ArrayBindingElement::Binding(inner) = element {
+                    collect_exported_binding_ranges(inner, exported);
+                }
+            }
+        }
+        BindingPattern::Rest(rest) => {
+            collect_exported_binding_ranges(&rest.argument, exported);
+        }
+        BindingPattern::Assignment(assignment) => {
+            collect_exported_binding_ranges(&assignment.left, exported);
+        }
+        BindingPattern::Missing(_) => {}
+    }
 }
 
 fn find_catalog_completion(
@@ -2019,6 +2071,24 @@ mod tests {
         "BAMTS-W069",
         "const x = 1;",
         "export const x = 1;"
+    );
+    rule_test!(
+        w069_property_read_does_not_mark_next_binding_exported,
+        "BAMTS-W069",
+        "const settings = { export: true }\nconst enabled = settings.export\nconst unused = 1\nexport { enabled }",
+        "export const kept = 1;"
+    );
+    rule_test!(
+        w069_namespace_exports_cross_the_module_boundary,
+        "BAMTS-W069",
+        "export namespace Settings { const unused = true; }",
+        "export namespace Settings { export const enabled = true; }"
+    );
+    rule_test!(
+        w069_nested_namespace_exports_cross_the_module_boundary,
+        "BAMTS-W069",
+        "namespace Settings { namespace Flags { const unused = true; } }",
+        "namespace Settings { export namespace Flags { export const enabled = true; } }"
     );
     rule_test!(
         w070_unused_parameter,
