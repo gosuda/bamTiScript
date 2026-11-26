@@ -19,8 +19,8 @@ defaults:
     shell: bash
 
 jobs:
-  windows-native:
-    name: Windows native boundary
+  windows-native-guard:
+    name: Windows native guard
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
@@ -58,9 +58,67 @@ jobs:
       - name: Test the Windows platform backend
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo test --locked -p bamts-platform --no-fail-fast
+
+  windows-native-linker:
+    name: Windows native linker
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install pinned Rust toolchain
+        id: toolchain
+        if: ${{ !cancelled() }}
+        run: |
+          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $toolchain
+      - name: Cache Rust dependencies
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        uses: ./.github/actions/rust-cache
       - name: Test the Microsoft linker driver and the Windows cache root
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo test --locked -p bamts-cli --lib --no-fail-fast -- windows_link fallback_cache_root
+
+  windows-native-exec:
+    name: Windows native executables and lanes
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install pinned Rust toolchain
+        id: toolchain
+        if: ${{ !cancelled() }}
+        run: |
+          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default $toolchain
+      - name: Cache Rust dependencies
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        uses: ./.github/actions/rust-cache
       - name: Test linked native executables
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo test --locked -p bamts-cli --test cli --no-fail-fast -- aot_ deep_nesting a_file_in_the_project_named_like_a_system_library_is_not_linked
@@ -133,7 +191,10 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            formal/quint/package-lock.json
 
       - name: Install npm dependencies
         id: npm
@@ -179,7 +240,7 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
 
       - name: Install npm dependencies
         run: npm ci
@@ -241,7 +302,7 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
 
       - name: Install npm dependencies
         run: npm ci
@@ -280,7 +341,10 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            formal/quint/package-lock.json
 
       - name: Install Quint
         uses: ./.github/actions/setup-quint
@@ -360,7 +424,7 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
       - name: Install npm dependencies
         run: npm ci
       - name: Install Rust toolchain
@@ -430,7 +494,7 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
-          package-manager-cache: false
+          cache: 'npm'
       - name: Install npm dependencies
         run: npm ci
       - name: Install Rust toolchain
