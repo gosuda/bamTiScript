@@ -3,13 +3,16 @@ name: CI (Depot)
 on:
   push:
     branches: [main]
-  pull_request:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -25,6 +28,8 @@ jobs:
           persist-credentials: false
       - id: toolchain
         run: rustup toolchain install
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - run: cargo fmt --all --check
       - if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -49,6 +54,15 @@ jobs:
           sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
           command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
+      - name: Cache npm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json', 'formal/quint/package-lock.json') }}
+          restore-keys: |
+            npm-
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Install dependencies (npm, cargo, Quint)
         id: dependencies
         run: |
@@ -139,6 +153,15 @@ jobs:
           sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
           command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
+      - name: Cache npm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json', 'formal/quint/package-lock.json') }}
+          restore-keys: |
+            npm-
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Install Quint, Racket 9.2 and Lean while the verifier builds
         run: |
           (cargo fetch --locked -q && cargo build --locked -q -p bamts-verification --bin bamts-verification) & b=$!
@@ -183,6 +206,15 @@ jobs:
           sudo ln -sf /opt/node-v24.18.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
           command -v node && test "$(node --version)" = v24.18.0
       - run: rustup toolchain install
+      - name: Cache npm store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json', 'formal/quint/package-lock.json') }}
+          restore-keys: |
+            npm-
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/rust-cache
       - name: Build receipt tools, sync snapshot, audit ledger
         run: |
           npm ci
