@@ -283,6 +283,12 @@ impl<'table> TypeRelations<'table> {
         self.cache.borrow().len()
     }
 
+    /// Number of environment-independent memoized pairs.
+    #[must_use]
+    pub fn clean_pairs(&self) -> usize {
+        self.clean.borrow().len()
+    }
+
     #[cfg(test)]
     fn computed_relations(&self) -> usize {
         self.computed_relations.get()
@@ -587,7 +593,8 @@ impl<'table> TypeRelations<'table> {
             }
         }
         // Environment-independent results additionally enter the clean memo
-        // keyed without the context. A hit returns the answer in every
+        // keyed without the context, up to the same capacity bound as the
+        // contextual cache. A hit returns the answer in every
         // environment with no bookkeeping. Withheld are comparisons that
         // consulted the environment and anything carrying erasure
         // requirements. A `true` proved with coinductive hypotheses is
@@ -604,9 +611,11 @@ impl<'table> TypeRelations<'table> {
             && frame.erasure_requirements.is_empty()
             && (result || frame.assumptions.is_empty())
         {
-            self.clean
-                .borrow_mut()
-                .insert((source, target, strictness), result);
+            let key = (source, target, strictness);
+            let mut clean = self.clean.borrow_mut();
+            if clean.len() < RELATION_CACHE_CAPACITY || clean.contains_key(&key) {
+                clean.insert(key, result);
+            }
         }
         if cacheable && !frame.approximate_alias && (result || frame.assumptions.is_empty()) {
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
@@ -3679,7 +3688,7 @@ mod tests {
     #[test]
     fn cache_is_bounded_and_results_stay_deterministic() {
         // 100 distinct array-of-literal types yield 9900 ordered pairs, far
-        // beyond the cache capacity.
+        // beyond the capacity shared by the contextual cache and the clean memo.
         let mut table = TypeTable::new();
         let arrays: Vec<TypeId> = (0..100)
             .map(|index| {
@@ -3695,6 +3704,11 @@ mod tests {
             }
         }
         assert!(relations.cached_pairs() <= RELATION_CACHE_CAPACITY);
+        assert!(
+            relations.clean_pairs() <= RELATION_CACHE_CAPACITY,
+            "clean memo holds {} pairs; the bound must cover both memos",
+            relations.clean_pairs()
+        );
 
         // A fresh relation engine over the same table computes identical
         // results, proving the cache never influences outcomes.
