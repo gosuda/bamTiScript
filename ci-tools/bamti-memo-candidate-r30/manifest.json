@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "source": {
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570",
+    "blobs": 1609
+  },
+  "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+  "threads": [
+    "PRRT_kwDOTlcNv868pc6E",
+    "PRRT_kwDOTlcNv868pc6c"
+  ],
+  "proof_sha256": {
+    "authored.json": "518f8d8abe0574b5d10de830a14e044e1826dbfc49b51095db82512faf5871e8",
+    "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
+    "verify.py": "ec241297bc856464973795973dfcb7e669f558a38ea0c6b220644abd0e206d8e",
+    "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
+    "baseline-receipt.json": "3bc92f1ec9c395239d8af1f39d011111c2be6a18b3008de50e1a59d573884525"
+  },
+  "workflow_sha256": "182e8acdd9862fafc5db6b9067b00e5691f7091b47a1722b3f49f5355403fb59",
+  "proposal": "da209eb58c151d172163f32a9cb2480f799434a3",
+  "baseline": {
+    "producer": "121fe5bde8e5c959e1a4655740272c0dee816e88",
+    "run": 45956976216,
+    "job": 140365611354,
+    "artifact": 15178952945,
+    "artifact_sha256": "9bfd2a8ec9bc3417d6901ec0fd4c6e475b9d9c560c34c4efda63db5a0838ba5a",
+    "terminal": "7cef7ac0b6c5a9afe6638e8edcf4ada7b5d28e64"
+  },
+  "authored_files": [
+    {
+      "path": "crates/bamts-compiler/src/checker/relations.rs",
+      "sha256": "edb5a6aa6df58b01755c3ee49e634d8de65601d000e1439a2d8db718af93aa44"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/tests.rs",
+      "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+      "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+      "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+    }
+  ],
+  "preparation": "Apply only the four authored files; cargo fmt records exact final source bytes. Verify all 1,609 original blob/mode identities, permit only the two frozen new TypeScript fixture files, freeze a temporary-index Git tree, and emit a deterministic gzip/base64 source payload with per-file SHA-256 and Git blobs. Full source bytes must remain exact through every gate and original source must be restored.",
+  "gates": [
+    "Pinned Rust and Node versions",
+    "Pinned TypeScript7.0.2 CLI on both unchanged fixtures",
+    "Successful compilation before focused controls",
+    "Frozen saturation work bound and both 4,096-entry memory bounds",
+    "Incompatible-leaf and full binder diagnostic arrays",
+    "Exact churn observer with no general complexity claim",
+    "Strengthened alias-view positive control (authentic mutation RED reused from baseline)",
+    "cargo fmt --all --check",
+    "cargo check --workspace --locked",
+    "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "cargo fetch --locked",
+    "Pinned TypeScript authority fixture fetch",
+    "Pinned Quint CLI and SHA-verified0.6.0 evaluator",
+    "cargo test --workspace --locked --no-fail-fast",
+    "Three pinned ignored Node oracle contracts",
+    "All configured npm-interface tests",
+    "git diff --check",
+    "Final exact candidate tree and original-source restoration"
+  ],
+  "no_claims": [
+    "General polynomial relation work",
+    "Total relation-engine memory bounded by the completed memo capacity",
+    "BH1 performance",
+    "Root/product completion"
+  ],
+  "publication_eligible": false
+}
