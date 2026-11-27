@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bamts_bytecode::MAX_BIGINT_BYTES;
 use smallvec::SmallVec;
@@ -82,6 +82,62 @@ enum Strictness {
     /// Symmetric overlap used by TypeScript assertions. Union sources need one
     /// related constituent rather than every constituent.
     Comparable,
+}
+
+type CleanRelationKey = (TypeId, TypeId, Strictness);
+
+/// Completed environment-independent pairs in insertion order.
+///
+/// Each map entry occurs exactly once in the queue. A new pair displaces the
+/// oldest retained pair at capacity; a hit or replacement keeps its position.
+/// Reuse separated by more than the capacity can still require recomputation.
+#[derive(Default)]
+struct CleanRelationMemo {
+    entries: HashMap<CleanRelationKey, bool>,
+    order: VecDeque<CleanRelationKey>,
+}
+
+impl CleanRelationMemo {
+    #[inline]
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.entries.len(), self.order.len());
+        self.entries.len()
+    }
+
+    #[inline]
+    fn get(&self, key: &CleanRelationKey) -> Option<&bool> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: CleanRelationKey, compatible: bool) {
+        if let Some(previous) = self.entries.get_mut(&key) {
+            *previous = compatible;
+            return;
+        }
+        if self.entries.len() == RELATION_CACHE_CAPACITY {
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("full clean memo has an oldest pair");
+            assert!(
+                self.entries.remove(&oldest).is_some(),
+                "clean memo queue contains only retained pairs",
+            );
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, compatible);
+        debug_assert_eq!(self.entries.len(), self.order.len());
+    }
+
+    #[cfg(test)]
+    fn remove(&mut self, key: &CleanRelationKey) -> Option<bool> {
+        let result = self.entries.remove(key);
+        if result.is_some() {
+            self.order.retain(|retained| retained != key);
+        }
+        debug_assert_eq!(self.entries.len(), self.order.len());
+        result
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -204,7 +260,7 @@ pub struct TypeRelations<'table> {
     /// admitted, a `false` under hypotheses is withheld. This is what lets
     /// the same structural comparison recur under hundreds of inference
     /// environments without recomputing.
-    clean: RefCell<HashMap<(TypeId, TypeId, Strictness), bool>>,
+    clean: RefCell<CleanRelationMemo>,
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<RelationKey>>,
@@ -258,7 +314,7 @@ impl<'table> TypeRelations<'table> {
         Self {
             table,
             cache: RefCell::new(HashMap::new()),
-            clean: RefCell::new(HashMap::new()),
+            clean: RefCell::new(CleanRelationMemo::default()),
             visiting: RefCell::new(HashSet::new()),
             active_alias_relations: RefCell::new(HashSet::new()),
             dependency_stack: RefCell::new(Vec::new()),
@@ -281,6 +337,12 @@ impl<'table> TypeRelations<'table> {
     #[must_use]
     pub fn cached_pairs(&self) -> usize {
         self.cache.borrow().len()
+    }
+
+    /// Number of environment-independent memoized pairs.
+    #[must_use]
+    pub fn clean_pairs(&self) -> usize {
+        self.clean.borrow().len()
     }
 
     #[cfg(test)]
@@ -587,9 +649,11 @@ impl<'table> TypeRelations<'table> {
             }
         }
         // Environment-independent results additionally enter the clean memo
-        // keyed without the context. A hit returns the answer in every
-        // environment with no bookkeeping. Withheld are comparisons that
-        // consulted the environment and anything carrying erasure
+        // keyed without the context, up to the same capacity bound as the
+        // contextual cache; a saturated memo displaces an older pair so the
+        // newly completed comparison stays shared. A hit returns the answer
+        // in every environment with no bookkeeping. Withheld are comparisons
+        // that consulted the environment and anything carrying erasure
         // requirements. A `true` proved with coinductive hypotheses is
         // admitted, including results that passed through an alias-cycle
         // re-entry: every guard re-entry is guarded by a structural
@@ -3679,7 +3743,7 @@ mod tests {
     #[test]
     fn cache_is_bounded_and_results_stay_deterministic() {
         // 100 distinct array-of-literal types yield 9900 ordered pairs, far
-        // beyond the cache capacity.
+        // beyond the capacity shared by the contextual cache and the clean memo.
         let mut table = TypeTable::new();
         let arrays: Vec<TypeId> = (0..100)
             .map(|index| {
@@ -3695,6 +3759,11 @@ mod tests {
             }
         }
         assert!(relations.cached_pairs() <= RELATION_CACHE_CAPACITY);
+        assert!(
+            relations.clean_pairs() <= RELATION_CACHE_CAPACITY,
+            "clean memo holds {} pairs; the bound must cover both memos",
+            relations.clean_pairs()
+        );
 
         // A fresh relation engine over the same table computes identical
         // results, proving the cache never influences outcomes.
@@ -3706,6 +3775,57 @@ mod tests {
                 assert_eq!(relations.assignable(source, target), expected);
             }
         }
+    }
+    #[test]
+    fn saturated_memo_still_shares_nested_comparisons() {
+        // One assignment can saturate both memos before reaching shared
+        // nested types, so a diamond compared after saturation must still
+        // share each level instead of recomputing it once per use.
+        let mut table = TypeTable::new();
+        let arrays: Vec<TypeId> = (0..100)
+            .map(|index| {
+                let literal = table.number_literal(&index.to_string());
+                table.array(literal)
+            })
+            .collect();
+        let number = table.number();
+        let one = table.number_literal("1");
+        let mut source = table.object_type(vec![PropertyType::new("value", false, one)]);
+        let mut target = table.object_type(vec![PropertyType::new("value", false, number)]);
+        for _ in 0..12 {
+            source = table.object_type(vec![
+                PropertyType::new("left", false, source),
+                PropertyType::new("right", false, source),
+            ]);
+            target = table.object_type(vec![
+                PropertyType::new("left", false, target),
+                PropertyType::new("right", false, target),
+            ]);
+        }
+        let relations = TypeRelations::new(&table);
+        for &filler_source in &arrays {
+            for &filler_target in &arrays {
+                let expected = filler_source == filler_target;
+                assert_eq!(relations.assignable(filler_source, filler_target), expected);
+            }
+        }
+        assert_eq!(
+            relations.clean_pairs(),
+            RELATION_CACHE_CAPACITY,
+            "filler must saturate the clean memo or the regression is vacuous"
+        );
+        assert_eq!(
+            relations.cached_pairs(),
+            RELATION_CACHE_CAPACITY,
+            "filler must saturate the contextual cache or the regression is vacuous"
+        );
+        let base = relations.computed_relations();
+        assert!(relations.assignable(source, target));
+        let delta = relations.computed_relations() - base;
+        assert!(
+            delta < 100,
+            "shared diamond levels recomputed {delta} times after saturation"
+        );
     }
 
     #[test]
@@ -5022,33 +5142,228 @@ mod tests {
     }
 
     #[test]
-    fn memo_shares_alias_views_of_one_recursive_type() {
+    fn alias_repeat_hits_alias_memo_not_expanded_view() {
+        // Dropping the expanded-view results forces the repeat through the
+        // alias pair itself: flat work below proves the alias comparison is
+        // memoized, not merely re-expanded onto a memoized view.
         let mut table = TypeTable::new();
         let number = table.number();
-        let a = SymbolId::new(610);
-        let a_t = SymbolId::new(611);
-        let named_a = table.named(a_t);
-        let a_app = table.applied_class(a, vec![named_a]);
-        let a_raw = table.object_type(vec![
-            PropertyType::new("value", false, named_a),
-            PropertyType::new("next", false, a_app),
-        ]);
-        declare_generic_class(&mut table, a, a_t, a_raw);
-        let a_number = table.applied_class(a, vec![number]);
+        let one = table.number_literal("1");
+        let view = table.object_type(vec![PropertyType::new("value", false, one)]);
+        let target = table.object_type(vec![PropertyType::new("value", false, number)]);
         let x = SymbolId::new(612);
         table.declare_alias(x, Vec::new());
-        table.publish_alias_template(x, a_number);
+        table.publish_alias_template(x, view);
         let alias_head = table.applied_alias(x, Vec::new());
         let relations = TypeRelations::new(&table);
-
-        assert!(relations.assignable(alias_head, a_number));
-        assert!(relations.assignable(a_number, alias_head));
+        assert!(relations.assignable(alias_head, target));
         let before = relations.computed_relations();
-        assert!(relations.assignable(alias_head, a_number));
+        assert!(
+            before > 0,
+            "alias comparison performed no structural work; the memo assertion below is vacuous"
+        );
+        relations
+            .clean
+            .borrow_mut()
+            .remove(&(view, target, Strictness::Assignable));
+        relations
+            .cache
+            .borrow_mut()
+            .retain(|key, _| !(key.source == view && key.target == target));
+        assert!(relations.assignable(alias_head, target));
         assert_eq!(
             relations.computed_relations(),
             before,
             "a settled alias comparison must come straight from the memo"
+        );
+    }
+    // The first tuple element performs 96 * 97 / 2 distinct object-pair
+    // comparisons before the second element enters its shared named graph.
+    fn memo_saturation_prefix(table: &mut TypeTable, extra: TypeId) -> (TypeId, TypeId) {
+        let mut sources = Vec::new();
+        let mut targets = Vec::new();
+        for index in 0..96 {
+            let tag = table.number_literal(&index.to_string());
+            sources.push(table.object_type(vec![
+                PropertyType::new("tag", false, tag),
+                PropertyType::new("extra", false, extra),
+            ]));
+            targets.push(table.object_type(vec![PropertyType::new("tag", false, tag)]));
+        }
+        (table.union(&sources), table.union(&targets))
+    }
+
+    fn memo_saturation_table(depth: u32, compatible_leaf: bool) -> (TypeTable, TypeId, TypeId) {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let (prefix_source, prefix_target) = memo_saturation_prefix(&mut table, number);
+        let one = table.number_literal("1");
+        let target_value = if compatible_leaf {
+            number
+        } else {
+            table.string()
+        };
+        let mut source = table.object_type(vec![PropertyType::new("value", false, one)]);
+        let mut target = table.object_type(vec![PropertyType::new("value", false, target_value)]);
+        for level in 0..depth {
+            let source_symbol = SymbolId::new(50_000 + level * 2);
+            let target_symbol = SymbolId::new(50_001 + level * 2);
+            let source_body = table.object_type(vec![
+                PropertyType::new("left", false, source),
+                PropertyType::new("right", false, source),
+            ]);
+            let target_body = table.object_type(vec![
+                PropertyType::new("left", false, target),
+                PropertyType::new("right", false, target),
+            ]);
+            table.set_interface_structure(source_symbol, source_body);
+            table.set_interface_structure(target_symbol, target_body);
+            source = table.named(source_symbol);
+            target = table.named(target_symbol);
+        }
+        let source = table.tuple(vec![prefix_source, source]);
+        let target = table.tuple(vec![prefix_target, target]);
+        (table, source, target)
+    }
+
+    #[test]
+    fn saturated_memos_admit_shared_named_relations() {
+        let (table, source, target) = memo_saturation_table(14, true);
+        let relations = TypeRelations::new(&table);
+        let compatible = relations.assignable(source, target);
+        eprintln!(
+            "MEMO_SATURATION compatible={compatible} computed={} clean={} contextual={}",
+            relations.computed_relations(),
+            relations.clean_pairs(),
+            relations.cached_pairs(),
+        );
+        assert!(compatible);
+        assert_eq!(relations.clean_pairs(), RELATION_CACHE_CAPACITY);
+        assert_eq!(relations.cached_pairs(), RELATION_CACHE_CAPACITY);
+        assert!(
+            relations.computed_relations() < 32_768,
+            "shared relation work grew after saturation: {}",
+            relations.computed_relations(),
+        );
+    }
+
+    #[test]
+    fn saturated_shared_graph_rejects_incompatible_leaf() {
+        let (table, source, target) = memo_saturation_table(14, false);
+        let relations = TypeRelations::new(&table);
+        assert!(!relations.assignable(source, target));
+        assert!(relations.clean_pairs() <= RELATION_CACHE_CAPACITY);
+        assert!(relations.cached_pairs() <= RELATION_CACHE_CAPACITY);
+    }
+
+    // Diagnostic observer, not a claim that a fixed-capacity policy has a
+    // general complexity bound. The filler between a/c exceeds cache capacity.
+    #[test]
+    fn observe_shared_graph_with_intervening_cache_churn() {
+        for depth in [2_u32, 4, 6] {
+            let mut table = TypeTable::new();
+            let number = table.number();
+            let (prefix_source, prefix_target) = memo_saturation_prefix(&mut table, number);
+            let one = table.number_literal("1");
+            let mut source = table.object_type(vec![PropertyType::new("value", false, one)]);
+            let mut target = table.object_type(vec![PropertyType::new("value", false, number)]);
+            for level in 0..depth {
+                let marker = table.number_literal(&(1000 + level).to_string());
+                let (filler_source, filler_target) = memo_saturation_prefix(&mut table, marker);
+                let source_body = table.object_type(vec![
+                    PropertyType::new("a", false, source),
+                    PropertyType::new("b", false, filler_source),
+                    PropertyType::new("c", false, source),
+                ]);
+                let target_body = table.object_type(vec![
+                    PropertyType::new("a", false, target),
+                    PropertyType::new("b", false, filler_target),
+                    PropertyType::new("c", false, target),
+                ]);
+                let source_symbol = SymbolId::new(60_000 + level * 2);
+                let target_symbol = SymbolId::new(60_001 + level * 2);
+                table.set_interface_structure(source_symbol, source_body);
+                table.set_interface_structure(target_symbol, target_body);
+                source = table.named(source_symbol);
+                target = table.named(target_symbol);
+            }
+            let source = table.tuple(vec![prefix_source, source]);
+            let target = table.tuple(vec![prefix_target, target]);
+            let relations = TypeRelations::new(&table);
+            let compatible = relations.assignable(source, target);
+            eprintln!(
+                "MEMO_CHURN depth={depth} compatible={compatible} computed={} clean={} contextual={}",
+                relations.computed_relations(),
+                relations.clean_pairs(),
+                relations.cached_pairs(),
+            );
+            assert!(compatible);
+            assert!(relations.clean_pairs() <= RELATION_CACHE_CAPACITY);
+            assert!(relations.cached_pairs() <= RELATION_CACHE_CAPACITY);
+        }
+    }
+
+    #[test]
+    fn saturated_memo_preserves_bounded_interleaved_reuse() {
+        let mut table = TypeTable::new();
+        let arrays: Vec<TypeId> = (0..100)
+            .map(|index| {
+                let literal = table.number_literal(&index.to_string());
+                table.array(literal)
+            })
+            .collect();
+        let number = table.number();
+        let numbers = table.array(number);
+        let mut target = table.object_type(vec![PropertyType::new("value", false, number)]);
+        for _ in 0..12 {
+            target = table.object_type(vec![
+                PropertyType::new("left", false, target),
+                PropertyType::new("middle", false, numbers),
+                PropertyType::new("right", false, target),
+            ]);
+        }
+        let mut sources = Vec::new();
+        for graph in 0..128 {
+            let leaf = table.number_literal(&(1000 + graph * 13).to_string());
+            let mut source = table.object_type(vec![PropertyType::new("value", false, leaf)]);
+            for level in 0..12 {
+                let literal = table.number_literal(&(1001 + graph * 13 + level).to_string());
+                let middle = table.array(literal);
+                source = table.object_type(vec![
+                    PropertyType::new("left", false, source),
+                    PropertyType::new("middle", false, middle),
+                    PropertyType::new("right", false, source),
+                ]);
+            }
+            sources.push(source);
+        }
+        let relations = TypeRelations::new(&table);
+        for &source in &arrays {
+            for &target in &arrays {
+                assert_eq!(relations.assignable(source, target), source == target);
+            }
+        }
+        assert_eq!(relations.clean_pairs(), RELATION_CACHE_CAPACITY);
+        assert_eq!(relations.cached_pairs(), RELATION_CACHE_CAPACITY);
+        let mut work = Vec::new();
+        for (graph, source) in sources.into_iter().enumerate() {
+            let before = relations.computed_relations();
+            let compatible = relations.assignable(source, target);
+            let computed = relations.computed_relations() - before;
+            eprintln!(
+                "MEMO_INTERLEAVED graph={graph} compatible={compatible} computed={computed} clean={} contextual={}",
+                relations.clean_pairs(),
+                relations.cached_pairs(),
+            );
+            assert!(compatible);
+            assert!(relations.clean_pairs() <= RELATION_CACHE_CAPACITY);
+            assert!(relations.cached_pairs() <= RELATION_CACHE_CAPACITY);
+            work.push(computed);
+        }
+        assert_eq!(work.len(), 128);
+        assert!(
+            work.iter().all(|&computed| computed < 100),
+            "bounded interleaving recomputed shared children: {work:?}",
         );
     }
 }
