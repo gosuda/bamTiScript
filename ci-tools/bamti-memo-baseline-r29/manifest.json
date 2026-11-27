@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "source": {
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570",
+    "blobs": 1609
+  },
+  "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+  "threads": [
+    "PRRT_kwDOTlcNv868pc6E",
+    "PRRT_kwDOTlcNv868pc6c"
+  ],
+  "proof_sha256": {
+    "verify.py": "67c95a1f10f1ec0b667a4a87fd76933128b03769c8cc6301c69fb72a8793bc80",
+    "native-oracle.mjs": "5d01441426f7b259249844efaaae7416406f5fe0b98ed294fff1d53e71cf9607",
+    "authored.json": "b812d8237c7ca549d9858d3f3890f1919e915bed655ebe573f88998eb27f32cd",
+    "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
+    "old-alias-test.txt": "418bf79dc2649505f560c7dfa26a9dabae4694364d77d2136de123ce0f03c552",
+    "strong-alias-test.txt": "3053fc67fdd30dd474da6b7ffeb30ea0ea39382d015eaf6fcb53b741ea79090d"
+  },
+  "workflow_sha256": "ce1b41f26b888a06029e68f9659988bcc235d09d51a531f4503a8f9c3058ce25",
+  "original_relations_sha256": "c546d14a38f77b2b0eb54c4ec7c690be97c6d82dcdc5fca385429e7481b40b27",
+  "original_checker_tests_sha256": "43127414cdcdf5d42efb3c59e38e84599415d088543a35f4335fd8f2a36f29ac",
+  "scope": "Freeze the reported cache saturation and alias-observation gaps before selecting a cache policy. This is an expected-RED baseline, not a publishable repair or product completion receipt.",
+  "primary": {
+    "union_alternatives": 96,
+    "shared_named_depth": 14,
+    "work_upper_bound_exclusive": 32768,
+    "clean_capacity": 4096,
+    "contextual_capacity": 4096,
+    "expected_compatibility": true,
+    "expected_cargo_exit": 101,
+    "negative_control": "Same one-tuple construction with incompatible string leaf must reject."
+  },
+  "churn": {
+    "depths": [
+      2,
+      4,
+      6
+    ],
+    "shape": "Named parents have a and c with the same prior child, separated by a fresh b union filler producing more than 4096 object comparisons.",
+    "contract": "Record complete work counts, correct answers and both memory bounds. No general complexity guarantee or GREEN repair claim is inferred from this observer."
+  },
+  "alias": {
+    "instrumentation": "cfg(test) counter increments immediately before actual applied_alias_view lookup; release behavior and cache policy remain unchanged.",
+    "positive": "The existing source memoizes the root alias and avoids another view traversal.",
+    "mutation": "Temporarily bypass root AppliedAlias memo lookup/admission. The original computed-only assertion must pass; the added view-step assertion must fail. Restore all exact bytes."
+  },
+  "native_oracle": {
+    "node": "24.18.0",
+    "typescript": "7.0.2",
+    "cases": [
+      {
+        "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+        "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d",
+        "expected_diagnostics": []
+      },
+      {
+        "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+        "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe",
+        "expected_diagnostics": [
+          2322
+        ]
+      }
+    ]
+  },
+  "source_restoration": "All 1609 original blob/mode identities must match before and after; remove the two temporary TypeScript fixture paths and restore both Rust files.",
+  "publication_eligible": false
+}

@@ -1,0 +1,26 @@
+    #[test]
+    fn memo_returns_settled_alias_comparison_without_recompute() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let one = table.number_literal("1");
+        let view = table.object_type(vec![PropertyType::new("value", false, one)]);
+        let target = table.object_type(vec![PropertyType::new("value", false, number)]);
+        let x = SymbolId::new(612);
+        table.declare_alias(x, Vec::new());
+        table.publish_alias_template(x, view);
+        let alias_head = table.applied_alias(x, Vec::new());
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.assignable(alias_head, target));
+        let before = relations.computed_relations();
+        assert!(
+            before > 0,
+            "alias comparison performed no structural work; the memo assertion below is vacuous"
+        );
+        assert!(relations.assignable(alias_head, target));
+        assert_eq!(
+            relations.computed_relations(),
+            before,
+            "a settled alias comparison must come straight from the memo"
+        );
+    }
