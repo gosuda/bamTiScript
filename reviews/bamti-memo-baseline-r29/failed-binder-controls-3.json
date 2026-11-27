@@ -1,0 +1,205 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "producer": "35990894d1ca8c9e797871295717ee580c2ea599",
+  "run_url": "https://github.com/gosuda/bamTiScript/actions/runs/45956564591",
+  "run": 45956564591,
+  "job": 140364301977,
+  "conclusion": "failure",
+  "artifact": {
+    "id": 15179167203,
+    "sha256": "21d8945c8f5bedd0838b4b9e2abefbaa32816bd0456b63b5ecfe699a50d304b3",
+    "producer_verified": true,
+    "api_and_upload_digest_match": true
+  },
+  "raw_job_log_sha256": "59436d8cb95aa272b79a31e5c5bf3c829adf8455dbd4c27aa6d2383cde8e6553",
+  "source": {
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570",
+    "blobs": 1609
+  },
+  "results": [
+    {
+      "accepted": true,
+      "command": [
+        "rustc",
+        "--version"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "4ad84f16acc2f3bdcfbc7b0788f1e74a4e649b962154a585b8f8d0b28eb0dd06",
+      "name": "rust-version",
+      "raw_exit": 0,
+      "seconds": 0.0158967799999985,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "node",
+        "--version"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "8f9258d5e9da5443c42966a661aee09292b49d1c64e718dcc5f72976500bac48",
+      "name": "node-version",
+      "raw_exit": 0,
+      "seconds": 0.0025473770000026263,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "npm",
+        "ci"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "9479de17585fc16ae8132ff399f71057676541695585071a55124ccc490961e2",
+      "name": "npm-pinned-typescript",
+      "raw_exit": 0,
+      "seconds": 0.42167429699999914,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "node",
+        "/home/runner/work/bamTiScript/bamTiScript/proof/ci-tools/bamti-memo-baseline-r29/native-oracle.mjs",
+        "/home/runner/work/bamTiScript/bamTiScript/source"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "8d915005997bf430a97ebd7704274c03ef36ba78997fc70b036f451d7f2abff0",
+      "name": "native-typescript-oracle",
+      "raw_exit": 0,
+      "seconds": 0.3980149670000017,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bamts-compiler",
+        "--lib",
+        "--no-run"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "0e5ebc833b47f1374439b28770e2fefa016805c5ec01443e41f85671640fe4a4",
+      "name": "compile-frozen-regressions",
+      "raw_exit": 0,
+      "seconds": 65.492469112,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bamts-compiler",
+        "--lib",
+        "--",
+        "checker::relations::tests::saturated_memos_admit_shared_named_relations",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "expected_exit": 101,
+      "log_sha256": "d12e85a69ec7fe85dcd28c7bb89729f3d66b73aae5c2bb94a6a24256303bedb7",
+      "name": "saturation-baseline-red",
+      "raw_exit": 101,
+      "seconds": 0.07884608199999832,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bamts-compiler",
+        "--lib",
+        "--",
+        "checker::relations::tests::saturated_shared_graph_rejects_incompatible_leaf",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "f0e69703da093c9a178a70a0d1439c2bb5f4b696cd091274b76072c94713d4ce",
+      "name": "incompatible-leaf-control",
+      "raw_exit": 0,
+      "seconds": 0.06380968500000961,
+      "timed_out": false
+    },
+    {
+      "accepted": false,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "bamts-compiler",
+        "--lib",
+        "--",
+        "checker::tests::source_assignment_after_",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "2baf8e80d772d8dd1ce49b677e097f15854ad90201eb840c4e83dace439c09cd",
+      "name": "source-assignment-controls",
+      "raw_exit": 101,
+      "seconds": 0.08638564100000679,
+      "timed_out": false
+    }
+  ],
+  "native_oracle": [
+    {
+      "accepted": true,
+      "actual": [],
+      "adapter": "pinned native tsc CLI with no emit and a temporary project",
+      "expected": [],
+      "id": "relation_memo_saturation.ts",
+      "node": "v24.18.0",
+      "process_error": null,
+      "raw_exit": 0,
+      "signal": null,
+      "source_sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d",
+      "stderr": "",
+      "stdout": "",
+      "typescript": "7.0.2"
+    },
+    {
+      "accepted": true,
+      "actual": [
+        2322
+      ],
+      "adapter": "pinned native tsc CLI with no emit and a temporary project",
+      "expected": [
+        2322
+      ],
+      "id": "relation_memo_saturation_invalid.ts",
+      "node": "v24.18.0",
+      "process_error": null,
+      "raw_exit": 1,
+      "signal": null,
+      "source_sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe",
+      "stderr": "",
+      "stdout": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts(229,7): error TS2322: Type '[SourceUnion, SourceLevel14]' is not assignable to type '[TargetUnion, TargetLevel14]'.\n  Type at position 1 in source is not compatible with type at position 1 in target.\n    Type 'SourceLevel14' is not assignable to type 'TargetLevel14'.\n      The types of 'left.left.left.left.left.left.left.left.left.left.left.left.left.left.value' are incompatible between these types.\n        Type 'number' is not assignable to type 'string'.\n",
+      "typescript": "7.0.2"
+    }
+  ],
+  "observations": [
+    "MEMO_SATURATION compatible=true computed=91231 clean=4096 contextual=4096"
+  ],
+  "source_restored": true,
+  "cause": "The two real binder controls correctly classified the assignments but the original assertions omitted existing ambient-provider(BAMTS-W053) and unused-local(BAMTS-W069) warnings. Positive observed W053/W069; negative observed W053/C004/W069. Churn and alias mutation phases were not reached.",
+  "correction": "Keep both TypeScript files byte-identical and every relation/cache assertion unchanged. Assert the full observed diagnostic arrays, without suppressing warnings or accepting arbitrary extras.",
+  "old_checker_test_sha256": "b9a0ecf1d966b1ff73bee6c408dfb5d6185d2fa62677466471dd9aa361b468b6",
+  "new_checker_test_sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98",
+  "publication_eligible": false
+}

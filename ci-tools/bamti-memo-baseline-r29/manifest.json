@@ -15,7 +15,7 @@
   "proof_sha256": {
     "verify.py": "67c95a1f10f1ec0b667a4a87fd76933128b03769c8cc6301c69fb72a8793bc80",
     "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
-    "authored.json": "b812d8237c7ca549d9858d3f3890f1919e915bed655ebe573f88998eb27f32cd",
+    "authored.json": "b9f5643a180191c59a4fa57b51b56cd076f941edc1b34dd94a433ffb9b880627",
     "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
     "old-alias-test.txt": "418bf79dc2649505f560c7dfa26a9dabae4694364d77d2136de123ce0f03c552",
     "strong-alias-test.txt": "3053fc67fdd30dd474da6b7ffeb30ea0ea39382d015eaf6fcb53b741ea79090d"
@@ -93,6 +93,31 @@
       "artifact_sha256": "e4583031736550ef64a9d1dccfedb64ef4ac6bae09f5e0adf4581b7e237bb1e4",
       "source_restored": true,
       "intended_red_reached": false
+    },
+    {
+      "producer": "35990894d1ca8c9e797871295717ee580c2ea599",
+      "run": 45956564591,
+      "job": 140364301977,
+      "phase": "source-assignment-controls",
+      "raw_exit": 101,
+      "expected_exit": 0,
+      "artifact": 15179167203,
+      "artifact_sha256": "21d8945c8f5bedd0838b4b9e2abefbaa32816bd0456b63b5ecfe699a50d304b3",
+      "source_restored": true,
+      "intended_saturation_red_reached": true,
+      "computed_relations": 91231
     }
-  ]
+  ],
+  "source_assignment_diagnostics": {
+    "positive": [
+      "BAMTS-W053",
+      "BAMTS-W069"
+    ],
+    "negative": [
+      "BAMTS-W053",
+      "BAMTS-C004",
+      "BAMTS-W069"
+    ],
+    "explanation": "Assert the complete observed diagnostic sequence, including existing ambient-provider and unused-local lint warnings. No warnings are filtered or disabled; TypeScript sources and all relation assertions remain unchanged."
+  }
 }
