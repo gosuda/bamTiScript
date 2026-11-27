@@ -14,7 +14,7 @@
   ],
   "proof_sha256": {
     "verify.py": "67c95a1f10f1ec0b667a4a87fd76933128b03769c8cc6301c69fb72a8793bc80",
-    "native-oracle.mjs": "4c6e874439830ad4ff5b7f7e02bbe3f179eaffdd92a3e26399d85cd62b6ee0bb",
+    "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
     "authored.json": "b812d8237c7ca549d9858d3f3890f1919e915bed655ebe573f88998eb27f32cd",
     "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
     "old-alias-test.txt": "418bf79dc2649505f560c7dfa26a9dabae4694364d77d2136de123ce0f03c552",
@@ -65,20 +65,34 @@
         ]
       }
     ],
-    "adapter": "Use the repository-established typescript/unstable/sync API, with exact installed TypeScript 7.0.2 metadata and per-fixture temporary tsconfig outside the source tree. The legacy TypeScript createProgram API was unavailable in the first baseline."
+    "adapter": "Pinned installed native tsc CLI, exact --version and package version 7.0.2, one temporary no-emit project per unchanged fixture. Positive requires raw exit0 and no diagnostics; negative requires compiler diagnostic status1 or2 and exactly the frozen2322 diagnostic on the exact fixture. Record all raw stdout/stderr/status; process errors, signals and other diagnostics are rejected."
   },
   "source_restoration": "All 1609 original blob/mode identities must match before and after; remove the two temporary TypeScript fixture paths and restore both Rust files.",
   "publication_eligible": false,
-  "prior_failure": {
-    "producer": "47cdec0a1e3cac8510e0270627c5445cbdeee41f",
-    "run": 45954699392,
-    "job": 140358358658,
-    "phase": "native-typescript-oracle",
-    "raw_exit": 1,
-    "expected_exit": 0,
-    "artifact": 15177972692,
-    "artifact_sha256": "8844bd4fbceb1ddd577120cbc34021533fad9748126528a3bbb678dc9757facc",
-    "source_restored": true,
-    "intended_red_reached": false
-  }
+  "prior_failures": [
+    {
+      "producer": "47cdec0a1e3cac8510e0270627c5445cbdeee41f",
+      "run": 45954699392,
+      "job": 140358358658,
+      "phase": "native-typescript-oracle",
+      "raw_exit": 1,
+      "expected_exit": 0,
+      "artifact": 15177972692,
+      "artifact_sha256": "8844bd4fbceb1ddd577120cbc34021533fad9748126528a3bbb678dc9757facc",
+      "source_restored": true,
+      "intended_red_reached": false
+    },
+    {
+      "producer": "0d351c30025e370d4dc5aa3fa0491e5849433dee",
+      "run": 45956264074,
+      "job": 140363328719,
+      "phase": "native-typescript-oracle",
+      "raw_exit": 1,
+      "expected_exit": 0,
+      "artifact": 15178294709,
+      "artifact_sha256": "e4583031736550ef64a9d1dccfedb64ef4ac6bae09f5e0adf4581b7e237bb1e4",
+      "source_restored": true,
+      "intended_red_reached": false
+    }
+  ]
 }

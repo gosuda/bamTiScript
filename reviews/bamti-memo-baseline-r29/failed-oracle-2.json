@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "producer": "0d351c30025e370d4dc5aa3fa0491e5849433dee",
+  "run_url": "https://github.com/gosuda/bamTiScript/actions/runs/45956264074",
+  "run": 45956264074,
+  "job": 140363328719,
+  "conclusion": "failure",
+  "source": {
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570",
+    "blobs": 1609
+  },
+  "artifact": {
+    "id": 15178294709,
+    "sha256": "e4583031736550ef64a9d1dccfedb64ef4ac6bae09f5e0adf4581b7e237bb1e4",
+    "producer_verified": true,
+    "api_and_upload_digest_match": true
+  },
+  "raw_job_log_sha256": "b1d36923fea17df347fb21137763a08947b136fa3c7948c102a787e3ba2b189c",
+  "results": [
+    {
+      "accepted": true,
+      "command": [
+        "rustc",
+        "--version"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "4ad84f16acc2f3bdcfbc7b0788f1e74a4e649b962154a585b8f8d0b28eb0dd06",
+      "name": "rust-version",
+      "raw_exit": 0,
+      "seconds": 0.020586033000000725,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "node",
+        "--version"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "8f9258d5e9da5443c42966a661aee09292b49d1c64e718dcc5f72976500bac48",
+      "name": "node-version",
+      "raw_exit": 0,
+      "seconds": 0.002948508999999433,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "npm",
+        "ci"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "d4fdfc687d2d860028da5a263fcf33c071f678d9679d62faaa86a502e3abe1da",
+      "name": "npm-pinned-typescript",
+      "raw_exit": 0,
+      "seconds": 0.5075261679999983,
+      "timed_out": false
+    },
+    {
+      "accepted": false,
+      "command": [
+        "node",
+        "/home/runner/work/bamTiScript/bamTiScript/proof/ci-tools/bamti-memo-baseline-r29/native-oracle.mjs",
+        "/home/runner/work/bamTiScript/bamTiScript/source"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "06ed9cde219baf17a780cbed3c0ca23b0e78d473a77b7681fee99ac8e6425541",
+      "name": "native-typescript-oracle",
+      "raw_exit": 1,
+      "seconds": 0.0906125650000007,
+      "timed_out": false
+    }
+  ],
+  "cause": "The repository's own adapter calls project.getSyntacticDiagnostics, but the installed7.0.2 public Project does not provide that method. Native project opening succeeded, then the adapter failed before any diagnostic record. This is an oracle harness failure, not a relation-engine RED.",
+  "source_restored": true,
+  "restored_files": 1609,
+  "intended_cache_red_reached": false,
+  "rust_compilation_reached": false,
+  "correction": "Use the pinned installed native tsc executable with --pretty false and an explicit temporary tsconfig, preserving every source fixture and expected diagnostic. Validate version, actual process status and exact diagnostic codes; do not guess another unstable API shape.",
+  "original_fixture_payload_sha256": "b812d8237c7ca549d9858d3f3890f1919e915bed655ebe573f88998eb27f32cd",
+  "publication_eligible": false
+}
