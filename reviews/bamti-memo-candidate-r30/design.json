@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "source": "97b2682378c9465811322c3c25eff8041a73da48",
+  "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+  "hypotheses": [
+    {
+      "weight": 0.98,
+      "claim": "Refusing every new completed key after both 4096-entry maps fill causes the reported permanently uncached shared-graph region.",
+      "falsifier": "Unchanged production should stay under 32768 computed relations for the frozen 96-union-prefix/depth 14 graph; observed 91231 falsifies that alternative."
+    },
+    {
+      "weight": 0.02,
+      "claim": "The specific reported growth comes from alias expansion or environment dependence.",
+      "falsifier": "The frozen direct TypeTable graph uses named interface views, no applied alias or parameter environment, and reproduces the failure."
+    }
+  ],
+  "decision": "Use a private FIFO memo abstraction for the two existing completed-result maps. New keys evict the oldest admitted key; updates do not duplicate or move queue entries. Keep both maps and both FIFO key queues at 4096 entries, with no policy-dependent truth changes.",
+  "alternative": "A full LRU would add mutable hit bookkeeping without evidence that hit recency is required for the reported stopped-admission failure. FIFO remains a bounded reuse policy, not a universal complexity guarantee.",
+  "scope": "Cache admission/replacement only; all coinductive keys, dependency propagation, clean eligibility, contextual variants and eight-variant bound are unchanged. Strengthen alias-test observation with an actual cfg(test) applied_alias_view counter.",
+  "churn_baseline": [
+    "MEMO_CHURN depth=2 compatible=true computed=37270 clean=4096 contextual=4096",
+    "MEMO_CHURN depth=4 compatible=true computed=149086 clean=4096 contextual=4096",
+    "MEMO_CHURN depth=6 compatible=true computed=596350 clean=4096 contextual=4096"
+  ],
+  "churn_contract": "Run the exact frozen adversarial filler observer on the candidate; report actual counts and preserve correctness/memory bounds. A larger working set may still cause exponential re-expansion under FIFO. Do not infer a general complexity guarantee.",
+  "preservation": {
+    "source_ts": [
+      {
+        "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+        "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+      },
+      {
+        "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+        "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+      }
+    ],
+    "old_mutant_red": "Original computation-only alias assertion passes when root alias memoization is disabled; stronger view-step assertion fails with exit 101 in baseline 45956976216."
+  },
+  "authored_sha256": [
+    {
+      "path": "crates/bamts-compiler/src/checker/relations.rs",
+      "sha256": "edb5a6aa6df58b01755c3ee49e634d8de65601d000e1439a2d8db718af93aa44"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/tests.rs",
+      "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+      "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+      "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+    }
+  ],
+  "publication_eligible": false
+}
