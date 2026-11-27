@@ -14,13 +14,13 @@
   ],
   "proof_sha256": {
     "verify.py": "67c95a1f10f1ec0b667a4a87fd76933128b03769c8cc6301c69fb72a8793bc80",
-    "native-oracle.mjs": "5d01441426f7b259249844efaaae7416406f5fe0b98ed294fff1d53e71cf9607",
+    "native-oracle.mjs": "4c6e874439830ad4ff5b7f7e02bbe3f179eaffdd92a3e26399d85cd62b6ee0bb",
     "authored.json": "b812d8237c7ca549d9858d3f3890f1919e915bed655ebe573f88998eb27f32cd",
     "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
     "old-alias-test.txt": "418bf79dc2649505f560c7dfa26a9dabae4694364d77d2136de123ce0f03c552",
     "strong-alias-test.txt": "3053fc67fdd30dd474da6b7ffeb30ea0ea39382d015eaf6fcb53b741ea79090d"
   },
-  "workflow_sha256": "ce1b41f26b888a06029e68f9659988bcc235d09d51a531f4503a8f9c3058ce25",
+  "workflow_sha256": "e23b965be4a33af8cfa8d5024219f33785597df7f7cb45ec13f03701cee44286",
   "original_relations_sha256": "c546d14a38f77b2b0eb54c4ec7c690be97c6d82dcdc5fca385429e7481b40b27",
   "original_checker_tests_sha256": "43127414cdcdf5d42efb3c59e38e84599415d088543a35f4335fd8f2a36f29ac",
   "scope": "Freeze the reported cache saturation and alias-observation gaps before selecting a cache policy. This is an expected-RED baseline, not a publishable repair or product completion receipt.",
@@ -64,8 +64,21 @@
           2322
         ]
       }
-    ]
+    ],
+    "adapter": "Use the repository-established typescript/unstable/sync API, with exact installed TypeScript 7.0.2 metadata and per-fixture temporary tsconfig outside the source tree. The legacy TypeScript createProgram API was unavailable in the first baseline."
   },
   "source_restoration": "All 1609 original blob/mode identities must match before and after; remove the two temporary TypeScript fixture paths and restore both Rust files.",
-  "publication_eligible": false
+  "publication_eligible": false,
+  "prior_failure": {
+    "producer": "47cdec0a1e3cac8510e0270627c5445cbdeee41f",
+    "run": 45954699392,
+    "job": 140358358658,
+    "phase": "native-typescript-oracle",
+    "raw_exit": 1,
+    "expected_exit": 0,
+    "artifact": 15177972692,
+    "artifact_sha256": "8844bd4fbceb1ddd577120cbc34021533fad9748126528a3bbb678dc9757facc",
+    "source_restored": true,
+    "intended_red_reached": false
+  }
 }

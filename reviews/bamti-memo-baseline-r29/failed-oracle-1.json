@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "producer": "47cdec0a1e3cac8510e0270627c5445cbdeee41f",
+  "run_url": "https://github.com/gosuda/bamTiScript/actions/runs/45954699392",
+  "run": 45954699392,
+  "job": 140358358658,
+  "conclusion": "failure",
+  "source": {
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570",
+    "blobs": 1609
+  },
+  "artifact": {
+    "id": 15177972692,
+    "sha256": "8844bd4fbceb1ddd577120cbc34021533fad9748126528a3bbb678dc9757facc",
+    "producer_verified": true,
+    "api_and_upload_digest_match": true
+  },
+  "raw_job_log_sha256": "d5cd83c1419a9dd7e44cf027e2c66b26d141970a843a9887f394d4706b16994b",
+  "results": [
+    {
+      "accepted": true,
+      "command": [
+        "rustc",
+        "--version"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "4ad84f16acc2f3bdcfbc7b0788f1e74a4e649b962154a585b8f8d0b28eb0dd06",
+      "name": "rust-version",
+      "raw_exit": 0,
+      "seconds": 0.01454206600000063,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "node",
+        "--version"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "8f9258d5e9da5443c42966a661aee09292b49d1c64e718dcc5f72976500bac48",
+      "name": "node-version",
+      "raw_exit": 0,
+      "seconds": 0.0025040270000005194,
+      "timed_out": false
+    },
+    {
+      "accepted": true,
+      "command": [
+        "npm",
+        "ci"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "67028ca58ef7cc5c34205460b7eab9e3b589a9aae0ae1a2b4be429160d9cb91c",
+      "name": "npm-pinned-typescript",
+      "raw_exit": 0,
+      "seconds": 0.3809779539999987,
+      "timed_out": false
+    },
+    {
+      "accepted": false,
+      "command": [
+        "node",
+        "/home/runner/work/bamTiScript/bamTiScript/proof/ci-tools/bamti-memo-baseline-r29/native-oracle.mjs",
+        "/home/runner/work/bamTiScript/bamTiScript/source"
+      ],
+      "expected_exit": 0,
+      "log_sha256": "975d4ca201fb837a02a9e25b28a5dc332a128d361d3b4f85b31ea386167602e4",
+      "name": "native-typescript-oracle",
+      "raw_exit": 1,
+      "seconds": 0.019379920000002215,
+      "timed_out": false
+    }
+  ],
+  "cause": "The original oracle incorrectly used legacy ts.ScriptTarget and ts.createProgram; installed TypeScript 7.0.2 exports version metadata but not those legacy compiler APIs. It failed at ScriptTarget.ESNext before emitting any native diagnostic records.",
+  "source_restored": true,
+  "restored_files": 1609,
+  "intended_cache_red_reached": false,
+  "rust_compilation_reached": false,
+  "correction": "Use the same public typescript/unstable/sync API contract already used by npm/test/oracle-support.mjs at exact source97b268; temporary projects are outside the source tree. Preserve every Rust and TypeScript fixture, expected diagnostic, source bound and mutation assertion. Remove the setup-node v4 unsupported package-manager-cache input; no dependency cache is requested.",
+  "original_fixture_payload_sha256": "b812d8237c7ca549d9858d3f3890f1919e915bed655ebe573f88998eb27f32cd",
+  "source_restoration_index_sha256": "5327da93d23def69c6002a0a3da1f3a010135c73350069de73996afd85641d37",
+  "publication_eligible": false
+}

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const source = resolve(process.argv[2]);
 const require = createRequire(resolve(source, "package.json"));
 const ts = require("typescript");
+const apiPath = require.resolve("typescript/unstable/sync");
+const { API } = await import(pathToFileURL(apiPath).href);
 assert.equal(process.version, "v24.18.0");
 assert.equal(ts.version, "7.0.2");
 const cases = [
@@ -17,30 +20,50 @@ let failures = 0;
 for (const [name, expected] of cases) {
   const path = resolve(source, "crates/bamts-compiler/src/checker/fixtures", name);
   const text = readFileSync(path, "utf8");
-  const options = {
-    target: ts.ScriptTarget.ESNext,
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    strict: true,
-    noUncheckedIndexedAccess: true,
-    noEmit: true,
-  };
-  const program = ts.createProgram([path], options);
-  const diagnostics = ts.getPreEmitDiagnostics(program).map((diagnostic) => ({
-    code: diagnostic.code,
-    category: diagnostic.category,
-    file: diagnostic.file ? basename(diagnostic.file.fileName) : null,
-    start: diagnostic.start ?? null,
-    length: diagnostic.length ?? null,
-    message: ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+  const directory = mkdtempSync(join(process.env.RUNNER_TEMP, "bamti-memo-oracle-"));
+  const config = join(directory, "tsconfig.json");
+  writeFileSync(config, JSON.stringify({
+    compilerOptions: {
+      target: "ESNext",
+      module: "NodeNext",
+      moduleResolution: "NodeNext",
+      strict: true,
+      noUncheckedIndexedAccess: true,
+      noEmit: true,
+    },
+    files: [path],
   }));
-  const actual = diagnostics.map((diagnostic) => diagnostic.code);
-  const accepted = JSON.stringify(actual) === JSON.stringify(expected);
-  console.log("TYPESCRIPT_MEMO_ORACLE " + JSON.stringify({
-    id: name, node: process.version, typescript: ts.version,
-    source_sha256: createHash("sha256").update(text).digest("hex"),
-    expected, actual, accepted, diagnostics,
-  }));
-  if (!accepted) failures += 1;
+  const api = new API({});
+  let snapshot;
+  try {
+    snapshot = api.updateSnapshot({ openProjects: [config] });
+    const project = snapshot.getProject(config);
+    assert.ok(project, "the pinned native API must open the exact project");
+    const diagnostics = [
+      ...project.getSyntacticDiagnostics(),
+      ...project.getSemanticDiagnostics(),
+    ].map((diagnostic) => ({
+      code: diagnostic.code,
+      category: diagnostic.category,
+      file: diagnostic.fileName ? basename(diagnostic.fileName) : null,
+      start: diagnostic.pos ?? null,
+      end: diagnostic.end ?? null,
+      message: diagnostic.text,
+    }));
+    const actual = diagnostics.map((diagnostic) => diagnostic.code);
+    const accepted = JSON.stringify(actual) === JSON.stringify(expected);
+    console.log("TYPESCRIPT_MEMO_ORACLE " + JSON.stringify({
+      id: name, node: process.version, typescript: ts.version,
+      adapter: "typescript/unstable/sync",
+      api_module_sha256: createHash("sha256").update(readFileSync(apiPath)).digest("hex"),
+      source_sha256: createHash("sha256").update(text).digest("hex"),
+      expected, actual, accepted, diagnostics,
+    }));
+    if (!accepted) failures += 1;
+  } finally {
+    snapshot?.dispose();
+    api.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 assert.equal(failures, 0);
