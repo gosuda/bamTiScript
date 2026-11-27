@@ -5036,29 +5036,25 @@ mod tests {
     }
 
     #[test]
-    fn memo_shares_alias_views_of_one_recursive_type() {
+    fn memo_returns_settled_alias_comparison_without_recompute() {
         let mut table = TypeTable::new();
         let number = table.number();
-        let a = SymbolId::new(610);
-        let a_t = SymbolId::new(611);
-        let named_a = table.named(a_t);
-        let a_app = table.applied_class(a, vec![named_a]);
-        let a_raw = table.object_type(vec![
-            PropertyType::new("value", false, named_a),
-            PropertyType::new("next", false, a_app),
-        ]);
-        declare_generic_class(&mut table, a, a_t, a_raw);
-        let a_number = table.applied_class(a, vec![number]);
+        let one = table.number_literal("1");
+        let view = table.object_type(vec![PropertyType::new("value", false, one)]);
+        let target = table.object_type(vec![PropertyType::new("value", false, number)]);
         let x = SymbolId::new(612);
         table.declare_alias(x, Vec::new());
-        table.publish_alias_template(x, a_number);
+        table.publish_alias_template(x, view);
         let alias_head = table.applied_alias(x, Vec::new());
         let relations = TypeRelations::new(&table);
 
-        assert!(relations.assignable(alias_head, a_number));
-        assert!(relations.assignable(a_number, alias_head));
+        assert!(relations.assignable(alias_head, target));
         let before = relations.computed_relations();
-        assert!(relations.assignable(alias_head, a_number));
+        assert!(
+            before > 0,
+            "alias comparison performed no structural work; the memo assertion below is vacuous"
+        );
+        assert!(relations.assignable(alias_head, target));
         assert_eq!(
             relations.computed_relations(),
             before,
