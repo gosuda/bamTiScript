@@ -1,0 +1,468 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "producer": "121fe5bde8e5c959e1a4655740272c0dee816e88",
+  "run_url": "https://github.com/gosuda/bamTiScript/actions/runs/45956976216",
+  "run": 45956976216,
+  "job": 140365611354,
+  "conclusion": "success",
+  "artifact": {
+    "id": 15178952945,
+    "sha256": "9bfd2a8ec9bc3417d6901ec0fd4c6e475b9d9c560c34c4efda63db5a0838ba5a",
+    "producer_verified": true,
+    "api_and_upload_digest_match": true
+  },
+  "raw_job_log_sha256": "32032fe9203705b405c1d00eb157c3f6d07c88ecebebf1ee4ccc124b72a0a7a7",
+  "source": {
+    "blobs": 1609,
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570"
+  },
+  "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+  "report": {
+    "manifest": {
+      "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+      "alias": {
+        "instrumentation": "cfg(test) counter increments immediately before actual applied_alias_view lookup; release behavior and cache policy remain unchanged.",
+        "mutation": "Temporarily bypass root AppliedAlias memo lookup/admission. The original computed-only assertion must pass; the added view-step assertion must fail. Restore all exact bytes.",
+        "positive": "The existing source memoizes the root alias and avoids another view traversal."
+      },
+      "churn": {
+        "contract": "Record complete work counts, correct answers and both memory bounds. No general complexity guarantee or GREEN repair claim is inferred from this observer.",
+        "depths": [
+          2,
+          4,
+          6
+        ],
+        "shape": "Named parents have a and c with the same prior child, separated by a fresh b union filler producing more than 4096 object comparisons."
+      },
+      "native_oracle": {
+        "adapter": "Pinned installed native tsc CLI, exact --version and package version 7.0.2, one temporary no-emit project per unchanged fixture. Positive requires raw exit0 and no diagnostics; negative requires compiler diagnostic status1 or2 and exactly the frozen2322 diagnostic on the exact fixture. Record all raw stdout/stderr/status; process errors, signals and other diagnostics are rejected.",
+        "cases": [
+          {
+            "expected_diagnostics": [],
+            "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+            "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+          },
+          {
+            "expected_diagnostics": [
+              2322
+            ],
+            "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+            "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+          }
+        ],
+        "node": "24.18.0",
+        "typescript": "7.0.2"
+      },
+      "original_checker_tests_sha256": "43127414cdcdf5d42efb3c59e38e84599415d088543a35f4335fd8f2a36f29ac",
+      "original_relations_sha256": "c546d14a38f77b2b0eb54c4ec7c690be97c6d82dcdc5fca385429e7481b40b27",
+      "primary": {
+        "clean_capacity": 4096,
+        "contextual_capacity": 4096,
+        "expected_cargo_exit": 101,
+        "expected_compatibility": true,
+        "negative_control": "Same one-tuple construction with incompatible string leaf must reject.",
+        "shared_named_depth": 14,
+        "union_alternatives": 96,
+        "work_upper_bound_exclusive": 32768
+      },
+      "prior_failures": [
+        {
+          "artifact": 15177972692,
+          "artifact_sha256": "8844bd4fbceb1ddd577120cbc34021533fad9748126528a3bbb678dc9757facc",
+          "expected_exit": 0,
+          "intended_red_reached": false,
+          "job": 140358358658,
+          "phase": "native-typescript-oracle",
+          "producer": "47cdec0a1e3cac8510e0270627c5445cbdeee41f",
+          "raw_exit": 1,
+          "run": 45954699392,
+          "source_restored": true
+        },
+        {
+          "artifact": 15178294709,
+          "artifact_sha256": "e4583031736550ef64a9d1dccfedb64ef4ac6bae09f5e0adf4581b7e237bb1e4",
+          "expected_exit": 0,
+          "intended_red_reached": false,
+          "job": 140363328719,
+          "phase": "native-typescript-oracle",
+          "producer": "0d351c30025e370d4dc5aa3fa0491e5849433dee",
+          "raw_exit": 1,
+          "run": 45956264074,
+          "source_restored": true
+        },
+        {
+          "artifact": 15179167203,
+          "artifact_sha256": "21d8945c8f5bedd0838b4b9e2abefbaa32816bd0456b63b5ecfe699a50d304b3",
+          "computed_relations": 91231,
+          "expected_exit": 0,
+          "intended_saturation_red_reached": true,
+          "job": 140364301977,
+          "phase": "source-assignment-controls",
+          "producer": "35990894d1ca8c9e797871295717ee580c2ea599",
+          "raw_exit": 101,
+          "run": 45956564591,
+          "source_restored": true
+        }
+      ],
+      "privacy": "public",
+      "proof_sha256": {
+        "authored.json": "b9f5643a180191c59a4fa57b51b56cd076f941edc1b34dd94a433ffb9b880627",
+        "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
+        "old-alias-test.txt": "418bf79dc2649505f560c7dfa26a9dabae4694364d77d2136de123ce0f03c552",
+        "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
+        "strong-alias-test.txt": "3053fc67fdd30dd474da6b7ffeb30ea0ea39382d015eaf6fcb53b741ea79090d",
+        "verify.py": "67c95a1f10f1ec0b667a4a87fd76933128b03769c8cc6301c69fb72a8793bc80"
+      },
+      "publication_eligible": false,
+      "repository": "gosuda/bamTiScript",
+      "schema": 1,
+      "scope": "Freeze the reported cache saturation and alias-observation gaps before selecting a cache policy. This is an expected-RED baseline, not a publishable repair or product completion receipt.",
+      "source": {
+        "blobs": 1609,
+        "head": "97b2682378c9465811322c3c25eff8041a73da48",
+        "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570"
+      },
+      "source_assignment_diagnostics": {
+        "explanation": "Assert the complete observed diagnostic sequence, including existing ambient-provider and unused-local lint warnings. No warnings are filtered or disabled; TypeScript sources and all relation assertions remain unchanged.",
+        "negative": [
+          "BAMTS-W053",
+          "BAMTS-C004",
+          "BAMTS-W069"
+        ],
+        "positive": [
+          "BAMTS-W053",
+          "BAMTS-W069"
+        ]
+      },
+      "source_restoration": "All 1609 original blob/mode identities must match before and after; remove the two temporary TypeScript fixture paths and restore both Rust files.",
+      "threads": [
+        "PRRT_kwDOTlcNv868pc6E",
+        "PRRT_kwDOTlcNv868pc6c"
+      ],
+      "workflow_sha256": "e23b965be4a33af8cfa8d5024219f33785597df7f7cb45ec13f03701cee44286"
+    },
+    "observations": [
+      "MEMO_SATURATION compatible=true computed=91231 clean=4096 contextual=4096",
+      "MEMO_CHURN depth=2 compatible=true computed=37270 clean=4096 contextual=4096",
+      "MEMO_CHURN depth=4 compatible=true computed=149086 clean=4096 contextual=4096",
+      "MEMO_CHURN depth=6 compatible=true computed=596350 clean=4096 contextual=4096"
+    ],
+    "oracle_records": [
+      {
+        "accepted": true,
+        "actual": [],
+        "adapter": "pinned native tsc CLI with no emit and a temporary project",
+        "expected": [],
+        "id": "relation_memo_saturation.ts",
+        "node": "v24.18.0",
+        "process_error": null,
+        "raw_exit": 0,
+        "signal": null,
+        "source_sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d",
+        "stderr": "",
+        "stdout": "",
+        "typescript": "7.0.2"
+      },
+      {
+        "accepted": true,
+        "actual": [
+          2322
+        ],
+        "adapter": "pinned native tsc CLI with no emit and a temporary project",
+        "expected": [
+          2322
+        ],
+        "id": "relation_memo_saturation_invalid.ts",
+        "node": "v24.18.0",
+        "process_error": null,
+        "raw_exit": 1,
+        "signal": null,
+        "source_sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe",
+        "stderr": "",
+        "stdout": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts(229,7): error TS2322: Type '[SourceUnion, SourceLevel14]' is not assignable to type '[TargetUnion, TargetLevel14]'.\n  Type at position 1 in source is not compatible with type at position 1 in target.\n    Type 'SourceLevel14' is not assignable to type 'TargetLevel14'.\n      The types of 'left.left.left.left.left.left.left.left.left.left.left.left.left.left.value' are incompatible between these types.\n        Type 'number' is not assignable to type 'string'.\n",
+        "typescript": "7.0.2"
+      }
+    ],
+    "publication_eligible": false,
+    "results": [
+      {
+        "accepted": true,
+        "command": [
+          "rustc",
+          "--version"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "4ad84f16acc2f3bdcfbc7b0788f1e74a4e649b962154a585b8f8d0b28eb0dd06",
+        "name": "rust-version",
+        "raw_exit": 0,
+        "seconds": 0.015679868999999513,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "node",
+          "--version"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "8f9258d5e9da5443c42966a661aee09292b49d1c64e718dcc5f72976500bac48",
+        "name": "node-version",
+        "raw_exit": 0,
+        "seconds": 0.002458575999998658,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "npm",
+          "ci"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "c8e64e9887ab93826c5c9b37f74105338ab9be601d792f2d465d36b6839034a6",
+        "name": "npm-pinned-typescript",
+        "raw_exit": 0,
+        "seconds": 0.3680876919999996,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "node",
+          "/home/runner/work/bamTiScript/bamTiScript/proof/ci-tools/bamti-memo-baseline-r29/native-oracle.mjs",
+          "/home/runner/work/bamTiScript/bamTiScript/source"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "8d915005997bf430a97ebd7704274c03ef36ba78997fc70b036f451d7f2abff0",
+        "name": "native-typescript-oracle",
+        "raw_exit": 0,
+        "seconds": 0.39341703500000236,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--no-run"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "188569e2b044dd1a227244675246444fe744d0acd908f6d2ca83e99b94c70763",
+        "name": "compile-frozen-regressions",
+        "raw_exit": 0,
+        "seconds": 62.41086488399999,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::saturated_memos_admit_shared_named_relations",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 101,
+        "log_sha256": "5d1a1f7efea63f60be59cba232bfe50085adec130ffb9227de8255be397cb8c0",
+        "name": "saturation-baseline-red",
+        "raw_exit": 101,
+        "seconds": 0.0737770439999963,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::saturated_shared_graph_rejects_incompatible_leaf",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "f0e69703da093c9a178a70a0d1439c2bb5f4b696cd091274b76072c94713d4ce",
+        "name": "incompatible-leaf-control",
+        "raw_exit": 0,
+        "seconds": 0.05909997599999883,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::tests::source_assignment_after_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "e90271f7ca902dba3883f33b6058290e27e04e5dc26292f1ab8411b25987ac5f",
+        "name": "source-assignment-controls",
+        "raw_exit": 0,
+        "seconds": 0.0869739790000068,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::observe_shared_graph_with_intervening_cache_churn",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "c09a3d068c2fe426ca80909f7e8940345d4c9a9f3ce7d81a624e7df6d6eae086",
+        "name": "unchanged-source-churn-observer",
+        "raw_exit": 0,
+        "seconds": 0.16572708599998975,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::memo_returns_settled_alias_comparison_without_recompute",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "5386bb51b5a3e20f33e4d613a75f80c5bfcf92e129df6644d8bff5d685025d09",
+        "name": "alias-view-positive-control",
+        "raw_exit": 0,
+        "seconds": 0.058502950000004716,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::memo_returns_settled_alias_comparison_without_recompute",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "1d81f8fa9d508af6ff400dadf1fb979cff6d554e18492393d8c5463944018b58",
+        "name": "alias-mutant-old-computed-control",
+        "raw_exit": 0,
+        "seconds": 61.070008568000006,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::memo_returns_settled_alias_comparison_without_recompute",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 101,
+        "log_sha256": "fe6de516090b086232ae11a9625653be8d2086053a81f4f2203a8222e2d69474",
+        "name": "alias-mutant-view-counter-red",
+        "raw_exit": 101,
+        "seconds": 60.344794686,
+        "timed_out": false
+      }
+    ],
+    "schema": 1,
+    "source_restored": true,
+    "status": "Expected saturation RED and incompatible-leaf/binder/TypeScript controls completed on unchanged production behavior; bounded churn is observational. The old alias computation assertion passes when root alias memoization is bypassed, while the frozen view-step assertion fails. No cache policy repair has been applied."
+  },
+  "interpretation": "The harness succeeded by requiring the actual saturation failure and actual alias-mutation failure, with all semantic/native/memory controls passing and all source restored. This is verified baseline evidence, not a product repair or root completion claim.",
+  "prior_failures": [
+    {
+      "artifact": 15177972692,
+      "artifact_sha256": "8844bd4fbceb1ddd577120cbc34021533fad9748126528a3bbb678dc9757facc",
+      "expected_exit": 0,
+      "intended_red_reached": false,
+      "job": 140358358658,
+      "phase": "native-typescript-oracle",
+      "producer": "47cdec0a1e3cac8510e0270627c5445cbdeee41f",
+      "raw_exit": 1,
+      "run": 45954699392,
+      "source_restored": true
+    },
+    {
+      "artifact": 15178294709,
+      "artifact_sha256": "e4583031736550ef64a9d1dccfedb64ef4ac6bae09f5e0adf4581b7e237bb1e4",
+      "expected_exit": 0,
+      "intended_red_reached": false,
+      "job": 140363328719,
+      "phase": "native-typescript-oracle",
+      "producer": "0d351c30025e370d4dc5aa3fa0491e5849433dee",
+      "raw_exit": 1,
+      "run": 45956264074,
+      "source_restored": true
+    },
+    {
+      "artifact": 15179167203,
+      "artifact_sha256": "21d8945c8f5bedd0838b4b9e2abefbaa32816bd0456b63b5ecfe699a50d304b3",
+      "computed_relations": 91231,
+      "expected_exit": 0,
+      "intended_saturation_red_reached": true,
+      "job": 140364301977,
+      "phase": "source-assignment-controls",
+      "producer": "35990894d1ca8c9e797871295717ee580c2ea599",
+      "raw_exit": 101,
+      "run": 45956564591,
+      "source_restored": true
+    }
+  ],
+  "publication_eligible": false,
+  "owned_workflow_retired": true,
+  "owned_workflow_path": ".github/workflows/bamti-memo-baseline-r29.yml",
+  "next_proposal": {
+    "commit": "da209eb58c151d172163f32a9cb2480f799434a3",
+    "branch": "ci/bamti-memo-candidate-20261127-r30",
+    "publication_eligible": false
+  }
+}
