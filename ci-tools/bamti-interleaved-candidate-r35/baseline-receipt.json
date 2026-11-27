@@ -1,0 +1,492 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "recorded_at": "2026-11-27 08:25:51 UTC",
+  "producer": "302eecdcaf02b51b53310e2bcd5b19fb18daccd3",
+  "run": 45964680447,
+  "job": 140390424734,
+  "conclusion": "success",
+  "meaning": "Expected-failure baseline harness on unchanged current production source.",
+  "artifact": {
+    "id": 15181563631,
+    "sha256": "c676d4650a3ce541f3a53ef46f22a3ea1e0ac65c0c516ad85591d93a0bd027da",
+    "size_in_bytes": 592709,
+    "producer_verified": true,
+    "verification": "GitHub API artifact metadata and upload log digest agree."
+  },
+  "raw_log_sha256": "4b28e956f7d5a92e7e8e491cb9f4f0937adacdb1ff0767a0c3b5e19558881435",
+  "normalized_log_sha256": "fa899bac3e77e86dacaa34ab43e4ff35a7ad4cfc48bdf9e9e3effaa351e0f437",
+  "report": {
+    "candidate_payload": {
+      "chunks": 10,
+      "files": [
+        {
+          "git_blob": "1da25307f488b33aeb1e117f589e4fabb11bbca4",
+          "mode": "100644",
+          "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+          "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+        },
+        {
+          "git_blob": "1b78b6ec71d02b110823dda9f54e14887a4c321c",
+          "mode": "100644",
+          "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+          "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+        },
+        {
+          "git_blob": "444742a953412b1eee6d9cfad084e7771df2d1f1",
+          "mode": "100644",
+          "path": "crates/bamts-compiler/src/checker/relations.rs",
+          "sha256": "da2b6aa194607523ef91a4d0ac2dc86b3d6ee29193ab8324765dc5cb5f76ed57"
+        },
+        {
+          "git_blob": "8479dfc681ba379a7669230cbe247f7a90027da1",
+          "mode": "100644",
+          "path": "crates/bamts-compiler/src/checker/tests.rs",
+          "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+        }
+      ],
+      "gzip_bytes": 114165,
+      "gzip_sha256": "8db303355650eb964b610188dbc5f45a7ccfc8a58486b9729eb359562f3fd736",
+      "payload_sha256": "a96aac244765bfad6c1ae4aa9e8f0276d655303fb028a7af370116daca9470f3",
+      "tree": "e87e9a30de4b7f5e0e9311933e228e483404db34"
+    },
+    "candidate_tree": "e87e9a30de4b7f5e0e9311933e228e483404db34",
+    "manifest": {
+      "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+      "authored_files": [
+        {
+          "path": "crates/bamts-compiler/src/checker/relations.rs",
+          "sha256": "da2b6aa194607523ef91a4d0ac2dc86b3d6ee29193ab8324765dc5cb5f76ed57"
+        },
+        {
+          "path": "crates/bamts-compiler/src/checker/tests.rs",
+          "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+        },
+        {
+          "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+          "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+        },
+        {
+          "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+          "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+        }
+      ],
+      "contract": "Preserve current implementation and both externally added tests exactly, append frozen native/binder controls and 128 depth-12 shared graphs. Every graph has a unique array relation between left and right. Record all128 results before asserting <100 work. Expected unchanged-source raw101 is accepted only after successful compilation with the intended assertion and exact graph set; all adjacent controls must pass. Both completed memo capacities remain4096.",
+      "no_claims": [
+        "Candidate correctness",
+        "General polynomial relation work",
+        "BH1 performance",
+        "Root/product completion"
+      ],
+      "privacy": "public",
+      "proof_sha256": {
+        "authored.json": "e2a0f3e92e327387530c5869f6c7687935ce2050fe05ab37573fe0c7ffd75ffc",
+        "interleaved-test.rs": "4a519257d1002ebef3d3c43ed2b1e0220befb3285855ad83daae69dc83fde867",
+        "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
+        "source-index.json": "7f9b65a160ea815eab4758b2d9147ef66841a7183bd46c9052b1be9fa198bea0",
+        "verify.py": "96d1237c09275d573ee6e8f9bc65a137d1c9b186ee0baddda345dd609d80bab1"
+      },
+      "publication_eligible": false,
+      "repository": "gosuda/bamTiScript",
+      "schema": 1,
+      "source": {
+        "blobs": 1609,
+        "head": "650e912e9f258cd9bf9fa43a59e556e44677833e",
+        "tree": "f311b28517bf1a9fc4cb1c6884d63e051ef65be3"
+      },
+      "thread": "PRRT_kwDOTlcNv868r4yY",
+      "workflow_sha256": "76510f619ac8dec88ee847516534ed53a6b89e8f8136915ed66b237ad0f17d1c"
+    },
+    "observations": [
+      "MEMO_INTERLEAVED graph=0 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=1 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=2 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=3 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=4 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=5 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=6 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=7 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=8 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=9 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=10 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=11 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=12 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=13 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=14 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=15 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=16 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=17 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=18 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=19 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=20 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=21 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=22 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=23 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=24 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=25 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=26 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=27 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=28 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=29 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=30 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=31 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=32 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=33 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=34 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=35 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=36 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=37 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=38 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=39 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=40 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=41 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=42 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=43 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=44 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=45 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=46 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=47 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=48 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=49 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=50 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=51 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=52 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=53 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=54 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=55 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=56 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=57 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=58 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=59 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=60 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=61 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=62 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=63 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=64 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=65 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=66 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=67 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=68 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=69 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=70 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=71 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=72 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=73 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=74 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=75 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=76 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=77 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=78 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=79 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=80 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=81 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=82 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=83 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=84 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=85 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=86 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=87 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=88 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=89 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=90 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=91 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=92 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=93 compatible=true computed=3086 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=94 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=95 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=96 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=97 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=98 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=99 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=100 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=101 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=102 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=103 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=104 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=105 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=106 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=107 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=108 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=109 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=110 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=111 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=112 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=113 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=114 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=115 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=116 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=117 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=118 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=119 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=120 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=121 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=122 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=123 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=124 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=125 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=126 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_INTERLEAVED graph=127 compatible=true computed=20477 clean=4096 contextual=4096",
+      "MEMO_CHURN depth=2 compatible=true computed=31929 clean=4096 contextual=4096",
+      "MEMO_CHURN depth=4 compatible=true computed=115750 clean=4096 contextual=4096",
+      "MEMO_CHURN depth=6 compatible=true computed=436607 clean=4096 contextual=4096"
+    ],
+    "oracle_records": [
+      {
+        "accepted": true,
+        "actual": [],
+        "adapter": "pinned native tsc CLI with no emit and a temporary project",
+        "expected": [],
+        "id": "relation_memo_saturation.ts",
+        "node": "v24.18.0",
+        "process_error": null,
+        "raw_exit": 0,
+        "signal": null,
+        "source_sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d",
+        "stderr": "",
+        "stdout": "",
+        "typescript": "7.0.2"
+      },
+      {
+        "accepted": true,
+        "actual": [
+          2322
+        ],
+        "adapter": "pinned native tsc CLI with no emit and a temporary project",
+        "expected": [
+          2322
+        ],
+        "id": "relation_memo_saturation_invalid.ts",
+        "node": "v24.18.0",
+        "process_error": null,
+        "raw_exit": 1,
+        "signal": null,
+        "source_sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe",
+        "stderr": "",
+        "stdout": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts(229,7): error TS2322: Type '[SourceUnion, SourceLevel14]' is not assignable to type '[TargetUnion, TargetLevel14]'.\n  Type at position 1 in source is not compatible with type at position 1 in target.\n    Type 'SourceLevel14' is not assignable to type 'TargetLevel14'.\n      The types of 'left.left.left.left.left.left.left.left.left.left.left.left.left.left.value' are incompatible between these types.\n        Type 'number' is not assignable to type 'string'.\n",
+        "typescript": "7.0.2"
+      }
+    ],
+    "publication_eligible": false,
+    "results": [
+      {
+        "accepted": true,
+        "command": [
+          "rustc",
+          "--version"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "4ad84f16acc2f3bdcfbc7b0788f1e74a4e649b962154a585b8f8d0b28eb0dd06",
+        "name": "rust-version",
+        "raw_exit": 0,
+        "seconds": 0.015420133000002778,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "node",
+          "--version"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "8f9258d5e9da5443c42966a661aee09292b49d1c64e718dcc5f72976500bac48",
+        "name": "node-version",
+        "raw_exit": 0,
+        "seconds": 0.0026753460000001894,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "npm",
+          "ci"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "956aabc91561e9354cd9b9d5ea6e8c28724730d501f44538f4bffbf03a6d60da",
+        "name": "npm-pinned-typescript",
+        "raw_exit": 0,
+        "seconds": 0.43278309799999803,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "node",
+          "/home/runner/work/bamTiScript/bamTiScript/proof/ci-tools/bamti-interleaved-baseline-r31/native-oracle.mjs",
+          "/home/runner/work/bamTiScript/bamTiScript/source"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "8d915005997bf430a97ebd7704274c03ef36ba78997fc70b036f451d7f2abff0",
+        "name": "native-typescript-oracle",
+        "raw_exit": 0,
+        "seconds": 0.3827648520000011,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--no-run"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "537f54f62ea29e02b36f6930bf002b43dcf38e132336cc9b6b1da10807eb4ca7",
+        "name": "compile-frozen-regressions",
+        "raw_exit": 0,
+        "seconds": 65.192929831,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::saturated_memo_preserves_bounded_interleaved_reuse",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 101,
+        "log_sha256": "bf22ce35bcff2783226955dc6de72a778e4588d9cc84c2f149b76d2853f2e025",
+        "name": "interleaved-current-baseline",
+        "raw_exit": 101,
+        "seconds": 0.5692248979999874,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::saturated_memo_still_shares_nested_comparisons",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "b942be2110cba3b8647bec662a8c0b3dcae09ceeca27ec644ae6ca371329e15a",
+        "name": "external-adjacent-diamond-control",
+        "raw_exit": 0,
+        "seconds": 0.0600533960000007,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::alias_repeat_hits_alias_memo_not_expanded_view",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "9d652380f3be269fda2dcd8501126af5c358c8b91be10e7b0605b91f5f3fc5b0",
+        "name": "external-alias-view-control",
+        "raw_exit": 0,
+        "seconds": 0.05463260300000172,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::saturated_shared_graph_rejects_incompatible_leaf",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "d8e472d0eca312724cbdfa91f172d05d909e5cbb704e8ed3ebe753fb8889f1d5",
+        "name": "incompatible-leaf-control",
+        "raw_exit": 0,
+        "seconds": 0.056952739999999835,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::tests::source_assignment_after_",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "f50445c0582bf651e30c9a48fcaff8fba8447eb5c0fb74303f7cb0c7c066e701",
+        "name": "source-assignment-controls",
+        "raw_exit": 0,
+        "seconds": 0.06890144099999418,
+        "timed_out": false
+      },
+      {
+        "accepted": true,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "bamts-compiler",
+          "--lib",
+          "--",
+          "checker::relations::tests::observe_shared_graph_with_intervening_cache_churn",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "expected_exit": 0,
+        "log_sha256": "6269f7531a7714787a7fd1e7e28234af4f74d748222f6fb56f212b94f945eef3",
+        "name": "current-churn-observer",
+        "raw_exit": 0,
+        "seconds": 0.18455466100000706,
+        "timed_out": false
+      }
+    ],
+    "schema": 1,
+    "source_gates_passed": false,
+    "source_restored": true,
+    "status": "Authentic unchanged-current-source interleaving RED and adjacent/native/alias controls recorded. Test-only snapshot; no source repair or general complexity claim."
+  },
+  "review_state": {
+    "maintained": "650e912e9f258cd9bf9fa43a59e556e44677833e",
+    "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+    "unresolved_thread": "PRRT_kwDOTlcNv868r4yY"
+  },
+  "publication": {
+    "maintained_source_changed": false,
+    "candidate_verified": false
+  },
+  "retirement": {
+    "workflow": ".github/workflows/bamti-interleaved-baseline-r31.yml",
+    "removed_in_this_additive_commit": true
+  }
+}

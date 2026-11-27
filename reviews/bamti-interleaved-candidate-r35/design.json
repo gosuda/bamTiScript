@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "source": "650e912e9f258cd9bf9fa43a59e556e44677833e",
+  "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+  "thread": "PRRT_kwDOTlcNv868r4yY",
+  "decision": "Bound only the clean memo with insertion-order FIFO; leave contextual cache admission and all relation semantics untouched.",
+  "preconditions": [
+    "The key is the query's unchanged TypeId pair and Strictness.",
+    "Only the existing clean-eligibility predicate can insert completed answers."
+  ],
+  "invariant": "Every retained map key occurs exactly once in the FIFO queue; both lengths stay equal and at most4096.",
+  "postconditions": [
+    "Hits return the existing answer without changing insertion order.",
+    "Replacing an existing answer leaves its queue position unchanged.",
+    "A distinct insertion at capacity removes the oldest retained key before insertion.",
+    "The cfg(test) remove method removes the key from both map and queue, preserving the external alias-view-removal test verbatim."
+  ],
+  "scope": {
+    "production_files": 1,
+    "contextual_admission_changed": false,
+    "relation_truth_rules_changed": false,
+    "external_tests_preserved": {
+      "saturated_memo_preserves_bounded_interleaved_reuse": "c609ab60e8bb3e68caf31e6568a711aad05f932b94b3189101ff2c3cfd1b8122",
+      "saturated_memo_still_shares_nested_comparisons": "8954e5a2a5cc989c4def0a69efd68655eb40a17a6f236095daea5bc68effac1a",
+      "alias_repeat_hits_alias_memo_not_expanded_view": "321319289acd678ff4462c746d906c87db3950c1bc32590bb0434e4eecfd6dee"
+    }
+  },
+  "baseline_checkpoint": "12adc11f6d1856d64f54a40a12d631b58116150e",
+  "baseline_run": 45964680447,
+  "baseline_summary": {
+    "graphs": 128,
+    "minimum_computed": 3086,
+    "maximum_computed": 20477,
+    "all_over_frozen_bound": true,
+    "raw_exit": 101,
+    "compile_exit": 0
+  },
+  "no_claims": [
+    "A general polynomial relation-work bound",
+    "Total relation-engine memory limited to the clean memo's capacity",
+    "BH1 performance",
+    "Root/product completion"
+  ],
+  "authored_files": [
+    {
+      "path": "crates/bamts-compiler/src/checker/relations.rs",
+      "sha256": "cc075f57a1e6110013643e6c5e12240763298d367ac96b0c5a6e5f903bf76ee3"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/tests.rs",
+      "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+      "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+      "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+    }
+  ],
+  "native_and_full_gates_pending": true
+}
