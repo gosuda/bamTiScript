@@ -12832,3 +12832,36 @@ fn element_access_enum_member_types_as_enum_dot_member() {
         "element access enum member should render as E.A"
     );
 }
+
+#[test]
+fn source_assignment_after_relation_cache_saturation() {
+    let result = check_text_strict_null(include_str!("fixtures/relation_memo_saturation.ts"));
+    let codes: Vec<_> = result
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.code().as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        ["BAMTS-W053", "BAMTS-W069"],
+        "{:?}",
+        result.diagnostics()
+    );
+}
+
+#[test]
+fn source_assignment_after_cache_saturation_rejects_leaf() {
+    let result =
+        check_text_strict_null(include_str!("fixtures/relation_memo_saturation_invalid.ts"));
+    let codes: Vec<_> = result
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.code().as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        ["BAMTS-W053", TYPE_NOT_ASSIGNABLE.as_str(), "BAMTS-W069"],
+        "{:?}",
+        result.diagnostics(),
+    );
+}
