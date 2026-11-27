@@ -5093,7 +5093,10 @@ mod tests {
     }
 
     #[test]
-    fn memo_returns_settled_alias_comparison_without_recompute() {
+    fn alias_repeat_hits_alias_memo_not_expanded_view() {
+        // Dropping the expanded-view results forces the repeat through the
+        // alias pair itself: flat work below proves the alias comparison is
+        // memoized, not merely re-expanded onto a memoized view.
         let mut table = TypeTable::new();
         let number = table.number();
         let one = table.number_literal("1");
@@ -5104,13 +5107,20 @@ mod tests {
         table.publish_alias_template(x, view);
         let alias_head = table.applied_alias(x, Vec::new());
         let relations = TypeRelations::new(&table);
-
         assert!(relations.assignable(alias_head, target));
         let before = relations.computed_relations();
         assert!(
             before > 0,
             "alias comparison performed no structural work; the memo assertion below is vacuous"
         );
+        relations
+            .clean
+            .borrow_mut()
+            .remove(&(view, target, Strictness::Assignable));
+        relations
+            .cache
+            .borrow_mut()
+            .retain(|key, _| !(key.source == view && key.target == target));
         assert!(relations.assignable(alias_head, target));
         assert_eq!(
             relations.computed_relations(),
