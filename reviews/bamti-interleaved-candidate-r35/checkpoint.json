@@ -856,10 +856,11 @@
       },
       {
         "id": "PRRT_kwDOTlcNv868tBxK",
-        "is_resolved": false
+        "is_resolved": true
       }
     ],
-    "external_original_resolutions_preserved": true
+    "external_original_resolutions_preserved": true,
+    "description_reply": 4717299995
   },
   "ordinary_runs": [
     {
@@ -867,18 +868,85 @@
       "name": "CI",
       "head": "d81eb646fd49c198e5710840daa4d88abc71fef6",
       "event": "pull_request",
-      "status": "in_progress",
-      "conclusion": null
+      "status": "completed",
+      "conclusion": "success",
+      "run_attempt": 1,
+      "updated_at": "2026-11-27T08:58:04Z",
+      "jobs": [
+        {
+          "id": 140400645121,
+          "name": "Formal",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140400645417,
+          "name": "Quality",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140400645446,
+          "name": "Preflight",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140402358360,
+          "name": "Conformance receipt shard 2/4",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140402358434,
+          "name": "Conformance receipt shard 1/4",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140402358492,
+          "name": "Conformance receipt shard 4/4",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140402358505,
+          "name": "Conformance receipt shard 3/4",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 140403605349,
+          "name": "Conformance receipt accounting",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
     }
   ],
-  "ordinary_monitoring_complete": false,
+  "ordinary_monitoring_complete": true,
   "retirement": {
     "workflow": ".github/workflows/bamti-interleaved-candidate-r35.yml",
-    "removed_in_this_additive_commit": true
+    "removed_in": "91f1e1e9b81dbb2b421e732808f601b5dec826f8",
+    "absence_verified_tree": "2b12ba05b90ceb506f91262e94577d534af39ed2",
+    "record_only_terminal_update": true
   },
   "limits": [
     "The >4096-intervening-pair observer still recomputes; no general polynomial-work bound is claimed.",
     "The4096 entry cap applies to each completed memo, not total relation-engine memory.",
     "No product-root or BH1 completion claim."
-  ]
+  ],
+  "completed_at": "2026-11-27 09:02:52 UTC",
+  "ordinary_source": {
+    "synthetic_merge": "e3ea68ad4d6d23b3eca2be30ab59bb680ceedfa7",
+    "tree": "12ee3512b688e9558e50dcf96de802adc3b52da5",
+    "quality_checkout_log_verified": true,
+    "quality_log_sha256": "7eea6df3fcac9cd598c5e72e41a7141fd9bd01cedd18340d549ca10bf3869840"
+  },
+  "terminal_refs": {
+    "maintained": "d81eb646fd49c198e5710840daa4d88abc71fef6",
+    "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+    "open": true,
+    "mergeable": true
+  }
 }
