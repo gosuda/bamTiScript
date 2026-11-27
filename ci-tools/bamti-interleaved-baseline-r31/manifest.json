@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "source": {
+    "head": "650e912e9f258cd9bf9fa43a59e556e44677833e",
+    "tree": "f311b28517bf1a9fc4cb1c6884d63e051ef65be3",
+    "blobs": 1609
+  },
+  "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+  "thread": "PRRT_kwDOTlcNv868r4yY",
+  "proof_sha256": {
+    "authored.json": "e2a0f3e92e327387530c5869f6c7687935ce2050fe05ab37573fe0c7ffd75ffc",
+    "source-index.json": "7f9b65a160ea815eab4758b2d9147ef66841a7183bd46c9052b1be9fa198bea0",
+    "verify.py": "96d1237c09275d573ee6e8f9bc65a137d1c9b186ee0baddda345dd609d80bab1",
+    "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
+    "interleaved-test.rs": "4a519257d1002ebef3d3c43ed2b1e0220befb3285855ad83daae69dc83fde867"
+  },
+  "workflow_sha256": "76510f619ac8dec88ee847516534ed53a6b89e8f8136915ed66b237ad0f17d1c",
+  "authored_files": [
+    {
+      "path": "crates/bamts-compiler/src/checker/relations.rs",
+      "sha256": "da2b6aa194607523ef91a4d0ac2dc86b3d6ee29193ab8324765dc5cb5f76ed57"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/tests.rs",
+      "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+      "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+    },
+    {
+      "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+      "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+    }
+  ],
+  "contract": "Preserve current implementation and both externally added tests exactly, append frozen native/binder controls and 128 depth-12 shared graphs. Every graph has a unique array relation between left and right. Record all128 results before asserting <100 work. Expected unchanged-source raw101 is accepted only after successful compilation with the intended assertion and exact graph set; all adjacent controls must pass. Both completed memo capacities remain4096.",
+  "no_claims": [
+    "Candidate correctness",
+    "General polynomial relation work",
+    "BH1 performance",
+    "Root/product completion"
+  ],
+  "publication_eligible": false
+}
