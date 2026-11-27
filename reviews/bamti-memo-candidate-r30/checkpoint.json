@@ -1,0 +1,642 @@
+{
+  "schema": 1,
+  "repository": "gosuda/bamTiScript",
+  "privacy": "public",
+  "source": {
+    "blobs": 1609,
+    "head": "97b2682378c9465811322c3c25eff8041a73da48",
+    "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570"
+  },
+  "native": {
+    "producer": "16f3b0caa5edb9ed2024a311f0bb6cde9421b9e0",
+    "run": 45958930080,
+    "job": 140371869699,
+    "run_url": "https://github.com/gosuda/bamTiScript/actions/runs/45958930080",
+    "conclusion": "success",
+    "artifact": {
+      "id": 15181065430,
+      "sha256": "49fa2e919169a34c5cdf62e7ba6cac087c06a2db2d75d8c8925a80f6a96f7bfd",
+      "producer_verified": true,
+      "api_and_upload_digest_match": true
+    },
+    "raw_log_sha256": "8158d440c73acf831ab895bd96559599ed3a2ad3b84e6261a53bf050d1f56fae",
+    "normalized_log_sha256": "37c2e166b37cbe535668011408c9f6543bab0b96bdcdfcc3929120d3c5ce83e9",
+    "report": {
+      "candidate_payload": {
+        "chunks": 10,
+        "files": [
+          {
+            "git_blob": "1da25307f488b33aeb1e117f589e4fabb11bbca4",
+            "mode": "100644",
+            "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+            "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+          },
+          {
+            "git_blob": "1b78b6ec71d02b110823dda9f54e14887a4c321c",
+            "mode": "100644",
+            "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+            "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+          },
+          {
+            "git_blob": "6c516dfcc851cffcf3e9f4675fb5e24ca6074da1",
+            "mode": "100644",
+            "path": "crates/bamts-compiler/src/checker/relations.rs",
+            "sha256": "98f1c04e0d7a5815c59c037d81c185bb3b8383e8fc189da925ca66f33fad1a3e"
+          },
+          {
+            "git_blob": "830b25882a9aad707cb4371881e86b3bf760398b",
+            "mode": "100644",
+            "path": "crates/bamts-compiler/src/checker/tests.rs",
+            "sha256": "ad1e5573e67de9e59fe59941d73abcce19501e7a03053bbb002ec4335076e92e"
+          }
+        ],
+        "gzip_bytes": 113750,
+        "gzip_sha256": "aa5af714c02e9eeec4695867e7536d241206f78651d36e508e1aeb51f7aebfd9",
+        "payload_sha256": "ef9f31c146bd8f65fbcadba01a638b2c3f38058d051460424e6a25a9f83dd0ef",
+        "tree": "d9ed75815f0a0aa93aece8b9f857facd239ae89c"
+      },
+      "candidate_tree": "d9ed75815f0a0aa93aece8b9f857facd239ae89c",
+      "manifest": {
+        "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+        "authored_files": [
+          {
+            "path": "crates/bamts-compiler/src/checker/relations.rs",
+            "sha256": "edb5a6aa6df58b01755c3ee49e634d8de65601d000e1439a2d8db718af93aa44"
+          },
+          {
+            "path": "crates/bamts-compiler/src/checker/tests.rs",
+            "sha256": "19fd267b131aa0ce0cdd16a32c76bcc6aa5ee7fa768722d3d3623c291e354d98"
+          },
+          {
+            "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation.ts",
+            "sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d"
+          },
+          {
+            "path": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts",
+            "sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe"
+          }
+        ],
+        "baseline": {
+          "artifact": 15178952945,
+          "artifact_sha256": "9bfd2a8ec9bc3417d6901ec0fd4c6e475b9d9c560c34c4efda63db5a0838ba5a",
+          "job": 140365611354,
+          "producer": "121fe5bde8e5c959e1a4655740272c0dee816e88",
+          "run": 45956976216,
+          "terminal": "7cef7ac0b6c5a9afe6638e8edcf4ada7b5d28e64"
+        },
+        "gates": [
+          "Pinned Rust and Node versions",
+          "Pinned TypeScript7.0.2 CLI on both unchanged fixtures",
+          "Successful compilation before focused controls",
+          "Frozen saturation work bound and both 4,096-entry memory bounds",
+          "Incompatible-leaf and full binder diagnostic arrays",
+          "Exact churn observer with no general complexity claim",
+          "Strengthened alias-view positive control (authentic mutation RED reused from baseline)",
+          "cargo fmt --all --check",
+          "cargo check --workspace --locked",
+          "cargo clippy --workspace --all-targets --locked -- -D warnings",
+          "cargo fetch --locked",
+          "Pinned TypeScript authority fixture fetch",
+          "Pinned Quint CLI and SHA-verified0.6.0 evaluator",
+          "cargo test --workspace --locked --no-fail-fast",
+          "Three pinned ignored Node oracle contracts",
+          "All configured npm-interface tests",
+          "git diff --check",
+          "Final exact candidate tree and original-source restoration"
+        ],
+        "no_claims": [
+          "General polynomial relation work",
+          "Total relation-engine memory bounded by the completed memo capacity",
+          "BH1 performance",
+          "Root/product completion"
+        ],
+        "preparation": "Apply only the four authored files; cargo fmt records exact final source bytes. Verify all 1,609 original blob/mode identities, permit only the two frozen new TypeScript fixture files, freeze a temporary-index Git tree, and emit a deterministic gzip/base64 source payload with per-file SHA-256 and Git blobs. Full source bytes must remain exact through every gate and original source must be restored.",
+        "privacy": "public",
+        "proof_sha256": {
+          "authored.json": "518f8d8abe0574b5d10de830a14e044e1826dbfc49b51095db82512faf5871e8",
+          "baseline-receipt.json": "3bc92f1ec9c395239d8af1f39d011111c2be6a18b3008de50e1a59d573884525",
+          "native-oracle.mjs": "26f0f74d8a84d3c4ce5b42d759bb2395a620e6702ecfc41e1ea1784f9cd4351c",
+          "source-index.json": "37b94dea6226db93eca7e075df71ba47cbd1c40e31054d749c89392495170cd8",
+          "verify.py": "ec241297bc856464973795973dfcb7e669f558a38ea0c6b220644abd0e206d8e"
+        },
+        "proposal": "da209eb58c151d172163f32a9cb2480f799434a3",
+        "publication_eligible": false,
+        "repository": "gosuda/bamTiScript",
+        "schema": 1,
+        "source": {
+          "blobs": 1609,
+          "head": "97b2682378c9465811322c3c25eff8041a73da48",
+          "tree": "b12ca68c0510d23bb5f05c42f19d846f62c08570"
+        },
+        "threads": [
+          "PRRT_kwDOTlcNv868pc6E",
+          "PRRT_kwDOTlcNv868pc6c"
+        ],
+        "workflow_sha256": "182e8acdd9862fafc5db6b9067b00e5691f7091b47a1722b3f49f5355403fb59"
+      },
+      "observations": [
+        "MEMO_SATURATION compatible=true computed=9358 clean=4096 contextual=4096",
+        "MEMO_CHURN depth=2 compatible=true computed=37270 clean=4096 contextual=4096",
+        "MEMO_CHURN depth=4 compatible=true computed=149086 clean=4096 contextual=4096",
+        "MEMO_CHURN depth=6 compatible=true computed=596350 clean=4096 contextual=4096"
+      ],
+      "oracle_records": [
+        {
+          "accepted": true,
+          "actual": [],
+          "adapter": "pinned native tsc CLI with no emit and a temporary project",
+          "expected": [],
+          "id": "relation_memo_saturation.ts",
+          "node": "v24.18.0",
+          "process_error": null,
+          "raw_exit": 0,
+          "signal": null,
+          "source_sha256": "bd132bbe82a8f739e8124095524bfc298bf2ce875959cd317a41bf4d95efbb3d",
+          "stderr": "",
+          "stdout": "",
+          "typescript": "7.0.2"
+        },
+        {
+          "accepted": true,
+          "actual": [
+            2322
+          ],
+          "adapter": "pinned native tsc CLI with no emit and a temporary project",
+          "expected": [
+            2322
+          ],
+          "id": "relation_memo_saturation_invalid.ts",
+          "node": "v24.18.0",
+          "process_error": null,
+          "raw_exit": 1,
+          "signal": null,
+          "source_sha256": "24243eb236924f6d74a1cdbc1ed54d0e116d323c86c146a53dc76834d68e0cbe",
+          "stderr": "",
+          "stdout": "crates/bamts-compiler/src/checker/fixtures/relation_memo_saturation_invalid.ts(229,7): error TS2322: Type '[SourceUnion, SourceLevel14]' is not assignable to type '[TargetUnion, TargetLevel14]'.\n  Type at position 1 in source is not compatible with type at position 1 in target.\n    Type 'SourceLevel14' is not assignable to type 'TargetLevel14'.\n      The types of 'left.left.left.left.left.left.left.left.left.left.left.left.left.left.value' are incompatible between these types.\n        Type 'number' is not assignable to type 'string'.\n",
+          "typescript": "7.0.2"
+        }
+      ],
+      "publication_eligible": true,
+      "results": [
+        {
+          "accepted": true,
+          "command": [
+            "rustc",
+            "--version"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "4ad84f16acc2f3bdcfbc7b0788f1e74a4e649b962154a585b8f8d0b28eb0dd06",
+          "name": "rust-version",
+          "raw_exit": 0,
+          "seconds": 0.015677104000001663,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "node",
+            "--version"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "8f9258d5e9da5443c42966a661aee09292b49d1c64e718dcc5f72976500bac48",
+          "name": "node-version",
+          "raw_exit": 0,
+          "seconds": 0.0025586759999995934,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "npm",
+            "ci"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "3443ad601d4b2b515c521bfa5d1aeeb0c9103340c5dc5a4f11c3fa160d8cad67",
+          "name": "npm-pinned-typescript",
+          "raw_exit": 0,
+          "seconds": 0.37391664099999744,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "fmt",
+            "--all"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "format-candidate",
+          "raw_exit": 0,
+          "seconds": 2.8989847719999986,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "node",
+            "/home/runner/work/bamTiScript/bamTiScript/proof/ci-tools/bamti-memo-candidate-r30/native-oracle.mjs",
+            "/home/runner/work/bamTiScript/bamTiScript/source"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "8d915005997bf430a97ebd7704274c03ef36ba78997fc70b036f451d7f2abff0",
+          "name": "native-typescript-oracle",
+          "raw_exit": 0,
+          "seconds": 0.3921151469999984,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-compiler",
+            "--lib",
+            "--no-run"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "1fdc21fe3c650dd2770bc75d04c04f2b91886f7a9dd996786fd70f92519d2be3",
+          "name": "compile-frozen-regressions",
+          "raw_exit": 0,
+          "seconds": 63.143660518999994,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-compiler",
+            "--lib",
+            "--",
+            "checker::relations::tests::saturated_memos_admit_shared_named_relations",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "d5365e3be695dfb6cd5c4e40da6586795687f4f685e9441b36ab7fc9e63d17ad",
+          "name": "saturation-candidate",
+          "raw_exit": 0,
+          "seconds": 0.060556796999989615,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-compiler",
+            "--lib",
+            "--",
+            "checker::relations::tests::saturated_shared_graph_rejects_incompatible_leaf",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "4be11400d970ee45c8bb31c0f0e3b62dea919a5498424a40bccbff4521f85180",
+          "name": "incompatible-leaf-control",
+          "raw_exit": 0,
+          "seconds": 0.062023973999998816,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-compiler",
+            "--lib",
+            "--",
+            "checker::tests::source_assignment_after_",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "080c60a5a9e9472596087d67403e43a08899c55372b85f011d5a448e0da09a27",
+          "name": "source-assignment-controls",
+          "raw_exit": 0,
+          "seconds": 0.07284416699999952,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-compiler",
+            "--lib",
+            "--",
+            "checker::relations::tests::observe_shared_graph_with_intervening_cache_churn",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "305798d30f0fa36f080bcd1a74b1473e664f9ce5c09b0d85df557387a3e2519c",
+          "name": "candidate-churn-observer",
+          "raw_exit": 0,
+          "seconds": 0.21748772300000496,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-compiler",
+            "--lib",
+            "--",
+            "checker::relations::tests::memo_returns_settled_alias_comparison_without_recompute",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "f4dc02f05968941069d4b1956e33d3553ac47f4c2b52f9d0806d720a7fe85b18",
+          "name": "alias-view-positive-control",
+          "raw_exit": 0,
+          "seconds": 0.058350249000000076,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "fmt",
+            "--all",
+            "--check"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "format-check",
+          "raw_exit": 0,
+          "seconds": 2.9342570170000073,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "check",
+            "--workspace",
+            "--locked"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "0587aed3382eef5d136f22d77005719ab6a0e37d51a361638e13d4e6c3fe30e2",
+          "name": "workspace-check",
+          "raw_exit": 0,
+          "seconds": 26.74080465099999,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "3a325a2d1ca831c279da9db2f8b4975a08337d33a02ed096df52f49e76564f4b",
+          "name": "workspace-clippy",
+          "raw_exit": 0,
+          "seconds": 23.363582881000013,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "fetch",
+            "--locked"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "e13b758dc1f600af3be6d94deadfab2ca801e1802fafae0801d260ab2820a0b4",
+          "name": "fetch-all-target-dependencies",
+          "raw_exit": 0,
+          "seconds": 0.3363619710000023,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "run",
+            "--locked",
+            "-p",
+            "bamts-verification",
+            "--",
+            "source",
+            "fetch",
+            "typescript-primary-tests",
+            "--dest",
+            "target/authority/typescript-7.0.2-tests"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "f8c755426c535d9d40d5a8a092e59f36ed8b6b22490c34a49e79a93c936c518d",
+          "name": "fetch-pinned-typescript-tests",
+          "raw_exit": 0,
+          "seconds": 63.454922350000004,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "npm",
+            "ci",
+            "--prefix",
+            "formal/quint"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "840d0f87a4ab4c22aa0508496a5d3403ea1a554d73f5d6e14328d58bb204821e",
+          "name": "install-pinned-quint-cli",
+          "raw_exit": 0,
+          "seconds": 0.6909296460000007,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "node",
+            "-p",
+            "require(\"./formal/quint/node_modules/@informalsystems/quint/dist/src/rust/binaryManager.js\").QUINT_EVALUATOR_VERSION"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "613ff7316ed558079973b8e02ce8dac763243297e0f4c8a584958c579f6e86fd",
+          "name": "quint-evaluator-version",
+          "raw_exit": 0,
+          "seconds": 0.021934669000017948,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "120",
+            "https://github.com/quint-co/quint/releases/download/evaluator/v0.6.0/quint_evaluator-x86_64-unknown-linux-gnu.tar.gz",
+            "--output",
+            "/home/runner/work/_temp/bamti-memo-candidate-r30/quint-evaluator.tar.gz"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "download-pinned-quint-evaluator",
+          "raw_exit": 0,
+          "seconds": 0.10975696400001311,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-fail-fast"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "5b6e0477755f08db83a2453227394586071515d72f9437c29f3b04d5d061cdba",
+          "name": "workspace-tests",
+          "raw_exit": 0,
+          "seconds": 385.91955953699994,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "bamts-verification",
+            "--lib",
+            "--",
+            "--ignored",
+            "--exact",
+            "corpus::tests::verify_node_version_accepts_pinned_and_rejects_missing",
+            "corpus::tests::oracle_runs_a_real_corpus_case",
+            "facets::tests::forged_unpinned_js_outcomes_are_not_a_public_proof_path"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "30626b93c8acedac67382ccdb4f7a43a455c78377ed01b1f8400394fef57ee30",
+          "name": "pinned-node-contracts",
+          "raw_exit": 0,
+          "seconds": 19.42020709999997,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "node",
+            "--test",
+            "--test-skip-pattern=staged cli-|clean consumer",
+            "npm/test/bamti-api.test.mjs",
+            "npm/test/bamti-cli.test.mjs",
+            "npm/test/bamti-native-addon-lifecycle.test.mjs",
+            "npm/test/bamti-native-loader.test.mjs",
+            "npm/test/bamti-transport.test.mjs",
+            "npm/test/contract-f21.test.mjs",
+            "npm/test/contract-f22.test.mjs",
+            "npm/test/contract-f23.test.mjs",
+            "npm/test/native-build-plan.test.mjs",
+            "npm/test/oracle-package-json.test.mjs",
+            "npm/test/oracle-root.test.mjs",
+            "npm/test/oracle-unstable-ast-clone.test.mjs",
+            "npm/test/oracle-unstable-ast-factory.test.mjs",
+            "npm/test/oracle-unstable-ast-is.test.mjs",
+            "npm/test/oracle-unstable-ast-scanner.test.mjs",
+            "npm/test/oracle-unstable-ast-utils.test.mjs",
+            "npm/test/oracle-unstable-ast-visitor.test.mjs",
+            "npm/test/oracle-unstable-ast.test.mjs",
+            "npm/test/oracle-unstable-async.test.mjs",
+            "npm/test/oracle-unstable-fs.test.mjs",
+            "npm/test/oracle-unstable-proto.test.mjs",
+            "npm/test/oracle-unstable-sync.test.mjs",
+            "npm/test/package-cli-platform.test.mjs",
+            "npm/test/package-native-platform.test.mjs"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "8192988fc47163fed8c608ad3127298ecb34f8054397b1e4a6c117ff245e7313",
+          "name": "npm-interface-tests",
+          "raw_exit": 0,
+          "seconds": 1.278592709999998,
+          "timed_out": false
+        },
+        {
+          "accepted": true,
+          "command": [
+            "git",
+            "diff",
+            "--check"
+          ],
+          "expected_exit": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "whitespace-check",
+          "raw_exit": 0,
+          "seconds": 0.2808694569999943,
+          "timed_out": false
+        }
+      ],
+      "schema": 1,
+      "source_gates_passed": true,
+      "source_restored": true,
+      "status": "All focused relation/native controls and prescribed quality gates passed on the exact emitted candidate tree. FIFO repairs stopped admission; the complete churn counts are reported without a universal complexity claim. Root completion and BH1 performance are not claimed."
+    }
+  },
+  "reconstructed_source": {
+    "tree": "d9ed75815f0a0aa93aece8b9f857facd239ae89c",
+    "blobs": 1611,
+    "all_blob_mode_identities_verified": true,
+    "payload_sha256": "ef9f31c146bd8f65fbcadba01a638b2c3f38058d051460424e6a25a9f83dd0ef",
+    "payload_file": "reviews/bamti-memo-candidate-r30/verified-source.json"
+  },
+  "baseline_checkpoint": "https://github.com/gosuda/bamTiScript/blob/7cef7ac0b6c5a9afe6638e8edcf4ada7b5d28e64/reviews/bamti-memo-baseline-r29/checkpoint.json",
+  "publication": {
+    "status": "Stopped before any product commit or maintained-ref mutation because the raw maintained head moved externally.",
+    "applied": false,
+    "maintained_head": "650e912e9f258cd9bf9fa43a59e556e44677833e",
+    "maintained_tree": "f311b28517bf1a9fc4cb1c6884d63e051ef65be3",
+    "actual_main": "a471de394b3f27408839ad8e0ec1642054c0aeee",
+    "external_commits": [
+      "9381a5afc50ec6c0a1756231f84fe182365f12e2",
+      "650e912e9f258cd9bf9fa43a59e556e44677833e"
+    ],
+    "external_original_thread_resolutions": true,
+    "new_unresolved_thread": "PRRT_kwDOTlcNv868r4yY",
+    "new_comment": 4716798333
+  },
+  "limitations": [
+    "The FIFO candidate fixes stopped admission on the frozen prefix/shared-graph case, 91231 to9358 computations. The over-capacity interleaved-filler observer retains counts37270/149086/596350; no general complexity guarantee is claimed.",
+    "The successful source gates bind only historical tree d9ed75815f0a0aa93aece8b9f857facd239ae89c. They do not validate external head650e912e or any future reconciliation.",
+    "No root/product completion or BH1 performance claim."
+  ],
+  "next": "Preserve external adjacent-diamond and alias-view-eviction tests. Freeze bounded interleaving on exact650e, then reconcile FIFO replacement with the current source and prove the final exact tree before maintained publication.",
+  "owned_workflow_retired": true,
+  "owned_workflow_path": ".github/workflows/bamti-memo-candidate-r30.yml"
+}
