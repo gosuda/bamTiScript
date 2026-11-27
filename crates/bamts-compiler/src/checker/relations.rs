@@ -594,9 +594,10 @@ impl<'table> TypeRelations<'table> {
         }
         // Environment-independent results additionally enter the clean memo
         // keyed without the context, up to the same capacity bound as the
-        // contextual cache. A hit returns the answer in every
-        // environment with no bookkeeping. Withheld are comparisons that
-        // consulted the environment and anything carrying erasure
+        // contextual cache; a saturated memo displaces an older pair so the
+        // newly completed comparison stays shared. A hit returns the answer
+        // in every environment with no bookkeeping. Withheld are comparisons
+        // that consulted the environment and anything carrying erasure
         // requirements. A `true` proved with coinductive hypotheses is
         // admitted, including results that passed through an alias-cycle
         // re-entry: every guard re-entry is guarded by a structural
@@ -613,9 +614,14 @@ impl<'table> TypeRelations<'table> {
         {
             let key = (source, target, strictness);
             let mut clean = self.clean.borrow_mut();
-            if clean.len() < RELATION_CACHE_CAPACITY || clean.contains_key(&key) {
-                clean.insert(key, result);
+            if clean.len() >= RELATION_CACHE_CAPACITY && !clean.contains_key(&key) {
+                // Dropping the new pair instead would make every shared
+                // nested comparison after saturation recompute once per use.
+                if let Some(old) = clean.keys().next().copied() {
+                    clean.remove(&old);
+                }
             }
+            clean.insert(key, result);
         }
         if cacheable && !frame.approximate_alias && (result || frame.assumptions.is_empty()) {
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
@@ -3720,6 +3726,57 @@ mod tests {
                 assert_eq!(relations.assignable(source, target), expected);
             }
         }
+    }
+    #[test]
+    fn saturated_memo_still_shares_nested_comparisons() {
+        // One assignment can saturate both memos before reaching shared
+        // nested types, so a diamond compared after saturation must still
+        // share each level instead of recomputing it once per use.
+        let mut table = TypeTable::new();
+        let arrays: Vec<TypeId> = (0..100)
+            .map(|index| {
+                let literal = table.number_literal(&index.to_string());
+                table.array(literal)
+            })
+            .collect();
+        let number = table.number();
+        let one = table.number_literal("1");
+        let mut source = table.object_type(vec![PropertyType::new("value", false, one)]);
+        let mut target = table.object_type(vec![PropertyType::new("value", false, number)]);
+        for _ in 0..12 {
+            source = table.object_type(vec![
+                PropertyType::new("left", false, source),
+                PropertyType::new("right", false, source),
+            ]);
+            target = table.object_type(vec![
+                PropertyType::new("left", false, target),
+                PropertyType::new("right", false, target),
+            ]);
+        }
+        let relations = TypeRelations::new(&table);
+        for &filler_source in &arrays {
+            for &filler_target in &arrays {
+                let expected = filler_source == filler_target;
+                assert_eq!(relations.assignable(filler_source, filler_target), expected);
+            }
+        }
+        assert_eq!(
+            relations.clean_pairs(),
+            RELATION_CACHE_CAPACITY,
+            "filler must saturate the clean memo or the regression is vacuous"
+        );
+        assert_eq!(
+            relations.cached_pairs(),
+            RELATION_CACHE_CAPACITY,
+            "filler must saturate the contextual cache or the regression is vacuous"
+        );
+        let base = relations.computed_relations();
+        assert!(relations.assignable(source, target));
+        let delta = relations.computed_relations() - base;
+        assert!(
+            delta < 100,
+            "shared diamond levels recomputed {delta} times after saturation"
+        );
     }
 
     #[test]
