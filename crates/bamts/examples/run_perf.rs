@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let executable = bamts::compile_source_file(Path::new(path))?;
     let compiled = started.elapsed();
     let mut host = bamts::node::NodeHost::new();
+    host.set_script_compiler(Box::new(bamts::ScriptCompiler));
     let started = Instant::now();
     let outcome = bamts::runtime::run(
         executable.wire(),
