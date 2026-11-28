@@ -927,9 +927,12 @@ def main() -> None:
             host={**report.host, "load_after": os.getloadavg()},
         )
         save(report, output)
-        print("BEGIN_OPTIMIZATION_REPORT", flush=True)
-        print(json.dumps(asdict(report), indent=2), flush=True)
-        print("END_OPTIMIZATION_REPORT", flush=True)
+        try:
+            print("BEGIN_OPTIMIZATION_REPORT", flush=True)
+            print(json.dumps(asdict(report), indent=2), flush=True)
+            print("END_OPTIMIZATION_REPORT", flush=True)
+        except BrokenPipeError:
+            pass
     except (ComparisonError, OSError, ValueError, subprocess.SubprocessError) as error:
         save(replace(report, status="failed", error=str(error)), output)
         raise
