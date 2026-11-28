@@ -168,8 +168,15 @@ def profile_function(source: str, name: str) -> str:
     return source[start:end].strip() + "\n"
 
 
-def prepare_baseline(baseline: Path, candidate: Path) -> dict[str, str]:
-    for relative in EXAMPLES:
+def prepare_baseline(
+    baseline: Path, candidate: Path, execution_only: bool = False
+) -> dict[str, str]:
+    wanted = (
+        tuple(p for p in EXAMPLES if p.endswith("run_perf.rs"))
+        if execution_only
+        else EXAMPLES
+    )
+    for relative in wanted:
         destination = baseline / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(candidate / relative, destination)
@@ -193,17 +200,20 @@ def prepare_baseline(baseline: Path, candidate: Path) -> dict[str, str]:
             + '\n[[example]]\nname = "run_perf"\nrequired-features = ["node-host"]\n',
             encoding="utf-8",
         )
-    candidate_tests = (candidate / RUNTIME_TESTS).read_text(encoding="utf-8")
-    baseline_tests = (baseline / RUNTIME_TESTS).read_text(encoding="utf-8")
-    for name in PROFILES:
-        replacement = profile_function(candidate_tests, name)
-        if f"fn {name}()" in baseline_tests:
-            previous = profile_function(baseline_tests, name)
-            baseline_tests = baseline_tests.replace(previous, replacement, 1)
-        else:
-            baseline_tests += "\n" + replacement
-    (baseline / RUNTIME_TESTS).write_text(baseline_tests, encoding="utf-8")
-    allowed = {*EXAMPLES, FACADE_MANIFEST, RUNTIME_TESTS}
+    if execution_only:
+        allowed = {*wanted, FACADE_MANIFEST}
+    else:
+        candidate_tests = (candidate / RUNTIME_TESTS).read_text(encoding="utf-8")
+        baseline_tests = (baseline / RUNTIME_TESTS).read_text(encoding="utf-8")
+        for name in PROFILES:
+            replacement = profile_function(candidate_tests, name)
+            if f"fn {name}()" in baseline_tests:
+                previous = profile_function(baseline_tests, name)
+                baseline_tests = baseline_tests.replace(previous, replacement, 1)
+            else:
+                baseline_tests += "\n" + replacement
+        (baseline / RUNTIME_TESTS).write_text(baseline_tests, encoding="utf-8")
+        allowed = {*EXAMPLES, FACADE_MANIFEST, RUNTIME_TESTS}
     changed = set(git(baseline, "diff", "--name-only").splitlines())
     untracked = set(
         git(baseline, "ls-files", "--others", "--exclude-standard").splitlines()
@@ -790,7 +800,9 @@ def main() -> None:
             )
             report = replace(
                 report,
-                instrumentation=prepare_baseline(disposable_baseline, candidate),
+                instrumentation=prepare_baseline(
+                    disposable_baseline, candidate, execution_only
+                ),
             )
             save(report, output)
             logged(
