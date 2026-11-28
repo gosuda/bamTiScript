@@ -918,13 +918,30 @@ printf 'started\\n' > probe-started
         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))?;
         let context = ExecutionContext::new(directory.path(), BTreeMap::new())?;
         let cancel = CancellationToken::new();
-        let (outcome, ready) =
-            cancel_after_readiness(&directory.path().join("probe-started"), &cancel, || {
-                probe_toolchain_in_context(compiler.into_os_string(), &context, &cancel)
-            });
-        assert_eq!(ready?, "started\n");
-        let error = outcome.expect_err("cancelled compiler probe must fail as cancellation");
+        let trigger = cancel.clone();
+        let marker = directory.path().join("probe-started");
+        // Date the cancel at the readiness marker, as the link test does, so
+        // the bound below measures cancellation, not process startup.
+        let canceller = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !marker.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let started = marker.is_file();
+            trigger.cancel();
+            started.then(Instant::now)
+        });
+        let error = probe_toolchain_in_context(compiler.into_os_string(), &context, &cancel)
+            .expect_err("cancelled compiler probe must fail as cancellation");
         assert!(matches!(error, DriverError::Cancelled));
+        let cancelled_at = canceller
+            .join()
+            .expect("probe cancellation thread completes")
+            .expect("the probe must start before it is cancelled");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(3),
+            "managed probe cancellation must be bounded"
+        );
         assert!(
             !directory.path().join("probe-returned").exists(),
             "compiler probe reached its natural exit"
