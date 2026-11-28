@@ -106,6 +106,8 @@ work. They are separate evidence from the elapsed-time samples.
 
 ## Historical local validation status
 
+Evidence claims in this report follow [the verification guide](../../../docs/explanation/verification.md).
+
 | Area | Status and evidence |
 | --- | --- |
 | Source bytecode tests | **138 passed** through pinned direct `rustc --test`, including a differential test over **280,893 exhaustive cases** comparing complete certificates or exact first errors with the original solver. |

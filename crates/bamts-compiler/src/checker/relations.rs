@@ -2479,7 +2479,16 @@ impl<'table> TypeRelations<'table> {
     ) -> Option<bool> {
         let element = self.table.concat_array_element(target)?;
         let relates_element = |source| self.relates(source, element, strictness);
-        match self.table.get(source) {
+        // An aliased array (e.g. `type Values = number[]`) must use the same
+        // specialization as a direct one; expanding only the target would lose
+        // the ConcatArray identity to the structural fallback.
+        let resolved = match self.table.get(source) {
+            Type::AppliedAlias { .. } | Type::TypeQuery { .. } => {
+                self.relation_alias_view(source).unwrap_or(source)
+            }
+            _ => source,
+        };
+        match self.table.get(resolved) {
             Type::Array(source) => Some(relates_element(*source)),
             Type::Tuple(shape) => Some(
                 (shape.required as usize >= shape.prefix.len()

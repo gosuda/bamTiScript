@@ -13,7 +13,8 @@ microbenchmarks also improved, with the phase and memory tradeoffs stated below.
 These are development comparisons on ordinary CI hosts. **They do not satisfy
 BH1 qualification or establish TypeScript product completion.** Later changes
 on main are outside the measured source pair. The evidence directory keeps its
-original date label; CI run times and decision-log additions use UTC.
+original date label; CI run times and decision-log additions use UTC. Evidence
+claims in this report follow [the verification guide](../../../docs/explanation/verification.md).
 
 ## Source and artifact provenance
 

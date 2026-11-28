@@ -4680,6 +4680,16 @@ fn array_concat_accepts_compatible_arrays_tuples_and_array_like_values() {
     assert_eq!(checker_codes(&checked), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
 }
 
+#[test]
+fn aliased_array_assigns_to_concat_array() {
+    let checked = check_text(
+        "type Values = number[];\
+         declare const values: Values;\
+         const out: ConcatArray<number> = values;",
+    );
+    assert_eq!(checker_codes(&checked), Vec::<&str>::new());
+}
+
 /// TS2576: super.S1 where S1 is a base static member. Also pins the
 /// superAccess oracle shape: static fires TS2576, instance fields fire
 /// TS2855, and a base instance method stays silent.
