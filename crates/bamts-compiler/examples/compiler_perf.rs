@@ -132,10 +132,17 @@ fn parse(declarations: usize, repetitions: usize) {
 
 fn program(entrypoint: &Path, repetitions: usize) {
     let entrypoint = entrypoint.canonicalize().expect("entrypoint exists");
-    let root = ProjectRoot::new(entrypoint.parent().expect("entrypoint has a parent"))
-        .expect("entrypoint has an absolute parent");
-    let config = ProjectConfig::parse(&root, root.path().join("tsconfig.json"), "{}")
-        .expect("empty project configuration is valid");
+    let parent = entrypoint.parent().expect("entrypoint has a parent");
+    let root_dir = parent
+        .ancestors()
+        .find(|directory| directory.join("tsconfig.json").is_file())
+        .unwrap_or(parent)
+        .to_path_buf();
+    let root = ProjectRoot::new(root_dir).expect("project root exists");
+    let config_path = root.path().join("tsconfig.json");
+    let config_source = std::fs::read_to_string(&config_path).unwrap_or_else(|_| "{}".to_owned());
+    let config = ProjectConfig::parse(&root, &config_path, &config_source)
+        .expect("project configuration is valid");
     let program = ProgramLoader::new(&root, config.options())
         .expect("project root exists")
         .load(&entrypoint)
