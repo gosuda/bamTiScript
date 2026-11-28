@@ -741,6 +741,8 @@ def main() -> None:
             side: source_revision(root)
             for side, root in (("baseline", baseline), ("candidate", candidate))
         }
+        tooling = Path(__file__).resolve().parent.parent
+        revisions["tooling"] = git(tooling, "rev-parse", "HEAD")
         report = replace(report, revisions=revisions)
         save(report, output)
         for root in (baseline, candidate):
